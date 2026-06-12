@@ -90,9 +90,9 @@ function pgStore() {
       const now = Date.now();
       const r = await pool.query(
         `INSERT INTO players(wallet,first_seen,last_claim,eligible,balance)
-         VALUES($1,$2,$2 - 60000,$3,$4)
-         ON CONFLICT(wallet) DO UPDATE SET eligible=$3, balance=$4
-         RETURNING *`, [wallet, now, eligible, balance]);
+         VALUES($1,$2::bigint,$3::bigint,$4,$5)
+         ON CONFLICT(wallet) DO UPDATE SET eligible=$4, balance=$5
+         RETURNING *`, [wallet, now, now - 60000, eligible, balance]);
       return r.rows[0];
     },
     async dailyTotal() {
@@ -105,7 +105,7 @@ function pgStore() {
       const c = await pool.connect();
       try {
         await c.query("BEGIN");
-        await c.query(`INSERT INTO players(wallet,first_seen,last_claim) VALUES($1,$2,$2-60000) ON CONFLICT(wallet) DO NOTHING`, [wallet, now]);
+        await c.query(`INSERT INTO players(wallet,first_seen,last_claim) VALUES($1,$2::bigint,$3::bigint) ON CONFLICT(wallet) DO NOTHING`, [wallet, now, now - 60000]);
         const { rows } = await c.query(`SELECT * FROM players WHERE wallet=$1 FOR UPDATE`, [wallet]);
         const p = rows[0];
         if (now - Number(p.last_claim) < COOLDOWN) { await c.query("ROLLBACK"); return { status: "cooldown", retryInMs: COOLDOWN - (now - Number(p.last_claim)) }; }
@@ -166,6 +166,8 @@ function memStore() {
 const store = makeStore();
 
 /* ----------------------------- API ----------------------------- */
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e?.message || e));
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -184,11 +186,13 @@ app.get("/pool", async (_q, res) => {
 app.post("/verify", async (req, res) => {
   const wallet = req.body?.wallet;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
-  let balance = 0, eligible = true;
-  if (verifyOn) { balance = await chikiBalance(wallet); eligible = balance >= MIN; }
-  const p = await store.touch(wallet, eligible, balance);
-  const chikis = eligible ? (balance >= 1_000_000 ? 2 : 1) : 0;
-  res.json({ wallet, eligible, balance, chikis, minHold: MIN, verified: verifyOn, firstSeen: Number(p.first_seen) });
+  try {
+    let balance = 0, eligible = true;
+    if (verifyOn) { balance = await chikiBalance(wallet); eligible = balance >= MIN; }
+    const p = await store.touch(wallet, eligible, balance);
+    const chikis = eligible ? (balance >= 1_000_000 ? 2 : 1) : 0;
+    res.json({ wallet, eligible, balance, chikis, minHold: MIN, verified: verifyOn, firstSeen: Number(p.first_seen) });
+  } catch (e) { res.status(500).json({ error: "verify failed: " + String(e.message || e) }); }
 });
 
 app.post("/claim", async (req, res) => {
