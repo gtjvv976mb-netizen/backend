@@ -1,9 +1,10 @@
-// Chiki Monsters — backend: holder verification + server-signed SOL payouts.
-// Run on devnet first (NETWORK=devnet). Never commit your .env.
+// Chiki Monsters backend v2 — Postgres-backed, idempotent logged payouts.
+// Holder verification + server-signed SOL payouts. Devnet-first; set DATABASE_URL for production.
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import bs58 from "bs58";
+import pg from "pg";
 import {
   Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
@@ -14,146 +15,242 @@ const {
   RPC_URL,
   CHIKI_MINT,
   MIN_HOLD = "500000",
+  MIN_HOLD_MINUTES = "0",          // anti-sybil: wallet must be "seen" this long before it can claim
   VERIFY_HOLDERS = "false",
   TREASURY_SECRET,
   TEAM_WALLET = "",
   REWARD_RATE_PER_MIN = "0.0008",
   MAX_CLAIM_SOL = "0.05",
+  DAILY_CAP_SOL = "1",             // global cap on confirmed payouts per rolling 24h
   CLAIM_COOLDOWN_SEC = "30",
+  DATABASE_URL = "",
   PORT = "8787",
 } = process.env;
 
 if (!RPC_URL || !TREASURY_SECRET) {
-  console.error("✖ Missing RPC_URL or TREASURY_SECRET in .env (copy .env.example → .env and fill it in).");
-  process.exit(1);
+  console.error("✖ Missing RPC_URL or TREASURY_SECRET in .env"); process.exit(1);
 }
-
-function parseSecret(s) {
-  s = s.trim();
-  if (s.startsWith("[")) return Uint8Array.from(JSON.parse(s)); // JSON array form
-  return bs58.decode(s);                                        // base58 form
-}
-
+const parseSecret = (s) => (s.trim().startsWith("[") ? Uint8Array.from(JSON.parse(s)) : bs58.decode(s.trim()));
 const conn = new Connection(RPC_URL, "confirmed");
 const treasury = Keypair.fromSecretKey(parseSecret(TREASURY_SECRET));
 const MINT = CHIKI_MINT ? new PublicKey(CHIKI_MINT) : null;
-const MIN = Number(MIN_HOLD);
-const RATE = Number(REWARD_RATE_PER_MIN);
-const CAP = Number(MAX_CLAIM_SOL);
+const MIN = Number(MIN_HOLD), RATE = Number(REWARD_RATE_PER_MIN), CAP = Number(MAX_CLAIM_SOL);
 const COOLDOWN = Number(CLAIM_COOLDOWN_SEC) * 1000;
+const HOLD_MS = Number(MIN_HOLD_MINUTES) * 60_000;
+const DAILY_CAP = Number(DAILY_CAP_SOL);
 const verifyOn = String(VERIFY_HOLDERS).toLowerCase() === "true";
 
-// In-memory player ledger. For production, back this with a real DB.
-const players = new Map(); // wallet -> { lastClaim, eligible, balance, lifetime }
-
-function isPubkey(s) { try { new PublicKey(s); return true; } catch { return false; } }
+const isPubkey = (s) => { try { new PublicKey(s); return true; } catch { return false; } };
 
 async function chikiBalance(owner) {
   if (!MINT) return 0;
   try {
-    const res = await conn.getParsedTokenAccountsByOwner(new PublicKey(owner), { mint: MINT });
-    let bal = 0;
-    for (const { account } of res.value) bal += account.data.parsed.info.tokenAmount.uiAmount || 0;
-    return bal;
+    const r = await conn.getParsedTokenAccountsByOwner(new PublicKey(owner), { mint: MINT });
+    let b = 0; for (const { account } of r.value) b += account.data.parsed.info.tokenAmount.uiAmount || 0;
+    return b;
   } catch { return 0; }
 }
+const poolSol = async () => (await conn.getBalance(treasury.publicKey)) / LAMPORTS_PER_SOL;
 
-async function poolSol() {
-  const lam = await conn.getBalance(treasury.publicKey);
-  return lam / LAMPORTS_PER_SOL;
+/* ----------------------------- storage ----------------------------- */
+// Two backends with one interface. Postgres when DATABASE_URL is set; else in-memory (dev only).
+function makeStore() {
+  if (DATABASE_URL) return pgStore();
+  console.warn("⚠ No DATABASE_URL — using IN-MEMORY store (state is lost on restart; NOT for mainnet).");
+  return memStore();
 }
 
+function pgStore() {
+  const pool = new pg.Pool({
+    connectionString: DATABASE_URL,
+    ssl: DATABASE_URL.includes("localhost") ? false : { rejectUnauthorized: false },
+  });
+  return {
+    kind: "postgres",
+    async init() {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS players(
+          wallet TEXT PRIMARY KEY,
+          first_seen BIGINT NOT NULL,
+          last_claim BIGINT NOT NULL DEFAULT 0,
+          lifetime_paid DOUBLE PRECISION NOT NULL DEFAULT 0,
+          eligible BOOLEAN NOT NULL DEFAULT false,
+          balance DOUBLE PRECISION NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS payouts(
+          id BIGSERIAL PRIMARY KEY,
+          wallet TEXT NOT NULL,
+          amount DOUBLE PRECISION NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          signature TEXT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );`);
+    },
+    async touch(wallet, eligible, balance) {
+      const now = Date.now();
+      const r = await pool.query(
+        `INSERT INTO players(wallet,first_seen,last_claim,eligible,balance)
+         VALUES($1,$2,$2 - 60000,$3,$4)
+         ON CONFLICT(wallet) DO UPDATE SET eligible=$3, balance=$4
+         RETURNING *`, [wallet, now, eligible, balance]);
+      return r.rows[0];
+    },
+    async dailyTotal() {
+      const r = await pool.query(
+        `SELECT COALESCE(SUM(amount),0) s FROM payouts WHERE status='confirmed' AND created_at > now()-interval '1 day'`);
+      return Number(r.rows[0].s);
+    },
+    // Atomically reserve a claim: row lock, cooldown + hold-time + amount check, advance last_claim, log pending payout.
+    async reserve(wallet, now, compute) {
+      const c = await pool.connect();
+      try {
+        await c.query("BEGIN");
+        await c.query(`INSERT INTO players(wallet,first_seen,last_claim) VALUES($1,$2,$2-60000) ON CONFLICT(wallet) DO NOTHING`, [wallet, now]);
+        const { rows } = await c.query(`SELECT * FROM players WHERE wallet=$1 FOR UPDATE`, [wallet]);
+        const p = rows[0];
+        if (now - Number(p.last_claim) < COOLDOWN) { await c.query("ROLLBACK"); return { status: "cooldown", retryInMs: COOLDOWN - (now - Number(p.last_claim)) }; }
+        if (now - Number(p.first_seen) < HOLD_MS) { await c.query("ROLLBACK"); return { status: "hold", waitMs: HOLD_MS - (now - Number(p.first_seen)) }; }
+        const amount = await compute(p);
+        if (!(amount > 0)) { await c.query("ROLLBACK"); return { status: "none" }; }
+        await c.query(`UPDATE players SET last_claim=$2, lifetime_paid=lifetime_paid+$3 WHERE wallet=$1`, [wallet, now, amount]);
+        const ins = await c.query(`INSERT INTO payouts(wallet,amount,status) VALUES($1,$2,'pending') RETURNING id`, [wallet, amount]);
+        await c.query("COMMIT");
+        return { status: "ok", amount, payoutId: ins.rows[0].id, prevLastClaim: Number(p.last_claim) };
+      } catch (e) { try { await c.query("ROLLBACK"); } catch {} throw e; }
+      finally { c.release(); }
+    },
+    async confirm(id, sig) { await pool.query(`UPDATE payouts SET status='confirmed', signature=$2 WHERE id=$1`, [id, sig]); },
+    async fail(id, wallet, prevLastClaim, amount) {
+      await pool.query(`UPDATE payouts SET status='failed' WHERE id=$1`, [id]);
+      await pool.query(`UPDATE players SET last_claim=$2, lifetime_paid=GREATEST(0,lifetime_paid-$3) WHERE wallet=$1`, [wallet, prevLastClaim, amount]);
+    },
+    async count() { return Number((await pool.query(`SELECT COUNT(*) n FROM players`)).rows[0].n); },
+  };
+}
+
+function memStore() {
+  const players = new Map(); const payouts = [];
+  const get = (w) => players.get(w);
+  return {
+    kind: "memory",
+    async init() {},
+    async touch(wallet, eligible, balance) {
+      const now = Date.now();
+      const p = get(wallet) || { wallet, first_seen: now, last_claim: now - 60000, lifetime_paid: 0 };
+      p.eligible = eligible; p.balance = balance; players.set(wallet, p); return p;
+    },
+    async dailyTotal() {
+      const cut = Date.now() - 86_400_000;
+      return payouts.filter(x => x.status === "confirmed" && x.t > cut).reduce((s, x) => s + x.amount, 0);
+    },
+    async reserve(wallet, now, compute) {
+      const p = get(wallet) || { wallet, first_seen: now, last_claim: now - 60000, lifetime_paid: 0 };
+      players.set(wallet, p);
+      if (now - p.last_claim < COOLDOWN) return { status: "cooldown", retryInMs: COOLDOWN - (now - p.last_claim) };
+      if (now - p.first_seen < HOLD_MS) return { status: "hold", waitMs: HOLD_MS - (now - p.first_seen) };
+      const amount = await compute(p);
+      if (!(amount > 0)) return { status: "none" };
+      const prev = p.last_claim; p.last_claim = now; p.lifetime_paid += amount;
+      const id = payouts.push({ id: payouts.length + 1, wallet, amount, status: "pending", t: now }) ;
+      return { status: "ok", amount, payoutId: id, prevLastClaim: prev };
+    },
+    async confirm(id, sig) { const p = payouts[id - 1]; if (p) { p.status = "confirmed"; p.signature = sig; } },
+    async fail(id, wallet, prevLastClaim, amount) {
+      const r = payouts[id - 1]; if (r) r.status = "failed";
+      const p = get(wallet); if (p) { p.last_claim = prevLastClaim; p.lifetime_paid = Math.max(0, p.lifetime_paid - amount); }
+    },
+    async count() { return players.size; },
+  };
+}
+
+const store = makeStore();
+
+/* ----------------------------- API ----------------------------- */
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Health / config
-app.get("/health", async (_req, res) => {
-  res.json({
-    ok: true, network: NETWORK, verifyHolders: verifyOn,
-    treasury: treasury.publicKey.toBase58(),
-    team: TEAM_WALLET || null, mint: CHIKI_MINT || null, minHold: MIN,
-  });
-});
+app.get("/health", async (_q, res) => res.json({
+  ok: true, network: NETWORK, store: store.kind, verifyHolders: verifyOn,
+  treasury: treasury.publicKey.toBase58(), team: TEAM_WALLET || null,
+  mint: CHIKI_MINT || null, minHold: MIN, minHoldMinutes: Number(MIN_HOLD_MINUTES), dailyCapSol: DAILY_CAP,
+}));
 
-// Live pool status
-app.get("/pool", async (_req, res) => {
-  try { res.json({ poolSol: await poolSol(), players: players.size }); }
+app.get("/pool", async (_q, res) => {
+  try { res.json({ poolSol: await poolSol(), players: await store.count(), dailyPaid: await store.dailyTotal() }); }
   catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
-// Verify a wallet's eligibility (reads on-chain $CHIKI balance via RPC)
 app.post("/verify", async (req, res) => {
   const wallet = req.body?.wallet;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
   let balance = 0, eligible = true;
   if (verifyOn) { balance = await chikiBalance(wallet); eligible = balance >= MIN; }
+  const p = await store.touch(wallet, eligible, balance);
   const chikis = eligible ? (balance >= 1_000_000 ? 2 : 1) : 0;
-  const p = players.get(wallet) || { lastClaim: 0, lifetime: 0 };
-  players.set(wallet, { ...p, eligible, balance, lastSeen: Date.now() });
-  res.json({ wallet, eligible, balance, chikis, minHold: MIN, verified: verifyOn });
+  res.json({ wallet, eligible, balance, chikis, minHold: MIN, verified: verifyOn, firstSeen: Number(p.first_seen) });
 });
 
-// Claim accrued SOL — server-authoritative (client cannot dictate the amount).
 app.post("/claim", async (req, res) => {
   const wallet = req.body?.wallet;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
 
-  // Re-check eligibility at claim time (anti-abuse)
-  let balance = 0, eligible = true;
-  if (verifyOn) { balance = await chikiBalance(wallet); eligible = balance >= MIN; }
-  if (!eligible) return res.status(403).json({ error: `below ${MIN.toLocaleString()} $CHIKI threshold`, balance });
+  if (verifyOn) {
+    const bal = await chikiBalance(wallet);
+    if (bal < MIN) return res.status(403).json({ error: `below ${MIN.toLocaleString()} $CHIKI threshold`, balance: bal });
+  }
+  let pool, daily;
+  try { pool = await poolSol(); daily = await store.dailyTotal(); }
+  catch (e) { return res.status(500).json({ error: "rpc/db error: " + String(e.message || e) }); }
+  if (daily >= DAILY_CAP) return res.status(429).json({ error: "daily payout cap reached", dailyCapSol: DAILY_CAP });
 
   const now = Date.now();
-  const p = players.get(wallet) || { lastClaim: now - 60_000, lifetime: 0 };
-  if (now - p.lastClaim < COOLDOWN)
-    return res.status(429).json({ error: "cooldown", retryInMs: COOLDOWN - (now - p.lastClaim) });
+  const compute = (p) => {
+    const minutes = Math.min((now - Number(p.last_claim)) / 60_000, 60);
+    let amt = Math.min(minutes * RATE, CAP, Math.max(0, DAILY_CAP - daily), Math.max(0, pool - 0.001));
+    return Math.floor(amt * 1e6) / 1e6;
+  };
 
-  // Accrue reward = elapsed minutes * rate, capped, and bounded by the live pool.
-  const minutes = Math.min((now - p.lastClaim) / 60_000, 60); // cap accrual window at 1h
-  let amount = Math.min(minutes * RATE, CAP);
-  const pool = await poolSol();
-  amount = Math.min(amount, Math.max(0, pool - 0.001)); // keep a little for rent/fees
-  amount = Math.floor(amount * 1e6) / 1e6;
-  if (amount <= 0) return res.status(409).json({ error: "nothing to claim yet (or pool empty)", poolSol: pool });
+  let r;
+  try { r = await store.reserve(wallet, now, compute); }
+  catch (e) { return res.status(500).json({ error: "reserve failed: " + String(e.message || e) }); }
+  if (r.status === "cooldown") return res.status(429).json({ error: "cooldown", retryInMs: r.retryInMs });
+  if (r.status === "hold") return res.status(403).json({ error: "wallet too new — min hold time not met", waitMs: r.waitMs });
+  if (r.status !== "ok") return res.status(409).json({ error: "nothing to claim yet (or pool/cap empty)", poolSol: pool });
 
   try {
     const tx = new Transaction().add(SystemProgram.transfer({
-      fromPubkey: treasury.publicKey,
-      toPubkey: new PublicKey(wallet),
-      lamports: Math.floor(amount * LAMPORTS_PER_SOL),
+      fromPubkey: treasury.publicKey, toPubkey: new PublicKey(wallet),
+      lamports: Math.floor(r.amount * LAMPORTS_PER_SOL),
     }));
     const sig = await conn.sendTransaction(tx, [treasury]);
     await conn.confirmTransaction(sig, "confirmed");
-    players.set(wallet, { ...p, lastClaim: now, eligible, balance, lifetime: (p.lifetime || 0) + amount });
-    res.json({
-      ok: true, wallet, amountSol: amount, signature: sig,
-      explorer: `https://explorer.solana.com/tx/${sig}?cluster=${NETWORK}`,
-      lifetimeSol: (p.lifetime || 0) + amount,
-    });
+    await store.confirm(r.payoutId, sig);
+    res.json({ ok: true, wallet, amountSol: r.amount, signature: sig,
+      explorer: `https://explorer.solana.com/tx/${sig}?cluster=${NETWORK}` });
   } catch (e) {
+    await store.fail(r.payoutId, wallet, r.prevLastClaim, r.amount); // refund cooldown so a failed payout isn't lost
     res.status(500).json({ error: "payout failed: " + String(e.message || e) });
   }
 });
 
-// One-shot devnet funding helper: open /fund in a browser to airdrop SOL to the treasury.
+// Devnet-only funding helper (open in a browser to airdrop to the treasury)
 app.get("/fund", async (req, res) => {
-  if (NETWORK !== "devnet") return res.status(400).json({ error: "funding helper is devnet-only" });
+  if (NETWORK !== "devnet") return res.status(400).json({ error: "devnet-only" });
   const amt = Math.min(2, Number(req.query.amount || 1));
-  const endpoints = [RPC_URL, "https://api.devnet.solana.com"];
-  for (const url of endpoints) {
+  for (const url of [RPC_URL, "https://api.devnet.solana.com"]) {
     try {
       const c = new Connection(url, "confirmed");
       const sig = await c.requestAirdrop(treasury.publicKey, Math.floor(amt * LAMPORTS_PER_SOL));
       await c.confirmTransaction(sig, "confirmed");
-      const bal = (await c.getBalance(treasury.publicKey)) / LAMPORTS_PER_SOL;
-      return res.json({ ok: true, airdropped: amt, poolSol: bal, signature: sig });
-    } catch (e) { /* try the next endpoint */ }
+      return res.json({ ok: true, airdropped: amt, poolSol: (await c.getBalance(treasury.publicKey)) / LAMPORTS_PER_SOL, signature: sig });
+    } catch {}
   }
-  res.status(502).json({ error: "airdrop failed (devnet faucets are rate-limited) — reload to retry in a moment" });
+  res.status(502).json({ error: "airdrop failed (devnet faucets are rate-limited) — reload to retry" });
 });
 
+await store.init();
 app.listen(Number(PORT), () => {
-  console.log(`Chiki backend on :${PORT}  ·  ${NETWORK}  ·  treasury ${treasury.publicKey.toBase58()}`);
-  console.log(`Holder verification: ${verifyOn ? "ON" : "OFF (devnet test mode)"}`);
+  console.log(`Chiki backend v2 on :${PORT} · ${NETWORK} · store=${store.kind} · treasury ${treasury.publicKey.toBase58()}`);
+  console.log(`verifyHolders=${verifyOn} · holdMin=${MIN_HOLD_MINUTES} · dailyCap=${DAILY_CAP} SOL`);
 });
