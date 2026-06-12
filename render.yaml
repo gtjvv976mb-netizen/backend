@@ -1,0 +1,33 @@
+# One-click deploy to Render. In Render: New → Blueprint → connect this repo.
+# Secrets (RPC_URL, TREASURY_SECRET, TEAM_WALLET) are marked sync:false —
+# you paste them in Render's dashboard, they are NOT stored in the repo.
+services:
+  - type: web
+    name: chiki-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NETWORK
+        value: devnet
+      - key: RPC_URL              # paste your DEVNET Helius URL in the dashboard
+        sync: false
+      - key: CHIKI_MINT
+        value: 5A5sXRYqTaNaocjEJvpNC8Feh3eUonuBTndjnWJupump
+      - key: MIN_HOLD
+        value: "500000"
+      - key: VERIFY_HOLDERS
+        value: "false"            # set "true" once RPC_URL points at mainnet
+      - key: TREASURY_SECRET      # paste in dashboard (JSON array or base58) — NEVER commit
+        sync: false
+      - key: TEAM_WALLET          # paste your team wallet public key
+        sync: false
+      - key: REWARD_RATE_PER_MIN
+        value: "0.0008"
+      - key: MAX_CLAIM_SOL
+        value: "0.05"
+      - key: CLAIM_COOLDOWN_SEC
+        value: "30"
