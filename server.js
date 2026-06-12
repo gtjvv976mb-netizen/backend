@@ -85,6 +85,19 @@ function pgStore() {
           signature TEXT,
           created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );`);
+      await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS profile JSONB`);
+    },
+    async getProfile(wallet) {
+      const r = await pool.query(`SELECT profile FROM players WHERE wallet=$1`, [wallet]);
+      return r.rows[0]?.profile || null;
+    },
+    async setProfile(wallet, profile) {
+      const now = Date.now();
+      await pool.query(
+        `INSERT INTO players(wallet,first_seen,last_claim,profile)
+         VALUES($1,$2::bigint,$3::bigint,$4::jsonb)
+         ON CONFLICT(wallet) DO UPDATE SET profile=$4::jsonb`,
+        [wallet, now, now - 60000, JSON.stringify(profile)]);
     },
     async touch(wallet, eligible, balance) {
       const now = Date.now();
@@ -136,8 +149,14 @@ function memStore() {
     async init() {},
     async touch(wallet, eligible, balance) {
       const now = Date.now();
-      const p = get(wallet) || { wallet, first_seen: now, last_claim: now - 60000, lifetime_paid: 0 };
+      const p = get(wallet) || { wallet, first_seen: now, last_claim: now - 60000, lifetime_paid: 0, profile: null };
       p.eligible = eligible; p.balance = balance; players.set(wallet, p); return p;
+    },
+    async getProfile(wallet) { return get(wallet)?.profile || null; },
+    async setProfile(wallet, profile) {
+      const now = Date.now();
+      const p = get(wallet) || { wallet, first_seen: now, last_claim: now - 60000, lifetime_paid: 0 };
+      p.profile = profile; players.set(wallet, p);
     },
     async dailyTotal() {
       const cut = Date.now() - 86_400_000;
@@ -191,8 +210,25 @@ app.post("/verify", async (req, res) => {
     if (verifyOn) { balance = await chikiBalance(wallet); eligible = balance >= MIN; }
     const p = await store.touch(wallet, eligible, balance);
     const chikis = eligible ? (balance >= 1_000_000 ? 2 : 1) : 0;
-    res.json({ wallet, eligible, balance, chikis, minHold: MIN, verified: verifyOn, firstSeen: Number(p.first_seen) });
+    res.json({ wallet, eligible, balance, chikis, minHold: MIN, verified: verifyOn, firstSeen: Number(p.first_seen), profile: p.profile || null });
   } catch (e) { res.status(500).json({ error: "verify failed: " + String(e.message || e) }); }
+});
+
+// Save / load a wallet's game profile (chikis + progress) so it follows the wallet across devices.
+app.post("/profile", async (req, res) => {
+  const wallet = req.body?.wallet, profile = req.body?.profile;
+  if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  if (!profile || typeof profile !== "object") return res.status(400).json({ error: "'profile' object required" });
+  if (JSON.stringify(profile).length > 6000) return res.status(413).json({ error: "profile too large" });
+  try { await store.setProfile(wallet, profile); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: "save failed: " + String(e.message || e) }); }
+});
+
+app.get("/profile", async (req, res) => {
+  const wallet = req.query?.wallet;
+  if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  try { res.json({ wallet, profile: await store.getProfile(wallet) }); }
+  catch (e) { res.status(500).json({ error: "load failed: " + String(e.message || e) }); }
 });
 
 app.post("/claim", async (req, res) => {
