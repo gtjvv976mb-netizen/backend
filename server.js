@@ -136,6 +136,23 @@ app.post("/claim", async (req, res) => {
   }
 });
 
+// One-shot devnet funding helper: open /fund in a browser to airdrop SOL to the treasury.
+app.get("/fund", async (req, res) => {
+  if (NETWORK !== "devnet") return res.status(400).json({ error: "funding helper is devnet-only" });
+  const amt = Math.min(2, Number(req.query.amount || 1));
+  const endpoints = [RPC_URL, "https://api.devnet.solana.com"];
+  for (const url of endpoints) {
+    try {
+      const c = new Connection(url, "confirmed");
+      const sig = await c.requestAirdrop(treasury.publicKey, Math.floor(amt * LAMPORTS_PER_SOL));
+      await c.confirmTransaction(sig, "confirmed");
+      const bal = (await c.getBalance(treasury.publicKey)) / LAMPORTS_PER_SOL;
+      return res.json({ ok: true, airdropped: amt, poolSol: bal, signature: sig });
+    } catch (e) { /* try the next endpoint */ }
+  }
+  res.status(502).json({ error: "airdrop failed (devnet faucets are rate-limited) — reload to retry in a moment" });
+});
+
 app.listen(Number(PORT), () => {
   console.log(`Chiki backend on :${PORT}  ·  ${NETWORK}  ·  treasury ${treasury.publicKey.toBase58()}`);
   console.log(`Holder verification: ${verifyOn ? "ON" : "OFF (devnet test mode)"}`);
