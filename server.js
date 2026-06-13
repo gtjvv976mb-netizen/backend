@@ -32,6 +32,7 @@ const {
   CLAIM_COOLDOWN_SEC = "30",
   DATABASE_URL = "",
   ADMIN_KEY = "",                   // set this to enable /admin/reset (wipe test profiles)
+  ADMIN_WALLETS = "",               // comma-separated wallet addresses allowed to PIN/announce in chat
   PORT = "8787",
 } = process.env;
 
@@ -281,6 +282,80 @@ function memStore() {
 
 const store = makeStore();
 
+/* ----------------------------- chat ----------------------------- */
+/* wallets allowed to pin/announce: ADMIN_WALLETS list + the team wallet */
+const ADMIN_SET = new Set(String(ADMIN_WALLETS || "").split(",").map(s => s.trim()).filter(Boolean));
+if (TEAM_WALLET) ADMIN_SET.add(TEAM_WALLET.trim());
+const isAdminWallet = (w) => ADMIN_SET.has(w);
+const CHAT_WINDOW = 120000;                   // a wallet shows as "online" for 2 min after its last beat
+const onlineUsers = new Map();                // wallet -> { handle, ts }
+
+/* profanity filter — normalize common leetspeak, then mask listed words (server-authoritative) */
+const BAD_WORDS = ["fuck","shit","bitch","asshole","bastard","cunt","dick","piss","slut","whore",
+  "nigger","nigga","faggot","retard","rape","cock","pussy","motherfucker","wank","twat","prick","jerkoff","cumshot"];
+function cleanText(s) {
+  s = String(s || "").replace(/\s+/g, " ").trim().slice(0, 300);
+  const norm = (w) => w.toLowerCase()
+    .replace(/[1!|]/g, "i").replace(/3/g, "e").replace(/[4@]/g, "a")
+    .replace(/0/g, "o").replace(/[5$]/g, "s").replace(/7/g, "t").replace(/[^a-z]/g, "");
+  return s.replace(/[\p{L}\p{N}@$!|*]+/gu, (tok) => {
+    const n = norm(tok);
+    for (const bad of BAD_WORDS) if (n === bad || (bad.length >= 4 && n.includes(bad))) return "*".repeat(tok.length);
+    return tok;
+  });
+}
+
+function makeChat() {
+  if (DATABASE_URL) {
+    const pool = new pg.Pool({
+      connectionString: DATABASE_URL, max: 3,
+      ssl: DATABASE_URL.includes("localhost") ? false : { rejectUnauthorized: false },
+    });
+    return {
+      kind: "postgres",
+      async init() {
+        await pool.query(`CREATE TABLE IF NOT EXISTS chat(
+          id BIGSERIAL PRIMARY KEY, ts BIGINT NOT NULL, wallet TEXT NOT NULL, handle TEXT,
+          body TEXT NOT NULL, to_wallet TEXT, pinned BOOLEAN NOT NULL DEFAULT false)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS chat_id_idx ON chat(id)`);
+      },
+      async send(m) {
+        const r = await pool.query(
+          `INSERT INTO chat(ts,wallet,handle,body,to_wallet,pinned) VALUES($1::bigint,$2,$3,$4,$5,$6) RETURNING *`,
+          [m.ts, m.wallet, m.handle || null, m.body, m.to || null, !!m.pinned]);
+        return r.rows[0];
+      },
+      async fetch(wallet, since) {
+        const r = await pool.query(
+          `SELECT * FROM chat WHERE id>$1 AND (to_wallet IS NULL OR to_wallet=$2 OR wallet=$2) ORDER BY id ASC LIMIT 200`,
+          [since || 0, wallet || ""]);
+        const p = await pool.query(`SELECT * FROM chat WHERE pinned=true ORDER BY id DESC LIMIT 1`);
+        return { messages: r.rows, pinned: p.rows[0] || null };
+      },
+      async pin(id, on) {
+        if (on) await pool.query(`UPDATE chat SET pinned=false WHERE pinned=true`);
+        await pool.query(`UPDATE chat SET pinned=$2 WHERE id=$1`, [id, !!on]);
+      },
+    };
+  }
+  const msgs = []; let seq = 1;
+  return {
+    kind: "memory",
+    async init() {},
+    async send(m) {
+      const row = { id: seq++, ts: m.ts, wallet: m.wallet, handle: m.handle || null, body: m.body, to_wallet: m.to || null, pinned: !!m.pinned };
+      msgs.push(row); if (msgs.length > 500) msgs.shift(); return row;
+    },
+    async fetch(wallet, since) {
+      const messages = msgs.filter(x => x.id > (since || 0) && (!x.to_wallet || x.to_wallet === wallet || x.wallet === wallet)).slice(-200);
+      const pinned = [...msgs].reverse().find(x => x.pinned) || null;
+      return { messages, pinned };
+    },
+    async pin(id, on) { if (on) msgs.forEach(x => x.pinned = false); const m = msgs.find(x => x.id === id); if (m) m.pinned = !!on; },
+  };
+}
+const chat = makeChat();
+
 /* ----------------------------- API ----------------------------- */
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e?.message || e));
 
@@ -339,8 +414,11 @@ const PRESENCE_WINDOW = 120000;   // a wallet counts as "online" for 2 min after
 app.post("/presence", async (req, res) => {
   const wallet = req.body?.wallet;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
-  try { await store.heartbeat(wallet, Number(req.body?.chikis) || 1, req.body?.roster); res.json(await store.presence(PRESENCE_WINDOW)); }
-  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  try {
+    await store.heartbeat(wallet, Number(req.body?.chikis) || 1, req.body?.roster);
+    onlineUsers.set(wallet, { handle: cleanText(req.body?.handle || "").slice(0, 24) || null, ts: Date.now() });
+    res.json(await store.presence(PRESENCE_WINDOW));
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 app.get("/presence", async (_q, res) => {
   try { res.json(await store.presence(PRESENCE_WINDOW)); }
@@ -359,6 +437,47 @@ app.get("/admin/reset", async (req, res) => {
   if (k !== "chikiwipe" && !(ADMIN_KEY && k === ADMIN_KEY)) return res.status(403).json({ error: "bad key" });
   try { const n = await store.resetProfiles(); res.json({ ok: true, profilesCleared: n }); }
   catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+/* ----------------------------- chat API ----------------------------- */
+// Send a message (global, or a DM if `to` is set). Profanity is masked server-side.
+app.post("/chat/send", async (req, res) => {
+  const { wallet, handle, text, to } = req.body || {};
+  if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  if (verifyOn) { try { if ((await chikiBalance(wallet)) < MIN) return res.status(403).json({ error: `hold ${MIN.toLocaleString()} $CHIKI to chat` }); } catch (e) {} }
+  const body = cleanText(text);
+  if (!body.trim()) return res.status(400).json({ error: "empty message" });
+  if (to && !isPubkey(to)) return res.status(400).json({ error: "bad recipient" });
+  let pinned = false;
+  if (req.body?.pin) {
+    if (!(isAdminWallet(wallet) || (ADMIN_KEY && req.body?.key === ADMIN_KEY))) return res.status(403).json({ error: "not allowed to pin" });
+    pinned = true;
+  }
+  try {
+    const row = await chat.send({ ts: Date.now(), wallet, handle: cleanText(handle || "").slice(0, 24), body, to, pinned });
+    if (pinned) await chat.pin(row.id, true);
+    onlineUsers.set(wallet, { handle: cleanText(handle || "").slice(0, 24) || null, ts: Date.now() });
+    res.json({ ok: true, message: row });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+// Poll for new messages (global + this wallet's DMs) and the current pinned message.
+app.get("/chat", async (req, res) => {
+  try { res.json(await chat.fetch(req.query?.wallet || "", Number(req.query?.since) || 0)); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+// Pin / unpin a message (admins only).
+app.post("/chat/pin", async (req, res) => {
+  const { wallet, id, pin, key } = req.body || {};
+  if (!(isAdminWallet(wallet) || (ADMIN_KEY && key === ADMIN_KEY))) return res.status(403).json({ error: "not allowed" });
+  try { await chat.pin(Number(id), pin !== false); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+// Who's online right now (with handles), for the chat user list + DM picker.
+app.get("/chat/online", async (_q, res) => {
+  const cut = Date.now() - CHAT_WINDOW; const users = [];
+  for (const [wallet, v] of onlineUsers) if (v.ts > cut)
+    users.push({ wallet, handle: v.handle, short: wallet.slice(0, 4) + "…" + wallet.slice(-4), admin: isAdminWallet(wallet) });
+  res.json({ users, count: users.length });
 });
 
 app.post("/claim", async (req, res) => {
@@ -424,6 +543,7 @@ app.get("/fund", async (req, res) => {
 });
 
 await store.init();
+await chat.init();
 app.listen(Number(PORT), () => {
   console.log(`Chiki backend v2 on :${PORT} · ${NETWORK} · store=${store.kind} · treasury ${treasury.publicKey.toBase58()}`);
   console.log(`verifyHolders=${verifyOn} · holdMin=${MIN_HOLD_MINUTES} · dailyCap=${DAILY_CAP} SOL`);
