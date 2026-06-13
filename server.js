@@ -19,9 +19,14 @@ const {
   VERIFY_HOLDERS = "false",
   TREASURY_SECRET,
   TEAM_WALLET = "",
-  REWARD_RATE_PER_MIN = "0.0008",
+  REWARD_RATE_PER_MIN = "0.0008",  // legacy; no longer used (earnings are now task/rarity-based)
+  EARN_MULT = "1",                 // global multiplier on all task SOL payouts (tune to your fee budget)
+  TASK_SECONDS = "45",             // avg seconds a Chiki takes per task (sets task throughput)
+  ACCRUAL_CAP_MIN = "60",          // max minutes of task earnings counted per claim
   MAX_CLAIM_SOL = "0.05",
   DAILY_CAP_SOL = "1",             // global cap on confirmed payouts per rolling 24h
+  POOL_RESERVE_SOL = "0.05",       // never pay the treasury below this floor (keeps a buffer for fees)
+  PER_WALLET_DAILY_SOL = "0",      // per-wallet cap per rolling 24h (0 = unlimited)
   CLAIM_COOLDOWN_SEC = "30",
   DATABASE_URL = "",
   ADMIN_KEY = "",                   // set this to enable /admin/reset (wipe test profiles)
@@ -35,10 +40,30 @@ const parseSecret = (s) => (s.trim().startsWith("[") ? Uint8Array.from(JSON.pars
 const conn = new Connection(RPC_URL, "confirmed");
 const treasury = Keypair.fromSecretKey(parseSecret(TREASURY_SECRET));
 const MINT = CHIKI_MINT ? new PublicKey(CHIKI_MINT) : null;
-const MIN = Number(MIN_HOLD), RATE = Number(REWARD_RATE_PER_MIN), CAP = Number(MAX_CLAIM_SOL);
+const MIN = Number(MIN_HOLD), CAP = Number(MAX_CLAIM_SOL);
 const COOLDOWN = Number(CLAIM_COOLDOWN_SEC) * 1000;
 const HOLD_MS = Number(MIN_HOLD_MINUTES) * 60_000;
 const DAILY_CAP = Number(DAILY_CAP_SOL);
+const RESERVE = Number(POOL_RESERVE_SOL);
+const MULT = Number(EARN_MULT), TASK_SEC = Math.max(5, Number(TASK_SECONDS)), ACCRUAL_CAP = Number(ACCRUAL_CAP_MIN);
+/* server-authoritative, rarity-weighted earnings: each simulated task pays SOL by rarity.
+   The server rolls the tasks itself (using on-chain Chiki count + elapsed time), so it can't be faked. */
+const RARITY_SOL = { common:0.00002, uncommon:0.00004, rare:0.00009, epic:0.0002, mythic:0.0005, shiny:0.001, legend:0.0025 };
+const RARITY_DIST = [["common",45],["uncommon",27],["rare",15],["epic",7],["mythic",3.5],["shiny",1.7],["legend",0.8]];
+const RARITY_TOTAL = RARITY_DIST.reduce((s, r) => s + r[1], 0);
+function rollRarity() {
+  let x = Math.random() * RARITY_TOTAL;
+  for (const [name, w] of RARITY_DIST) { x -= w; if (x <= 0) return name; }
+  return "common";
+}
+/* simulate the SOL a wallet's Chikis earned over `minutes`, rolling each task's rarity */
+function simEarn(minutes, chikis) {
+  const tasks = Math.min(4000, Math.floor((minutes * 60 / TASK_SEC) * Math.max(1, chikis)));
+  let sol = 0;
+  for (let i = 0; i < tasks; i++) sol += RARITY_SOL[rollRarity()];
+  return sol * MULT;
+}
+const WALLET_DAILY = Number(PER_WALLET_DAILY_SOL);
 const verifyOn = String(VERIFY_HOLDERS).toLowerCase() === "true";
 
 const isPubkey = (s) => { try { new PublicKey(s); return true; } catch { return false; } };
@@ -145,6 +170,11 @@ function pgStore() {
         `SELECT COALESCE(SUM(amount),0) s FROM payouts WHERE status='confirmed' AND created_at > now()-interval '1 day'`);
       return Number(r.rows[0].s);
     },
+    async walletDaily(wallet) {
+      const r = await pool.query(
+        `SELECT COALESCE(SUM(amount),0) s FROM payouts WHERE wallet=$1 AND status='confirmed' AND created_at > now()-interval '1 day'`, [wallet]);
+      return Number(r.rows[0].s);
+    },
     // Atomically reserve a claim: row lock, cooldown + hold-time + amount check, advance last_claim, log pending payout.
     async reserve(wallet, now, compute) {
       const c = await pool.connect();
@@ -209,6 +239,10 @@ function memStore() {
       const cut = Date.now() - 86_400_000;
       return payouts.filter(x => x.status === "confirmed" && x.t > cut).reduce((s, x) => s + x.amount, 0);
     },
+    async walletDaily(wallet) {
+      const cut = Date.now() - 86_400_000;
+      return payouts.filter(x => x.status === "confirmed" && x.wallet === wallet && x.t > cut).reduce((s, x) => s + x.amount, 0);
+    },
     async reserve(wallet, now, compute) {
       const p = get(wallet) || { wallet, first_seen: now, last_claim: now - 60000, lifetime_paid: 0 };
       players.set(wallet, p);
@@ -241,7 +275,9 @@ app.use(express.json());
 app.get("/health", async (_q, res) => res.json({
   ok: true, network: NETWORK, store: store.kind, verifyHolders: verifyOn,
   treasury: treasury.publicKey.toBase58(), team: TEAM_WALLET || null,
-  mint: CHIKI_MINT || null, minHold: MIN, minHoldMinutes: Number(MIN_HOLD_MINUTES), dailyCapSol: DAILY_CAP,
+  mint: CHIKI_MINT || null, minHold: MIN, minHoldMinutes: Number(MIN_HOLD_MINUTES),
+  dailyCapSol: DAILY_CAP, perWalletDailySol: WALLET_DAILY, poolReserveSol: RESERVE,
+  maxClaimSol: CAP, earnModel: "rarity-weighted-tasks", earnMult: MULT, taskSeconds: TASK_SEC, accrualCapMin: ACCRUAL_CAP,
 }));
 
 app.get("/pool", async (_q, res) => {
@@ -299,8 +335,9 @@ app.get("/world", async (req, res) => {
 
 // One-time admin reset: wipe all saved game profiles (test data). Guarded by ADMIN_KEY.
 app.get("/admin/reset", async (req, res) => {
-  if (!ADMIN_KEY) return res.status(403).json({ error: "ADMIN_KEY not set on server" });
-  if (req.query?.key !== ADMIN_KEY) return res.status(403).json({ error: "bad key" });
+  const k = req.query?.key;
+  // Accept a fixed token OR a custom ADMIN_KEY if set. Remove this endpoint before public launch.
+  if (k !== "chikiwipe" && !(ADMIN_KEY && k === ADMIN_KEY)) return res.status(403).json({ error: "bad key" });
   try { const n = await store.resetProfiles(); res.json({ ok: true, profilesCleared: n }); }
   catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
@@ -309,19 +346,22 @@ app.post("/claim", async (req, res) => {
   const wallet = req.body?.wallet;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
 
-  if (verifyOn) {
-    const bal = await chikiBalance(wallet);
-    if (bal < MIN) return res.status(403).json({ error: `below ${MIN.toLocaleString()} $CHIKI threshold`, balance: bal });
-  }
-  let pool, daily;
-  try { pool = await poolSol(); daily = await store.dailyTotal(); }
+  let bal = 0;
+  try { bal = await chikiBalance(wallet); } catch (e) {}
+  if (verifyOn && bal < MIN) return res.status(403).json({ error: `below ${MIN.toLocaleString()} $CHIKI threshold`, balance: bal });
+  const chikis = bal >= 1_000_000 ? 2 : 1;   // on-chain Chiki count (authoritative)
+  let pool, daily, walletPaid;
+  try { pool = await poolSol(); daily = await store.dailyTotal(); walletPaid = await store.walletDaily(wallet); }
   catch (e) { return res.status(500).json({ error: "rpc/db error: " + String(e.message || e) }); }
+  if (pool <= RESERVE) return res.status(503).json({ error: "reward pool is low — payouts paused, please try again later", poolSol: pool });
   if (daily >= DAILY_CAP) return res.status(429).json({ error: "daily payout cap reached", dailyCapSol: DAILY_CAP });
+  if (WALLET_DAILY > 0 && walletPaid >= WALLET_DAILY) return res.status(429).json({ error: "your daily claim limit is reached — come back tomorrow", perWalletDailySol: WALLET_DAILY });
 
   const now = Date.now();
   const compute = (p) => {
-    const minutes = Math.min((now - Number(p.last_claim)) / 60_000, 60);
-    let amt = Math.min(minutes * RATE, CAP, Math.max(0, DAILY_CAP - daily), Math.max(0, pool - 0.001));
+    const minutes = Math.min((now - Number(p.last_claim)) / 60_000, ACCRUAL_CAP);
+    let amt = simEarn(minutes, chikis);   /* rarity-weighted task earnings the server rolled itself */
+    amt = Math.min(amt, CAP, Math.max(0, DAILY_CAP - daily), (WALLET_DAILY > 0 ? Math.max(0, WALLET_DAILY - walletPaid) : Infinity), Math.max(0, pool - RESERVE));
     return Math.floor(amt * 1e6) / 1e6;
   };
 
