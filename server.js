@@ -215,6 +215,21 @@ function pgStore() {
       await pool.query(`UPDATE players SET last_claim=$2, lifetime_paid=GREATEST(0,lifetime_paid-$3) WHERE wallet=$1`, [wallet, prevLastClaim, amount]);
     },
     async count() { return Number((await pool.query(`SELECT COUNT(*) n FROM players`)).rows[0].n); },
+    async allChikis(exclude, cap) {
+      const r = await pool.query(`SELECT wallet, profile FROM players WHERE profile IS NOT NULL`);
+      const out = [];
+      for (const row of r.rows) {
+        if (row.wallet === exclude) continue;
+        for (const c of (row.profile?.chikis || [])) { out.push({ wallet: row.wallet, sp: c.sp | 0, level: c.level | 0 }); if (out.length >= cap) return out; }
+      }
+      return out;
+    },
+    async claimedTotals() {
+      const r = await pool.query(`SELECT profile FROM players WHERE profile IS NOT NULL`);
+      let chikis = 0, holders = 0;
+      for (const row of r.rows) { const c = row.profile?.chikis || []; if (c.length) { holders++; chikis += c.length; } }
+      return { chikis, holders };
+    },
   };
 }
 
@@ -277,6 +292,19 @@ function memStore() {
       const p = get(wallet); if (p) { p.last_claim = prevLastClaim; p.lifetime_paid = Math.max(0, p.lifetime_paid - amount); }
     },
     async count() { return players.size; },
+    async allChikis(exclude, cap) {
+      const out = [];
+      for (const [wallet, p] of players) {
+        if (wallet === exclude || !p.profile?.chikis) continue;
+        for (const c of p.profile.chikis) { out.push({ wallet, sp: c.sp | 0, level: c.level | 0 }); if (out.length >= cap) return out; }
+      }
+      return out;
+    },
+    async claimedTotals() {
+      let chikis = 0, holders = 0;
+      for (const p of players.values()) { const c = p.profile?.chikis || []; if (c.length) { holders++; chikis += c.length; } }
+      return { chikis, holders };
+    },
   };
 }
 
@@ -376,6 +404,7 @@ async function getStats() {
     try { out.teamSol = (await conn.getBalance(new PublicKey(TEAM_WALLET))) / LAMPORTS_PER_SOL; } catch (e) {}
     try { out.teamChiki = await chikiBalance(TEAM_WALLET); } catch (e) {}
   }
+  try { const t = await store.claimedTotals(); out.claimedChikis = t.chikis; out.holders = t.holders; } catch (e) {}
   _statsCache = { t: Date.now(), data: out };
   return out;
 }
@@ -535,6 +564,11 @@ app.get("/leaderboard", async (_q, res) => {
 app.get("/feed", async (req, res) => {
   const since = Number(req.query?.since) || 0;
   res.json({ events: feedEvents.filter(e => e.id > since) });
+});
+// Every Chiki ever claimed (all saved profiles, online or not) — so the world reflects real ownership.
+app.get("/allchikis", async (req, res) => {
+  try { res.json({ chikis: await store.allChikis(req.query?.exclude || "", Math.min(160, Number(req.query?.cap) || 120)) }); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
 app.post("/claim", async (req, res) => {
