@@ -356,6 +356,51 @@ function makeChat() {
 }
 const chat = makeChat();
 
+/* ----------------------------- live stats / leaderboard / feed ----------------------------- */
+const SUPPLY_TOTAL = 1_000_000_000;     // pump.fun mints exactly 1B; supply only drops via burns
+const feedEvents = []; let _feedSeq = 1;
+function pushFeed(type, data) {
+  feedEvents.push({ id: _feedSeq++, ts: Date.now(), type, ...data });
+  if (feedEvents.length > 80) feedEvents.shift();
+}
+let _statsCache = { t: 0, data: null };
+async function getStats() {
+  if (_statsCache.data && Date.now() - _statsCache.t < 15000) return _statsCache.data;
+  const out = { network: NETWORK, minHold: MIN, whaleMin: WHALE_MIN, poolReserveSol: RESERVE };
+  try { out.poolSol = await poolSol(); } catch (e) {}
+  try { out.players = await store.count(); } catch (e) {}
+  try { out.dailyPaidSol = await store.dailyTotal(); } catch (e) {}
+  try { const p = await store.presence(PRESENCE_WINDOW); out.activeUsers = p.activeUsers; out.chikimons = p.chikimons; } catch (e) {}
+  if (MINT) { try { const s = await conn.getTokenSupply(MINT); out.supply = s.value.uiAmount; out.burned = Math.max(0, SUPPLY_TOTAL - (s.value.uiAmount || 0)); } catch (e) {} }
+  if (TEAM_WALLET) {
+    try { out.teamSol = (await conn.getBalance(new PublicKey(TEAM_WALLET))) / LAMPORTS_PER_SOL; } catch (e) {}
+    try { out.teamChiki = await chikiBalance(TEAM_WALLET); } catch (e) {}
+  }
+  _statsCache = { t: Date.now(), data: out };
+  return out;
+}
+let _lbCache = { t: 0, data: null };
+async function getLeaderboard() {
+  if (_lbCache.data && Date.now() - _lbCache.t < 180000) return _lbCache.data;
+  const holders = [];
+  if (MINT) {
+    try {
+      const largest = await conn.getTokenLargestAccounts(MINT);
+      const accs = (largest.value || []).slice(0, 20);
+      const infos = await Promise.all(accs.map(a => conn.getParsedAccountInfo(a.address).catch(() => null)));
+      for (let i = 0; i < accs.length; i++) {
+        const owner = infos[i]?.value?.data?.parsed?.info?.owner;
+        const bal = accs[i].uiAmount || 0;
+        if (!owner || bal < MIN) continue;
+        holders.push({ owner, balance: bal, whale: bal >= WHALE_MIN });
+      }
+    } catch (e) {}
+  }
+  const data = { holders: holders.slice(0, 15), updatedAt: Date.now() };
+  _lbCache = { t: Date.now(), data };
+  return data;
+}
+
 /* ----------------------------- API ----------------------------- */
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e?.message || e));
 
@@ -480,6 +525,18 @@ app.get("/chat/online", async (_q, res) => {
   res.json({ users, count: users.length });
 });
 
+/* ----------------------------- real stats / leaderboard / feed API ----------------------------- */
+app.get("/stats", async (_q, res) => {
+  try { res.json(await getStats()); } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+app.get("/leaderboard", async (_q, res) => {
+  try { res.json(await getLeaderboard()); } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+app.get("/feed", async (req, res) => {
+  const since = Number(req.query?.since) || 0;
+  res.json({ events: feedEvents.filter(e => e.id > since) });
+});
+
 app.post("/claim", async (req, res) => {
   const wallet = req.body?.wallet;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
@@ -519,6 +576,7 @@ app.post("/claim", async (req, res) => {
     const sig = await conn.sendTransaction(tx, [treasury]);
     await conn.confirmTransaction(sig, "confirmed");
     await store.confirm(r.payoutId, sig);
+    pushFeed("claim", { wallet, short: wallet.slice(0, 4) + "…" + wallet.slice(-4), amountSol: r.amount, signature: sig });
     res.json({ ok: true, wallet, amountSol: r.amount, signature: sig,
       explorer: `https://explorer.solana.com/tx/${sig}?cluster=${NETWORK}` });
   } catch (e) {
