@@ -194,6 +194,10 @@ function pgStore() {
       const r = await pool.query(`SELECT COALESCE(lifetime_paid,0) p FROM players WHERE wallet=$1`, [wallet]);
       return Number(r.rows[0]?.p || 0);   // real SOL actually paid out to this wallet
     },
+    async topEarners(limit) {
+      const r = await pool.query(`SELECT wallet, COALESCE(lifetime_paid,0) p, profile->>'handle' AS handle FROM players WHERE lifetime_paid > 0 ORDER BY lifetime_paid DESC LIMIT $1`, [limit]);
+      return r.rows.map(x => ({ wallet: x.wallet, earnedSol: Number(x.p), handle: x.handle || null }));
+    },
     // Atomically reserve a claim: row lock, cooldown + hold-time + amount check, advance last_claim, log pending payout.
     async reserve(wallet, now, compute) {
       const c = await pool.connect();
@@ -284,6 +288,12 @@ function memStore() {
       return payouts.filter(x => x.status === "confirmed" && x.wallet === wallet && x.t > cut).reduce((s, x) => s + x.amount, 0);
     },
     async earned(wallet) { return Number(get(wallet)?.lifetime_paid || 0); },   // real SOL actually paid out to this wallet
+    async topEarners(limit) {
+      const arr = [];
+      for (const [wallet, p] of players) { const e = Number(p.lifetime_paid || 0); if (e > 0) arr.push({ wallet, earnedSol: e, handle: p.profile?.handle || null }); }
+      arr.sort((a, b) => b.earnedSol - a.earnedSol);
+      return arr.slice(0, limit);
+    },
     async reserve(wallet, now, compute) {
       const p = get(wallet) || { wallet, first_seen: now, last_claim: now - 60000, lifetime_paid: 0 };
       players.set(wallet, p);
@@ -438,7 +448,9 @@ async function getLeaderboard() {
       }
     } catch (e) {}
   }
-  const data = { holders: holders.slice(0, 15), updatedAt: Date.now() };
+  let earners = [];
+  try { earners = await store.topEarners(15); } catch (e) {}
+  const data = { holders: holders.slice(0, 15), earners, updatedAt: Date.now() };
   _lbCache = { t: Date.now(), data };
   return data;
 }
