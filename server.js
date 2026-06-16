@@ -190,6 +190,10 @@ function pgStore() {
         `SELECT COALESCE(SUM(amount),0) s FROM payouts WHERE wallet=$1 AND status='confirmed' AND created_at > now()-interval '1 day'`, [wallet]);
       return Number(r.rows[0].s);
     },
+    async earned(wallet) {
+      const r = await pool.query(`SELECT COALESCE(lifetime_paid,0) p FROM players WHERE wallet=$1`, [wallet]);
+      return Number(r.rows[0]?.p || 0);   // real SOL actually paid out to this wallet
+    },
     // Atomically reserve a claim: row lock, cooldown + hold-time + amount check, advance last_claim, log pending payout.
     async reserve(wallet, now, compute) {
       const c = await pool.connect();
@@ -275,6 +279,7 @@ function memStore() {
       const cut = Date.now() - 86_400_000;
       return payouts.filter(x => x.status === "confirmed" && x.wallet === wallet && x.t > cut).reduce((s, x) => s + x.amount, 0);
     },
+    async earned(wallet) { return Number(get(wallet)?.lifetime_paid || 0); },   // real SOL actually paid out to this wallet
     async reserve(wallet, now, compute) {
       const p = get(wallet) || { wallet, first_seen: now, last_claim: now - 60000, lifetime_paid: 0 };
       players.set(wallet, p);
@@ -481,6 +486,14 @@ app.get("/profile", async (req, res) => {
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
   try { res.json({ wallet, profile: await store.getProfile(wallet) }); }
   catch (e) { res.status(500).json({ error: "load failed: " + String(e.message || e) }); }
+});
+
+// Real SOL paid out to a wallet (authentic "earned" figure for the profile).
+app.get("/earned", async (req, res) => {
+  const wallet = req.query?.wallet;
+  if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  try { res.json({ wallet, lifetimePaid: await store.earned(wallet) }); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
 // Live activity: heartbeat in, get back current active users + roaming chikis.
