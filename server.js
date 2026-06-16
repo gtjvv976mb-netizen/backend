@@ -224,7 +224,11 @@ function pgStore() {
       const out = [];
       for (const row of r.rows) {
         if (row.wallet === exclude) continue;
-        for (const c of (row.profile?.chikis || [])) { out.push({ wallet: row.wallet, sp: c.sp | 0, level: c.level | 0 }); if (out.length >= cap) return out; }
+        const pr = row.profile || {}, handle = pr.handle || null, bal = pr.bal || 0;
+        for (const c of (pr.chikis || [])) {
+          out.push({ wallet: row.wallet, handle, bal, sp: c.sp | 0, level: c.level | 0, nick: c.nick || null, tasksDone: c.tasksDone | 0, hungry: !!c.hungry, isLegend: !!c.isLegend });
+          if (out.length >= cap) return out;
+        }
       }
       return out;
     },
@@ -301,7 +305,11 @@ function memStore() {
       const out = [];
       for (const [wallet, p] of players) {
         if (wallet === exclude || !p.profile?.chikis) continue;
-        for (const c of p.profile.chikis) { out.push({ wallet, sp: c.sp | 0, level: c.level | 0 }); if (out.length >= cap) return out; }
+        const handle = p.profile.handle || null, bal = p.profile.bal || 0;
+        for (const c of p.profile.chikis) {
+          out.push({ wallet, handle, bal, sp: c.sp | 0, level: c.level | 0, nick: c.nick || null, tasksDone: c.tasksDone | 0, hungry: !!c.hungry, isLegend: !!c.isLegend });
+          if (out.length >= cap) return out;
+        }
       }
       return out;
     },
