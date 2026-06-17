@@ -516,6 +516,20 @@ app.get("/earned", async (req, res) => {
   catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// Chiki Pouch: SOL accrued and waiting to be claimed (read-only estimate, no payout).
+app.get("/claimable", async (req, res) => {
+  const wallet = req.query?.wallet;
+  if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  try {
+    let bal = 0; try { bal = await chikiBalance(wallet); } catch (e) {}
+    const p = await store.touch(wallet, bal >= MIN, bal);
+    const chikis = chikiCount(bal, p.whale_since) || 1;
+    const minutes = Math.min((Date.now() - Number(p.last_claim)) / 60000, ACCRUAL_CAP);
+    const claimable = Math.max(0, Math.floor(simEarn(minutes, chikis) * 1e6) / 1e6);
+    res.json({ wallet, claimableSol: claimable, lifetimePaid: await store.earned(wallet) });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // Live activity: heartbeat in, get back current active users + roaming chikis.
 const PRESENCE_WINDOW = 120000;   // a wallet counts as "online" for 2 min after its last beat
 app.post("/presence", async (req, res) => {
