@@ -74,6 +74,27 @@ function simEarn(minutes, chikis) {
   const tasks = Math.min(4000, Math.floor((minutes * 60 / TASK_SEC) * Math.max(1, chikis)));
   return tasks * RARITY_EV * MULT;
 }
+/* ---- SEEDED deterministic earnings ----
+   The exact same math runs on the client, so the rares a player SEES are the rares the
+   server pays for. Cheat-proof: the sequence is seeded by wallet + last_claim (both server-known),
+   not by anything the client reports. Each Chiki earns 1 "slot" every TASK_SEC seconds. */
+function chikiHash(str){
+  let h = 1779033703 ^ str.length;
+  for (let i = 0; i < str.length; i++){ h = Math.imul(h ^ str.charCodeAt(i), 3432918353); h = (h << 13) | (h >>> 19); }
+  h = Math.imul(h ^ (h >>> 16), 2246822507); h = Math.imul(h ^ (h >>> 13), 3266489909);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function slotRarity(wallet, lastClaim, ci, slot){
+  let x = chikiHash(wallet + "|" + lastClaim + "|" + ci + "|" + slot) * RARITY_TOTAL;
+  for (const [name, w] of RARITY_DIST){ x -= w; if (x <= 0) return name; }
+  return "common";
+}
+function seededEarn(wallet, lastClaim, chikis, minutes){
+  const slots = Math.min(4000, Math.floor(minutes * 60 / TASK_SEC));
+  let sol = 0;
+  for (let ci = 0; ci < chikis; ci++) for (let s = 0; s < slots; s++) sol += RARITY_SOL[slotRarity(wallet, lastClaim, ci, s)];
+  return sol * MULT;
+}
 const WALLET_DAILY = Number(PER_WALLET_DAILY_SOL);
 const verifyOn = String(VERIFY_HOLDERS).toLowerCase() === "true";
 
@@ -525,9 +546,12 @@ app.get("/claimable", async (req, res) => {
     let bal = 0; try { bal = await chikiBalance(wallet); } catch (e) {}
     const p = await store.touch(wallet, bal >= MIN, bal);
     const chikis = chikiCount(bal, p.whale_since) || 1;
-    const minutes = Math.min((Date.now() - Number(p.last_claim)) / 60000, ACCRUAL_CAP);
-    const claimable = Math.max(0, Math.floor(simEarn(minutes, chikis) * 1e6) / 1e6);
-    res.json({ wallet, claimableSol: claimable, lifetimePaid: await store.earned(wallet) });
+    const lastClaim = Number(p.last_claim);
+    const minutes = Math.min((Date.now() - lastClaim) / 60000, ACCRUAL_CAP);
+    const claimable = Math.max(0, Math.floor(seededEarn(wallet, lastClaim, chikis, minutes) * 1e6) / 1e6);
+    /* seed params let the client mirror the EXACT same rarity sequence it will be paid for */
+    res.json({ wallet, claimableSol: claimable, lifetimePaid: await store.earned(wallet),
+      lastClaim, chikis, taskSec: TASK_SEC, mult: MULT, accrualCap: ACCRUAL_CAP, raritySol: RARITY_SOL });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
@@ -638,7 +662,7 @@ app.post("/claim", async (req, res) => {
   const now = Date.now();
   const compute = (p) => {
     const minutes = Math.min((now - Number(p.last_claim)) / 60_000, ACCRUAL_CAP);
-    let amt = simEarn(minutes, chikis);   /* rarity-weighted task earnings the server rolled itself */
+    let amt = seededEarn(wallet, Number(p.last_claim), chikis, minutes);   /* deterministic seeded rarity earnings (synced with the client) */
     amt = Math.min(amt, (CAP > 0 ? CAP : Infinity), Math.max(0, DAILY_CAP - daily), (WALLET_DAILY > 0 ? Math.max(0, WALLET_DAILY - walletPaid) : Infinity), Math.max(0, pool - RESERVE));
     return Math.floor(amt * 1e6) / 1e6;
   };
