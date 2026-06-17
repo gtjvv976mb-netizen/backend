@@ -66,12 +66,13 @@ function rollRarity() {
   for (const [name, w] of RARITY_DIST) { x -= w; if (x <= 0) return name; }
   return "common";
 }
-/* simulate the SOL a wallet's Chikis earned over `minutes`, rolling each task's rarity */
+/* DETERMINISTIC earnings: expected SOL per task (rarity-weighted average) × tasks.
+   No per-call randomness, so the Chiki Pouch rises smoothly with time and the
+   estimate matches the actual claim exactly (no jitter). */
+const RARITY_EV = RARITY_DIST.reduce((s, [name, w]) => s + RARITY_SOL[name] * (w / RARITY_TOTAL), 0);
 function simEarn(minutes, chikis) {
   const tasks = Math.min(4000, Math.floor((minutes * 60 / TASK_SEC) * Math.max(1, chikis)));
-  let sol = 0;
-  for (let i = 0; i < tasks; i++) sol += RARITY_SOL[rollRarity()];
-  return sol * MULT;
+  return tasks * RARITY_EV * MULT;
 }
 const WALLET_DAILY = Number(PER_WALLET_DAILY_SOL);
 const verifyOn = String(VERIFY_HOLDERS).toLowerCase() === "true";
