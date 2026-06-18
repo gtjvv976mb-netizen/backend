@@ -531,6 +531,30 @@ app.get("/profile", async (req, res) => {
   catch (e) { res.status(500).json({ error: "load failed: " + String(e.message || e) }); }
 });
 
+// ADMIN: grant a wallet a normal Chiki (e.g., a whale's owed 2nd earner). Protected by ADMIN_KEY.
+// GET /admin/grant-chiki?key=SECRET&wallet=PUBKEY[&sp=0-9][&nick=Name]
+app.get("/admin/grant-chiki", async (req, res) => {
+  const KEY = process.env.ADMIN_KEY || "";
+  if (!KEY || req.query?.key !== KEY) return res.status(403).json({ error: "forbidden" });
+  const wallet = req.query?.wallet;
+  if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  try {
+    const profile = (await store.getProfile(wallet)) || null;
+    if (!profile || !Array.isArray(profile.chikis)) return res.status(404).json({ error: "no profile for that wallet (they must have played at least once)" });
+    const normals = profile.chikis.filter(c => !c.isLegend).length;
+    if (normals >= 2) return res.json({ ok: false, reason: "already has 2 normal Chikis", chikis: profile.chikis.length });
+    // normal species indices 0..9 (10..14 are Legendaries); pick one not already owned if possible
+    const owned = new Set(profile.chikis.map(c => c.sp | 0));
+    let sp = Number.isInteger(+req.query?.sp) ? Math.max(0, Math.min(9, +req.query.sp)) : -1;
+    if (sp < 0) { for (let i = 0; i < 10; i++) if (!owned.has(i)) { sp = i; break; } if (sp < 0) sp = Math.floor(Math.random() * 10); }
+    const nick = (req.query?.nick ? String(req.query.nick).slice(0, 16) : null);
+    profile.chikis.push({ br: 1, sp, xp: 0, food: 1800, nick, level: 1, hungry: false, tending: false, battleXp: 0, cardTier: null, isLegend: false, skillPts: 0, tasksDone: 0, arenaSkills: null, sleepCycles: 0 });
+    profile._serverSavedAt = Date.now();
+    await store.setProfile(wallet, profile);
+    res.json({ ok: true, wallet, granted: { sp, nick }, totalChikis: profile.chikis.length });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // Real SOL paid out to a wallet (authentic "earned" figure for the profile).
 app.get("/earned", async (req, res) => {
   const wallet = req.query?.wallet;
