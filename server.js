@@ -261,9 +261,9 @@ function pgStore() {
     },
     async claimedTotals() {
       const r = await pool.query(`SELECT profile FROM players WHERE profile IS NOT NULL`);
-      let chikis = 0, holders = 0;
-      for (const row of r.rows) { const c = row.profile?.chikis || []; if (c.length) { holders++; chikis += c.length; } }
-      return { chikis, holders };
+      let chikis = 0, holders = 0, legends = 0;
+      for (const row of r.rows) { const c = row.profile?.chikis || []; if (c.length) { holders++; chikis += c.length; legends += c.filter(x => x.isLegend).length; } }
+      return { chikis, holders, legends };
     },
   };
 }
@@ -347,9 +347,9 @@ function memStore() {
       return out;
     },
     async claimedTotals() {
-      let chikis = 0, holders = 0;
-      for (const p of players.values()) { const c = p.profile?.chikis || []; if (c.length) { holders++; chikis += c.length; } }
-      return { chikis, holders };
+      let chikis = 0, holders = 0, legends = 0;
+      for (const p of players.values()) { const c = p.profile?.chikis || []; if (c.length) { holders++; chikis += c.length; legends += c.filter(x => x.isLegend).length; } }
+      return { chikis, holders, legends };
     },
   };
 }
@@ -450,7 +450,7 @@ async function getStats() {
     try { out.teamSol = (await conn.getBalance(new PublicKey(TEAM_WALLET))) / LAMPORTS_PER_SOL; } catch (e) {}
     try { out.teamChiki = await chikiBalance(TEAM_WALLET); } catch (e) {}
   }
-  try { const t = await store.claimedTotals(); out.claimedChikis = t.chikis; out.holders = t.holders; } catch (e) {}
+  try { const t = await store.claimedTotals(); out.claimedChikis = t.chikis; out.holders = t.holders; out.legendsHatched = t.legends; } catch (e) {}
   _statsCache = { t: Date.now(), data: out };
   return out;
 }
