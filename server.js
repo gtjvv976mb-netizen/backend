@@ -4,6 +4,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import bs58 from "bs58";
+import nacl from "tweetnacl";
 import pg from "pg";
 import {
   Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL,
@@ -100,6 +101,76 @@ const WALLET_DAILY = Number(PER_WALLET_DAILY_SOL);
 const verifyOn = String(VERIFY_HOLDERS).toLowerCase() === "true";
 
 const isPubkey = (s) => { try { new PublicKey(s); return true; } catch { return false; } };
+
+/* Prove the request really comes from the owner of `wallet`:
+   the client signs "…wallet:<wallet>…ts:<ms>…" with their Phantom key; we verify it here.
+   Stops anyone from CHATTING / PINNING as the team, rewards, or any other wallet they don't own. */
+function verifyWalletSig(wallet, msg, sigB64) {
+  try {
+    if (!wallet || !msg || !sigB64) return false;
+    const m = String(msg);
+    if (!m.includes("wallet:" + wallet)) return false;            // signature must bind THIS wallet
+    const tm = m.match(/ts:(\d+)/); if (!tm) return false;
+    const ts = Number(tm[1]);
+    if (Date.now() - ts > 24 * 3600 * 1000) return false;         // signed too long ago
+    if (ts - Date.now() > 5 * 60 * 1000) return false;            // future-dated
+    const sig = Buffer.from(String(sigB64), "base64");
+    if (sig.length !== 64) return false;
+    return nacl.sign.detached.verify(new TextEncoder().encode(m), sig, new PublicKey(wallet).toBytes());
+  } catch (e) { return false; }
+}
+
+/* ----- anti-cheat / anti-XSS: clamp the client profile to legal values before storing ----- */
+const MAX_LEVEL = 50, MAX_BR = 30;
+const maxStamOf  = lv => 80 + lv * 12;
+const foodMaxSec = lv => Math.round(30 + (Math.min(lv, MAX_LEVEL) - 1) / 49 * 690) * 60;
+const xpNeed     = lv => Math.round(140 + (Math.max(1, lv) - 1) * 95 + Math.pow(Math.max(1, lv), 2) * 0.8);
+const legStamMax = lv => Math.round(120 + (Math.min(Math.max(lv, 1), MAX_LEVEL) - 1) / 49 * 780);
+const stripTags  = s => String(s == null ? "" : s).replace(/[<>]/g, "");          // no HTML tags ⇒ no stored XSS
+const clampNum   = (v, lo, hi, def) => { v = Number(v); return isFinite(v) ? Math.max(lo, Math.min(hi, v)) : def; };
+
+// Returns a sanitized copy of the incoming profile, using the previously-stored one to block roll-backs / jumps.
+function sanitizeProfile(prev, p) {
+  const out = { ...p };
+  if (out.handle != null) out.handle = stripTags(out.handle).slice(0, 16);
+  out.glory   = clampNum(out.glory, 0, 1e12, 0);
+  out.renames = clampNum(out.renames, 0, 99, 0);
+  const prevCh = (prev && Array.isArray(prev.chikis)) ? prev.chikis : [];
+  if (Array.isArray(out.chikis)) {
+    let normals = 0, legs = 0; const kept = [];
+    for (const c of out.chikis) {
+      const isLegend = !!c.isLegend;
+      if (isLegend) { if (legs >= 1) continue; legs++; } else { if (normals >= 2) continue; normals++; }   // hatch caps
+      const sp = clampNum(c.sp, 0, 14, 0);
+      const pc = prevCh.find(x => (x.sp | 0) === sp) || {};
+      const prevLv = clampNum(pc.level, 1, MAX_LEVEL, 1);
+      // level: can't go DOWN, can't jump (saves happen on every level-up); new Chikis allowed any legal level
+      let lv = clampNum(c.level, 1, MAX_LEVEL, 1);
+      if (pc.level != null) lv = Math.min(Math.max(lv, prevLv), prevLv + 4);
+      kept.push({
+        sp, level: lv, isLegend, hungry: !!c.hungry, tending: !!c.tending,
+        nick: c.nick != null ? stripTags(c.nick).slice(0, 16) : null,
+        xp: clampNum(c.xp, 0, xpNeed(lv), 0),
+        food: clampNum(c.food, 0, foodMaxSec(lv), 0),
+        stamina: clampNum(c.stamina, 0, isLegend ? legStamMax(lv) : maxStamOf(lv), maxStamOf(lv)),
+        tasksDone:   Math.max(clampNum(c.tasksDone, 0, 1e12, 0),   clampNum(pc.tasksDone, 0, 1e12, 0)),   // monotonic
+        sleepCycles: Math.max(clampNum(c.sleepCycles, 0, 1e9, 0),  clampNum(pc.sleepCycles, 0, 1e9, 0)),
+        renames: clampNum(c.renames, 0, 9, 0),
+        br: Math.max(clampNum(c.br, 1, MAX_BR, 1), clampNum(pc.br, 1, MAX_BR, 1)),
+        battleXp: clampNum(c.battleXp, 0, 1e12, 0),
+        skillPts: clampNum(c.skillPts, 0, 999, 0),
+        arenaSkills: Array.isArray(c.arenaSkills) ? c.arenaSkills.slice(0, 12).map(s => clampNum(s, 0, 11, 0)) : null,
+        cardTier: (c.cardTier && typeof c.cardTier === "object" && !Array.isArray(c.cardTier)) ? c.cardTier : null,
+        arenaStam: c.arenaStam != null ? clampNum(c.arenaStam, 0, legStamMax(lv), legStamMax(lv)) : null,
+        arenaSleepUntil: clampNum(c.arenaSleepUntil, 0, Date.now() + 24 * 3600 * 1000, 0),
+      });
+    }
+    out.chikis = kept;
+  }
+  return out;
+}
+const _lastSave = new Map();   // light per-wallet write throttle
+const _lastChat = new Map();   // light per-wallet chat throttle
 
 async function chikiBalance(owner) {
   if (!MINT) return 0;
@@ -368,7 +439,7 @@ const onlineUsers = new Map();                // wallet -> { handle, ts }
 const BAD_WORDS = ["fuck","shit","bitch","asshole","bastard","cunt","dick","piss","slut","whore",
   "nigger","nigga","faggot","retard","rape","cock","pussy","motherfucker","wank","twat","prick","jerkoff","cumshot"];
 function cleanText(s) {
-  s = String(s || "").replace(/\s+/g, " ").trim().slice(0, 300);
+  s = String(s || "").replace(/[<>]/g, "").replace(/\s+/g, " ").trim().slice(0, 300);   // strip < > so chat/handles can't inject HTML
   const norm = (w) => w.toLowerCase()
     .replace(/[1!|]/g, "i").replace(/3/g, "e").replace(/[4@]/g, "a")
     .replace(/0/g, "o").replace(/[5$]/g, "s").replace(/7/g, "t").replace(/[^a-z]/g, "");
@@ -518,10 +589,18 @@ app.post("/profile", async (req, res) => {
   const wallet = req.body?.wallet, profile = req.body?.profile;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
   if (!profile || typeof profile !== "object") return res.status(400).json({ error: "'profile' object required" });
-  profile._serverSavedAt = Date.now();   // authoritative "last seen" for offline progression
-  if (JSON.stringify(profile).length > 6000) return res.status(413).json({ error: "profile too large" });
-  try { await store.setProfile(wallet, profile); res.json({ ok: true, serverSavedAt: profile._serverSavedAt }); }
-  catch (e) { res.status(500).json({ error: "save failed: " + String(e.message || e) }); }
+  if (JSON.stringify(profile).length > 8000) return res.status(413).json({ error: "profile too large" });
+  const now = Date.now();
+  if (now - (_lastSave.get(wallet) || 0) < 600) return res.json({ ok: true, throttled: true });   // ignore rapid-fire writes (anti-spam)
+  _lastSave.set(wallet, now);
+  try {
+    const prev = await store.getProfile(wallet);
+    // admins are trusted (creator testing); everyone else is clamped to legal values
+    const safe = isAdminWallet(wallet) ? profile : sanitizeProfile(prev, profile);
+    safe._serverSavedAt = now;   // authoritative "last seen" for offline progression
+    await store.setProfile(wallet, safe);
+    res.json({ ok: true, serverSavedAt: safe._serverSavedAt });
+  } catch (e) { res.status(500).json({ error: "save failed: " + String(e.message || e) }); }
 });
 
 app.get("/profile", async (req, res) => {
@@ -605,8 +684,8 @@ app.get("/world", async (req, res) => {
 // One-time admin reset: wipe all saved game profiles (test data). Guarded by ADMIN_KEY.
 app.get("/admin/reset", async (req, res) => {
   const k = req.query?.key;
-  // Accept a fixed token OR a custom ADMIN_KEY if set. Remove this endpoint before public launch.
-  if (k !== "chikiwipe" && !(ADMIN_KEY && k === ADMIN_KEY)) return res.status(403).json({ error: "bad key" });
+  // ONLY the secret ADMIN_KEY can wipe profiles (the old hardcoded "chikiwipe" backdoor is removed).
+  if (!ADMIN_KEY || k !== ADMIN_KEY) return res.status(403).json({ error: "forbidden" });
   try { const n = await store.resetProfiles(); res.json({ ok: true, profilesCleared: n }); }
   catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
@@ -616,6 +695,9 @@ app.get("/admin/reset", async (req, res) => {
 app.post("/chat/send", async (req, res) => {
   const { wallet, handle, text, to } = req.body || {};
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  if (!verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig)) return res.status(401).json({ error: "chat sign-in required — approve the wallet signature to prove this is your wallet" });
+  if (Date.now() - (_lastChat.get(wallet) || 0) < 800) return res.status(429).json({ error: "slow down — you're sending messages too fast" });
+  _lastChat.set(wallet, Date.now());
   if (verifyOn) { try { if ((await chikiBalance(wallet)) < MIN) return res.status(403).json({ error: `hold ${MIN.toLocaleString()} $CHIKI to chat` }); } catch (e) {} }
   const body = cleanText(text);
   if (!body.trim()) return res.status(400).json({ error: "empty message" });
@@ -640,7 +722,9 @@ app.get("/chat", async (req, res) => {
 // Pin / unpin a message (admins only).
 app.post("/chat/pin", async (req, res) => {
   const { wallet, id, pin, key } = req.body || {};
-  if (!(isAdminWallet(wallet) || (ADMIN_KEY && key === ADMIN_KEY))) return res.status(403).json({ error: "not allowed" });
+  const keyOk = ADMIN_KEY && key === ADMIN_KEY;
+  if (!keyOk && !verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig)) return res.status(401).json({ error: "wallet signature required" });
+  if (!(keyOk || isAdminWallet(wallet))) return res.status(403).json({ error: "not allowed" });
   try { await chat.pin(Number(id), pin !== false); res.json({ ok: true }); }
   catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
