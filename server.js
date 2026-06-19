@@ -494,11 +494,12 @@ function makeChat() {
         return r.rows[0];
       },
       async fetch(wallet, since) {
+        /* return the NEWEST 200 above `since` (then re-sort ascending) so new messages are never cut off */
         const r = await pool.query(
-          `SELECT * FROM chat WHERE id>$1 AND (to_wallet IS NULL OR to_wallet=$2 OR wallet=$2) ORDER BY id ASC LIMIT 200`,
+          `SELECT * FROM chat WHERE id>$1 AND (to_wallet IS NULL OR to_wallet=$2 OR wallet=$2) ORDER BY id DESC LIMIT 200`,
           [since || 0, wallet || ""]);
         const p = await pool.query(`SELECT * FROM chat WHERE pinned=true ORDER BY id DESC LIMIT 1`);
-        return { messages: r.rows, pinned: p.rows[0] || null };
+        return { messages: r.rows.reverse(), pinned: p.rows[0] || null };
       },
       async pin(id, on) {
         if (on) await pool.query(`UPDATE chat SET pinned=false WHERE pinned=true`);
@@ -758,12 +759,12 @@ app.get("/admin/reset", async (req, res) => {
 app.post("/chat/send", async (req, res) => {
   const { wallet, handle, text, to } = req.body || {};
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
-  // signature is OPTIONAL: a forged signature is rejected, but a missing one is allowed so every wallet (incl. mobile) can chat
-  if (req.body?.authSig && !verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig)) return res.status(401).json({ error: "invalid wallet signature" });
+  // VERIFICATION REQUIRED: every chatter must prove they own this wallet with a signature (anti-impersonation)
+  if (!verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig)) return res.status(401).json({ error: "wallet verification required — approve the one-time sign-in to prove you own this wallet" });
   if (Date.now() - (_lastChat.get(wallet) || 0) < 800) return res.status(429).json({ error: "slow down — you're sending messages too fast" });
   _lastChat.set(wallet, Date.now());
-  /* chat is open to any wallet-verified player — the 500k hold gates EARNING, not chatting.
-     Anti-impersonation (signature) + anti-spam (throttle) above still apply. */
+  /* holder verification: when on-chain checks are enabled, chatters must hold the minimum $CHIKI */
+  if (verifyOn) { try { if ((await chikiBalance(wallet)) < MIN) return res.status(403).json({ error: `hold ${MIN.toLocaleString()} $CHIKI to chat` }); } catch (e) {} }
   const body = cleanText(text);
   if (!body.trim()) return res.status(400).json({ error: "empty message" });
   if (to && !isPubkey(to)) return res.status(400).json({ error: "bad recipient" });
