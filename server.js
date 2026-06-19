@@ -25,7 +25,7 @@ const {
   REWARD_RATE_PER_MIN = "0.0008",  // legacy; no longer used (earnings are now task/rarity-based)
   EARN_MULT = "1",                 // global multiplier on all task SOL payouts (tune to your fee budget)
   TASK_SECONDS = "45",             // avg seconds a Chiki takes per task (sets task throughput)
-  ACCRUAL_CAP_MIN = "60",          // max minutes of task earnings counted per claim
+  ACCRUAL_CAP_MIN = "1440",        // max minutes of task earnings counted per claim (24h pouch cap)
   MAX_CLAIM_SOL = "0.05",
   DAILY_CAP_SOL = "1",             // global cap on confirmed payouts per rolling 24h
   POOL_RESERVE_SOL = "0.05",       // never pay the treasury below this floor (keeps a buffer for fees)
