@@ -17,7 +17,7 @@ const {
   CHIKI_MINT,
   MIN_HOLD = "500000",
   MIN_HOLD_MINUTES = "0",          // anti-sybil: wallet must be "seen" this long before it can claim
-  WHALE_MIN_HOLD = "1000000",      // balance for the 2nd Chiki
+  WHALE_MIN_HOLD = "800000",       // balance for the 2nd Chiki
   WHALE_HOLD_HOURS = "6",          // must hold >= WHALE_MIN_HOLD continuously this long to earn the 2nd Chiki
   VERIFY_HOLDERS = "false",
   TREASURY_SECRET,
