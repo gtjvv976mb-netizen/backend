@@ -4,7 +4,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import bs58 from "bs58";
-import nacl from "tweetnacl";
+import crypto from "node:crypto";   // built-in — used for Ed25519 chat-signature verification (no external dep)
 import pg from "pg";
 import {
   Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL,
@@ -116,7 +116,11 @@ function verifyWalletSig(wallet, msg, sigB64) {
     if (ts - Date.now() > 5 * 60 * 1000) return false;            // future-dated
     const sig = Buffer.from(String(sigB64), "base64");
     if (sig.length !== 64) return false;
-    return nacl.sign.detached.verify(new TextEncoder().encode(m), sig, new PublicKey(wallet).toBytes());
+    // verify the Ed25519 signature with Node's built-in crypto (wrap the raw 32-byte key in SPKI DER)
+    const pub = Buffer.from(new PublicKey(wallet).toBytes());
+    const der = Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), pub]);
+    const key = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
+    return crypto.verify(null, Buffer.from(m, "utf8"), key, sig);
   } catch (e) { return false; }
 }
 
