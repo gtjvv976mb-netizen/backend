@@ -136,67 +136,47 @@ function sanitizeProfile(prev, p) {
   out.glory   = clampNum(out.glory, 0, 1e12, 0);
   out.renames = clampNum(out.renames, 0, 99, 0);
   const prevCh = (prev && Array.isArray(prev.chikis)) ? prev.chikis : [];
-  if (Array.isArray(out.chikis)) {
+  // ===== ROSTER IS NEVER REDUCED: a wallet keeps every Chiki it has ever owned (by species),
+  //       unless the player explicitly releases it. Incoming saves update existing Chikis and may
+  //       ADD new species within the hatch caps, but can never drop a previously-owned one. =====
+  const inc = Array.isArray(out.chikis) ? out.chikis : [];
+  if (inc.length || prevCh.length) {
+    const firstBySp = arr => { const m = new Map(); for (const c of arr) { const sp = clampNum(c.sp, 0, 14, 0); if (!m.has(sp)) m.set(sp, c); } return m; };
+    const incBySp = firstBySp(inc), prevBySp = firstBySp(prevCh);
+    const order = [];
+    for (const sp of prevBySp.keys()) order.push(sp);                          // 1) preserve EVERY previously-owned species first
+    for (const sp of incBySp.keys()) if (!prevBySp.has(sp)) order.push(sp);    // 2) then any brand-new species the save added
     let normals = 0, legs = 0; const kept = [];
-    for (const c of out.chikis) {
-      const isLegend = !!c.isLegend;
-      if (isLegend) { if (legs >= 1) continue; legs++; } else { if (normals >= 2) continue; normals++; }   // hatch caps
-      const sp = clampNum(c.sp, 0, 14, 0);
-      const pc = prevCh.find(x => (x.sp | 0) === sp) || {};
+    for (const sp of order) {
+      const ic = incBySp.get(sp), pc = prevBySp.get(sp) || {};
+      const src = ic || pc;                                                    // prefer the incoming (latest) data; fall back to stored
+      const isLegend = !!(src.isLegend || pc.isLegend);
+      if (isLegend) { if (legs >= 1) continue; legs++; } else { if (normals >= 2) continue; normals++; }   // caps drop EXCESS NEW ones, never originals
       const prevLv = clampNum(pc.level, 1, MAX_LEVEL, 1);
-      // level: can't go DOWN, can't jump (saves happen on every level-up); new Chikis allowed any legal level
-      let lv = clampNum(c.level, 1, MAX_LEVEL, 1);
-      if (pc.level != null) lv = Math.min(Math.max(lv, prevLv), prevLv + 4);
+      let lv = clampNum(src.level, 1, MAX_LEVEL, 1);
+      if (pc.level != null) lv = Math.min(Math.max(lv, prevLv), prevLv + 4);   // level monotonic, no jumps
       kept.push({
-        sp, level: lv, isLegend, hungry: !!c.hungry, tending: !!c.tending,
-        nick: c.nick != null ? stripTags(c.nick).slice(0, 16) : null,
-        xp: clampNum(c.xp, 0, xpNeed(lv), 0),
-        food: clampNum(c.food, 0, foodMaxSec(lv), 0),
-        stamina: clampNum(c.stamina, 0, isLegend ? legStamMax(lv) : maxStamOf(lv), maxStamOf(lv)),
-        tasksDone:   Math.max(clampNum(c.tasksDone, 0, 1e12, 0),   clampNum(pc.tasksDone, 0, 1e12, 0)),   // monotonic
-        sleepCycles: Math.max(clampNum(c.sleepCycles, 0, 1e9, 0),  clampNum(pc.sleepCycles, 0, 1e9, 0)),
-        renames: clampNum(c.renames, 0, 9, 0),
-        br: Math.max(clampNum(c.br, 1, MAX_BR, 1), clampNum(pc.br, 1, MAX_BR, 1)),
-        battleXp: clampNum(c.battleXp, 0, 1e12, 0),
-        skillPts: clampNum(c.skillPts, 0, 999, 0),
-        arenaSkills: Array.isArray(c.arenaSkills) ? c.arenaSkills.slice(0, 12).map(s => clampNum(s, 0, 11, 0)) : null,
-        cardTier: (c.cardTier && typeof c.cardTier === "object" && !Array.isArray(c.cardTier)) ? c.cardTier : null,
-        arenaStam: c.arenaStam != null ? clampNum(c.arenaStam, 0, legStamMax(lv), legStamMax(lv)) : null,
-        arenaSleepUntil: clampNum(c.arenaSleepUntil, 0, Date.now() + 24 * 3600 * 1000, 0),
-      });
-    }
-    // NON-DESTRUCTIVE MERGE: a save must NEVER drop a Chiki the wallet already owned.
-    // (Players cannot delete Chikis in normal play, so the roster is monotonic by species.)
-    // This protects existing rosters from being clobbered by a stray/onboarding/partial save.
-    const keptSp = new Set(kept.map(c => c.sp));
-    let nN = kept.filter(c => !c.isLegend).length, nL = kept.filter(c => c.isLegend).length;
-    for (const pcc of prevCh) {
-      const sp = clampNum(pcc.sp, 0, 14, 0);
-      if (keptSp.has(sp)) continue;                       // already represented in the incoming save
-      const isLegend = !!pcc.isLegend;
-      if (isLegend) { if (nL >= 1) continue; nL++; } else { if (nN >= 2) continue; nN++; }
-      const lv = clampNum(pcc.level, 1, MAX_LEVEL, 1);
-      kept.push({
-        sp, level: lv, isLegend, hungry: !!pcc.hungry, tending: !!pcc.tending,
-        nick: pcc.nick != null ? stripTags(pcc.nick).slice(0, 16) : null,
-        xp: clampNum(pcc.xp, 0, xpNeed(lv), 0),
-        food: clampNum(pcc.food, 0, foodMaxSec(lv), 0),
-        stamina: clampNum(pcc.stamina, 0, isLegend ? legStamMax(lv) : maxStamOf(lv), maxStamOf(lv)),
-        tasksDone: clampNum(pcc.tasksDone, 0, 1e12, 0),
-        sleepCycles: clampNum(pcc.sleepCycles, 0, 1e9, 0),
-        renames: clampNum(pcc.renames, 0, 9, 0),
-        br: clampNum(pcc.br, 1, MAX_BR, 1),
-        battleXp: clampNum(pcc.battleXp, 0, 1e12, 0),
-        skillPts: clampNum(pcc.skillPts, 0, 999, 0),
-        arenaSkills: Array.isArray(pcc.arenaSkills) ? pcc.arenaSkills.slice(0, 12).map(s => clampNum(s, 0, 11, 0)) : null,
-        cardTier: (pcc.cardTier && typeof pcc.cardTier === "object" && !Array.isArray(pcc.cardTier)) ? pcc.cardTier : null,
-        arenaStam: pcc.arenaStam != null ? clampNum(pcc.arenaStam, 0, legStamMax(lv), legStamMax(lv)) : null,
-        arenaSleepUntil: clampNum(pcc.arenaSleepUntil, 0, Date.now() + 24 * 3600 * 1000, 0),
+        sp, level: lv, isLegend, hungry: !!src.hungry, tending: !!src.tending,
+        nick: src.nick != null ? stripTags(src.nick).slice(0, 16) : (pc.nick != null ? stripTags(pc.nick).slice(0, 16) : null),
+        xp: clampNum(src.xp, 0, xpNeed(lv), 0),
+        food: clampNum(src.food, 0, foodMaxSec(lv), 0),
+        stamina: clampNum(src.stamina, 0, isLegend ? legStamMax(lv) : maxStamOf(lv), maxStamOf(lv)),
+        tasksDone:   Math.max(clampNum(src.tasksDone, 0, 1e12, 0),  clampNum(pc.tasksDone, 0, 1e12, 0)),    // monotonic
+        sleepCycles: Math.max(clampNum(src.sleepCycles, 0, 1e9, 0), clampNum(pc.sleepCycles, 0, 1e9, 0)),
+        renames: clampNum(src.renames, 0, 9, 0),
+        br: Math.max(clampNum(src.br, 1, MAX_BR, 1), clampNum(pc.br, 1, MAX_BR, 1)),
+        battleXp: clampNum(src.battleXp, 0, 1e12, 0),
+        skillPts: clampNum(src.skillPts, 0, 999, 0),
+        arenaSkills: Array.isArray(src.arenaSkills) ? src.arenaSkills.slice(0, 12).map(s => clampNum(s, 0, 11, 0))
+                   : (Array.isArray(pc.arenaSkills) ? pc.arenaSkills.slice(0, 12).map(s => clampNum(s, 0, 11, 0)) : null),
+        cardTier: (src.cardTier && typeof src.cardTier === "object" && !Array.isArray(src.cardTier)) ? src.cardTier
+                : ((pc.cardTier && typeof pc.cardTier === "object" && !Array.isArray(pc.cardTier)) ? pc.cardTier : null),
+        arenaStam: src.arenaStam != null ? clampNum(src.arenaStam, 0, legStamMax(lv), legStamMax(lv))
+                 : (pc.arenaStam != null ? clampNum(pc.arenaStam, 0, legStamMax(lv), legStamMax(lv)) : null),
+        arenaSleepUntil: clampNum(src.arenaSleepUntil != null ? src.arenaSleepUntil : pc.arenaSleepUntil, 0, Date.now() + 24 * 3600 * 1000, 0),
       });
     }
     out.chikis = kept;
-  } else if (prevCh.length) {
-    out.chikis = prevCh;   // incoming save omitted chikis entirely → keep what we had, never wipe
   }
   return out;
 }
