@@ -664,16 +664,19 @@ app.get("/admin/restore-chikis", async (req, res) => {
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
   const spec = String(req.query?.roster || "").trim();
   if (!spec) return res.status(400).json({ error: "roster required, e.g. roster=0:12:Spike,10:8:L:Genbu" });
+  const replace = (req.query?.set === "1" || req.query?.set === "true");   // set=1 → replace the whole roster with exactly this spec
   try {
-    const profile = (await store.getProfile(wallet)) || { chikis: [] };
-    if (!Array.isArray(profile.chikis)) profile.chikis = [];
+    const profile = (await store.getProfile(wallet)) || {};
+    if (replace || !Array.isArray(profile.chikis)) profile.chikis = [];
     const have = new Set(profile.chikis.map(c => c.sp | 0));
+    let nN = profile.chikis.filter(c => !c.isLegend).length, nL = profile.chikis.filter(c => c.isLegend).length;
     const added = [];
     for (const part of spec.split(",")) {
       const f = part.split(":").map(s => s.trim());
       const sp = clampNum(f[0], 0, 14, -1); if (sp < 0) continue;
       if (have.has(sp)) continue;                                   // don't duplicate a species they already have
       const isLegend = f.includes("L") || f.includes("l") || sp >= 10;
+      if (isLegend) { if (nL >= 1) continue; nL++; } else { if (nN >= 2) continue; nN++; }   // enforce hatch caps
       const lv = clampNum(f[1], 1, MAX_LEVEL, 1);
       const nick = f.find((x, i) => i >= 2 && x && x !== "L" && x !== "l") || null;
       profile.chikis.push({ sp, level: lv, isLegend, hungry: false, tending: false,
@@ -685,7 +688,7 @@ app.get("/admin/restore-chikis", async (req, res) => {
     }
     profile._serverSavedAt = Date.now();
     await store.setProfile(wallet, profile);
-    res.json({ ok: true, wallet, added, totalChikis: profile.chikis.length });
+    res.json({ ok: true, wallet, replace, added, totalChikis: profile.chikis.length });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
@@ -754,7 +757,8 @@ app.post("/chat/send", async (req, res) => {
   if (!verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig)) return res.status(401).json({ error: "chat sign-in required — approve the wallet signature to prove this is your wallet" });
   if (Date.now() - (_lastChat.get(wallet) || 0) < 800) return res.status(429).json({ error: "slow down — you're sending messages too fast" });
   _lastChat.set(wallet, Date.now());
-  if (verifyOn) { try { if ((await chikiBalance(wallet)) < MIN) return res.status(403).json({ error: `hold ${MIN.toLocaleString()} $CHIKI to chat` }); } catch (e) {} }
+  /* chat is open to any wallet-verified player — the 500k hold gates EARNING, not chatting.
+     Anti-impersonation (signature) + anti-spam (throttle) above still apply. */
   const body = cleanText(text);
   if (!body.trim()) return res.status(400).json({ error: "empty message" });
   if (to && !isPubkey(to)) return res.status(400).json({ error: "bad recipient" });
