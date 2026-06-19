@@ -155,6 +155,15 @@ function sanitizeProfile(prev, p) {
       const prevLv = clampNum(pc.level, 1, MAX_LEVEL, 1);
       let lv = clampNum(src.level, 1, MAX_LEVEL, 1);
       if (pc.level != null) lv = Math.min(Math.max(lv, prevLv), prevLv + 4);   // level monotonic, no jumps
+      // BR can't be injected — it only rises gradually via Battle EXP; cap the per-save jump
+      const brP = clampNum(pc.br, 1, MAX_BR, 1);
+      let brF = Math.max(clampNum(src.br, 1, MAX_BR, 1), brP);
+      if (pc.br != null) brF = Math.min(brF, brP + 3);
+      // skill-card tiers must be a clean {slot:1..5} map — never accept arbitrary values
+      const rawCT = (src.cardTier && typeof src.cardTier === "object" && !Array.isArray(src.cardTier)) ? src.cardTier
+                  : ((pc.cardTier && typeof pc.cardTier === "object" && !Array.isArray(pc.cardTier)) ? pc.cardTier : null);
+      let ctF = null;
+      if (rawCT) { ctF = {}; for (const k in rawCT) { const slot = k | 0; if (slot >= 0 && slot < 12) ctF[slot] = clampNum(rawCT[k], 1, 5, 1); } }
       kept.push({
         sp, level: lv, isLegend, hungry: !!src.hungry, tending: !!src.tending,
         nick: src.nick != null ? stripTags(src.nick).slice(0, 16) : (pc.nick != null ? stripTags(pc.nick).slice(0, 16) : null),
@@ -164,13 +173,12 @@ function sanitizeProfile(prev, p) {
         tasksDone:   Math.max(clampNum(src.tasksDone, 0, 1e12, 0),  clampNum(pc.tasksDone, 0, 1e12, 0)),    // monotonic
         sleepCycles: Math.max(clampNum(src.sleepCycles, 0, 1e9, 0), clampNum(pc.sleepCycles, 0, 1e9, 0)),
         renames: clampNum(src.renames, 0, 9, 0),
-        br: Math.max(clampNum(src.br, 1, MAX_BR, 1), clampNum(pc.br, 1, MAX_BR, 1)),
+        br: brF,
         battleXp: clampNum(src.battleXp, 0, 1e12, 0),
         skillPts: clampNum(src.skillPts, 0, 999, 0),
         arenaSkills: Array.isArray(src.arenaSkills) ? src.arenaSkills.slice(0, 12).map(s => clampNum(s, 0, 11, 0))
                    : (Array.isArray(pc.arenaSkills) ? pc.arenaSkills.slice(0, 12).map(s => clampNum(s, 0, 11, 0)) : null),
-        cardTier: (src.cardTier && typeof src.cardTier === "object" && !Array.isArray(src.cardTier)) ? src.cardTier
-                : ((pc.cardTier && typeof pc.cardTier === "object" && !Array.isArray(pc.cardTier)) ? pc.cardTier : null),
+        cardTier: ctF,
         arenaStam: src.arenaStam != null ? clampNum(src.arenaStam, 0, legStamMax(lv), legStamMax(lv))
                  : (pc.arenaStam != null ? clampNum(pc.arenaStam, 0, legStamMax(lv), legStamMax(lv)) : null),
         arenaSleepUntil: clampNum(src.arenaSleepUntil != null ? src.arenaSleepUntil : pc.arenaSleepUntil, 0, Date.now() + 24 * 3600 * 1000, 0),
