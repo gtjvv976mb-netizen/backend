@@ -29,6 +29,7 @@ const {
   MAX_CLAIM_SOL = "0.05",
   DAILY_CAP_SOL = "1",             // global cap on confirmed payouts per rolling 24h
   POOL_RESERVE_SOL = "0.05",       // never pay the treasury below this floor (keeps a buffer for fees)
+  POOL_REF_SOL = "1",              // earnings scale UP once the pool grows past this (×1 below it, so payouts never shrink)
   PER_WALLET_DAILY_SOL = "0",      // per-wallet cap per rolling 24h (0 = unlimited)
   CLAIM_COOLDOWN_SEC = "30",
   DATABASE_URL = "",
@@ -49,6 +50,10 @@ const COOLDOWN = Number(CLAIM_COOLDOWN_SEC) * 1000;
 const HOLD_MS = Number(MIN_HOLD_MINUTES) * 60_000;
 const DAILY_CAP = Number(DAILY_CAP_SOL);
 const RESERVE = Number(POOL_RESERVE_SOL);
+const POOL_REF = Math.max(0.000001, Number(POOL_REF_SOL));   // earnings scale UP as pool grows past this; never below ×1
+// pool-scaling multiplier: ×1 while the pool is small (payouts never shrink), grows linearly as the treasury fills.
+// Still hard-bounded downstream by per-claim CAP, the pool-RESERVE floor, and the global DAILY_CAP — it can never overdraw.
+const poolFactor = (pool) => Math.max(1, (Number(pool) || 0) / POOL_REF);
 const MULT = Number(EARN_MULT), TASK_SEC = Math.max(5, Number(TASK_SECONDS)), ACCRUAL_CAP = Number(ACCRUAL_CAP_MIN);
 const WHALE_MIN = Number(WHALE_MIN_HOLD), WHALE_HOLD_MS = Number(WHALE_HOLD_HOURS) * 3600_000;
 const CLAIM_TAX = Math.min(0.95, Math.max(0, Number(process.env.CLAIM_TAX_PCT || 20) / 100));   /* SOL claim tax — withheld from payout, stays in treasury (1% burn / 39% pool / 60% team bookkeeping) */
@@ -60,7 +65,7 @@ function chikiCount(balance, whaleSince) {
 }
 /* server-authoritative, rarity-weighted earnings: each simulated task pays SOL by rarity.
    The server rolls the tasks itself (using on-chain Chiki count + elapsed time), so it can't be faked. */
-const RARITY_SOL = { common:0.000004, uncommon:0.000008, rare:0.000018, epic:0.00004, mythic:0.0001, shiny:0.0002, legend:0.0005 };  /* 5x lower — preserve the reward pool while volume/fees are low */
+const RARITY_SOL = { common:0.00002, uncommon:0.00004, rare:0.00009, epic:0.0002, mythic:0.0005, shiny:0.001, legend:0.0025 };  /* common 0.00002 SOL · base rates doubled (~5x vs original) · still bounded by per-claim cap, pool reserve floor + daily cap */
 const RARITY_DIST = [["common",45],["uncommon",27],["rare",15],["epic",7],["mythic",3.5],["shiny",1.7],["legend",0.8]];
 const RARITY_TOTAL = RARITY_DIST.reduce((s, r) => s + r[1], 0);
 function rollRarity() {
@@ -715,12 +720,14 @@ app.get("/claimable", async (req, res) => {
     const eligible = !verifyOn || bal >= MIN;
     const chikis = eligible ? (chikiCount(bal, p.whale_since) || 1) : 0;   // below the hold threshold ⇒ no accrual (matches /claim)
     const lastClaim = Number(p.last_claim);
+    let poolBal = 0; try { poolBal = await poolSol(); } catch (e) {}
+    const pf = poolFactor(poolBal);   // pool-scaling multiplier (≥1) — bigger payouts as the treasury fills
     const minutes = Math.min((Date.now() - lastClaim) / 60000, ACCRUAL_CAP);
-    const gross = Math.max(0, seededEarn(wallet, lastClaim, chikis, minutes));
+    const gross = Math.max(0, seededEarn(wallet, lastClaim, chikis, minutes) * pf);
     const claimable = Math.floor(gross * (1 - CLAIM_TAX) * 1e6) / 1e6;   /* net after the SOL claim tax (tax stays in treasury) */
     /* seed params let the client mirror the EXACT same rarity sequence it will be paid for */
     res.json({ wallet, claimableSol: claimable, claimGrossSol: Math.floor(gross*1e6)/1e6, claimTaxPct: Math.round(CLAIM_TAX*100), lifetimePaid: await store.earned(wallet),
-      eligible, minHold: MIN, balance: bal, lastClaim, chikis, taskSec: TASK_SEC, mult: MULT, accrualCap: ACCRUAL_CAP, raritySol: RARITY_SOL });
+      eligible, minHold: MIN, balance: bal, lastClaim, chikis, taskSec: TASK_SEC, mult: MULT, accrualCap: ACCRUAL_CAP, raritySol: RARITY_SOL, poolFactor: pf, poolSol: Math.floor(poolBal*1e6)/1e6, poolRef: POOL_REF });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
@@ -838,7 +845,7 @@ app.post("/claim", async (req, res) => {
   const now = Date.now();
   const compute = (p) => {
     const minutes = Math.min((now - Number(p.last_claim)) / 60_000, ACCRUAL_CAP);
-    let amt = seededEarn(wallet, Number(p.last_claim), chikis, minutes);   /* deterministic seeded rarity earnings (synced with the client) */
+    let amt = seededEarn(wallet, Number(p.last_claim), chikis, minutes) * poolFactor(pool);   /* deterministic seeded rarity earnings (synced with client) × pool-scaling factor */
     amt = amt * (1 - CLAIM_TAX);                                           /* SOL claim tax withheld — the tax stays in the treasury */
     amt = Math.min(amt, (CAP > 0 ? CAP : Infinity), Math.max(0, DAILY_CAP - daily), (WALLET_DAILY > 0 ? Math.max(0, WALLET_DAILY - walletPaid) : Infinity), Math.max(0, pool - RESERVE));
     return Math.floor(amt * 1e6) / 1e6;
