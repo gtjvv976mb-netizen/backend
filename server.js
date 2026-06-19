@@ -165,7 +165,38 @@ function sanitizeProfile(prev, p) {
         arenaSleepUntil: clampNum(c.arenaSleepUntil, 0, Date.now() + 24 * 3600 * 1000, 0),
       });
     }
+    // NON-DESTRUCTIVE MERGE: a save must NEVER drop a Chiki the wallet already owned.
+    // (Players cannot delete Chikis in normal play, so the roster is monotonic by species.)
+    // This protects existing rosters from being clobbered by a stray/onboarding/partial save.
+    const keptSp = new Set(kept.map(c => c.sp));
+    let nN = kept.filter(c => !c.isLegend).length, nL = kept.filter(c => c.isLegend).length;
+    for (const pcc of prevCh) {
+      const sp = clampNum(pcc.sp, 0, 14, 0);
+      if (keptSp.has(sp)) continue;                       // already represented in the incoming save
+      const isLegend = !!pcc.isLegend;
+      if (isLegend) { if (nL >= 1) continue; nL++; } else { if (nN >= 2) continue; nN++; }
+      const lv = clampNum(pcc.level, 1, MAX_LEVEL, 1);
+      kept.push({
+        sp, level: lv, isLegend, hungry: !!pcc.hungry, tending: !!pcc.tending,
+        nick: pcc.nick != null ? stripTags(pcc.nick).slice(0, 16) : null,
+        xp: clampNum(pcc.xp, 0, xpNeed(lv), 0),
+        food: clampNum(pcc.food, 0, foodMaxSec(lv), 0),
+        stamina: clampNum(pcc.stamina, 0, isLegend ? legStamMax(lv) : maxStamOf(lv), maxStamOf(lv)),
+        tasksDone: clampNum(pcc.tasksDone, 0, 1e12, 0),
+        sleepCycles: clampNum(pcc.sleepCycles, 0, 1e9, 0),
+        renames: clampNum(pcc.renames, 0, 9, 0),
+        br: clampNum(pcc.br, 1, MAX_BR, 1),
+        battleXp: clampNum(pcc.battleXp, 0, 1e12, 0),
+        skillPts: clampNum(pcc.skillPts, 0, 999, 0),
+        arenaSkills: Array.isArray(pcc.arenaSkills) ? pcc.arenaSkills.slice(0, 12).map(s => clampNum(s, 0, 11, 0)) : null,
+        cardTier: (pcc.cardTier && typeof pcc.cardTier === "object" && !Array.isArray(pcc.cardTier)) ? pcc.cardTier : null,
+        arenaStam: pcc.arenaStam != null ? clampNum(pcc.arenaStam, 0, legStamMax(lv), legStamMax(lv)) : null,
+        arenaSleepUntil: clampNum(pcc.arenaSleepUntil, 0, Date.now() + 24 * 3600 * 1000, 0),
+      });
+    }
     out.chikis = kept;
+  } else if (prevCh.length) {
+    out.chikis = prevCh;   // incoming save omitted chikis entirely → keep what we had, never wipe
   }
   return out;
 }
@@ -634,6 +665,42 @@ app.get("/admin/grant-chiki", async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// ADMIN RECOVERY: rebuild a wallet's roster for a user whose Chikis were lost to the old overwrite bug.
+// GET /admin/restore-chikis?key=SECRET&wallet=PUBKEY&roster=sp:level[:L][:Nick],sp:level,...
+//   sp = species index (0-9 normal, 10-14 legendary), add ":L" to mark a legendary, optional ":Nick" name.
+//   The restored Chikis are MERGED with whatever the wallet currently has (never reduces the roster).
+app.get("/admin/restore-chikis", async (req, res) => {
+  const KEY = process.env.ADMIN_KEY || "";
+  if (!KEY || req.query?.key !== KEY) return res.status(403).json({ error: "forbidden" });
+  const wallet = req.query?.wallet;
+  if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  const spec = String(req.query?.roster || "").trim();
+  if (!spec) return res.status(400).json({ error: "roster required, e.g. roster=0:12:Spike,10:8:L:Genbu" });
+  try {
+    const profile = (await store.getProfile(wallet)) || { chikis: [] };
+    if (!Array.isArray(profile.chikis)) profile.chikis = [];
+    const have = new Set(profile.chikis.map(c => c.sp | 0));
+    const added = [];
+    for (const part of spec.split(",")) {
+      const f = part.split(":").map(s => s.trim());
+      const sp = clampNum(f[0], 0, 14, -1); if (sp < 0) continue;
+      if (have.has(sp)) continue;                                   // don't duplicate a species they already have
+      const isLegend = f.includes("L") || f.includes("l") || sp >= 10;
+      const lv = clampNum(f[1], 1, MAX_LEVEL, 1);
+      const nick = f.find((x, i) => i >= 2 && x && x !== "L" && x !== "l") || null;
+      profile.chikis.push({ sp, level: lv, isLegend, hungry: false, tending: false,
+        nick: nick ? stripTags(nick).slice(0, 16) : null, xp: 0, food: foodMaxSec(lv),
+        stamina: isLegend ? legStamMax(lv) : maxStamOf(lv), tasksDone: 0, sleepCycles: 0,
+        renames: 0, br: 1, battleXp: 0, skillPts: 0, arenaSkills: null, cardTier: null,
+        arenaStam: isLegend ? legStamMax(lv) : null, arenaSleepUntil: 0 });
+      have.add(sp); added.push({ sp, level: lv, isLegend, nick });
+    }
+    profile._serverSavedAt = Date.now();
+    await store.setProfile(wallet, profile);
+    res.json({ ok: true, wallet, added, totalChikis: profile.chikis.length });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // Real SOL paid out to a wallet (authentic "earned" figure for the profile).
 app.get("/earned", async (req, res) => {
   const wallet = req.query?.wallet;
@@ -649,14 +716,15 @@ app.get("/claimable", async (req, res) => {
   try {
     let bal = 0; try { bal = await chikiBalance(wallet); } catch (e) {}
     const p = await store.touch(wallet, bal >= MIN, bal);
-    const chikis = chikiCount(bal, p.whale_since) || 1;
+    const eligible = !verifyOn || bal >= MIN;
+    const chikis = eligible ? (chikiCount(bal, p.whale_since) || 1) : 0;   // below the hold threshold ⇒ no accrual (matches /claim)
     const lastClaim = Number(p.last_claim);
     const minutes = Math.min((Date.now() - lastClaim) / 60000, ACCRUAL_CAP);
     const gross = Math.max(0, seededEarn(wallet, lastClaim, chikis, minutes));
     const claimable = Math.floor(gross * (1 - CLAIM_TAX) * 1e6) / 1e6;   /* net after the SOL claim tax (tax stays in treasury) */
     /* seed params let the client mirror the EXACT same rarity sequence it will be paid for */
     res.json({ wallet, claimableSol: claimable, claimGrossSol: Math.floor(gross*1e6)/1e6, claimTaxPct: Math.round(CLAIM_TAX*100), lifetimePaid: await store.earned(wallet),
-      lastClaim, chikis, taskSec: TASK_SEC, mult: MULT, accrualCap: ACCRUAL_CAP, raritySol: RARITY_SOL });
+      eligible, minHold: MIN, balance: bal, lastClaim, chikis, taskSec: TASK_SEC, mult: MULT, accrualCap: ACCRUAL_CAP, raritySol: RARITY_SOL });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
