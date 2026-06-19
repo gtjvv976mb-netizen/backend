@@ -758,7 +758,8 @@ app.get("/admin/reset", async (req, res) => {
 app.post("/chat/send", async (req, res) => {
   const { wallet, handle, text, to } = req.body || {};
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
-  if (!verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig)) return res.status(401).json({ error: "chat sign-in required — approve the wallet signature to prove this is your wallet" });
+  // signature is OPTIONAL: a forged signature is rejected, but a missing one is allowed so every wallet (incl. mobile) can chat
+  if (req.body?.authSig && !verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig)) return res.status(401).json({ error: "invalid wallet signature" });
   if (Date.now() - (_lastChat.get(wallet) || 0) < 800) return res.status(429).json({ error: "slow down — you're sending messages too fast" });
   _lastChat.set(wallet, Date.now());
   /* chat is open to any wallet-verified player — the 500k hold gates EARNING, not chatting.
