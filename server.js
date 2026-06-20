@@ -28,9 +28,9 @@ const {
   ACCRUAL_CAP_MIN = "1440",        // max minutes of task earnings counted per claim (24h pouch cap)
   MAX_CLAIM_SOL = "1",             // per-claim ceiling — high enough that even a 2-Chiki full pouch isn't clipped (displayed pouch ≈ actual payout)
   DAILY_CAP_SOL = "1",             // absolute backstop ceiling (rarely binds; the real cap is DAILY_CAP_FRAC below)
-  DAILY_CAP_FRAC = "0.5",          // global daily payout cap as a FRACTION of the live pool (0.5 = up to 50% of the pool per 24h). Scales with the pool — never a stuck number.
+  DAILY_CAP_FRAC = "0.25",         // global daily payout cap as a FRACTION of the live pool (0.25 = up to 25% of the pool per 24h). Scales with the pool — never a stuck number.
   POOL_RESERVE_SOL = "0.05",       // never pay the treasury below this floor — the hard "never go into debt" guarantee
-  POOL_REF_SOL = "10",             // reward reference: payout = base_table × (pool / POOL_REF). A pure % of the pool — scales BOTH up and down, no stuck floor. Lower = more generous.
+  POOL_REF_SOL = "20",             // reward reference: payout = base_table × (pool / POOL_REF). Higher = SMALLER payouts (longer runway). Lower = more generous.
   PER_WALLET_DAILY_SOL = "0",      // per-wallet cap per rolling 24h (0 = unlimited)
   CLAIM_COOLDOWN_SEC = "30",
   DATABASE_URL = "",
@@ -334,12 +334,16 @@ function pgStore() {
         const p = rows[0];
         if (now - Number(p.last_claim) < COOLDOWN) { await c.query("ROLLBACK"); return { status: "cooldown", retryInMs: COOLDOWN - (now - Number(p.last_claim)) }; }
         if (now - Number(p.first_seen) < HOLD_MS) { await c.query("ROLLBACK"); return { status: "hold", waitMs: HOLD_MS - (now - Number(p.first_seen)) }; }
-        const amount = await compute(p);
-        if (!(amount > 0)) { await c.query("ROLLBACK"); return { status: "none" }; }
-        await c.query(`UPDATE players SET last_claim=$2, lifetime_paid=lifetime_paid+$3 WHERE wallet=$1`, [wallet, now, amount]);
-        const ins = await c.query(`INSERT INTO payouts(wallet,amount,status) VALUES($1,$2,'pending') RETURNING id`, [wallet, amount]);
+        const r = await compute(p);
+        if (!(r.paid > 0)) { await c.query("ROLLBACK"); return { status: "none" }; }
+        const prev = Number(p.last_claim);
+        // Advance last_claim ONLY by the fraction of the pouch actually paid, so a capped claim keeps the remainder.
+        const remainMs = r.grossNet > 0 ? Math.round(r.capMs * Math.max(0, 1 - r.paid / r.grossNet)) : 0;
+        let newLast = now - remainMs; if (newLast < prev) newLast = prev; if (newLast > now) newLast = now;
+        await c.query(`UPDATE players SET last_claim=$2, lifetime_paid=lifetime_paid+$3 WHERE wallet=$1`, [wallet, newLast, r.paid]);
+        const ins = await c.query(`INSERT INTO payouts(wallet,amount,status) VALUES($1,$2,'pending') RETURNING id`, [wallet, r.paid]);
         await c.query("COMMIT");
-        return { status: "ok", amount, payoutId: ins.rows[0].id, prevLastClaim: Number(p.last_claim) };
+        return { status: "ok", amount: r.paid, payoutId: ins.rows[0].id, prevLastClaim: prev };
       } catch (e) { try { await c.query("ROLLBACK"); } catch {} throw e; }
       finally { c.release(); }
     },
@@ -425,11 +429,15 @@ function memStore() {
       players.set(wallet, p);
       if (now - p.last_claim < COOLDOWN) return { status: "cooldown", retryInMs: COOLDOWN - (now - p.last_claim) };
       if (now - p.first_seen < HOLD_MS) return { status: "hold", waitMs: HOLD_MS - (now - p.first_seen) };
-      const amount = await compute(p);
-      if (!(amount > 0)) return { status: "none" };
-      const prev = p.last_claim; p.last_claim = now; p.lifetime_paid += amount;
-      const id = payouts.push({ id: payouts.length + 1, wallet, amount, status: "pending", t: now }) ;
-      return { status: "ok", amount, payoutId: id, prevLastClaim: prev };
+      const r = await compute(p);
+      if (!(r.paid > 0)) return { status: "none" };
+      const prev = p.last_claim;
+      // Advance last_claim ONLY by the fraction actually paid — a capped claim keeps the remainder in the pouch.
+      const remainMs = r.grossNet > 0 ? Math.round(r.capMs * Math.max(0, 1 - r.paid / r.grossNet)) : 0;
+      let newLast = now - remainMs; if (newLast < prev) newLast = prev; if (newLast > now) newLast = now;
+      p.last_claim = newLast; p.lifetime_paid += r.paid;
+      const id = payouts.push({ id: payouts.length + 1, wallet, amount: r.paid, status: "pending", t: now });
+      return { status: "ok", amount: r.paid, payoutId: id, prevLastClaim: prev };
     },
     async confirm(id, sig) { const p = payouts[id - 1]; if (p) { p.status = "confirmed"; p.signature = sig; } },
     async fail(id, wallet, prevLastClaim, amount) {
@@ -726,12 +734,15 @@ app.get("/claimable", async (req, res) => {
     const lastClaim = Number(p.last_claim);
     let poolBal = 0; try { poolBal = await poolSol(); } catch (e) {}
     const pf = poolFactor(poolBal);   // pool-scaling multiplier (≥1) — bigger payouts as the treasury fills
-    const minutes = Math.min((Date.now() - lastClaim) / 60000, ACCRUAL_CAP);
+    // Activity gating: client reports the fraction of time its Chikis were AWAKE + FED. Clamped to [0,1],
+    // so it can only REDUCE earnings (a cheater reporting 1 just gets today's behavior — no new exploit).
+    const activeFrac = Math.max(0, Math.min(1, Number(req.query?.activeFrac ?? 1)));
+    const minutes = Math.min((Date.now() - lastClaim) / 60000, ACCRUAL_CAP) * activeFrac;
     const gross = Math.max(0, seededEarn(wallet, lastClaim, chikis, minutes) * pf);
     const claimable = Math.floor(gross * (1 - CLAIM_TAX) * 1e6) / 1e6;   /* net after the SOL claim tax (tax stays in treasury) */
     /* seed params let the client mirror the EXACT same rarity sequence it will be paid for */
     res.json({ wallet, claimableSol: claimable, claimGrossSol: Math.floor(gross*1e6)/1e6, claimTaxPct: Math.round(CLAIM_TAX*100), lifetimePaid: await store.earned(wallet),
-      eligible, minHold: MIN, balance: bal, lastClaim, chikis, taskSec: TASK_SEC, mult: MULT, accrualCap: ACCRUAL_CAP, raritySol: RARITY_SOL, poolFactor: pf, poolSol: Math.floor(poolBal*1e6)/1e6, poolRef: POOL_REF });
+      eligible, minHold: MIN, balance: bal, lastClaim, chikis, taskSec: TASK_SEC, mult: MULT, accrualCap: ACCRUAL_CAP, raritySol: RARITY_SOL, poolFactor: pf, activeFrac, poolSol: Math.floor(poolBal*1e6)/1e6, poolRef: POOL_REF });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
@@ -848,13 +859,18 @@ app.post("/claim", async (req, res) => {
   if (daily >= dailyCapNow) return res.status(429).json({ error: "daily payout cap reached — resets over the next 24h", dailyCapSol: dailyCapNow });
   if (WALLET_DAILY > 0 && walletPaid >= WALLET_DAILY) return res.status(429).json({ error: "your daily claim limit is reached — come back tomorrow", perWalletDailySol: WALLET_DAILY });
 
+  // Activity gating: fraction of time the Chikis were AWAKE + FED (client-reported, clamped to [0,1] so it can only reduce, never exploit).
+  const activeFrac = Math.max(0, Math.min(1, Number(req.body?.activeFrac ?? 1)));
   const now = Date.now();
   const compute = (p) => {
-    const minutes = Math.min((now - Number(p.last_claim)) / 60_000, ACCRUAL_CAP);
-    let amt = seededEarn(wallet, Number(p.last_claim), chikis, minutes) * poolFactor(pool);   /* seeded rarity earnings × (pool / POOL_REF) — a pure % of the live pool */
-    amt = amt * (1 - CLAIM_TAX);                                           /* SOL claim tax withheld — the tax stays in the treasury */
-    amt = Math.min(amt, (CAP > 0 ? CAP : Infinity), Math.max(0, dailyCapNow - daily), (WALLET_DAILY > 0 ? Math.max(0, WALLET_DAILY - walletPaid) : Infinity), Math.max(0, pool - RESERVE));
-    return Math.floor(amt * 1e6) / 1e6;
+    const capMs = Math.min(now - Number(p.last_claim), ACCRUAL_CAP * 60_000);   // effective earning window (bounded by the accrual cap)
+    const minutes = (capMs / 60_000) * activeFrac;                              // only awake+fed time earns
+    const grossNet = seededEarn(wallet, Number(p.last_claim), chikis, minutes) * poolFactor(pool) * (1 - CLAIM_TAX);   /* full claimable, net of tax, BEFORE caps */
+    let amt = Math.min(grossNet, (CAP > 0 ? CAP : Infinity), Math.max(0, dailyCapNow - daily), (WALLET_DAILY > 0 ? Math.max(0, WALLET_DAILY - walletPaid) : Infinity), Math.max(0, pool - RESERVE));
+    const paid = Math.floor(amt * 1e6) / 1e6;
+    // Return the gross + window so reserve() can advance last_claim ONLY by the fraction actually paid —
+    // a capped claim must NOT forfeit the un-paid remainder (it stays in the pouch).
+    return { paid, grossNet, capMs };
   };
 
   let r;
