@@ -734,15 +734,17 @@ app.get("/claimable", async (req, res) => {
     const lastClaim = Number(p.last_claim);
     let poolBal = 0; try { poolBal = await poolSol(); } catch (e) {}
     const pf = poolFactor(poolBal);   // pool-scaling multiplier (≥1) — bigger payouts as the treasury fills
-    // Activity gating: client reports the fraction of time its Chikis were AWAKE + FED. Clamped to [0,1],
-    // so it can only REDUCE earnings (a cheater reporting 1 just gets today's behavior — no new exploit).
-    const activeFrac = Math.max(0, Math.min(1, Number(req.query?.activeFrac ?? 1)));
-    const minutes = Math.min((Date.now() - lastClaim) / 60000, ACCRUAL_CAP) * activeFrac;
+    // Activity gating: client reports ABSOLUTE awake+fed SECONDS (monotonic — only grows). We earn for that much
+    // time, capped at wall-clock elapsed and the accrual cap. Absolute (not a fraction) so the pouch NEVER shrinks
+    // when a Chiki later sleeps. Capped at elapsed ⇒ can only reduce vs. today, never an exploit.
+    const elapsedMin = Math.min((Date.now() - lastClaim) / 60000, ACCRUAL_CAP);
+    const activeSec = Number(req.query?.activeSec);
+    const minutes = Number.isFinite(activeSec) ? Math.min(elapsedMin, Math.max(0, activeSec / 60)) : elapsedMin;
     const gross = Math.max(0, seededEarn(wallet, lastClaim, chikis, minutes) * pf);
     const claimable = Math.floor(gross * (1 - CLAIM_TAX) * 1e6) / 1e6;   /* net after the SOL claim tax (tax stays in treasury) */
     /* seed params let the client mirror the EXACT same rarity sequence it will be paid for */
     res.json({ wallet, claimableSol: claimable, claimGrossSol: Math.floor(gross*1e6)/1e6, claimTaxPct: Math.round(CLAIM_TAX*100), lifetimePaid: await store.earned(wallet),
-      eligible, minHold: MIN, balance: bal, lastClaim, chikis, taskSec: TASK_SEC, mult: MULT, accrualCap: ACCRUAL_CAP, raritySol: RARITY_SOL, poolFactor: pf, activeFrac, poolSol: Math.floor(poolBal*1e6)/1e6, poolRef: POOL_REF });
+      eligible, minHold: MIN, balance: bal, lastClaim, chikis, taskSec: TASK_SEC, mult: MULT, accrualCap: ACCRUAL_CAP, raritySol: RARITY_SOL, poolFactor: pf, activeMin: minutes, poolSol: Math.floor(poolBal*1e6)/1e6, poolRef: POOL_REF });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
@@ -859,13 +861,14 @@ app.post("/claim", async (req, res) => {
   if (daily >= dailyCapNow) return res.status(429).json({ error: "daily payout cap reached — resets over the next 24h", dailyCapSol: dailyCapNow });
   if (WALLET_DAILY > 0 && walletPaid >= WALLET_DAILY) return res.status(429).json({ error: "your daily claim limit is reached — come back tomorrow", perWalletDailySol: WALLET_DAILY });
 
-  // Activity gating: fraction of time the Chikis were AWAKE + FED (client-reported, clamped to [0,1] so it can only reduce, never exploit).
-  const activeFrac = Math.max(0, Math.min(1, Number(req.body?.activeFrac ?? 1)));
+  // Activity gating: ABSOLUTE awake+fed seconds (client-reported, monotonic), capped at wall-clock elapsed so it can
+  // only reduce earnings, never exploit. Absolute (not a fraction) ⇒ the pouch never shrinks when a Chiki later sleeps.
+  const activeSec = Number(req.body?.activeSec);
   const now = Date.now();
   const compute = (p) => {
     const capMs = Math.min(now - Number(p.last_claim), ACCRUAL_CAP * 60_000);   // effective earning window (bounded by the accrual cap)
-    const minutes = (capMs / 60_000) * activeFrac;                              // only awake+fed time earns
-    const grossNet = seededEarn(wallet, Number(p.last_claim), chikis, minutes) * poolFactor(pool) * (1 - CLAIM_TAX);   /* full claimable, net of tax, BEFORE caps */
+    const earnMin = Number.isFinite(activeSec) ? Math.min(capMs / 60_000, Math.max(0, activeSec / 60)) : (capMs / 60_000);   // only awake+fed time earns
+    const grossNet = seededEarn(wallet, Number(p.last_claim), chikis, earnMin) * poolFactor(pool) * (1 - CLAIM_TAX);   /* full claimable, net of tax, BEFORE caps */
     let amt = Math.min(grossNet, (CAP > 0 ? CAP : Infinity), Math.max(0, dailyCapNow - daily), (WALLET_DAILY > 0 ? Math.max(0, WALLET_DAILY - walletPaid) : Infinity), Math.max(0, pool - RESERVE));
     const paid = Math.floor(amt * 1e6) / 1e6;
     // Return the gross + window so reserve() can advance last_claim ONLY by the fraction actually paid —
