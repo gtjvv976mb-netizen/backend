@@ -26,10 +26,11 @@ const {
   EARN_MULT = "1",                 // global multiplier on all task SOL payouts (tune to your fee budget)
   TASK_SECONDS = "45",             // avg seconds a Chiki takes per task (sets task throughput)
   ACCRUAL_CAP_MIN = "1440",        // max minutes of task earnings counted per claim (24h pouch cap)
-  MAX_CLAIM_SOL = "0.05",
-  DAILY_CAP_SOL = "1",             // global cap on confirmed payouts per rolling 24h
-  POOL_RESERVE_SOL = "0.05",       // never pay the treasury below this floor (keeps a buffer for fees)
-  POOL_REF_SOL = "1",              // earnings scale UP once the pool grows past this (×1 below it, so payouts never shrink)
+  MAX_CLAIM_SOL = "1",             // per-claim ceiling — high enough that even a 2-Chiki full pouch isn't clipped (displayed pouch ≈ actual payout)
+  DAILY_CAP_SOL = "1",             // absolute backstop ceiling (rarely binds; the real cap is DAILY_CAP_FRAC below)
+  DAILY_CAP_FRAC = "0.5",          // global daily payout cap as a FRACTION of the live pool (0.5 = up to 50% of the pool per 24h). Scales with the pool — never a stuck number.
+  POOL_RESERVE_SOL = "0.05",       // never pay the treasury below this floor — the hard "never go into debt" guarantee
+  POOL_REF_SOL = "10",             // reward reference: payout = base_table × (pool / POOL_REF). A pure % of the pool — scales BOTH up and down, no stuck floor. Lower = more generous.
   PER_WALLET_DAILY_SOL = "0",      // per-wallet cap per rolling 24h (0 = unlimited)
   CLAIM_COOLDOWN_SEC = "30",
   DATABASE_URL = "",
@@ -50,10 +51,13 @@ const COOLDOWN = Number(CLAIM_COOLDOWN_SEC) * 1000;
 const HOLD_MS = Number(MIN_HOLD_MINUTES) * 60_000;
 const DAILY_CAP = Number(DAILY_CAP_SOL);
 const RESERVE = Number(POOL_RESERVE_SOL);
-const POOL_REF = Math.max(0.000001, Number(POOL_REF_SOL));   // earnings scale UP as pool grows past this; never below ×1
-// pool-scaling multiplier: ×1 while the pool is small (payouts never shrink), grows linearly as the treasury fills.
-// Still hard-bounded downstream by per-claim CAP, the pool-RESERVE floor, and the global DAILY_CAP — it can never overdraw.
-const poolFactor = (pool) => Math.max(1, (Number(pool) || 0) / POOL_REF);
+const POOL_REF = Math.max(0.000001, Number(POOL_REF_SOL));
+const DAILY_FRAC = Math.min(1, Math.max(0, Number(DAILY_CAP_FRAC)));
+// TRUE percentage-of-pool model: payout = base_table × (pool / POOL_REF).
+// This is a pure fraction of the LIVE pool — it scales DOWN as the pool drains and UP as it refills (no stuck floor).
+// Because every payout is read against the current pool and bounded by the RESERVE floor, the pool asymptotes toward
+// the reserve but never crosses it: the treasury can never go into debt, and rewards self-correct without a fixed cap.
+const poolFactor = (pool) => (Number(pool) || 0) / POOL_REF;
 const MULT = Number(EARN_MULT), TASK_SEC = Math.max(5, Number(TASK_SECONDS)), ACCRUAL_CAP = Number(ACCRUAL_CAP_MIN);
 const WHALE_MIN = Number(WHALE_MIN_HOLD), WHALE_HOLD_MS = Number(WHALE_HOLD_HOURS) * 3600_000;
 const CLAIM_TAX = Math.min(0.95, Math.max(0, Number(process.env.CLAIM_TAX_PCT || 20) / 100));   /* SOL claim tax — withheld from payout, stays in treasury (1% burn / 39% pool / 60% team bookkeeping) */
@@ -839,15 +843,17 @@ app.post("/claim", async (req, res) => {
   try { pool = await poolSol(); daily = await store.dailyTotal(); walletPaid = await store.walletDaily(wallet); }
   catch (e) { return res.status(500).json({ error: "rpc/db error: " + String(e.message || e) }); }
   if (pool <= RESERVE) return res.status(503).json({ error: "reward pool is low — payouts paused, please try again later", poolSol: pool });
-  if (daily >= DAILY_CAP) return res.status(429).json({ error: "daily payout cap reached", dailyCapSol: DAILY_CAP });
+  // Daily cap is a pure FRACTION of the live pool — it scales up/down with the pool and is never a stuck number.
+  const dailyCapNow = DAILY_FRAC * pool;
+  if (daily >= dailyCapNow) return res.status(429).json({ error: "daily payout cap reached — resets over the next 24h", dailyCapSol: dailyCapNow });
   if (WALLET_DAILY > 0 && walletPaid >= WALLET_DAILY) return res.status(429).json({ error: "your daily claim limit is reached — come back tomorrow", perWalletDailySol: WALLET_DAILY });
 
   const now = Date.now();
   const compute = (p) => {
     const minutes = Math.min((now - Number(p.last_claim)) / 60_000, ACCRUAL_CAP);
-    let amt = seededEarn(wallet, Number(p.last_claim), chikis, minutes) * poolFactor(pool);   /* deterministic seeded rarity earnings (synced with client) × pool-scaling factor */
+    let amt = seededEarn(wallet, Number(p.last_claim), chikis, minutes) * poolFactor(pool);   /* seeded rarity earnings × (pool / POOL_REF) — a pure % of the live pool */
     amt = amt * (1 - CLAIM_TAX);                                           /* SOL claim tax withheld — the tax stays in the treasury */
-    amt = Math.min(amt, (CAP > 0 ? CAP : Infinity), Math.max(0, DAILY_CAP - daily), (WALLET_DAILY > 0 ? Math.max(0, WALLET_DAILY - walletPaid) : Infinity), Math.max(0, pool - RESERVE));
+    amt = Math.min(amt, (CAP > 0 ? CAP : Infinity), Math.max(0, dailyCapNow - daily), (WALLET_DAILY > 0 ? Math.max(0, WALLET_DAILY - walletPaid) : Infinity), Math.max(0, pool - RESERVE));
     return Math.floor(amt * 1e6) / 1e6;
   };
 
