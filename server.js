@@ -28,7 +28,7 @@ const {
   ACCRUAL_CAP_MIN = "1440",        // max minutes of task earnings counted per claim (24h pouch cap)
   MAX_CLAIM_SOL = "1",             // per-claim ceiling — high enough that even a 2-Chiki full pouch isn't clipped (displayed pouch ≈ actual payout)
   DAILY_CAP_SOL = "1",             // absolute backstop ceiling (rarely binds; the real cap is DAILY_CAP_FRAC below)
-  DAILY_CAP_FRAC = "0.25",         // global daily payout cap as a FRACTION of the live pool (0.25 = up to 25% of the pool per 24h). Scales with the pool — never a stuck number.
+  DAILY_CAP_FRAC = "1",            // NO daily limit — claim anytime. 1 = up to the whole spendable pool/day, so the daily check never binds before the reserve floor does.
   POOL_RESERVE_SOL = "0.05",       // never pay the treasury below this floor — the hard "never go into debt" guarantee
   POOL_REF_SOL = "20",             // reward reference: payout = base_table × (pool / POOL_REF). Higher = SMALLER payouts (longer runway). Lower = more generous.
   PER_WALLET_DAILY_SOL = "0",      // per-wallet cap per rolling 24h (0 = unlimited)
@@ -195,6 +195,8 @@ function sanitizeProfile(prev, p) {
         arenaStam: src.arenaStam != null ? clampNum(src.arenaStam, 0, legStamMax(lv), legStamMax(lv))
                  : (pc.arenaStam != null ? clampNum(pc.arenaStam, 0, legStamMax(lv), legStamMax(lv)) : null),
         arenaSleepUntil: clampNum(src.arenaSleepUntil != null ? src.arenaSleepUntil : pc.arenaSleepUntil, 0, Date.now() + 24 * 3600 * 1000, 0),
+        sleeping: !!src.sleeping,                                                                  // preserve nap state across the server round-trip
+        sleepUntil: clampNum(src.sleepUntil != null ? src.sleepUntil : pc.sleepUntil, 0, Date.now() + 24 * 3600 * 1000, 0),   // ...so a refresh RESUMES the nap instead of restarting it
       });
     }
     out.chikis = kept;
