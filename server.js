@@ -551,6 +551,28 @@ function pushFeed(type, data) {
   feedEvents.push({ id: _feedSeq++, ts: Date.now(), type, ...data });
   if (feedEvents.length > 80) feedEvents.shift();
 }
+// Count unique on-chain $CHIKI holders via Helius DAS (getTokenAccounts). Heavy call → cached 30 min.
+let _holdersCache = { t: 0, n: 0 };
+async function chikiHolderCount() {
+  if (!MINT) return 0;
+  if (_holdersCache.n && Date.now() - _holdersCache.t < 30 * 60 * 1000) return _holdersCache.n;
+  try {
+    const owners = new Set(); let cursor, pages = 0;
+    while (pages < 60) {
+      const params = { mint: MINT, limit: 1000, options: { showZeroBalance: false } };
+      if (cursor) params.cursor = cursor;
+      const r = await fetch(RPC_URL, { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: "holders", method: "getTokenAccounts", params }) });
+      const j = await r.json();
+      const accs = (j && j.result && j.result.token_accounts) || [];
+      for (const a of accs) if (a.owner) owners.add(a.owner);
+      cursor = j && j.result && j.result.cursor; pages++;
+      if (!cursor || accs.length === 0) break;
+    }
+    if (owners.size) _holdersCache = { t: Date.now(), n: owners.size };
+    return _holdersCache.n;
+  } catch (e) { return _holdersCache.n || 0; }
+}
 let _statsCache = { t: 0, data: null };
 async function getStats() {
   if (_statsCache.data && Date.now() - _statsCache.t < 15000) return _statsCache.data;
@@ -560,6 +582,7 @@ async function getStats() {
   try { out.dailyPaidSol = await store.dailyTotal(); } catch (e) {}
   try { const p = await store.presence(PRESENCE_WINDOW); out.activeUsers = p.activeUsers; out.chikimons = p.chikimons; } catch (e) {}
   if (MINT) { try { const s = await conn.getTokenSupply(MINT); out.supply = s.value.uiAmount; out.burned = Math.max(0, SUPPLY_TOTAL - (s.value.uiAmount || 0)); } catch (e) {} }
+  try { out.chikiHolders = await chikiHolderCount(); } catch (e) {}
   if (TEAM_WALLET) {
     try { out.teamSol = (await conn.getBalance(new PublicKey(TEAM_WALLET))) / LAMPORTS_PER_SOL; } catch (e) {}
     try { out.teamChiki = await chikiBalance(TEAM_WALLET); } catch (e) {}
