@@ -517,7 +517,7 @@ function cupSnapshot(forWallet) {
   const out = {
     exists: !!liveCup, public: cupPublic,
     status: s ? s.status : "none",
-    entryGlory: s ? s.entryGlory : 100, prizePool: s ? s.prizePool : 4.0, cap: s ? s.cap : 16,
+    entryGlory: s ? s.entryGlory : 0, prizePool: s ? s.prizePool : 4.0, cap: s ? s.cap : 16,
     entrants: s ? s.entrants.map(e => ({ name: e.snap.name, br: e.snap.br, element: e.snap.element, bot: !!e.bot, ready: !!e.ready })) : [],
     round: live ? liveCup.roundName : null,
     matches: live ? liveCup.currentMatches() : [],
@@ -1049,7 +1049,7 @@ app.post("/cup/ready", async (req, res) => {
 app.post("/cup/create", async (req, res) => {
   if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
   try {
-    const entryGlory = Math.max(0, Number(req.body?.entryGlory) || 100);
+    const entryGlory = Math.max(0, Number(req.body?.entryGlory) || 0);   // free entry by default
     const prizePool = Math.max(0, Number(req.body?.prizePool) || 4.0);
     liveCup = createCup({ entryGlory, prizePool, seedBase: "cup-" + Date.now() });
     res.json({ ok: true, ...cupSnapshot(req.body?.wallet) });
