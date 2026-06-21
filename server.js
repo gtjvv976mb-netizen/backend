@@ -356,7 +356,8 @@ function pgStore() {
     },
     async count() { return Number((await pool.query(`SELECT COUNT(*) n FROM players`)).rows[0].n); },
     async allChikis(exclude, cap) {
-      const r = await pool.query(`SELECT wallet, profile FROM players WHERE profile IS NOT NULL`);
+      // bounded scan — only pull enough rows to fill the cap (avoids loading ALL profiles into memory each call)
+      const r = await pool.query(`SELECT wallet, profile FROM players WHERE profile IS NOT NULL ORDER BY last_claim DESC LIMIT $1`, [Math.max(20, Math.min(300, (cap||60) * 3))]);
       const out = [];
       for (const row of r.rows) {
         if (row.wallet === exclude) continue;
@@ -558,7 +559,7 @@ async function chikiHolderCount() {
   if (_holdersCache.n && Date.now() - _holdersCache.t < 30 * 60 * 1000) return _holdersCache.n;
   try {
     const owners = new Set(); let cursor, pages = 0;
-    while (pages < 60) {
+    while (pages < 25) {
       const params = { mint: MINT, limit: 1000, options: { showZeroBalance: false } };
       if (cursor) params.cursor = cursor;
       const r = await fetch(RPC_URL, { method: "POST", headers: { "content-type": "application/json" },
@@ -582,7 +583,7 @@ async function getStats() {
   try { out.dailyPaidSol = await store.dailyTotal(); } catch (e) {}
   try { const p = await store.presence(PRESENCE_WINDOW); out.activeUsers = p.activeUsers; out.chikimons = p.chikimons; } catch (e) {}
   if (MINT) { try { const s = await conn.getTokenSupply(MINT); out.supply = s.value.uiAmount; out.burned = Math.max(0, SUPPLY_TOTAL - (s.value.uiAmount || 0)); } catch (e) {} }
-  try { out.chikiHolders = await chikiHolderCount(); } catch (e) {}
+  out.chikiHolders = _holdersCache.n || 0; chikiHolderCount().catch(()=>{});   // non-blocking: serve cached, refresh in background
   if (TEAM_WALLET) {
     try { out.teamSol = (await conn.getBalance(new PublicKey(TEAM_WALLET))) / LAMPORTS_PER_SOL; } catch (e) {}
     try { out.teamChiki = await chikiBalance(TEAM_WALLET); } catch (e) {}
@@ -861,8 +862,9 @@ app.get("/feed", async (req, res) => {
 });
 // Every Chiki ever claimed (all saved profiles, online or not) — so the world reflects real ownership.
 app.get("/allchikis", async (req, res) => {
+  // Degrade gracefully: the shared world is cosmetic — never 500 the client over it.
   try { res.json({ chikis: await store.allChikis(req.query?.exclude || "", Math.min(160, Number(req.query?.cap) || 120)) }); }
-  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  catch (e) { console.error("allchikis error:", e.message||e); res.json({ chikis: [] }); }
 });
 
 app.post("/claim", async (req, res) => {
