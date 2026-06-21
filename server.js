@@ -29,10 +29,10 @@ const {
   ACCRUAL_CAP_MIN = "1440",        // max minutes of task earnings counted per claim (24h pouch cap)
   MAX_CLAIM_SOL = "1",             // per-claim ceiling — high enough that even a 2-Chiki full pouch isn't clipped (displayed pouch ≈ actual payout)
   DAILY_CAP_SOL = "1",             // absolute backstop ceiling (rarely binds; the real cap is DAILY_CAP_FRAC below)
-  DAILY_CAP_FRAC = "1",            // NO daily limit — claim anytime. 1 = up to the whole spendable pool/day, so the daily check never binds before the reserve floor does.
+  DAILY_CAP_FRAC = "0.20",         // DAILY CAP: total payouts ≤ 20% of the live pool per 24h (auto-scales with the pool; protects against drains)
   POOL_RESERVE_SOL = "0.05",       // never pay the treasury below this floor — the hard "never go into debt" guarantee
   POOL_REF_SOL = "20",             // reward reference: payout = base_table × (pool / POOL_REF). Higher = SMALLER payouts (longer runway). Lower = more generous.
-  PER_WALLET_DAILY_SOL = "0",      // per-wallet cap per rolling 24h (0 = unlimited)
+  PER_WALLET_DAILY_SOL = "0.1",    // per-wallet cap per rolling 24h (0 = unlimited) — stops one wallet draining the pool
   CLAIM_COOLDOWN_SEC = "30",
   DATABASE_URL = "",
   ADMIN_KEY = "",                   // set this to enable /admin/reset (wipe test profiles)
@@ -387,9 +387,15 @@ function pgStore() {
       return out;
     },
     async claimedTotals() {
-      const r = await pool.query(`SELECT profile FROM players WHERE profile IS NOT NULL`);
+      // Keepers + active Chikis = CURRENT eligible holders only (a wallet's last-known balance ≥ threshold);
+      // legends = all-time hatched. This stops counting wallets that hatched a Chiki once and have since left.
+      const r = await pool.query(`SELECT profile, eligible FROM players WHERE profile IS NOT NULL`);
       let chikis = 0, holders = 0, legends = 0;
-      for (const row of r.rows) { const c = row.profile?.chikis || []; if (c.length) { holders++; chikis += c.length; legends += c.filter(x => x.isLegend).length; } }
+      for (const row of r.rows) {
+        const c = row.profile?.chikis || []; if (!c.length) continue;
+        legends += c.filter(x => x.isLegend).length;
+        if (row.eligible) { holders++; chikis += c.length; }
+      }
       return { chikis, holders, legends };
     },
   };
@@ -481,7 +487,11 @@ function memStore() {
     },
     async claimedTotals() {
       let chikis = 0, holders = 0, legends = 0;
-      for (const p of players.values()) { const c = p.profile?.chikis || []; if (c.length) { holders++; chikis += c.length; legends += c.filter(x => x.isLegend).length; } }
+      for (const p of players.values()) {
+        const c = p.profile?.chikis || []; if (!c.length) continue;
+        legends += c.filter(x => x.isLegend).length;          // all-time legends hatched
+        if (p.eligible) { holders++; chikis += c.length; }     // current keepers + their Chikis only
+      }
       return { chikis, holders, legends };
     },
   };
@@ -583,6 +593,7 @@ function makeChat() {
           id BIGSERIAL PRIMARY KEY, ts BIGINT NOT NULL, wallet TEXT NOT NULL, handle TEXT,
           body TEXT NOT NULL, to_wallet TEXT, pinned BOOLEAN NOT NULL DEFAULT false)`);
         await pool.query(`CREATE INDEX IF NOT EXISTS chat_id_idx ON chat(id)`);
+        await pool.query(`ALTER TABLE chat ADD COLUMN IF NOT EXISTS reactions JSONB NOT NULL DEFAULT '{}'::jsonb`);   // {emoji:[wallet,...]}
       },
       async send(m) {
         const r = await pool.query(
@@ -596,11 +607,24 @@ function makeChat() {
           `SELECT * FROM chat WHERE id>$1 AND (to_wallet IS NULL OR to_wallet=$2 OR wallet=$2) ORDER BY id DESC LIMIT 200`,
           [since || 0, wallet || ""]);
         const p = await pool.query(`SELECT * FROM chat WHERE pinned=true ORDER BY id DESC LIMIT 1`);
-        return { messages: r.rows.reverse(), pinned: p.rows[0] || null };
+        // reaction counts for recently-reacted messages, so clients refresh them without re-fetching whole messages
+        const rr = await pool.query(`SELECT id, reactions FROM chat WHERE reactions <> '{}'::jsonb ORDER BY id DESC LIMIT 150`);
+        const recentReactions = {}; for (const row of rr.rows) recentReactions[row.id] = row.reactions;
+        return { messages: r.rows.reverse(), pinned: p.rows[0] || null, recentReactions };
       },
       async pin(id, on) {
         if (on) await pool.query(`UPDATE chat SET pinned=false WHERE pinned=true`);
         await pool.query(`UPDATE chat SET pinned=$2 WHERE id=$1`, [id, !!on]);
+      },
+      async react(id, emoji, wallet) {
+        const r = await pool.query(`SELECT reactions FROM chat WHERE id=$1`, [id]);
+        if (!r.rows[0]) return null;
+        const rx = r.rows[0].reactions || {};
+        const set = new Set(rx[emoji] || []);
+        if (set.has(wallet)) set.delete(wallet); else set.add(wallet);   // toggle
+        if (set.size) rx[emoji] = [...set]; else delete rx[emoji];
+        await pool.query(`UPDATE chat SET reactions=$2::jsonb WHERE id=$1`, [id, JSON.stringify(rx)]);
+        return rx;
       },
     };
   }
@@ -609,15 +633,24 @@ function makeChat() {
     kind: "memory",
     async init() {},
     async send(m) {
-      const row = { id: seq++, ts: m.ts, wallet: m.wallet, handle: m.handle || null, body: m.body, to_wallet: m.to || null, pinned: !!m.pinned };
+      const row = { id: seq++, ts: m.ts, wallet: m.wallet, handle: m.handle || null, body: m.body, to_wallet: m.to || null, pinned: !!m.pinned, reactions: {} };
       msgs.push(row); if (msgs.length > 500) msgs.shift(); return row;
     },
     async fetch(wallet, since) {
       const messages = msgs.filter(x => x.id > (since || 0) && (!x.to_wallet || x.to_wallet === wallet || x.wallet === wallet)).slice(-200);
       const pinned = [...msgs].reverse().find(x => x.pinned) || null;
-      return { messages, pinned };
+      const recentReactions = {}; for (const x of msgs) if (x.reactions && Object.keys(x.reactions).length) recentReactions[x.id] = x.reactions;
+      return { messages, pinned, recentReactions };
     },
     async pin(id, on) { if (on) msgs.forEach(x => x.pinned = false); const m = msgs.find(x => x.id === id); if (m) m.pinned = !!on; },
+    async react(id, emoji, wallet) {
+      const m = msgs.find(x => x.id === id); if (!m) return null;
+      const rx = m.reactions || (m.reactions = {});
+      const set = new Set(rx[emoji] || []);
+      if (set.has(wallet)) set.delete(wallet); else set.add(wallet);
+      if (set.size) rx[emoji] = [...set]; else delete rx[emoji];
+      return rx;
+    },
   };
 }
 const chat = makeChat();
@@ -666,6 +699,11 @@ async function getStats() {
     try { out.teamChiki = await chikiBalance(TEAM_WALLET); } catch (e) {}
   }
   try { const t = await store.claimedTotals(); out.claimedChikis = t.chikis; out.holders = t.holders; out.legendsHatched = t.legends; } catch (e) {}
+  // Chikoria Cup rewards
+  out.cupPrizePool = liveCup ? liveCup.state.prizePool : 4;          // SOL on the line per cup
+  out.cupChampionSol = 1;                                            // champion's share
+  let cupOwed = 0; for (const v of cupPrizes.values()) cupOwed += v; // prizes credited but not yet claimed
+  out.cupOwedSol = +cupOwed.toFixed(4);
   _statsCache = { t: Date.now(), data: out };
   return out;
 }
@@ -905,6 +943,17 @@ app.post("/chat/send", async (req, res) => {
     onlineUsers.set(wallet, { handle: cleanText(handle || "").slice(0, 24) || null, ts: Date.now() });
     res.json({ ok: true, message: row });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+// React to a message (toggle one of the allowed emojis). Signed like chat send (anti-impersonation).
+const REACT_EMOJIS = ["👍", "❤️", "😂", "🔥", "🎉", "😮"];
+app.post("/chat/react", async (req, res) => {
+  const { wallet, id, emoji } = req.body || {};
+  if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  if (!verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig)) return res.status(401).json({ error: "wallet verification required" });
+  if (!REACT_EMOJIS.includes(emoji)) return res.status(400).json({ error: "unsupported emoji" });
+  const mid = Number(id); if (!(mid > 0)) return res.status(400).json({ error: "bad message id" });
+  try { const rx = await chat.react(mid, emoji, wallet); if (rx == null) return res.status(404).json({ error: "message not found" }); res.json({ ok: true, id: mid, reactions: rx }); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 // Poll for new messages (global + this wallet's DMs) and the current pinned message.
 app.get("/chat", async (req, res) => {
