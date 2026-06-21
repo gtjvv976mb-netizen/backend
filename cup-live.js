@@ -7,11 +7,21 @@
 import { resolveBattle } from "./cup-resolver.js";
 
 const SEED16 = [1,16,8,9,5,12,4,13,3,14,6,11,7,10,2,15];
-function payout(place){
-  // 10-player field (16-slot bracket + 6 byes) → real players finish at places {1,2,3,4,5,5,7,7,9,9}.
-  // 4 SOL pool · Champion 1 SOL · scaled consolation for the other 9 (totals exactly 4.00).
+function payout(place, cap){
+  // Each table totals exactly 4.00 SOL with a 1.00 SOL champion. The 16-slot bracket pads with byes,
+  // so the REAL finishing-place sets are: 8p {1,2,3,4,5,5,7,7} · 10p {…,9,9} · 16p {…,9×4,13×4}.
+  cap = cap || 10;
+  if(cap <= 8){                                   // 8 players
+    if(place===1) return 1.00; if(place===2) return 0.85; if(place===3) return 0.60; if(place===4) return 0.45;
+    if(place<=6) return 0.30; return 0.25;        // 5–6 · 7–8
+  }
+  if(cap >= 16){                                  // 16 players
+    if(place===1) return 1.00; if(place===2) return 0.60; if(place===3) return 0.42; if(place===4) return 0.32;
+    if(place<=6) return 0.24; if(place<=8) return 0.18; if(place<=12) return 0.13; return 0.075;
+  }
+  // 10 players (default)
   if(place===1) return 1.00; if(place===2) return 0.70; if(place===3) return 0.50; if(place===4) return 0.40;
-  if(place<=6) return 0.28; if(place<=8) return 0.24; return 0.18;   // 5–6th · 7–8th · 9th+
+  if(place<=6) return 0.28; if(place<=8) return 0.24; return 0.18;
 }
 // Play order for a 16 double-elim (interleaved so eliminated players don't wait long).
 const SCHEDULE = ["WB1","LB1","WB2","LB2","WB3","LB3","WF","LB4","LB5","LF","GF"];
@@ -40,10 +50,10 @@ function hydrate(snap){
 function createCup(opts={}, snap=null){
   const S = snap ? hydrate(snap) : {
     status:"registration",                 // registration | live | finished
-    entryGlory: opts.entryGlory ?? 0,
+    entryGlory: opts.entryGlory ?? 100,
     prizePool: opts.prizePool ?? 4.0,
     seedBase: opts.seedBase || ("cup-"+Date.now()),
-    cap: opts.cap ?? 10, entrants: [], byes: [],   // {wallet, snap, ready} — 10 real players, bracket padded to 16 with byes
+    cap: [8,10,16].includes(opts.cap) ? opts.cap : 10, entrants: [], byes: [],   // 8/10/16 real players; bracket padded to 16 with byes
     roundIdx: -1, mid: 0, log: [], place: {},
     // working slots (hold entrant objects)
     slot:[], wb1w:[],wb1l:[],wb2w:[],wb2l:[],wb3w:[],wb3l:[], wf:null,wfl:null,
@@ -121,7 +131,7 @@ function createCup(opts={}, snap=null){
     finished(){ return S.status==="finished"; },
     // final placements + SOL payouts (call after finished)
     results(){
-      return S.entrants.map(e=>{ const pl=S.place[e.wallet]; const sol=payout(pl); return {wallet:e.wallet, name:e.snap.name, place:pl, sol:+sol.toFixed(4)}; })
+      return S.entrants.map(e=>{ const pl=S.place[e.wallet]; const sol=payout(pl, S.cap); return {wallet:e.wallet, name:e.snap.name, place:pl, sol:+sol.toFixed(4)}; })
                        .sort((a,b)=>a.place-b.place);
     },
 
