@@ -9,6 +9,7 @@ import pg from "pg";
 import {
   Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
+import { createCup } from "./cup-live.js";   // Chikoria Cup live orchestrator (double-elim, deterministic resolver)
 
 dotenv.config();
 const {
@@ -267,7 +268,10 @@ function pgStore() {
       await pool.query(`CREATE TABLE IF NOT EXISTS presence(
         wallet TEXT PRIMARY KEY, last_active BIGINT NOT NULL, chikis INT NOT NULL DEFAULT 1)`);
       await pool.query(`ALTER TABLE presence ADD COLUMN IF NOT EXISTS roster JSONB`);
+      await pool.query(`CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v JSONB)`);   // small durable key/value (Cup prize ledger, flags)
     },
+    async kvGet(k) { const r = await pool.query(`SELECT v FROM kv WHERE k=$1`, [k]); return r.rows[0]?.v ?? null; },
+    async kvSet(k, v) { await pool.query(`INSERT INTO kv(k,v) VALUES($1,$2::jsonb) ON CONFLICT(k) DO UPDATE SET v=$2::jsonb`, [k, JSON.stringify(v)]); },
     async heartbeat(wallet, chikis, roster) {
       await pool.query(
         `INSERT INTO presence(wallet,last_active,chikis,roster) VALUES($1,$2::bigint,$3,$4::jsonb)
@@ -392,11 +396,13 @@ function pgStore() {
 }
 
 function memStore() {
-  const players = new Map(); const payouts = []; const presenceMap = new Map();
+  const players = new Map(); const payouts = []; const presenceMap = new Map(); const kv = new Map();
   const get = (w) => players.get(w);
   return {
     kind: "memory",
     async init() {},
+    async kvGet(k) { return kv.has(k) ? kv.get(k) : null; },
+    async kvSet(k, v) { kv.set(k, v); },
     async touch(wallet, eligible, balance) {
       const now = Date.now();
       const p = get(wallet) || { wallet, first_seen: now, last_claim: now - 60000, lifetime_paid: 0, profile: null };
@@ -488,6 +494,61 @@ const store = makeStore();
 const ADMIN_SET = new Set(String(ADMIN_WALLETS || "").split(",").map(s => s.trim()).filter(Boolean));
 if (TEAM_WALLET) ADMIN_SET.add(TEAM_WALLET.trim());
 const isAdminWallet = (w) => ADMIN_SET.has(w);
+
+/* ----------------------------- Chikoria Cup (live event) ----------------------------- */
+const CUP_ELEMS = ["Water", "Fire", "Beast", "Storm", "Light"];
+let liveCup = null;                  // in-memory orchestrator (null until an admin creates one)
+let cupPublic = true;                // true = open to ALL players (launched). Admin can flip to admin-only via /cup/public.
+const cupPrizes = new Map();         // wallet -> owed SOL (DURABLE — these are real funds; persisted to kv)
+async function loadCupState() {
+  try { const p = await store.kvGet("cup_prizes"); if (p && typeof p === "object") for (const k in p) { const v = Number(p[k]) || 0; if (v > 0) cupPrizes.set(k, v); } } catch (e) {}
+  try { const v = await store.kvGet("cup_public"); if (v !== null && v !== undefined) cupPublic = !!v; } catch (e) {}   // honor an explicit admin toggle; otherwise keep the default (public)
+}
+async function saveCupPrizes() { const o = {}; for (const [k, v] of cupPrizes) if (v > 0) o[k] = v; try { await store.kvSet("cup_prizes", o); } catch (e) {} }
+const cupAdminOk = (req) => {
+  const key = req.body?.key || req.query?.key;
+  if (process.env.ADMIN_KEY && key === process.env.ADMIN_KEY) return true;
+  const w = req.body?.wallet || req.query?.wallet;
+  return !!(w && isAdminWallet(w));
+};
+function cupSnapshot(forWallet) {
+  const s = liveCup ? liveCup.state : null;
+  const live = !!liveCup && s.status === "live";
+  const out = {
+    exists: !!liveCup, public: cupPublic,
+    status: s ? s.status : "none",
+    entryGlory: s ? s.entryGlory : 100, prizePool: s ? s.prizePool : 4.0, cap: s ? s.cap : 16,
+    entrants: s ? s.entrants.map(e => ({ name: e.snap.name, br: e.snap.br, element: e.snap.element, bot: !!e.bot, ready: !!e.ready })) : [],
+    round: live ? liveCup.roundName : null,
+    matches: live ? liveCup.currentMatches() : [],
+    champion: s && s.champion ? s.champion.snap.name : null,
+    results: (s && s.status === "finished") ? liveCup.results() : null,
+  };
+  if (forWallet) {
+    const me = s && s.entrants.find(e => e.wallet === forWallet);
+    out.youRegistered = !!me; out.youReady = !!(me && me.ready);
+    out.yourPrize = cupPrizes.get(forWallet) || 0;
+    out.youPlace = (s && s.place) ? (s.place[forWallet] || null) : null;
+    out.isAdmin = isAdminWallet(forWallet);
+  }
+  return out;
+}
+// Validate + clamp a client-supplied legendary snapshot against the wallet's stored roster (anti-inflation).
+async function cupSnapFromBody(wallet, snap) {
+  const prof = await store.getProfile(wallet);
+  const roster = (prof && Array.isArray(prof.chikis)) ? prof.chikis : [];
+  const legends = roster.filter(c => c && c.isLegend);
+  if (!legends.length) return { error: "Hatch a Legendary first to enter the Cup." };
+  const bestBr = legends.reduce((m, c) => Math.max(m, Number(c.br) || 1), 1);
+  const el = CUP_ELEMS.includes(snap?.element) ? snap.element : "Fire";
+  let skills = Array.isArray(snap?.arenaSkills) ? snap.arenaSkills.map(n => n | 0).filter(n => n >= 0 && n < 12) : [];
+  if (!skills.length) skills = [0, 1, 2];
+  const ct = {}; if (snap?.cardTier && typeof snap.cardTier === "object") for (const k in snap.cardTier) { const sl = k | 0; if (sl >= 0 && sl < 12) ct[sl] = Math.max(1, Math.min(5, Number(snap.cardTier[k]) || 1)); }
+  const br = Math.max(1, Math.min(MAX_BR, Math.min(Number(snap?.br) || bestBr, bestBr)));   // can't claim a higher BR than your best legendary
+  const name = stripTags(snap?.name || (prof?.handle) || wallet.slice(0, 4)).slice(0, 18) || wallet.slice(0, 4);
+  return { snap: { name, element: el, br, arenaSkills: skills, cardTier: ct, glory: 0 } };
+}
+
 const CHAT_WINDOW = 120000;                   // a wallet shows as "online" for 2 min after its last beat
 const onlineUsers = new Map();                // wallet -> { handle, ts }
 
@@ -777,9 +838,11 @@ app.get("/claimable", async (req, res) => {
     // Earnings are time-based again (stable). A proper server-authoritative activity model can re-enable this later.
     const minutes = Math.min((Date.now() - lastClaim) / 60000, ACCRUAL_CAP);
     const gross = Math.max(0, seededEarn(wallet, lastClaim, chikis, minutes) * pf);
-    const claimable = Math.floor(gross * (1 - CLAIM_TAX) * 1e6) / 1e6;   /* net after the SOL claim tax (tax stays in treasury) */
+    const accrued = Math.floor(gross * (1 - CLAIM_TAX) * 1e6) / 1e6;   /* net after the SOL claim tax (tax stays in treasury) */
+    const cupPrize = Math.floor((cupPrizes.get(wallet) || 0) * 1e6) / 1e6;   /* won Cup SOL waiting in the pouch (no tax) */
+    const claimable = Math.floor((accrued + cupPrize) * 1e6) / 1e6;
     /* seed params let the client mirror the EXACT same rarity sequence it will be paid for */
-    res.json({ wallet, claimableSol: claimable, claimGrossSol: Math.floor(gross*1e6)/1e6, claimTaxPct: Math.round(CLAIM_TAX*100), lifetimePaid: await store.earned(wallet),
+    res.json({ wallet, claimableSol: claimable, accruedSol: accrued, cupPrizeSol: cupPrize, claimGrossSol: Math.floor(gross*1e6)/1e6, claimTaxPct: Math.round(CLAIM_TAX*100), lifetimePaid: await store.earned(wallet),
       eligible, minHold: MIN, balance: bal, lastClaim, chikis, taskSec: TASK_SEC, mult: MULT, accrualCap: ACCRUAL_CAP, raritySol: RARITY_SOL, poolFactor: pf, activeMin: minutes, poolSol: Math.floor(poolBal*1e6)/1e6, poolRef: POOL_REF });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
@@ -886,9 +949,12 @@ app.post("/claim", async (req, res) => {
 
   let bal = 0;
   try { bal = await chikiBalance(wallet); } catch (e) {}
-  if (verifyOn && bal < MIN) return res.status(403).json({ error: `below ${MIN.toLocaleString()} $CHIKI threshold`, balance: bal });
+  const belowMin = verifyOn && bal < MIN;
+  const prizeOwed = cupPrizes.get(wallet) || 0;
+  // Below the threshold you can't accrue — but a Cup prize you've already WON is still yours to claim.
+  if (belowMin && !(prizeOwed > 0)) return res.status(403).json({ error: `below ${MIN.toLocaleString()} $CHIKI threshold`, balance: bal });
   const pRow = await store.touch(wallet, bal >= MIN, bal);
-  const chikis = chikiCount(bal, pRow.whale_since) || 1;   // 2nd Chiki only after the whale hold time
+  const chikis = belowMin ? 0 : (chikiCount(bal, pRow.whale_since) || 1);   // 2nd Chiki only after the whale hold time; 0 below threshold (prize-only claim)
   let pool, daily, walletPaid;
   try { pool = await poolSol(); daily = await store.dailyTotal(); walletPaid = await store.walletDaily(wallet); }
   catch (e) { return res.status(500).json({ error: "rpc/db error: " + String(e.message || e) }); }
@@ -916,23 +982,127 @@ app.post("/claim", async (req, res) => {
   catch (e) { return res.status(500).json({ error: "reserve failed: " + String(e.message || e) }); }
   if (r.status === "cooldown") return res.status(429).json({ error: "cooldown", retryInMs: r.retryInMs });
   if (r.status === "hold") return res.status(403).json({ error: "wallet too new — min hold time not met", waitMs: r.waitMs });
-  if (r.status !== "ok") return res.status(409).json({ error: "nothing to claim yet (or pool/cap empty)", poolSol: pool });
+  // r.status is now "ok" (accrued SOL to pay) or "none" (no accrual). A Cup prize can be paid in either case.
+  const base = r.status === "ok" ? r.amount : 0;
+  const prizePay = Math.floor(Math.min(prizeOwed, Math.max(0, pool - RESERVE - base)) * 1e6) / 1e6;   // prize comes from the same treasury; never breach the reserve floor
+  const total = Math.floor((base + prizePay) * 1e6) / 1e6;
+  if (!(total > 0)) return res.status(409).json({ error: "nothing to claim yet (or pool/cap empty)", poolSol: pool });
 
   try {
     const tx = new Transaction().add(SystemProgram.transfer({
       fromPubkey: treasury.publicKey, toPubkey: new PublicKey(wallet),
-      lamports: Math.floor(r.amount * LAMPORTS_PER_SOL),
+      lamports: Math.floor(total * LAMPORTS_PER_SOL),
     }));
     const sig = await conn.sendTransaction(tx, [treasury]);
     await conn.confirmTransaction(sig, "confirmed");
-    await store.confirm(r.payoutId, sig);
-    pushFeed("claim", { wallet, short: wallet.slice(0, 4) + "…" + wallet.slice(-4), amountSol: r.amount, signature: sig });
-    res.json({ ok: true, wallet, amountSol: r.amount, signature: sig,
+    if (r.status === "ok") await store.confirm(r.payoutId, sig);
+    if (prizePay > 0) { const left = Math.floor(((cupPrizes.get(wallet) || 0) - prizePay) * 1e6) / 1e6; if (left > 0) cupPrizes.set(wallet, left); else cupPrizes.delete(wallet); await saveCupPrizes(); }
+    pushFeed("claim", { wallet, short: wallet.slice(0, 4) + "…" + wallet.slice(-4), amountSol: total, signature: sig });
+    res.json({ ok: true, wallet, amountSol: total, accruedSol: base, cupPrizeSol: prizePay, signature: sig,
       explorer: `https://explorer.solana.com/tx/${sig}?cluster=${NETWORK}` });
   } catch (e) {
-    await store.fail(r.payoutId, wallet, r.prevLastClaim, r.amount); // refund cooldown so a failed payout isn't lost
+    if (r.status === "ok") await store.fail(r.payoutId, wallet, r.prevLastClaim, r.amount); // refund cooldown so a failed payout isn't lost; prize stays owed
     res.status(500).json({ error: "payout failed: " + String(e.message || e) });
   }
+});
+
+/* ----------------------------- Chikoria Cup endpoints ----------------------------- */
+// Public: current cup state (pass ?wallet= for your own registration/prize info)
+app.get("/cup/status", async (req, res) => {
+  try { res.json(cupSnapshot(req.query?.wallet && isPubkey(req.query.wallet) ? req.query.wallet : null)); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Player: enter the cup — deducts the Glory entry fee from the stored profile, seats a clamped snapshot.
+app.post("/cup/register", async (req, res) => {
+  const wallet = req.body?.wallet;
+  if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  if (!liveCup || liveCup.state.status !== "registration") return res.status(409).json({ error: "registration is not open" });
+  if (!cupPublic && !isAdminWallet(wallet)) return res.status(403).json({ error: "the Cup isn't open to the public yet" });
+  if (liveCup.state.entrants.find(e => e.wallet === wallet)) return res.status(409).json({ error: "already registered" });
+  if (liveCup.state.entrants.length >= liveCup.state.cap) return res.status(409).json({ error: "the Cup is full" });
+  try {
+    const prof = await store.getProfile(wallet);
+    if (!prof) return res.status(403).json({ error: "play first — no saved profile found" });
+    const fee = liveCup.state.entryGlory;
+    const glory = Number(prof.glory) || 0;
+    if (glory < fee) return res.status(402).json({ error: `need ${fee} ✨ Glory to enter (you have ${Math.floor(glory)})`, glory });
+    const built = await cupSnapFromBody(wallet, req.body?.snap || {});
+    if (built.error) return res.status(403).json({ error: built.error });
+    prof.glory = glory - fee;                       // deduct entry fee server-side
+    await store.setProfile(wallet, prof);
+    liveCup.register(wallet, built.snap);
+    res.json({ ok: true, gloryLeft: prof.glory, ...cupSnapshot(wallet) });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Player: lock in (ready up) for the current round.
+app.post("/cup/ready", async (req, res) => {
+  const wallet = req.body?.wallet;
+  if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  if (!liveCup || liveCup.state.status !== "live") return res.status(409).json({ error: "no live round" });
+  try { const ok = liveCup.ready(wallet); if (!ok) return res.status(404).json({ error: "you're not in this cup" }); res.json({ ok: true, ...cupSnapshot(wallet) }); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Admin: create a fresh cup (registration opens immediately).
+app.post("/cup/create", async (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  try {
+    const entryGlory = Math.max(0, Number(req.body?.entryGlory) || 100);
+    const prizePool = Math.max(0, Number(req.body?.prizePool) || 4.0);
+    liveCup = createCup({ entryGlory, prizePool, seedBase: "cup-" + Date.now() });
+    res.json({ ok: true, ...cupSnapshot(req.body?.wallet) });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Admin: launch / unlaunch publicly (controls whether non-admins can see+enter the Cup).
+app.post("/cup/public", async (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  cupPublic = !!req.body?.public;
+  try { await store.kvSet("cup_public", cupPublic); } catch (e) {}
+  res.json({ ok: true, public: cupPublic });
+});
+
+// Admin: fill empty seats with bots (for a dry run). Bots auto-ready every round.
+app.post("/cup/fill", async (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  if (!liveCup || liveCup.state.status !== "registration") return res.status(409).json({ error: "registration is not open" });
+  try {
+    const S = liveCup.state; let added = 0;
+    const NAMES = ["Voltere", "Aquilo", "Pyrrhos", "Umbros", "Selka", "Bronto", "Lumix", "Krait", "Nyxa", "Orrin", "Wystan", "Galador", "Adalor", "Tyrannos", "Grovador", "Dragonos"];
+    while (S.entrants.length < S.cap) {
+      const i = S.entrants.length, id = "BOT" + i;
+      const el = CUP_ELEMS[i % 5], br = 4 + ((i * 5 + 3) % 24), sk = [i % 12, (i + 4) % 12, (i + 8) % 12];
+      const ct = {}; sk.forEach(s => ct[s] = Math.min(5, 1 + (br / 6 | 0)));
+      liveCup.register(id, { name: NAMES[i % NAMES.length] + " ·" + br, element: el, br, arenaSkills: sk, cardTier: ct });
+      const e = S.entrants.find(x => x.wallet === id); if (e) e.bot = true; added++;
+    }
+    res.json({ ok: true, added, ...cupSnapshot(req.body?.wallet) });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Admin: start the cup (needs a full lobby).
+app.post("/cup/start", async (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  if (!liveCup) return res.status(409).json({ error: "no cup created" });
+  try { liveCup.start(); res.json({ ok: true, ...cupSnapshot(req.body?.wallet) }); }
+  catch (e) { res.status(400).json({ error: String(e.message || e) }); }
+});
+
+// Admin: resolve the current round (lock-in window closes). Bots auto-ready; on finish, prizes are credited.
+app.post("/cup/resolve-round", async (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  if (!liveCup || liveCup.state.status !== "live") return res.status(409).json({ error: "no live round" });
+  try {
+    liveCup.state.entrants.forEach(e => { if (e.bot) e.ready = true; });   // bots always lock in
+    const r = liveCup.resolveRound();
+    if (r.finished) {
+      for (const row of liveCup.results()) { if (row.sol > 0 && isPubkey(row.wallet)) cupPrizes.set(row.wallet, (cupPrizes.get(row.wallet) || 0) + row.sol); }
+      await saveCupPrizes();
+    }
+    res.json({ ok: true, result: r, ...cupSnapshot(req.body?.wallet) });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
 // Devnet-only funding helper (open in a browser to airdrop to the treasury)
@@ -956,5 +1126,5 @@ app.listen(Number(PORT), () => {
   console.log(`Chiki backend v2 on :${PORT} · ${NETWORK} · store=${store.kind} · treasury ${treasury.publicKey.toBase58()}`);
   console.log(`verifyHolders=${verifyOn} · holdMin=${MIN_HOLD_MINUTES} · dailyCap=${DAILY_CAP} SOL`);
 });
-store.init().then(()=>console.log("store ready")).catch(e=>console.error("store.init failed:", e?.message||e));
+store.init().then(()=>{ console.log("store ready"); return loadCupState(); }).then(()=>console.log(`cup state loaded (public=${cupPublic}, owed prizes=${cupPrizes.size})`)).catch(e=>console.error("store.init failed:", e?.message||e));
 chat.init().then(()=>console.log("chat ready")).catch(e=>console.error("chat.init failed:", e?.message||e));
