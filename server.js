@@ -70,7 +70,7 @@ function chikiCount(balance, whaleSince) {
 }
 /* server-authoritative, rarity-weighted earnings: each simulated task pays SOL by rarity.
    The server rolls the tasks itself (using on-chain Chiki count + elapsed time), so it can't be faked. */
-const RARITY_SOL = { common:0.00002, uncommon:0.00004, rare:0.00009, epic:0.0002, mythic:0.0005, shiny:0.001, legend:0.0025 };  /* common 0.00002 SOL · base rates doubled (~5x vs original) · no daily cap — only bounded by the per-claim cap + pool reserve floor */
+const RARITY_SOL = { common:0.00002, uncommon:0.00004, rare:0.00009, epic:0.0002, mythic:0.0005, shiny:0.001, legend:0.0025 };  /* common 0.00002 SOL · base rates doubled (~5x vs original) · bounded by per-claim cap, daily pool cap, per-wallet daily cap + reserve floor */
 const RARITY_DIST = [["common",45],["uncommon",27],["rare",15],["epic",7],["mythic",3.5],["shiny",1.7],["legend",0.8]];
 const RARITY_TOTAL = RARITY_DIST.reduce((s, r) => s + r[1], 0);
 function rollRarity() {
@@ -742,7 +742,7 @@ app.get("/health", async (_q, res) => res.json({
   ok: true, network: NETWORK, store: store.kind, verifyHolders: verifyOn,
   treasury: treasury.publicKey.toBase58(), team: TEAM_WALLET || null,
   mint: CHIKI_MINT || null, minHold: MIN, minHoldMinutes: Number(MIN_HOLD_MINUTES),
-  dailyCap: "none", perWalletDailySol: WALLET_DAILY, poolReserveSol: RESERVE,
+  dailyCapPctOfPool: Math.round(DAILY_FRAC * 100), perWalletDailySol: WALLET_DAILY, poolReserveSol: RESERVE,
   maxClaimSol: CAP, earnModel: "rarity-weighted-tasks", earnMult: MULT, taskSeconds: TASK_SEC, accrualCapMin: ACCRUAL_CAP,
   whaleMin: WHALE_MIN, whaleHoldHours: Number(WHALE_HOLD_HOURS),
 }));
@@ -1007,12 +1007,15 @@ app.post("/claim", async (req, res) => {
   if (belowMin && !(prizeOwed > 0)) return res.status(403).json({ error: `below ${MIN.toLocaleString()} $CHIKI threshold`, balance: bal });
   const pRow = await store.touch(wallet, bal >= MIN, bal);
   const chikis = belowMin ? 0 : (chikiCount(bal, pRow.whale_since) || 1);   // 2nd Chiki only after the whale hold time; 0 below threshold (prize-only claim)
-  let pool;
-  try { pool = await poolSol(); }
+  let pool, daily, walletPaid;
+  try { pool = await poolSol(); daily = await store.dailyTotal(); walletPaid = await store.walletDaily(wallet); }
   catch (e) { return res.status(500).json({ error: "rpc/db error: " + String(e.message || e) }); }
   if (pool <= RESERVE) return res.status(503).json({ error: "reward pool is low — payouts paused, please try again later", poolSol: pool });
-  // NO DAILY CAP — players can claim whenever they want. The only protection is the RESERVE floor below,
-  // which guarantees the treasury can never be drained into debt (a per-claim ceiling MAX_CLAIM_SOL still applies if set).
+  // DAILY CAP (enforced): total daily payouts are bounded to a FRACTION of the live pool, and each wallet to PER_WALLET_DAILY_SOL.
+  // Cup prizes are exempt — a winner can always collect their prize even if the day's accrual caps are hit.
+  const dailyCapNow = DAILY_FRAC * pool;
+  if (DAILY_FRAC < 1 && daily >= dailyCapNow && !(prizeOwed > 0)) return res.status(429).json({ error: "today's reward pool cap is reached — resets over the next 24h", dailyCapSol: +dailyCapNow.toFixed(4) });
+  if (WALLET_DAILY > 0 && walletPaid >= WALLET_DAILY && !(prizeOwed > 0)) return res.status(429).json({ error: `your daily claim limit (${WALLET_DAILY} ◎) is reached — come back tomorrow`, perWalletDailySol: WALLET_DAILY });
 
   // Activity gating DISABLED (was client-reported + lossy). Time-based earning, stable.
   const now = Date.now();
@@ -1020,7 +1023,10 @@ app.post("/claim", async (req, res) => {
     const capMs = Math.min(now - Number(p.last_claim), ACCRUAL_CAP * 60_000);   // effective earning window (bounded by the accrual cap)
     const earnMin = capMs / 60_000;
     const grossNet = seededEarn(wallet, Number(p.last_claim), chikis, earnMin) * poolFactor(pool) * (1 - CLAIM_TAX);   /* full claimable, net of tax, BEFORE caps */
-    let amt = Math.min(grossNet, (CAP > 0 ? CAP : Infinity), Math.max(0, pool - RESERVE));
+    let amt = Math.min(grossNet, (CAP > 0 ? CAP : Infinity),
+      Math.max(0, dailyCapNow - daily),                                          // remaining room under today's pool cap
+      (WALLET_DAILY > 0 ? Math.max(0, WALLET_DAILY - walletPaid) : Infinity),     // remaining room under this wallet's daily cap
+      Math.max(0, pool - RESERVE));
     const paid = Math.floor(amt * 1e6) / 1e6;
     // Return the gross + window so reserve() can advance last_claim ONLY by the fraction actually paid —
     // a capped claim must NOT forfeit the un-paid remainder (it stays in the pouch).
@@ -1197,7 +1203,7 @@ app.get("/fund", async (req, res) => {
 // then initialize the DB in the background (errors logged, not fatal — the server stays up and recovers).
 app.listen(Number(PORT), () => {
   console.log(`Chiki backend v2 on :${PORT} · ${NETWORK} · store=${store.kind} · treasury ${treasury.publicKey.toBase58()}`);
-  console.log(`verifyHolders=${verifyOn} · holdMin=${MIN_HOLD_MINUTES} · dailyCap=none`);
+  console.log(`verifyHolders=${verifyOn} · holdMin=${MIN_HOLD_MINUTES} · dailyCap=${Math.round(DAILY_FRAC*100)}% pool/day · perWallet=${WALLET_DAILY} SOL`);
 });
 store.init().then(()=>{ console.log("store ready"); return loadCupState(); }).then(()=>console.log(`cup state loaded (public=${cupPublic}, owed prizes=${cupPrizes.size})`)).catch(e=>console.error("store.init failed:", e?.message||e));
 chat.init().then(()=>console.log("chat ready")).catch(e=>console.error("chat.init failed:", e?.message||e));
