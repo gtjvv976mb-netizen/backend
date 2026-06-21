@@ -950,9 +950,11 @@ app.get("/fund", async (req, res) => {
   res.status(502).json({ error: "airdrop failed (devnet faucets are rate-limited) — reload to retry" });
 });
 
-await store.init();
-await chat.init();
+// Open the port FIRST so Render detects it immediately (no "No open ports" timeout on a cold DB),
+// then initialize the DB in the background (errors logged, not fatal — the server stays up and recovers).
 app.listen(Number(PORT), () => {
   console.log(`Chiki backend v2 on :${PORT} · ${NETWORK} · store=${store.kind} · treasury ${treasury.publicKey.toBase58()}`);
   console.log(`verifyHolders=${verifyOn} · holdMin=${MIN_HOLD_MINUTES} · dailyCap=${DAILY_CAP} SOL`);
 });
+store.init().then(()=>console.log("store ready")).catch(e=>console.error("store.init failed:", e?.message||e));
+chat.init().then(()=>console.log("chat ready")).catch(e=>console.error("chat.init failed:", e?.message||e));
