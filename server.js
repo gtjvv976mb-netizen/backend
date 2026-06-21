@@ -503,8 +503,11 @@ const cupPrizes = new Map();         // wallet -> owed SOL (DURABLE — these ar
 async function loadCupState() {
   try { const p = await store.kvGet("cup_prizes"); if (p && typeof p === "object") for (const k in p) { const v = Number(p[k]) || 0; if (v > 0) cupPrizes.set(k, v); } } catch (e) {}
   try { const v = await store.kvGet("cup_public"); if (v !== null && v !== undefined) cupPublic = !!v; } catch (e) {}   // honor an explicit admin toggle; otherwise keep the default (public)
+  try { const cs = await store.kvGet("cup_state"); if (cs && cs.status) liveCup = createCup({}, cs); } catch (e) { console.error("cup_state restore failed:", e?.message || e); }   // resume an in-progress bracket after a restart
 }
 async function saveCupPrizes() { const o = {}; for (const [k, v] of cupPrizes) if (v > 0) o[k] = v; try { await store.kvSet("cup_prizes", o); } catch (e) {} }
+// Persist the LIVE bracket so a restart (deploy / spin-down / crash) resumes instead of losing the cup.
+async function persistCup() { try { await store.kvSet("cup_state", liveCup ? liveCup.snapshot() : null); } catch (e) {} }
 const cupAdminOk = (req) => {
   const key = req.body?.key || req.query?.key;
   if (process.env.ADMIN_KEY && key === process.env.ADMIN_KEY) return true;
@@ -1030,6 +1033,7 @@ app.post("/cup/register", async (req, res) => {
     prof.glory = glory - fee;                       // deduct entry fee server-side
     await store.setProfile(wallet, prof);
     liveCup.register(wallet, built.snap);
+    await persistCup();
     res.json({ ok: true, gloryLeft: prof.glory, ...cupSnapshot(wallet) });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
@@ -1039,7 +1043,7 @@ app.post("/cup/ready", async (req, res) => {
   const wallet = req.body?.wallet;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
   if (!liveCup || liveCup.state.status !== "live") return res.status(409).json({ error: "no live round" });
-  try { const ok = liveCup.ready(wallet); if (!ok) return res.status(404).json({ error: "you're not in this cup" }); res.json({ ok: true, ...cupSnapshot(wallet) }); }
+  try { const ok = liveCup.ready(wallet); if (!ok) return res.status(404).json({ error: "you're not in this cup" }); await persistCup(); res.json({ ok: true, ...cupSnapshot(wallet) }); }
   catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
@@ -1050,6 +1054,7 @@ app.post("/cup/create", async (req, res) => {
     const entryGlory = Math.max(0, Number(req.body?.entryGlory) || 0);   // free entry by default
     const prizePool = Math.max(0, Number(req.body?.prizePool) || 4.0);
     liveCup = createCup({ entryGlory, prizePool, seedBase: "cup-" + Date.now() });
+    await persistCup();
     res.json({ ok: true, ...cupSnapshot(req.body?.wallet) });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
@@ -1076,6 +1081,7 @@ app.post("/cup/fill", async (req, res) => {
       liveCup.register(id, { name: NAMES[i % NAMES.length] + " ·" + br, element: el, br, arenaSkills: sk, cardTier: ct });
       const e = S.entrants.find(x => x.wallet === id); if (e) e.bot = true; added++;
     }
+    await persistCup();
     res.json({ ok: true, added, ...cupSnapshot(req.body?.wallet) });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
@@ -1084,7 +1090,7 @@ app.post("/cup/fill", async (req, res) => {
 app.post("/cup/start", async (req, res) => {
   if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
   if (!liveCup) return res.status(409).json({ error: "no cup created" });
-  try { liveCup.start(); res.json({ ok: true, ...cupSnapshot(req.body?.wallet) }); }
+  try { liveCup.start(); await persistCup(); res.json({ ok: true, ...cupSnapshot(req.body?.wallet) }); }
   catch (e) { res.status(400).json({ error: String(e.message || e) }); }
 });
 
@@ -1099,8 +1105,28 @@ app.post("/cup/resolve-round", async (req, res) => {
       for (const row of liveCup.results()) { if (row.sol > 0 && isPubkey(row.wallet)) cupPrizes.set(row.wallet, (cupPrizes.get(row.wallet) || 0) + row.sol); }
       await saveCupPrizes();
     }
+    await persistCup();
     res.json({ ok: true, result: r, ...cupSnapshot(req.body?.wallet) });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Admin: AUDIT the owed-prize ledger (read-only) — who is still owed Cup SOL, and how much.
+app.get("/cup/prizes", async (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  const prizes = [...cupPrizes.entries()].map(([wallet, sol]) => ({ wallet, sol: +Number(sol).toFixed(4) })).sort((a, b) => b.sol - a.sol);
+  res.json({ count: prizes.length, totalSol: +prizes.reduce((s, x) => s + x.sol, 0).toFixed(4), prizes });
+});
+
+// Admin RECOVERY: manually credit a wallet a Cup prize (e.g., if a cup's result was lost before crediting).
+// Strictly ADMIN_KEY-gated because it creates claimable SOL — a public wallet check is NOT enough here.
+app.post("/cup/grant", async (req, res) => {
+  if (!process.env.ADMIN_KEY || req.body?.key !== process.env.ADMIN_KEY) return res.status(403).json({ error: "admin key required" });
+  const wallet = req.body?.wallet, sol = Number(req.body?.sol);
+  if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  if (!(sol > 0)) return res.status(400).json({ error: "positive 'sol' required" });
+  cupPrizes.set(wallet, +(((cupPrizes.get(wallet) || 0) + sol)).toFixed(6));
+  await saveCupPrizes();
+  res.json({ ok: true, wallet, granted: sol, owedNow: cupPrizes.get(wallet) });
 });
 
 // Devnet-only funding helper (open in a browser to airdrop to the treasury)

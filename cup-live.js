@@ -16,13 +16,34 @@ function payout(place){
 // Play order for a 16 double-elim (interleaved so eliminated players don't wait long).
 const SCHEDULE = ["WB1","LB1","WB2","LB2","WB3","LB3","WF","LB4","LB5","LF","GF"];
 
-function createCup(opts={}){
+// Bracket slots that hold ARRAYS of entrant objects, and SINGLE entrant objects — used by snapshot/hydrate.
+const ARR_SLOTS = ["slot","wb1w","wb1l","wb2w","wb2l","wb3w","wb3l","lb1","lb2","lb3","lb4"];
+const ONE_SLOTS = ["wf","wfl","lb5","lbc","champion"];
+
+// Rebuild S from a JSON snapshot, restoring object IDENTITY (bracket arrays point at the SAME entrant objects
+// as `entrants`/`byes`), so flags like `ready` set on an entrant are seen everywhere it appears.
+function hydrate(snap){
   const S = {
+    status:snap.status, entryGlory:snap.entryGlory, prizePool:snap.prizePool, seedBase:snap.seedBase, cap:snap.cap,
+    entrants:(snap.entrants||[]).map(e=>({...e})), byes:(snap.byes||[]).map(e=>({...e})),
+    roundIdx:snap.roundIdx, mid:snap.mid||0, log:snap.log||[], place:snap.place||{},
+    slot:[], wb1w:[],wb1l:[],wb2w:[],wb2l:[],wb3w:[],wb3l:[], wf:null,wfl:null,
+    lb1:[],lb2:[],lb3:[],lb4:[], lb5:null, lbc:null, champion:null,
+  };
+  const map=new Map(); [...S.entrants,...S.byes].forEach(e=>map.set(e.wallet,e));
+  const deref=a=>(a||[]).map(w=> w!=null ? map.get(w) : undefined);
+  for(const k of ARR_SLOTS) S[k]=deref(snap[k]);
+  for(const k of ONE_SLOTS) S[k]= snap[k]!=null ? map.get(snap[k]) : null;
+  return S;
+}
+
+function createCup(opts={}, snap=null){
+  const S = snap ? hydrate(snap) : {
     status:"registration",                 // registration | live | finished
     entryGlory: opts.entryGlory ?? 0,
     prizePool: opts.prizePool ?? 4.0,
     seedBase: opts.seedBase || ("cup-"+Date.now()),
-    cap: opts.cap ?? 10, entrants: [],      // {wallet, snap, ready} — 10 real players, bracket padded to 16 with byes
+    cap: opts.cap ?? 10, entrants: [], byes: [],   // {wallet, snap, ready} — 10 real players, bracket padded to 16 with byes
     roundIdx: -1, mid: 0, log: [], place: {},
     // working slots (hold entrant objects)
     slot:[], wb1w:[],wb1l:[],wb2w:[],wb2l:[],wb3w:[],wb3l:[], wf:null,wfl:null,
@@ -32,6 +53,16 @@ function createCup(opts={}){
   const api = {
     state: S,
     get roundName(){ return S.roundIdx>=0 ? SCHEDULE[S.roundIdx] : null; },
+
+    // JSON-safe snapshot for durable storage. Bracket slots are stored as wallet refs; hydrate() restores identity.
+    snapshot(){
+      const refs = a => (a||[]).map(e=> e ? e.wallet : null);
+      const out = { status:S.status, entryGlory:S.entryGlory, prizePool:S.prizePool, seedBase:S.seedBase, cap:S.cap,
+        roundIdx:S.roundIdx, mid:S.mid, log:S.log, place:S.place, entrants:S.entrants, byes:S.byes||[] };
+      for(const k of ARR_SLOTS) out[k]=refs(S[k]);
+      for(const k of ONE_SLOTS) out[k]= S[k] ? S[k].wallet : null;
+      return out;
+    },
 
     register(wallet, snap){
       if(S.status!=="registration") throw new Error("registration closed");
@@ -47,7 +78,8 @@ function createCup(opts={}){
       const seeded = S.entrants.slice().sort((a,b)=>(b.snap.br||1)-(a.snap.br||1));
       // Pad to a full 16-slot bracket with auto-forfeit BYES so a non-power-of-2 field still runs a clean double-elim.
       // Byes take the bottom seeds, lose to any real player, and are excluded from placements/prizes.
-      for(let i=seeded.length;i<16;i++) seeded.push({ wallet:"__BYE"+i, snap:{name:"(bye)",br:0,element:"Light",arenaSkills:[0,1,2],cardTier:{}}, ready:true, bye:true });
+      S.byes = [];
+      for(let i=seeded.length;i<16;i++){ const b={ wallet:"__BYE"+i, snap:{name:"(bye)",br:0,element:"Light",arenaSkills:[0,1,2],cardTier:{}}, ready:true, bye:true }; seeded.push(b); S.byes.push(b); }
       S.slot = SEED16.map(s=>seeded[s-1]);
       S.status="live"; S.roundIdx=0;
       return this.currentMatches();
