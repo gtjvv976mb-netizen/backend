@@ -206,15 +206,28 @@ function sanitizeProfile(prev, p) {
 const _lastSave = new Map();   // light per-wallet write throttle
 const _lastChat = new Map();   // light per-wallet chat throttle
 
+// Per-wallet $CHIKI balance — CACHED 30s so 500+ polling clients don't spam Helius (429s).
+const _balCache = new Map();
 async function chikiBalance(owner) {
   if (!MINT) return 0;
+  const c = _balCache.get(owner);
+  if (c && Date.now() - c.t < 30000) return c.v;
   try {
     const r = await conn.getParsedTokenAccountsByOwner(new PublicKey(owner), { mint: MINT });
     let b = 0; for (const { account } of r.value) b += account.data.parsed.info.tokenAmount.uiAmount || 0;
+    _balCache.set(owner, { t: Date.now(), v: b });
+    if (_balCache.size > 5000) _balCache.clear();   // simple bound
     return b;
-  } catch { return 0; }
+  } catch { return c ? c.v : 0; }
 }
-const poolSol = async () => (await conn.getBalance(treasury.publicKey)) / LAMPORTS_PER_SOL;
+// Treasury (reward pool) SOL — CACHED 20s. Pool changes slowly; this kills the per-request getBalance spam.
+let _poolCache = { t: 0, v: 0 };
+const poolSol = async () => {
+  if (_poolCache.t && Date.now() - _poolCache.t < 20000) return _poolCache.v;
+  const v = (await conn.getBalance(treasury.publicKey)) / LAMPORTS_PER_SOL;
+  _poolCache = { t: Date.now(), v };
+  return v;
+};
 
 /* ----------------------------- storage ----------------------------- */
 // Two backends with one interface. Postgres when DATABASE_URL is set; else in-memory (dev only).
