@@ -8,9 +8,10 @@ import { resolveBattle } from "./cup-resolver.js";
 
 const SEED16 = [1,16,8,9,5,12,4,13,3,14,6,11,7,10,2,15];
 function payout(place){
-  // 4 SOL prize pool · Champion 1 SOL · scaled consolation for everyone else (totals exactly 4.00)
-  if(place===1) return 1.00; if(place===2) return 0.60; if(place===3) return 0.42; if(place===4) return 0.32;
-  if(place<=6) return 0.24; if(place<=8) return 0.18; if(place<=12) return 0.13; return 0.075;
+  // 10-player field (16-slot bracket + 6 byes) → real players finish at places {1,2,3,4,5,5,7,7,9,9}.
+  // 4 SOL pool · Champion 1 SOL · scaled consolation for the other 9 (totals exactly 4.00).
+  if(place===1) return 1.00; if(place===2) return 0.70; if(place===3) return 0.50; if(place===4) return 0.40;
+  if(place<=6) return 0.28; if(place<=8) return 0.24; return 0.18;   // 5–6th · 7–8th · 9th+
 }
 // Play order for a 16 double-elim (interleaved so eliminated players don't wait long).
 const SCHEDULE = ["WB1","LB1","WB2","LB2","WB3","LB3","WF","LB4","LB5","LF","GF"];
@@ -21,7 +22,7 @@ function createCup(opts={}){
     entryGlory: opts.entryGlory ?? 0,
     prizePool: opts.prizePool ?? 4.0,
     seedBase: opts.seedBase || ("cup-"+Date.now()),
-    cap: 16, entrants: [],                  // {wallet, snap, ready}
+    cap: opts.cap ?? 10, entrants: [],      // {wallet, snap, ready} — 10 real players, bracket padded to 16 with byes
     roundIdx: -1, mid: 0, log: [], place: {},
     // working slots (hold entrant objects)
     slot:[], wb1w:[],wb1l:[],wb2w:[],wb2l:[],wb3w:[],wb3l:[], wf:null,wfl:null,
@@ -44,6 +45,9 @@ function createCup(opts={}){
     start(){
       if(S.entrants.length!==S.cap) throw new Error(`need ${S.cap} entrants (have ${S.entrants.length})`);
       const seeded = S.entrants.slice().sort((a,b)=>(b.snap.br||1)-(a.snap.br||1));
+      // Pad to a full 16-slot bracket with auto-forfeit BYES so a non-power-of-2 field still runs a clean double-elim.
+      // Byes take the bottom seeds, lose to any real player, and are excluded from placements/prizes.
+      for(let i=seeded.length;i<16;i++) seeded.push({ wallet:"__BYE"+i, snap:{name:"(bye)",br:0,element:"Light",arenaSkills:[0,1,2],cardTier:{}}, ready:true, bye:true });
       S.slot = SEED16.map(s=>seeded[s-1]);
       S.status="live"; S.roundIdx=0;
       return this.currentMatches();
@@ -62,7 +66,10 @@ function createCup(opts={}){
       const pairs=this._pairs(), winners=[], losers=[], forfeits=[];
       for(const [a,b] of pairs){
         let w,l,ff=null;
-        if(a.ready && b.ready){ const r=resolveBattle(a.snap,b.snap,S.seedBase+"|"+SCHEDULE[S.roundIdx]+"|"+(S.mid++)); w=r.winner==="a"?a:b; l=r.winner==="a"?b:a; }
+        if(a.bye && b.bye){ w=a; l=b; }                       // bye vs bye — advance one (still a bye), no battle
+        else if(a.bye){ w=b; l=a; }                           // a real player auto-advances over a bye
+        else if(b.bye){ w=a; l=b; }
+        else if(a.ready && b.ready){ const r=resolveBattle(a.snap,b.snap,S.seedBase+"|"+SCHEDULE[S.roundIdx]+"|"+(S.mid++)); w=r.winner==="a"?a:b; l=r.winner==="a"?b:a; }
         else if(a.ready){ w=a; l=b; ff=b.wallet; }            // forfeit
         else if(b.ready){ w=b; l=a; ff=a.wallet; }
         else { w=(a.snap.br||1)>=(b.snap.br||1)?a:b; l=w===a?b:a; ff="both"; }  // double no-show
@@ -126,8 +133,9 @@ export { createCup, payout, SCHEDULE };
 /* ---------- self-test: run a full LIVE cup ---------- */
 if (import.meta.url === `file://${process.argv[1]}`) {
   const ELEMS=["Water","Fire","Beast","Storm","Light"];
+  const N=10;
   const mk=()=>{ const cup=createCup({seedBase:"live-1"});
-    for(let i=0;i<16;i++){ const br=4+((i*5+3)%24), el=ELEMS[i%5], sk=[i%12,(i+4)%12,(i+8)%12], ct={}; sk.forEach(s=>ct[s]=Math.min(5,1+(br/6|0)));
+    for(let i=0;i<N;i++){ const br=4+((i*5+3)%24), el=ELEMS[i%5], sk=[i%12,(i+4)%12,(i+8)%12], ct={}; sk.forEach(s=>ct[s]=Math.min(5,1+(br/6|0)));
       cup.register("W"+i, {name:`L${String(i+1).padStart(2,"0")}(${el[0]}·${br})`, element:el, br, arenaSkills:sk, cardTier:ct}); }
     return cup; };
 
@@ -137,14 +145,17 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   while(!cup.finished()){ cup.state.entrants.forEach(e=>e.ready=true); const r=cup.resolveRound(); rounds++;
     console.log(`R${rounds} ${r.round}: ${r.winners.length} advance${r.finished?` · 🏆 ${r.champion}`:` → next ${r.next}`}`); }
   console.log("rounds:", rounds, "(expect 11)");
-  const everyone=cup.results().every(x=>x.place>=1&&x.place<=16);
-  const total=cup.results().reduce((s,x)=>s+x.sol,0);
-  console.log("everyone placed+paid:", everyone?"PASS ✅":"FAIL ❌", "· total SOL", total.toFixed(3));
+  const res=cup.results();
+  const everyone = res.length===N && res.every(x=>x.place>=1 && x.sol>0);
+  const total=res.reduce((s,x)=>s+x.sol,0);
+  console.log("real players:", res.length, "(expect "+N+")");
+  console.log("places:", res.map(x=>x.place).join(","));
+  console.log("everyone placed+paid:", everyone?"PASS ✅":"FAIL ❌", "· total SOL", total.toFixed(3), "(expect 4.000)");
 
-  // forfeit test: champion-elect (seed 1) no-shows round 1 → must be eliminated/forfeited
+  // forfeit test: a real player in a real-vs-real match no-shows round 1 → must be forfeited
   const cup2=mk(); cup2.start();
-  const m=cup2.currentMatches()[0];
-  cup2.state.entrants.forEach(e=>{ if(e.wallet!==m.a.wallet) e.ready=true; });  // everyone ready EXCEPT player a of match 1
+  const m=cup2.currentMatches().find(x=>x.a.br>0 && x.b.br>0);   // a match with no bye
+  cup2.state.entrants.forEach(e=>{ if(e.wallet!==m.a.wallet) e.ready=true; });  // everyone ready EXCEPT player a of that match
   const r1=cup2.resolveRound();
   console.log("forfeit handled (no-show loses):", r1.forfeits.length>0?"PASS ✅":"FAIL ❌", JSON.stringify(r1.forfeits[0]));
 }

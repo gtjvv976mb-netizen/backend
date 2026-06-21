@@ -517,7 +517,7 @@ function cupSnapshot(forWallet) {
   const out = {
     exists: !!liveCup, public: cupPublic,
     status: s ? s.status : "none",
-    entryGlory: s ? s.entryGlory : 0, prizePool: s ? s.prizePool : 4.0, cap: s ? s.cap : 16,
+    entryGlory: s ? s.entryGlory : 0, prizePool: s ? s.prizePool : 4.0, cap: s ? s.cap : 10,
     entrants: s ? s.entrants.map(e => ({ name: e.snap.name, br: e.snap.br, element: e.snap.element, bot: !!e.bot, ready: !!e.ready })) : [],
     round: live ? liveCup.roundName : null,
     matches: live ? liveCup.currentMatches() : [],
