@@ -398,6 +398,15 @@ function pgStore() {
       }
       return { chikis, holders, legends };
     },
+    // One-shot: add `amount` Glory to every wallet whose roster contains a Legendary. Returns count granted.
+    async grantGloryToLegends(amount) {
+      const r = await pool.query(
+        `UPDATE players
+           SET profile = jsonb_set(profile, '{glory}', to_jsonb(COALESCE((profile->>'glory')::numeric, 0) + $1::numeric))
+         WHERE profile IS NOT NULL AND profile->'chikis' @> '[{"isLegend": true}]'::jsonb`,
+        [amount]);
+      return r.rowCount || 0;
+    },
   };
 }
 
@@ -493,6 +502,14 @@ function memStore() {
         if (p.eligible) { holders++; chikis += c.length; }     // current keepers + their Chikis only
       }
       return { chikis, holders, legends };
+    },
+    async grantGloryToLegends(amount) {
+      let n = 0;
+      for (const p of players.values()) {
+        const c = p.profile?.chikis || [];
+        if (c.some(x => x.isLegend)) { p.profile.glory = (Number(p.profile.glory) || 0) + amount; n++; }
+      }
+      return n;
     },
   };
 }
@@ -926,6 +943,14 @@ app.get("/admin/reset", async (req, res) => {
   catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// GET /admin/grant-glory-legends?key=SECRET[&amount=100] — gift Glory to EVERY wallet that owns a Legendary.
+app.get("/admin/grant-glory-legends", async (req, res) => {
+  if (!ADMIN_KEY || req.query?.key !== ADMIN_KEY) return res.status(403).json({ error: "forbidden" });
+  const amount = Math.max(1, Number(req.query?.amount) || 100);
+  try { const holders = await store.grantGloryToLegends(amount); res.json({ ok: true, grantedEach: amount, legendaryHolders: holders }); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 /* ----------------------------- chat API ----------------------------- */
 // Send a message (global, or a DM if `to` is set). Profanity is masked server-side.
 app.post("/chat/send", async (req, res) => {
@@ -1210,7 +1235,11 @@ app.post("/cup/grant", async (req, res) => {
 app.post("/cup/refund", async (req, res) => {
   if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
   const amount = Math.max(1, Number(req.body?.amount) || 100);
-  const list = Array.isArray(req.body?.wallets) && req.body.wallets.length ? req.body.wallets : [...cupPayers.keys()];
+  // refund a specific {wallets:[...]}, OR source:"finishers" (everyone in the prize ledger = first cup's entrants), OR the paid-log
+  let list;
+  if (Array.isArray(req.body?.wallets) && req.body.wallets.length) list = req.body.wallets;
+  else if (req.body?.source === "finishers") list = [...cupPrizes.keys()];
+  else list = [...cupPayers.keys()];
   const done = [];
   for (const w of list) { if (await refundGlory(w, amount)) { done.push(w); cupPayers.delete(w); } }
   await savePayers();
