@@ -510,12 +510,20 @@ const CUP_ELEMS = ["Water", "Fire", "Beast", "Storm", "Light"];
 let liveCup = null;                  // in-memory orchestrator (null until an admin creates one)
 let cupPublic = true;                // true = open to ALL players (launched). Admin can flip to admin-only via /cup/public.
 const cupPrizes = new Map();         // wallet -> owed SOL (DURABLE — these are real funds; persisted to kv)
+const cupPayers = new Map();         // wallet -> Glory paid in entry fees (DURABLE log, so we can refund on a reset)
 async function loadCupState() {
   try { const p = await store.kvGet("cup_prizes"); if (p && typeof p === "object") for (const k in p) { const v = Number(p[k]) || 0; if (v > 0) cupPrizes.set(k, v); } } catch (e) {}
   try { const v = await store.kvGet("cup_public"); if (v !== null && v !== undefined) cupPublic = !!v; } catch (e) {}   // honor an explicit admin toggle; otherwise keep the default (public)
+  try { const py = await store.kvGet("cup_payers"); if (py && typeof py === "object") for (const k in py) cupPayers.set(k, Number(py[k]) || 0); } catch (e) {}
   try { const cs = await store.kvGet("cup_state"); if (cs && cs.status) liveCup = createCup({}, cs); } catch (e) { console.error("cup_state restore failed:", e?.message || e); }   // resume an in-progress bracket after a restart
 }
 async function saveCupPrizes() { const o = {}; for (const [k, v] of cupPrizes) if (v > 0) o[k] = v; try { await store.kvSet("cup_prizes", o); } catch (e) {} }
+async function savePayers() { const o = {}; for (const [k, v] of cupPayers) if (v > 0) o[k] = v; try { await store.kvSet("cup_payers", o); } catch (e) {} }
+// Add Glory back to a wallet's stored profile (used to refund cup entry fees on a reset).
+async function refundGlory(wallet, amount) {
+  if (!isPubkey(wallet) || !(amount > 0)) return false;
+  try { const p = await store.getProfile(wallet); if (!p) return false; p.glory = (Number(p.glory) || 0) + amount; await store.setProfile(wallet, p); return true; } catch (e) { return false; }
+}
 // Persist the LIVE bracket so a restart (deploy / spin-down / crash) resumes instead of losing the cup.
 async function persistCup() { try { await store.kvSet("cup_state", liveCup ? liveCup.snapshot() : null); } catch (e) {} }
 const cupAdminOk = (req) => {
@@ -1085,8 +1093,10 @@ app.post("/cup/register", async (req, res) => {
     if (glory < fee) return res.status(402).json({ error: `need ${fee} ✨ Glory to enter (you have ${Math.floor(glory)})`, glory });
     const built = await cupSnapFromBody(wallet, req.body?.snap || {});
     if (built.error) return res.status(403).json({ error: built.error });
-    prof.glory = glory - fee;                       // deduct entry fee server-side
-    await store.setProfile(wallet, prof);
+    if (fee > 0) {
+      prof.glory = glory - fee; await store.setProfile(wallet, prof);
+      cupPayers.set(wallet, (cupPayers.get(wallet) || 0) + fee); await savePayers();   // remember how much they paid, so a reset can refund it
+    }
     liveCup.register(wallet, built.snap);
     await persistCup();
     res.json({ ok: true, gloryLeft: prof.glory, ...cupSnapshot(wallet) });
@@ -1109,9 +1119,19 @@ app.post("/cup/create", async (req, res) => {
     const entryGlory = req.body?.entryGlory != null ? Math.max(0, Number(req.body.entryGlory) || 0) : 100;   // 100 ✨ Glory entry by default
     const prizePool = Math.max(0, Number(req.body?.prizePool) || 4.0);
     const cap = [8, 10, 16].includes(Number(req.body?.cap)) ? Number(req.body.cap) : 10;
+    // REFUND THE PREVIOUS LOBBY: anyone seated in the cup being replaced gets their entry Glory back,
+    // so players who paid are never burned by a reset.
+    let refunded = 0, refundEach = (liveCup && Array.isArray(liveCup.state.entrants)) ? (Number(liveCup.state.entryGlory) || 0) : 0;
+    if (refundEach > 0) {
+      for (const e of liveCup.state.entrants) {
+        if (!e || e.bot || !isPubkey(e.wallet)) continue;
+        if (await refundGlory(e.wallet, refundEach)) { refunded++; cupPayers.delete(e.wallet); }   // refunded → clear from the paid log
+      }
+      await savePayers();
+    }
     liveCup = createCup({ entryGlory, prizePool, cap, seedBase: "cup-" + Date.now() });
     await persistCup();
-    res.json({ ok: true, ...cupSnapshot(req.body?.wallet) });
+    res.json({ ok: true, refundedPlayers: refunded, refundEachGlory: refundEach, ...cupSnapshot(req.body?.wallet) });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
@@ -1183,6 +1203,25 @@ app.post("/cup/grant", async (req, res) => {
   cupPrizes.set(wallet, +(((cupPrizes.get(wallet) || 0) + sol)).toFixed(6));
   await saveCupPrizes();
   res.json({ ok: true, wallet, granted: sol, owedNow: cupPrizes.get(wallet) });
+});
+
+// Admin: refund cup-entry GLORY to wallets (e.g., players from a lost lobby that wasn't auto-refunded).
+// Pass {wallets:[...]} to refund a specific list, or omit it to refund everyone in the durable paid-log.
+app.post("/cup/refund", async (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  const amount = Math.max(1, Number(req.body?.amount) || 100);
+  const list = Array.isArray(req.body?.wallets) && req.body.wallets.length ? req.body.wallets : [...cupPayers.keys()];
+  const done = [];
+  for (const w of list) { if (await refundGlory(w, amount)) { done.push(w); cupPayers.delete(w); } }
+  await savePayers();
+  res.json({ ok: true, refundedEachGlory: amount, count: done.length, wallets: done });
+});
+
+// Admin: view the durable paid-log (who paid entry Glory and how much) — for auditing refunds.
+app.get("/cup/payers", async (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  const payers = [...cupPayers.entries()].map(([wallet, glory]) => ({ wallet, glory }));
+  res.json({ count: payers.length, totalGlory: payers.reduce((s, x) => s + x.glory, 0), payers });
 });
 
 // Devnet-only funding helper (open in a browser to airdrop to the treasury)
