@@ -10,6 +10,7 @@ import {
   Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
 import { createCup } from "./cup-live.js";   // Chikoria Cup live orchestrator (double-elim, deterministic resolver)
+import { createMatch as pvpCreate, submit as pvpSubmit, tick as pvpTick, viewFor as pvpView } from "./pvp-engine.js";   // live PvP battles
 
 dotenv.config();
 const {
@@ -343,6 +344,15 @@ function pgStore() {
       const r = await pool.query(`SELECT wallet, COALESCE(lifetime_paid,0) p, profile->>'handle' AS handle FROM players WHERE lifetime_paid > 0 ORDER BY lifetime_paid DESC LIMIT $1`, [limit]);
       return r.rows.map(x => ({ wallet: x.wallet, earnedSol: Number(x.p), handle: x.handle || null }));
     },
+    async totalPaid() {   // ALL-TIME SOL paid out to keepers (sum of every wallet's lifetime payouts)
+      const r = await pool.query(`SELECT COALESCE(SUM(lifetime_paid),0) p FROM players`);
+      return Number(r.rows[0]?.p || 0);
+    },
+    async chikisForWallets(wallets) {   // total Chikis owned in-game by a given set of wallets (the real keepers)
+      if (!wallets || !wallets.length) return 0;
+      const r = await pool.query(`SELECT COALESCE(SUM(jsonb_array_length(profile->'chikis')),0) c FROM players WHERE wallet = ANY($1) AND jsonb_typeof(profile->'chikis')='array'`, [wallets]);
+      return Number(r.rows[0]?.c || 0);
+    },
     // Atomically reserve a claim: row lock, cooldown + hold-time + amount check, advance last_claim, log pending payout.
     async reserve(wallet, now, compute) {
       const c = await pool.connect();
@@ -451,6 +461,8 @@ function memStore() {
       return payouts.filter(x => x.status === "confirmed" && x.wallet === wallet && x.t > cut).reduce((s, x) => s + x.amount, 0);
     },
     async earned(wallet) { return Number(get(wallet)?.lifetime_paid || 0); },   // real SOL actually paid out to this wallet
+    async totalPaid() { let s = 0; for (const p of players.values()) s += Number(p.lifetime_paid || 0); return s; },
+    async chikisForWallets(wallets) { const set = new Set(wallets || []); let c = 0; for (const [w, p] of players) { if (set.has(w)) { const ch = p.profile?.chikis; if (Array.isArray(ch)) c += ch.length; } } return c; },
     async topEarners(limit) {
       const arr = [];
       for (const [wallet, p] of players) { const e = Number(p.lifetime_paid || 0); if (e > 0) arr.push({ wallet, earnedSol: e, handle: p.profile?.handle || null }); }
@@ -694,13 +706,16 @@ function pushFeed(type, data) {
   feedEvents.push({ id: _feedSeq++, ts: Date.now(), type, ...data });
   if (feedEvents.length > 80) feedEvents.shift();
 }
-// Count unique on-chain $CHIKI holders via Helius DAS (getTokenAccounts). Heavy call → cached 30 min.
-let _holdersCache = { t: 0, n: 0 };
+// On-chain $CHIKI holders via Helius DAS (getTokenAccounts). Also computes KEEPERS = owners whose TOTAL balance ≥ MIN.
+// Heavy call → cached 30 min. Accurate ground truth (vs the stale eligible-flag profile scan).
+let _holdersCache = { t: 0, n: 0, keepers: 0, keeperSet: new Set() };
 async function chikiHolderCount() {
-  if (!MINT) return 0;
-  if (_holdersCache.n && Date.now() - _holdersCache.t < 30 * 60 * 1000) return _holdersCache.n;
+  if (!MINT) return _holdersCache;
+  if (_holdersCache.n && Date.now() - _holdersCache.t < 30 * 60 * 1000) return _holdersCache;
   try {
-    const owners = new Set(); let cursor, pages = 0;
+    let dec = 6; try { dec = await chikiDecimals(); } catch (e) {}
+    const threshold = BigInt(Math.round(MIN)) * (10n ** BigInt(dec));   // raw token units for the MIN_HOLD threshold
+    const owners = new Set(), bal = new Map(); let cursor, pages = 0;
     while (pages < 25) {
       const params = { mint: MINT, limit: 1000, options: { showZeroBalance: false } };
       if (cursor) params.cursor = cursor;
@@ -708,13 +723,18 @@ async function chikiHolderCount() {
         body: JSON.stringify({ jsonrpc: "2.0", id: "holders", method: "getTokenAccounts", params }) });
       const j = await r.json();
       const accs = (j && j.result && j.result.token_accounts) || [];
-      for (const a of accs) if (a.owner) owners.add(a.owner);
+      for (const a of accs) { if (!a.owner) continue; owners.add(a.owner);
+        let amt = 0n; try { amt = BigInt(a.amount || 0); } catch (e) {}
+        bal.set(a.owner, (bal.get(a.owner) || 0n) + amt); }                // sum across a holder's multiple token accounts
       cursor = j && j.result && j.result.cursor; pages++;
       if (!cursor || accs.length === 0) break;
     }
-    if (owners.size) _holdersCache = { t: Date.now(), n: owners.size };
-    return _holdersCache.n;
-  } catch (e) { return _holdersCache.n || 0; }
+    if (owners.size) {
+      const keeperSet = new Set(); for (const [o, amt] of bal) if (amt >= threshold) keeperSet.add(o);
+      _holdersCache = { t: Date.now(), n: owners.size, keepers: keeperSet.size, keeperSet };
+    }
+    return _holdersCache;
+  } catch (e) { return _holdersCache; }
 }
 let _statsCache = { t: 0, data: null };
 async function getStats() {
@@ -723,6 +743,7 @@ async function getStats() {
   try { out.poolSol = await poolSol(); } catch (e) {}
   try { out.players = await store.count(); } catch (e) {}
   try { out.dailyPaidSol = await store.dailyTotal(); } catch (e) {}
+  try { out.totalPaidSol = await store.totalPaid(); } catch (e) {}   // ALL-TIME SOL paid to keepers
   try { const p = await store.presence(PRESENCE_WINDOW); out.activeUsers = p.activeUsers; out.chikimons = p.chikimons; } catch (e) {}
   if (MINT) { try { const s = await conn.getTokenSupply(MINT); out.supply = s.value.uiAmount; out.burned = Math.max(0, SUPPLY_TOTAL - (s.value.uiAmount || 0)); } catch (e) {} }
   out.chikiHolders = _holdersCache.n || 0; chikiHolderCount().catch(()=>{});   // non-blocking: serve cached, refresh in background
@@ -730,7 +751,10 @@ async function getStats() {
     try { out.teamSol = (await conn.getBalance(new PublicKey(TEAM_WALLET))) / LAMPORTS_PER_SOL; } catch (e) {}
     try { out.teamChiki = await chikiBalance(TEAM_WALLET); } catch (e) {}
   }
-  try { const t = await store.claimedTotals(); out.claimedChikis = t.chikis; out.holders = t.holders; out.legendsHatched = t.legends; } catch (e) {}
+  try { const t = await store.claimedTotals(); out.legendsHatched = t.legends; } catch (e) {}   // legends = all-time hatched
+  // KEEPERS + ACTIVE CHIKIS — accurate, from the on-chain ≥MIN holder set (not the stale eligible flag)
+  out.holders = _holdersCache.keepers || 0;
+  try { out.claimedChikis = await store.chikisForWallets([...(_holdersCache.keeperSet || [])]); } catch (e) { out.claimedChikis = 0; }
   // Chikoria Cup rewards
   out.cupPrizePool = liveCup ? liveCup.state.prizePool : 4;          // SOL on the line per cup
   out.cupChampionSol = 1;                                            // champion's share
@@ -1265,6 +1289,86 @@ app.get("/cup/payers", async (req, res) => {
   if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
   const payers = [...cupPayers.entries()].map(([wallet, glory]) => ({ wallet, glory }));
   res.json({ count: payers.length, totalGlory: payers.reduce((s, x) => s + x.glory, 0), payers });
+});
+
+/* ----------------------------- LIVE PvP battles ----------------------------- */
+const pvpMatches = new Map();   // matchId -> live match (in-memory; a battle is short-lived)
+const pvpSideOf = (m, wallet) => m.walletA === wallet ? "a" : m.walletB === wallet ? "b" : null;
+// drive turn timeouts / forfeits + clean up finished matches
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, m] of pvpMatches) {
+    try { pvpTick(m, now); } catch (e) {}
+    if (m.status === "finished") { if (!m._doneAt) m._doneAt = now; else if (now - m._doneAt > 180000) pvpMatches.delete(id); }
+  }
+}, 1000);
+
+const pvpQueue = [];                  // [{wallet, snap, ts}] players waiting for a live opponent
+const pvpPlayerMatch = new Map();     // wallet -> their current matchId (so cup + queued players can find their battle)
+function pvpStartMatch(a, b, opts) {  // a,b = snapshots with .wallet
+  const m = pvpCreate(a, b, opts || { turnMs: 30000 });
+  pvpMatches.set(m.id, m); pvpPlayerMatch.set(m.walletA, m.id); pvpPlayerMatch.set(m.walletB, m.id);
+  return m;
+}
+
+// Admin/Cup: create a live PvP match from two player snapshots {wallet, name, element, br, arenaSkills, cardTier}.
+app.post("/pvp/create", async (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  const a = req.body?.a, b = req.body?.b;
+  if (!a?.wallet || !b?.wallet || !isPubkey(a.wallet) || !isPubkey(b.wallet)) return res.status(400).json({ error: "a.wallet and b.wallet required" });
+  const m = pvpStartMatch(a, b, { turnMs: Math.max(8000, Number(req.body?.turnMs) || 30000), id: req.body?.id });
+  res.json({ ok: true, matchId: m.id, a: m.walletA, b: m.walletB, turnMs: m.turnMs });
+});
+
+// Open Chikiseum matchmaking: join the queue; pairs with the next waiting player into a live match.
+app.post("/pvp/queue", (req, res) => {
+  const wallet = req.body?.wallet, snap = req.body?.snap;
+  if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  if (!snap || !snap.element) return res.status(400).json({ error: "legendary 'snap' required" });
+  snap.wallet = wallet;
+  const cur = pvpPlayerMatch.get(wallet); const curM = cur && pvpMatches.get(cur);
+  if (curM && curM.status === "active") return res.json({ status: "matched", matchId: cur, side: pvpSideOf(curM, wallet) });
+  if (pvpQueue.find(q => q.wallet === wallet)) return res.json({ status: "searching", queued: pvpQueue.length });
+  const opp = pvpQueue.find(q => q.wallet !== wallet);
+  if (opp) {
+    pvpQueue.splice(pvpQueue.indexOf(opp), 1);
+    const m = pvpStartMatch(opp.snap, snap, { turnMs: 30000 });   // opponent = side a, joiner = side b
+    return res.json({ status: "matched", matchId: m.id, side: pvpSideOf(m, wallet) });
+  }
+  pvpQueue.push({ wallet, snap, ts: Date.now() });
+  res.json({ status: "searching", queued: pvpQueue.length });
+});
+
+// Poll matchmaking / find your current match (used by open Chikiseum AND cup players).
+app.get("/pvp/queue", (req, res) => {
+  const wallet = req.query?.wallet; if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "wallet required" });
+  const cur = pvpPlayerMatch.get(wallet); const m = cur && pvpMatches.get(cur);
+  if (m) return res.json({ status: "matched", matchId: cur, side: pvpSideOf(m, wallet), over: m.status === "finished" });
+  res.json({ status: pvpQueue.find(q => q.wallet === wallet) ? "searching" : "idle", queued: pvpQueue.length });
+});
+
+// Leave the matchmaking queue.
+app.post("/pvp/cancel", (req, res) => {
+  const wallet = req.body?.wallet; const i = pvpQueue.findIndex(q => q.wallet === wallet);
+  if (i >= 0) pvpQueue.splice(i, 1);
+  res.json({ ok: true });
+});
+
+// Player: poll your live battle state (only your own hand is revealed).
+app.get("/pvp/state", (req, res) => {
+  const m = pvpMatches.get(req.query?.matchId); if (!m) return res.status(404).json({ error: "match not found" });
+  const who = pvpSideOf(m, req.query?.wallet); if (!who) return res.status(403).json({ error: "not your match" });
+  try { pvpTick(m); } catch (e) {}
+  res.json(pvpView(m, who));
+});
+
+// Player: lock in your cards for the current turn. body: { matchId, wallet, cards:[handIndex,...] }
+app.post("/pvp/move", (req, res) => {
+  const m = pvpMatches.get(req.body?.matchId); if (!m) return res.status(404).json({ error: "match not found" });
+  const who = pvpSideOf(m, req.body?.wallet); if (!who) return res.status(403).json({ error: "not your match" });
+  const r = pvpSubmit(m, who, Array.isArray(req.body?.cards) ? req.body.cards : []);
+  if (!r.ok) return res.status(400).json({ error: r.error });
+  res.json(pvpView(m, who));
 });
 
 // Devnet-only funding helper (open in a browser to airdrop to the treasury)
