@@ -101,8 +101,9 @@ function createCup(opts={}, snap=null){
                                            b:{wallet:b.wallet,name:b.snap.name,br:b.snap.br,element:b.snap.element} }));
     },
 
-    // resolve the current round (call when the lock-in window closes), advance the bracket
-    resolveRound(){
+    // resolve the current round (call when the lock-in window closes), advance the bracket.
+    // decide(a,b) → "a"|"b" (or the entrant) supplies a LIVE PvP result; return null to fall back to the deterministic engine.
+    resolveRound(decide){
       if(S.status!=="live") throw new Error("cup not live");
       const rname=SCHEDULE[S.roundIdx];
       const pairs=this._pairs(), winners=[], losers=[], forfeits=[];
@@ -111,7 +112,12 @@ function createCup(opts={}, snap=null){
         if(a.bye && b.bye){ w=a; l=b; }                       // bye vs bye — advance one (still a bye), no battle
         else if(a.bye){ w=b; l=a; }                           // a real player auto-advances over a bye
         else if(b.bye){ w=a; l=b; }
-        else if(a.ready && b.ready){ const r=resolveBattle(a.snap,b.snap,S.seedBase+"|"+SCHEDULE[S.roundIdx]+"|"+(S.mid++)); w=r.winner==="a"?a:b; l=r.winner==="a"?b:a; }
+        else if(a.ready && b.ready){
+          const dw = decide ? decide(a,b) : null;             // live PvP winner, if any
+          if(dw==="a"||dw===a){ w=a; l=b; }
+          else if(dw==="b"||dw===b){ w=b; l=a; }
+          else { const r=resolveBattle(a.snap,b.snap,S.seedBase+"|"+SCHEDULE[S.roundIdx]+"|"+(S.mid++)); w=r.winner==="a"?a:b; l=r.winner==="a"?b:a; }
+        }
         else if(a.ready){ w=a; l=b; ff=b.wallet; }            // forfeit
         else if(b.ready){ w=b; l=a; ff=a.wallet; }
         else { w=(a.snap.br||1)>=(b.snap.br||1)?a:b; l=w===a?b:a; ff="both"; }  // double no-show
