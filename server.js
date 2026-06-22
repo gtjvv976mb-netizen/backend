@@ -10,7 +10,7 @@ import {
   Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
 import { createCup } from "./cup-live.js";   // Chikoria Cup live orchestrator (double-elim, deterministic resolver)
-import { createMatch as pvpCreate, submit as pvpSubmit, tick as pvpTick, viewFor as pvpView } from "./pvp-engine.js";   // live PvP battles
+import { createMatch as pvpCreate, submit as pvpSubmit, tick as pvpTick, viewFor as pvpView, forfeit as pvpForfeit } from "./pvp-engine.js";   // live PvP battles
 
 dotenv.config();
 const {
@@ -1391,14 +1391,17 @@ app.post("/pvp/queue", (req, res) => {
   snap.wallet = wallet;
   const cur = pvpPlayerMatch.get(wallet); const curM = cur && pvpMatches.get(cur);
   if (curM && curM.status === "active") return res.json({ status: "matched", matchId: cur, side: pvpSideOf(curM, wallet) });
-  if (pvpQueue.find(q => q.wallet === wallet)) return res.json({ status: "searching", queued: pvpQueue.length });
+  const now = Date.now();
+  for (let i = pvpQueue.length - 1; i >= 0; i--) if (now - pvpQueue[i].ts > 12000) pvpQueue.splice(i, 1);   // drop players who stopped polling (left)
+  const mine = pvpQueue.find(q => q.wallet === wallet);
+  if (mine) { mine.ts = now; mine.snap = snap; return res.json({ status: "searching", queued: pvpQueue.length }); }   // refresh my presence
   const opp = pvpQueue.find(q => q.wallet !== wallet);
   if (opp) {
     pvpQueue.splice(pvpQueue.indexOf(opp), 1);
     const m = pvpStartMatch(opp.snap, snap, { turnMs: 30000 });   // opponent = side a, joiner = side b
     return res.json({ status: "matched", matchId: m.id, side: pvpSideOf(m, wallet) });
   }
-  pvpQueue.push({ wallet, snap, ts: Date.now() });
+  pvpQueue.push({ wallet, snap, ts: now });
   res.json({ status: "searching", queued: pvpQueue.length });
 });
 
@@ -1432,6 +1435,14 @@ app.post("/pvp/move", (req, res) => {
   const r = pvpSubmit(m, who, Array.isArray(req.body?.cards) ? req.body.cards : []);
   if (!r.ok) return res.status(400).json({ error: r.error });
   res.json(pvpView(m, who));
+});
+
+// Player: leave the battle → instant loss; the opponent wins immediately (no waiting for the timer).
+app.post("/pvp/forfeit", (req, res) => {
+  const m = pvpMatches.get(req.body?.matchId); if (!m) return res.status(404).json({ error: "match not found" });
+  const who = pvpSideOf(m, req.body?.wallet); if (!who) return res.status(403).json({ error: "not your match" });
+  pvpForfeit(m, who);
+  res.json({ ok: true, ...pvpView(m, who) });
 });
 
 // Devnet-only funding helper (open in a browser to airdrop to the treasury)

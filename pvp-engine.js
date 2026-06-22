@@ -200,6 +200,12 @@ function sideView(s, isYou){
     base.hand = s.hand.map((slot,i)=>({ i, slot, type:ARCHK[slot], cost:CARD_COST[slot], tier:tier(s.snap,slot) })); }
   return base;
 }
+// A player explicitly leaves → instant loss, opponent wins.
+function forfeit(m, who){
+  if(!m || m.status!=="active") return false;
+  finish(m, who==="a"?"b":"a", "forfeit", []);
+  return true;
+}
 function viewFor(m, who){
   const me=who==="a"?m.sides.a:m.sides.b, foe=who==="a"?m.sides.b:m.sides.a;
   if(me) me.lastSeen=Date.now();
@@ -215,7 +221,7 @@ function viewFor(m, who){
   };
 }
 
-export { createMatch, submit, tick, viewFor, ARCHK, CARD_COST };
+export { createMatch, submit, tick, viewFor, forfeit, ARCHK, CARD_COST };
 
 /* ---------- self-test (node pvp-engine.js) ---------- */
 if (import.meta.url === `file://${process.argv[1]}`) {
