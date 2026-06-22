@@ -536,11 +536,14 @@ const cupPrizes = new Map();         // wallet -> owed SOL (DURABLE — these ar
 const cupPayers = new Map();         // wallet -> Glory paid in entry fees (DURABLE log, so we can refund on a reset)
 const gloryCredits = new Map();      // wallet -> pending Glory to ADD on the player's next login/refresh.
                                      // Lives OUTSIDE the profile so client saves can't clobber it (Glory is client-authoritative).
+let cupTotalAwarded = 0;             // DURABLE cumulative SOL ever awarded as Chikoria Cup prizes (across all cups)
+async function saveCupAwarded() { try { await store.kvSet("cup_total_awarded", cupTotalAwarded); } catch (e) {} }
 async function loadCupState() {
   try { const p = await store.kvGet("cup_prizes"); if (p && typeof p === "object") for (const k in p) { const v = Number(p[k]) || 0; if (v > 0) cupPrizes.set(k, v); } } catch (e) {}
   try { const v = await store.kvGet("cup_public"); if (v !== null && v !== undefined) cupPublic = !!v; } catch (e) {}   // honor an explicit admin toggle; otherwise keep the default (public)
   try { const py = await store.kvGet("cup_payers"); if (py && typeof py === "object") for (const k in py) cupPayers.set(k, Number(py[k]) || 0); } catch (e) {}
   try { const gc = await store.kvGet("glory_credits"); if (gc && typeof gc === "object") for (const k in gc) { const v = Number(gc[k]) || 0; if (v > 0) gloryCredits.set(k, v); } } catch (e) {}
+  try { const ta = await store.kvGet("cup_total_awarded"); if (ta != null) cupTotalAwarded = Number(ta) || 0; } catch (e) {}
   try { const cs = await store.kvGet("cup_state"); if (cs && cs.status) liveCup = createCup({}, cs); } catch (e) { console.error("cup_state restore failed:", e?.message || e); }   // resume an in-progress bracket after a restart
 }
 async function saveCupPrizes() { const o = {}; for (const [k, v] of cupPrizes) if (v > 0) o[k] = v; try { await store.kvSet("cup_prizes", o); } catch (e) {} }
@@ -766,6 +769,7 @@ async function getStats() {
   out.cupChampionSol = 1;                                            // champion's share
   let cupOwed = 0; for (const v of cupPrizes.values()) cupOwed += v; // prizes credited but not yet claimed
   out.cupOwedSol = +cupOwed.toFixed(4);
+  out.cupAwardedSol = +Number(cupTotalAwarded || 0).toFixed(4);       // ALL-TIME SOL rewarded in the Chikoria Cup
   _statsCache = { t: Date.now(), data: out };
   return out;
 }
@@ -1247,8 +1251,10 @@ app.post("/cup/resolve-round", async (req, res) => {
     liveCup.state.entrants.forEach(e => { if (e.bot) e.ready = true; });   // bots always lock in
     const r = liveCup.resolveRound();
     if (r.finished) {
-      for (const row of liveCup.results()) { if (row.sol > 0 && isPubkey(row.wallet)) cupPrizes.set(row.wallet, (cupPrizes.get(row.wallet) || 0) + row.sol); }
-      await saveCupPrizes();
+      let awarded = 0;
+      for (const row of liveCup.results()) { if (row.sol > 0 && isPubkey(row.wallet)) { cupPrizes.set(row.wallet, (cupPrizes.get(row.wallet) || 0) + row.sol); awarded += row.sol; } }
+      cupTotalAwarded = +(cupTotalAwarded + awarded).toFixed(4);
+      await saveCupPrizes(); await saveCupAwarded();
     }
     await persistCup();
     res.json({ ok: true, result: r, ...cupSnapshot(req.body?.wallet) });
@@ -1296,8 +1302,10 @@ app.post("/cup/finalize-round", async (req, res) => {
     };
     const r = liveCup.resolveRound(decide);
     if (r.finished) {
-      for (const row of liveCup.results()) { if (row.sol > 0 && isPubkey(row.wallet)) cupPrizes.set(row.wallet, (cupPrizes.get(row.wallet) || 0) + row.sol); }
-      await saveCupPrizes();
+      let awarded = 0;
+      for (const row of liveCup.results()) { if (row.sol > 0 && isPubkey(row.wallet)) { cupPrizes.set(row.wallet, (cupPrizes.get(row.wallet) || 0) + row.sol); awarded += row.sol; } }
+      cupTotalAwarded = +(cupTotalAwarded + awarded).toFixed(4);
+      await saveCupPrizes(); await saveCupAwarded();
     }
     cupRound = null; await persistCup();
     res.json({ ok: true, result: r, ...cupSnapshot(req.body?.wallet) });
