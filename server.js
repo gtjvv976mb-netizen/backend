@@ -30,7 +30,7 @@ const {
   ACCRUAL_CAP_MIN = "1440",        // max minutes of task earnings counted per claim (24h pouch cap)
   MAX_CLAIM_SOL = "1",             // per-claim ceiling — high enough that even a 2-Chiki full pouch isn't clipped (displayed pouch ≈ actual payout)
   DAILY_CAP_SOL = "1",             // absolute backstop ceiling (rarely binds; the real cap is DAILY_CAP_FRAC below)
-  DAILY_CAP_FRAC = "0.20",         // DAILY CAP: total payouts ≤ 20% of the live pool per 24h (auto-scales with the pool; protects against drains)
+  DAILY_CAP_FRAC = "1",            // NO daily cap on the reward pool (1 = up to the whole spendable pool/day) — the reserve floor is the only pool guard
   POOL_RESERVE_SOL = "0.05",       // never pay the treasury below this floor — the hard "never go into debt" guarantee
   POOL_REF_SOL = "20",             // reward reference: payout = base_table × (pool / POOL_REF). Higher = SMALLER payouts (longer runway). Lower = more generous.
   PER_WALLET_DAILY_SOL = "0.1",    // per-wallet cap per rolling 24h (0 = unlimited) — stops one wallet draining the pool
@@ -71,7 +71,7 @@ function chikiCount(balance, whaleSince) {
 }
 /* server-authoritative, rarity-weighted earnings: each simulated task pays SOL by rarity.
    The server rolls the tasks itself (using on-chain Chiki count + elapsed time), so it can't be faked. */
-const RARITY_SOL = { common:0.00002, uncommon:0.00004, rare:0.00009, epic:0.0002, mythic:0.0005, shiny:0.001, legend:0.0025 };  /* common 0.00002 SOL · base rates doubled (~5x vs original) · bounded by per-claim cap, daily pool cap, per-wallet daily cap + reserve floor */
+const RARITY_SOL = { common:0.000008, uncommon:0.000016, rare:0.000036, epic:0.00008, mythic:0.0002, shiny:0.0004, legend:0.001 };  /* task rewards cut 60% across the board · NO daily pool cap · bounded by per-claim cap, per-wallet daily cap + reserve floor */
 const RARITY_DIST = [["common",45],["uncommon",27],["rare",15],["epic",7],["mythic",3.5],["shiny",1.7],["legend",0.8]];
 const RARITY_TOTAL = RARITY_DIST.reduce((s, r) => s + r[1], 0);
 function rollRarity() {
@@ -530,6 +530,7 @@ const isAdminWallet = (w) => ADMIN_SET.has(w);
 /* ----------------------------- Chikoria Cup (live event) ----------------------------- */
 const CUP_ELEMS = ["Water", "Fire", "Beast", "Storm", "Light"];
 let liveCup = null;                  // in-memory orchestrator (null until an admin creates one)
+let cupRound = null;                 // transient: the current round's LIVE PvP matches { battling, matchByWallet, side, matches }
 let cupPublic = true;                // true = open to ALL players (launched). Admin can flip to admin-only via /cup/public.
 const cupPrizes = new Map();         // wallet -> owed SOL (DURABLE — these are real funds; persisted to kv)
 const cupPayers = new Map();         // wallet -> Glory paid in entry fees (DURABLE log, so we can refund on a reset)
@@ -587,6 +588,11 @@ function cupSnapshot(forWallet) {
     out.yourPrize = cupPrizes.get(forWallet) || 0;
     out.youPlace = (s && s.place) ? (s.place[forWallet] || null) : null;
     out.isAdmin = isAdminWallet(forWallet);
+    if (cupRound && cupRound.battling) {           // a live PvP round is underway — tell the player about their match
+      out.roundBattling = true;
+      const mid = cupRound.matchByWallet.get(forWallet);
+      if (mid) { out.pvpMatchId = mid; out.pvpSide = cupRound.side.get(forWallet); const mm = pvpMatches.get(mid); out.pvpOver = mm ? mm.status === "finished" : false; }
+    }
   }
   return out;
 }
@@ -798,7 +804,7 @@ app.get("/health", async (_q, res) => res.json({
   ok: true, network: NETWORK, store: store.kind, verifyHolders: verifyOn,
   treasury: treasury.publicKey.toBase58(), team: TEAM_WALLET || null,
   mint: CHIKI_MINT || null, minHold: MIN, minHoldMinutes: Number(MIN_HOLD_MINUTES),
-  dailyCapPctOfPool: Math.round(DAILY_FRAC * 100), perWalletDailySol: WALLET_DAILY, poolReserveSol: RESERVE,
+  dailyCap: DAILY_FRAC >= 1 ? "none" : Math.round(DAILY_FRAC * 100) + "% pool/day", perWalletDailySol: WALLET_DAILY, poolReserveSol: RESERVE,
   maxClaimSol: CAP, earnModel: "rarity-weighted-tasks", earnMult: MULT, taskSeconds: TASK_SEC, accrualCapMin: ACCRUAL_CAP,
   whaleMin: WHALE_MIN, whaleHoldHours: Number(WHALE_HOLD_HOURS),
 }));
@@ -1095,7 +1101,7 @@ app.post("/claim", async (req, res) => {
     const earnMin = capMs / 60_000;
     const grossNet = seededEarn(wallet, Number(p.last_claim), chikis, earnMin) * poolFactor(pool) * (1 - CLAIM_TAX);   /* full claimable, net of tax, BEFORE caps */
     let amt = Math.min(grossNet, (CAP > 0 ? CAP : Infinity),
-      Math.max(0, dailyCapNow - daily),                                          // remaining room under today's pool cap
+      (DAILY_FRAC < 1 ? Math.max(0, dailyCapNow - daily) : Infinity),             // daily pool cap (Infinity = no cap)
       (WALLET_DAILY > 0 ? Math.max(0, WALLET_DAILY - walletPaid) : Infinity),     // remaining room under this wallet's daily cap
       Math.max(0, pool - RESERVE));
     const paid = Math.floor(amt * 1e6) / 1e6;
@@ -1249,6 +1255,55 @@ app.post("/cup/resolve-round", async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// Admin: START the current round as LIVE PvP — spin up a real battle for every real-vs-real pair.
+// Players then fight; byes/bots resolve automatically at finalize.
+app.post("/cup/start-round", async (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  if (!liveCup || liveCup.state.status !== "live") return res.status(409).json({ error: "no live round" });
+  try {
+    const S = liveCup.state;
+    const entOf = w => S.entrants.find(x => x.wallet === w);
+    const isReal = w => { const e = entOf(w); return !!(e && !e.bot && isPubkey(w)); };
+    const round = { battling: true, matchByWallet: new Map(), side: new Map(), matches: [] };
+    for (const m of liveCup.currentMatches()) {
+      const aw = m.a.wallet, bw = m.b.wallet, ea = entOf(aw), eb = entOf(bw);
+      if (ea) ea.ready = true; if (eb) eb.ready = true;   // mark seated so resolveRound runs the decide() path
+      if (isReal(aw) && isReal(bw)) {
+        const match = pvpStartMatch({ ...ea.snap, wallet: aw }, { ...eb.snap, wallet: bw }, { turnMs: 30000 });
+        round.matchByWallet.set(aw, match.id); round.matchByWallet.set(bw, match.id);
+        round.side.set(aw, "a"); round.side.set(bw, "b");
+        round.matches.push({ matchId: match.id, a: aw, b: bw });
+      }
+    }
+    cupRound = round; await persistCup();
+    res.json({ ok: true, liveMatches: round.matches.length, ...cupSnapshot(req.body?.wallet) });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Admin: FINALIZE the round — advance the bracket using the live PvP winners (unfinished matches fall back to the engine).
+app.post("/cup/finalize-round", async (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  if (!liveCup || liveCup.state.status !== "live") return res.status(409).json({ error: "no live round" });
+  try {
+    const round = cupRound;
+    liveCup.state.entrants.forEach(e => { if (e.bot) e.ready = true; });
+    const decide = (a, b) => {
+      if (!round) return null;
+      const mid = round.matchByWallet.get(a.wallet); if (!mid) return null;
+      const m = pvpMatches.get(mid); if (!m || m.status !== "finished") return null;   // not done → deterministic fallback
+      const winWallet = m.winner === "a" ? m.walletA : m.walletB;
+      return winWallet === a.wallet ? "a" : "b";
+    };
+    const r = liveCup.resolveRound(decide);
+    if (r.finished) {
+      for (const row of liveCup.results()) { if (row.sol > 0 && isPubkey(row.wallet)) cupPrizes.set(row.wallet, (cupPrizes.get(row.wallet) || 0) + row.sol); }
+      await saveCupPrizes();
+    }
+    cupRound = null; await persistCup();
+    res.json({ ok: true, result: r, ...cupSnapshot(req.body?.wallet) });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // Admin: AUDIT the owed-prize ledger (read-only) — who is still owed Cup SOL, and how much.
 app.get("/cup/prizes", async (req, res) => {
   if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
@@ -1390,7 +1445,7 @@ app.get("/fund", async (req, res) => {
 // then initialize the DB in the background (errors logged, not fatal — the server stays up and recovers).
 app.listen(Number(PORT), () => {
   console.log(`Chiki backend v2 on :${PORT} · ${NETWORK} · store=${store.kind} · treasury ${treasury.publicKey.toBase58()}`);
-  console.log(`verifyHolders=${verifyOn} · holdMin=${MIN_HOLD_MINUTES} · dailyCap=${Math.round(DAILY_FRAC*100)}% pool/day · perWallet=${WALLET_DAILY} SOL`);
+  console.log(`verifyHolders=${verifyOn} · holdMin=${MIN_HOLD_MINUTES} · dailyCap=${DAILY_FRAC>=1?"none":Math.round(DAILY_FRAC*100)+"% pool/day"} · perWallet=${WALLET_DAILY} SOL`);
 });
 store.init().then(()=>{ console.log("store ready"); return loadCupState(); }).then(()=>console.log(`cup state loaded (public=${cupPublic}, owed prizes=${cupPrizes.size})`)).catch(e=>console.error("store.init failed:", e?.message||e));
 chat.init().then(()=>console.log("chat ready")).catch(e=>console.error("chat.init failed:", e?.message||e));
