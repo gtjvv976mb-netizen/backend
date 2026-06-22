@@ -398,14 +398,10 @@ function pgStore() {
       }
       return { chikis, holders, legends };
     },
-    // One-shot: add `amount` Glory to every wallet whose roster contains a Legendary. Returns count granted.
-    async grantGloryToLegends(amount) {
-      const r = await pool.query(
-        `UPDATE players
-           SET profile = jsonb_set(profile, '{glory}', to_jsonb(COALESCE((profile->>'glory')::numeric, 0) + $1::numeric))
-         WHERE profile IS NOT NULL AND profile->'chikis' @> '[{"isLegend": true}]'::jsonb`,
-        [amount]);
-      return r.rowCount || 0;
+    // Wallets whose roster contains a Legendary (for Glory gifts).
+    async legendHolderWallets() {
+      const r = await pool.query(`SELECT wallet FROM players WHERE profile IS NOT NULL AND profile->'chikis' @> '[{"isLegend": true}]'::jsonb`);
+      return r.rows.map(x => x.wallet);
     },
   };
 }
@@ -503,13 +499,10 @@ function memStore() {
       }
       return { chikis, holders, legends };
     },
-    async grantGloryToLegends(amount) {
-      let n = 0;
-      for (const p of players.values()) {
-        const c = p.profile?.chikis || [];
-        if (c.some(x => x.isLegend)) { p.profile.glory = (Number(p.profile.glory) || 0) + amount; n++; }
-      }
-      return n;
+    async legendHolderWallets() {
+      const out = [];
+      for (const [wallet, p] of players) { const c = p.profile?.chikis || []; if (c.some(x => x.isLegend)) out.push(wallet); }
+      return out;
     },
   };
 }
@@ -528,14 +521,28 @@ let liveCup = null;                  // in-memory orchestrator (null until an ad
 let cupPublic = true;                // true = open to ALL players (launched). Admin can flip to admin-only via /cup/public.
 const cupPrizes = new Map();         // wallet -> owed SOL (DURABLE — these are real funds; persisted to kv)
 const cupPayers = new Map();         // wallet -> Glory paid in entry fees (DURABLE log, so we can refund on a reset)
+const gloryCredits = new Map();      // wallet -> pending Glory to ADD on the player's next login/refresh.
+                                     // Lives OUTSIDE the profile so client saves can't clobber it (Glory is client-authoritative).
 async function loadCupState() {
   try { const p = await store.kvGet("cup_prizes"); if (p && typeof p === "object") for (const k in p) { const v = Number(p[k]) || 0; if (v > 0) cupPrizes.set(k, v); } } catch (e) {}
   try { const v = await store.kvGet("cup_public"); if (v !== null && v !== undefined) cupPublic = !!v; } catch (e) {}   // honor an explicit admin toggle; otherwise keep the default (public)
   try { const py = await store.kvGet("cup_payers"); if (py && typeof py === "object") for (const k in py) cupPayers.set(k, Number(py[k]) || 0); } catch (e) {}
+  try { const gc = await store.kvGet("glory_credits"); if (gc && typeof gc === "object") for (const k in gc) { const v = Number(gc[k]) || 0; if (v > 0) gloryCredits.set(k, v); } } catch (e) {}
   try { const cs = await store.kvGet("cup_state"); if (cs && cs.status) liveCup = createCup({}, cs); } catch (e) { console.error("cup_state restore failed:", e?.message || e); }   // resume an in-progress bracket after a restart
 }
 async function saveCupPrizes() { const o = {}; for (const [k, v] of cupPrizes) if (v > 0) o[k] = v; try { await store.kvSet("cup_prizes", o); } catch (e) {} }
 async function savePayers() { const o = {}; for (const [k, v] of cupPayers) if (v > 0) o[k] = v; try { await store.kvSet("cup_payers", o); } catch (e) {} }
+async function saveGloryCredits() { const o = {}; for (const [k, v] of gloryCredits) if (v > 0) o[k] = v; try { await store.kvSet("glory_credits", o); } catch (e) {} }
+// Apply any pending Glory credit to a freshly-loaded profile (called on login/refresh). Persists + clears the credit
+// so it survives the client's authoritative profile saves and lands exactly once.
+async function applyGloryCredit(wallet, profile) {
+  const credit = gloryCredits.get(wallet) || 0;
+  if (!(credit > 0) || !profile) return profile;
+  profile.glory = (Number(profile.glory) || 0) + credit;
+  try { await store.setProfile(wallet, profile); } catch (e) {}
+  gloryCredits.delete(wallet); await saveGloryCredits();
+  return profile;
+}
 // Add Glory back to a wallet's stored profile (used to refund cup entry fees on a reset).
 async function refundGlory(wallet, amount) {
   if (!isPubkey(wallet) || !(amount > 0)) return false;
@@ -787,7 +794,8 @@ app.post("/verify", async (req, res) => {
     const chikis = eligible ? (chikiCount(balance, p.whale_since) || 1) : 0;
     const whalePending = eligible && balance >= WHALE_MIN && chikis < 2;
     const whaleReadyInMs = whalePending && p.whale_since ? Math.max(0, WHALE_HOLD_MS - (Date.now() - Number(p.whale_since))) : 0;
-    res.json({ wallet, eligible, balance, chikis, whalePending, whaleReadyInMs, minHold: MIN, verified: verifyOn, firstSeen: Number(p.first_seen), profile: p.profile || null });
+    const profile = await applyGloryCredit(wallet, p.profile || null);   // deliver any pending Glory gift on this login (clobber-proof)
+    res.json({ wallet, eligible, balance, chikis, whalePending, whaleReadyInMs, minHold: MIN, verified: verifyOn, firstSeen: Number(p.first_seen), profile: profile || null });
   } catch (e) { res.status(500).json({ error: "verify failed: " + String(e.message || e) }); }
 });
 
@@ -944,11 +952,17 @@ app.get("/admin/reset", async (req, res) => {
 });
 
 // GET /admin/grant-glory-legends?key=SECRET[&amount=100] — gift Glory to EVERY wallet that owns a Legendary.
+// Credits a pending-ledger (not the live profile) so it survives the client's authoritative saves;
+// each player receives it on their next login/refresh.
 app.get("/admin/grant-glory-legends", async (req, res) => {
   if (!ADMIN_KEY || req.query?.key !== ADMIN_KEY) return res.status(403).json({ error: "forbidden" });
   const amount = Math.max(1, Number(req.query?.amount) || 100);
-  try { const holders = await store.grantGloryToLegends(amount); res.json({ ok: true, grantedEach: amount, legendaryHolders: holders }); }
-  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  try {
+    const wallets = await store.legendHolderWallets();
+    for (const w of wallets) gloryCredits.set(w, (gloryCredits.get(w) || 0) + amount);
+    await saveGloryCredits();
+    res.json({ ok: true, grantedEach: amount, legendaryHolders: wallets.length, applied: "on each player's next login/refresh" });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
 /* ----------------------------- chat API ----------------------------- */
