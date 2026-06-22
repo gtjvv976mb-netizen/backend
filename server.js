@@ -536,7 +536,7 @@ const cupPrizes = new Map();         // wallet -> owed SOL (DURABLE — these ar
 const cupPayers = new Map();         // wallet -> Glory paid in entry fees (DURABLE log, so we can refund on a reset)
 const gloryCredits = new Map();      // wallet -> pending Glory to ADD on the player's next login/refresh.
                                      // Lives OUTSIDE the profile so client saves can't clobber it (Glory is client-authoritative).
-let cupTotalAwarded = 0;             // DURABLE cumulative SOL ever awarded as Chikoria Cup prizes (across all cups)
+let cupTotalAwarded = Number(process.env.CUP_AWARDED_SEED || 8);   // DURABLE cumulative SOL ever rewarded as Cup prizes; seeded with the 2 cups already run (4 SOL each). New cups add to it.
 async function saveCupAwarded() { try { await store.kvSet("cup_total_awarded", cupTotalAwarded); } catch (e) {} }
 async function loadCupState() {
   try { const p = await store.kvGet("cup_prizes"); if (p && typeof p === "object") for (const k in p) { const v = Number(p[k]) || 0; if (v > 0) cupPrizes.set(k, v); } } catch (e) {}
