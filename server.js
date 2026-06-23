@@ -563,6 +563,8 @@ function memeSupply() {
   for (const c of MEME_CHARS) { const m = memeMinted[c.key] || 0, left = Math.max(0, MEME_CAP - m); chars[c.key] = { name: c.name, minted: m, cap: MEME_CAP, left }; totalLeft += left; }
   return { chars, totalLeft, cap: MEME_CAP };
 }
+// A player may hold only ONE Meme Legendary that isn't up for sale. To get another, list (sell) the current one first.
+function memeOwnedActive(wallet) { return memeHatches.filter(h => h.wallet === wallet && !h.listed).length; }
 function pickMeme() {
   const avail = MEME_CHARS.filter(c => (memeMinted[c.key] || 0) < MEME_CAP);
   if (!avail.length) return null;
@@ -1373,6 +1375,7 @@ app.post("/meme/hatch", async (req, res) => {
   if (!isPubkey(wallet)) return res.status(400).json({ error: "valid wallet required" });
   const now = Date.now(), last = _memeLastHatch.get(wallet) || 0;
   if (now - last < 4000) return res.status(429).json({ error: "slow down — one egg at a time" });
+  if (memeOwnedActive(wallet) >= 1) return res.status(409).json({ error: "You already own a Meme Legendary — list it in the Bazaar (put it up for sale) before hatching another." });
   const c = pickMeme();
   if (!c) return res.status(409).json({ error: "sold out — every Meme Dynasty edition has hatched" });
   _memeLastHatch.set(wallet, now);
@@ -1386,7 +1389,7 @@ app.get("/meme/mine", (req, res) => {
   const wallet = req.query && req.query.wallet;
   if (!isPubkey(wallet)) return res.status(400).json({ error: "wallet required" });
   const items = memeHatches.filter(h => h.wallet === wallet)
-    .map(h => ({ id: h.id, char: h.char, name: h.name, edition: h.edition, status: h.status, mintAddr: h.mintAddr, ts: h.ts }))
+    .map(h => ({ id: h.id, char: h.char, name: h.name, edition: h.edition, status: h.status, mintAddr: h.mintAddr, ts: h.ts, listed: h.listed || null }))
     .sort((a, b) => b.ts - a.ts);
   res.json({ items, supply: memeSupply() });
 });
@@ -1404,6 +1407,46 @@ app.post("/meme/minted", async (req, res) => {
   if (!h) return res.status(404).json({ error: "hatch not found" });
   h.status = "minted"; h.mintAddr = mintAddr || null; await saveMeme();
   res.json({ ok: true });
+});
+
+// ----- Mystic Market NFT Bazaar (devnet) — list / unlist / browse / buy a Meme Dynasty NFT -----
+// (Off-chain ownership ledger for the devnet demo. Mainnet should use Metaplex Auction House / Tensor for
+//  escrowless on-chain trades + royalties — never a custom escrow.)
+app.post("/meme/list", async (req, res) => {
+  const { wallet, hatchId, price } = req.body || {};
+  if (!isPubkey(wallet)) return res.status(400).json({ error: "wallet required" });
+  const h = memeHatches.find(x => x.id === hatchId);
+  if (!h) return res.status(404).json({ error: "NFT not found" });
+  if (h.wallet !== wallet) return res.status(403).json({ error: "not your NFT" });
+  const p = Number(price); if (!(p > 0)) return res.status(400).json({ error: "price must be greater than 0" });
+  h.listed = { price: +p.toFixed(4), ts: Date.now() }; await saveMeme();
+  res.json({ ok: true });
+});
+app.post("/meme/unlist", async (req, res) => {
+  const { wallet, hatchId } = req.body || {};
+  const h = memeHatches.find(x => x.id === hatchId);
+  if (!h || h.wallet !== wallet) return res.status(403).json({ error: "not your NFT" });
+  h.listed = null; await saveMeme();
+  res.json({ ok: true });
+});
+app.get("/meme/market", (req, res) => {
+  const items = memeHatches.filter(h => h.listed)
+    .map(h => ({ id: h.id, char: h.char, name: h.name, edition: h.edition, price: h.listed.price, seller: h.wallet, mintAddr: h.mintAddr, status: h.status, listedAt: h.listed.ts }))
+    .sort((a, b) => a.price - b.price);
+  res.json({ items, supply: memeSupply() });
+});
+// Buy a listed NFT — transfers in-game ownership + records the sale. (Payment settled client-side for the devnet demo.)
+app.post("/meme/buy", async (req, res) => {
+  const { wallet, hatchId } = req.body || {};
+  if (!isPubkey(wallet)) return res.status(400).json({ error: "wallet required" });
+  const h = memeHatches.find(x => x.id === hatchId);
+  if (!h || !h.listed) return res.status(409).json({ error: "this NFT is no longer for sale" });
+  if (h.wallet === wallet) return res.status(400).json({ error: "you can't buy your own listing" });
+  if (memeOwnedActive(wallet) >= 1) return res.status(409).json({ error: "You already own a Meme Legendary — list yours for sale before buying another." });
+  const price = h.listed.price, seller = h.wallet;
+  h.wallet = wallet; h.listed = null; h.lastSale = { price, from: seller, to: wallet, ts: Date.now() };
+  await saveMeme();
+  res.json({ ok: true, price, seller, char: h.char, name: h.name, edition: h.edition });
 });
 
 // Admin: AUDIT the owed-prize ledger (read-only) — who is still owed Cup SOL, and how much.
