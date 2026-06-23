@@ -835,9 +835,13 @@ if(location.search.indexOf("embed")>-1){
 .aiTriNote{text-align:center;font-size:12.5px;color:#cfe0ff;margin:0 0 14px;line-height:1.5}
 .aiEnter{font-family:inherit;font-weight:800;font-size:16px;width:100%;padding:12px;margin-top:8px;border:2px solid #b98a2e;border-radius:12px;background:linear-gradient(180deg,#ffd93d,#e0a800);color:#3a2a00;cursor:pointer;box-shadow:0 4px 0 #a87c00}
 .aiEnter:active{transform:translateY(2px);box-shadow:0 2px 0 #a87c00}
-/* ===================== CHIKISEUM — windowed pop-up (centered card over a dim backdrop) ===================== */
-#arenaOverlay{position:fixed!important;inset:0!important;left:0!important;right:0!important;width:100vw!important;max-width:none!important;height:100vh!important;z-index:1500;align-items:center!important;justify-content:center!important;padding:16px!important;background:rgba(5,8,15,.72)!important;-webkit-backdrop-filter:blur(5px);backdrop-filter:blur(5px);pointer-events:auto!important}
-#arenaBox{width:min(96vw,1000px)!important;max-width:96vw!important;height:min(95vh,820px)!important;max-height:95vh!important;border-radius:18px!important;border:1px solid rgba(120,150,210,.3)!important;box-shadow:0 26px 70px rgba(0,0,0,.62)!important}
+/* ===================== CHIKISEUM — hub is a windowed pop-up, BATTLES are full screen ===================== */
+#arenaOverlay{position:fixed!important;inset:0!important;left:0!important;right:0!important;width:100vw!important;max-width:none!important;height:100vh!important;z-index:1500;align-items:center!important;justify-content:center!important;background:rgba(5,8,15,.72)!important;-webkit-backdrop-filter:blur(5px);backdrop-filter:blur(5px);pointer-events:auto!important}
+/* HUB (introMode) = centered windowed card over the dim backdrop */
+#arenaBox.introMode{width:min(96vw,1000px)!important;max-width:96vw!important;height:min(95vh,820px)!important;max-height:95vh!important;border-radius:18px!important;border:1px solid rgba(120,150,210,.3)!important;box-shadow:0 26px 70px rgba(0,0,0,.62)!important;margin:16px!important}
+/* BATTLE (no introMode) = full screen */
+#arenaBox:not(.introMode){width:100vw!important;max-width:100vw!important;height:100vh!important;max-height:100vh!important;border-radius:0!important;border:none!important;box-shadow:none!important;margin:0!important}
+#arenaOverlay:has(#arenaBox:not(.introMode)){background:#05080f!important;-webkit-backdrop-filter:none;backdrop-filter:none}
 #upgPanel{z-index:200!important}   /* card verify/upgrade panel must sit above the reskinned arena UI */
 #upgPanel .upgBox{box-shadow:0 24px 60px rgba(0,0,0,.7)}
 #arenaBox.introMode>#arenaZoom{display:block!important}   /* allow the card zoom preview inside the hub */
@@ -908,11 +912,11 @@ if(location.search.indexOf("embed")>-1){
 #arenaBox::after{content:"";position:absolute;inset:0;background:rgba(5,8,15,.30);pointer-events:none;z-index:0}
 #arenaBox.introMode{background:radial-gradient(120% 80% at 50% 0%,#243a63,#0d1426 75%);overflow-y:auto}
 #arenaBox.introMode #arenaIntro{position:relative;z-index:2;max-width:780px;margin:46px auto 24px;padding:0 16px 24px}
-#arenaHead{position:absolute;top:10px;right:14px;left:auto;z-index:46;background:none;border:none;padding:0;margin:0;font-size:0;width:auto;display:flex;gap:10px;align-items:center}
-#arenaBox.introMode #arenaHead{position:absolute}
+#arenaHead{position:absolute;bottom:16px;right:14px;top:auto;left:auto;z-index:46;background:none;border:none;padding:0;margin:0;font-size:0;width:auto;display:flex;flex-direction:column;gap:9px;align-items:flex-end}
+#arenaBox.introMode #arenaHead{position:absolute;top:12px;right:14px;bottom:auto;left:auto}   /* HUB: Exit Chikiseum sits top-right (battles keep it bottom-right) */
 #arenaHead .x{font-size:22px;color:#ffd9d9;cursor:pointer}#arenaInfo{font-size:18px}
 /* banner */
-#arenaBanner{position:absolute;top:8px;left:50%;transform:translateX(-50%);width:min(30vw,330px);height:auto;z-index:6;filter:drop-shadow(0 4px 10px rgba(0,0,0,.6));pointer-events:none}
+#arenaBanner{display:none!important}   /* logo removed from the battle stage to free up space */
 #arenaBox.introMode #arenaBanner{display:none}
 /* energy bar art + pips */
 #aEnergyBox{position:absolute;top:14px;left:16px;width:240px;height:84px;background:url("ui/energybar.png") center/contain no-repeat;z-index:7}
@@ -926,7 +930,17 @@ if(location.search.indexOf("embed")>-1){
 #aTimerBox.on{display:block}
 #aTimerBox .tv{position:absolute;left:60%;top:49%;transform:translate(-50%,-50%);font-weight:800;font-size:22px;color:#ffe9b0;letter-spacing:1px;text-shadow:0 1px 3px #000,0 0 9px rgba(255,200,80,.55);white-space:nowrap}
 #aTimerBox.low .tv{color:#ff8a8a}
-.aMatch2{position:absolute;top:108px;left:50%;transform:translateX(-50%);z-index:6;font-size:12px;font-weight:700;color:#eaf2ff;background:rgba(10,14,30,.7);border:1px solid #2c4470;border-radius:16px;padding:4px 14px;white-space:nowrap}
+.aMatch2{display:none}   /* matchup/element now lives in the top-center info panel */
+#pvpLobby{background:rgba(8,14,28,.78);border:1px solid #2c4470;border-radius:13px;padding:11px 13px;margin:0 0 13px}
+#pvpLobby .lobHd{font-weight:800;font-size:14px;color:#cfe0ff;margin-bottom:7px;display:flex;align-items:center;gap:7px}
+#pvpLobby .lobN{background:#1f7bd6;color:#fff;font-size:11px;border-radius:999px;padding:1px 8px}
+#pvpLobby .lobRow{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 0;border-top:1px solid #1c2c48;font-size:13px;color:#e7eefb;font-weight:700}
+#pvpLobby .lobRow.chal{color:#ffd166}
+#pvpLobby .lobEmpty{font-size:12.5px;color:#8fa6c9;line-height:1.5;padding:4px 0}
+#pvpLobby .lobBtn{font-family:inherit;font-weight:800;font-size:12px;padding:7px 12px;border:none;border-radius:9px;cursor:pointer;background:linear-gradient(180deg,#5aa9ff,#1f7bd6);color:#fff}
+#pvpLobby .lobBtn.acc{background:linear-gradient(180deg,#5fe08a,#28a55a)}
+#pvpLobby .lobBtn.dec{background:rgba(40,20,20,.8);color:#ff9a9a;padding:7px 10px}
+#pvpLobby .lobBtn.sent,#pvpLobby .lobBtn:disabled{background:#2c4470;color:#9fb3d6;cursor:default}
 /* stage + fighters */
 #arenaStage{position:absolute;inset:0;width:100%;height:100%;aspect-ratio:auto;background:none;border-radius:0;margin:0;box-shadow:none;z-index:1}
 .aFighter{position:absolute;bottom:30%;width:auto;gap:6px}
@@ -980,14 +994,16 @@ if(location.search.indexOf("embed")>-1){
 }
 </style>
 <div id="arenaOverlay"><div id="arenaBox">
-  <div id="arenaHead">⚔️ The Chikiseum <button id="arenaExitBattle" class="aHeadBtn danger" title="Leave this battle — back to the hub">🚪 Exit Battle</button> <span id="arenaInfo" title="Chikiseum guide">ℹ️</span> <button id="arenaClose" class="aHeadBtn" title="Leave the Chikiseum">✕ Exit Chikiseum</button></div>
+  <div id="arenaHead"><button id="arenaExitBattle" class="aHeadBtn danger" title="Leave this battle — back to the hub">🚪 Exit Battle</button> <button id="arenaClose" class="aHeadBtn" title="Leave the Chikiseum">✕ Exit Chikiseum</button></div>
   <img id="arenaBanner" src="ui/chikiseum-banner.png" alt="Chikiseum">
   <div id="arenaZoom"></div>
   <div id="arenaIntro">
     <div id="hubChampBanner" style="display:none"></div>
+    <div id="pvpLobby" style="display:none"></div>
     <div class="aiTabs">
       <button class="aiTab on" data-ai="cards">🃏 My Deck</button>
       <button class="aiTab" data-ai="mech">⚔️ How to Battle</button>
+      <button class="aiTab" data-ai="cup">🏆 Chikoria Cup</button>
       <button class="aiTab" data-ai="tok">✨ Rewards</button>
       <button class="aiTab" data-ai="welcome">📖 Guide</button>
     </div>
@@ -1017,6 +1033,17 @@ if(location.search.indexOf("embed")>-1){
       <div class="aiBlock glory"><h4>✨ Spend Glory</h4>Mint new skill cards from <b>150 ✨</b> (cost rises as your deck grows). Master cards: Tier 3→4 <b>120 ✨</b> · Tier 4→5 <b>300 ✨</b>.</div>
       <div class="aiBlock"><h4>🪙 $CHIKI costs</h4>Mint a card <b>25,000 $CHIKI</b> · Tier 4→5 mastery <b>50,000 $CHIKI</b> · feeding restores stamina. Every spend: <b>1% burned</b> · 49.5% reward pool · 49.5% team.</div>
       <div class="aiBlock"><h4>🔮 Mystic Market</h4>Hatch Legendary Eggs and acquire skill cards at Mithra's Mystic Market.</div>
+    </div>
+    <div class="aiPane" data-aip="cup">
+      <h3>🏆 The Chikoria Cup</h3>
+      <p>Chikoria's grand tournament. Legendaries clash in <b>live PvP</b> for real <b>SOL</b> — and the winner is crowned <b>Champion</b>, taking home the legendary <b>Chikoria Cup trophy</b>. 🌊</p>
+      <div style="text-align:center;margin:4px 0 12px"><img src="chikoriacup_art.png" alt="Chikoria Cup Trophy" style="width:150px;height:auto;filter:drop-shadow(0 8px 18px rgba(0,0,0,.55))"></div>
+      <div class="aiBlock"><h4>🥇 The Trophy</h4>The Champion is awarded the <b>Chikoria Cup</b> in full 3D. It <b>floats and spins above their Legendary</b> for the whole world to see, and shines in their <b>profile</b>. Only the <b>reigning champion</b> holds it — win the next Cup to take it.</div>
+      <div class="aiBlock"><h4>🗺️ Format</h4><b>Double-elimination</b> bracket of <b>8, 10, or 16</b> Legendaries. Lose twice and you're out — one loss still leaves a path through the lower bracket.</div>
+      <div class="aiBlock"><h4>🎟️ Entry</h4><b>100 ✨ Glory</b> to register. Open the <b>🏆 Chikoria Cup</b> button (upper-right) when a Cup is live to claim your seat.</div>
+      <div class="aiBlock"><h4>⚔️ Battles</h4>Every match is a <b>live PvP duel fought right here in the Chikiseum</b> — same deck, energy, and element triangle. No auto-resolve: outplay your opponent to advance.</div>
+      <div class="aiBlock glory"><h4>💰 Prizes</h4>Pool of <b>4 SOL</b> split across the top placements, with <b>1 SOL to the Champion</b>. Prizes land in your <b>Chiki Pouch</b> to claim. 🌊</div>
+      <p style="text-align:center;color:#9fb3d6;font-size:12.5px">Crystals up, Trainers. The next Cup awaits. 👑</p>
     </div>
     <div class="aiPane on" data-aip="cards">
       <div id="hubLeg3D"><div id="hub3d"><div class="ld">Loading 3D…</div></div><div id="hubLegStats"></div></div>
@@ -1452,8 +1479,15 @@ const SPECIES=[
   {names:["Tyrannos","Tyrannos","Tyrannos"],type:"Legendary",body:"#5b7a3a",accent:"#c4d97a",mane:"shadow",maneCols:["#5b7a3a","#3d4f28","#c4d97a"],aura:"green"},   /* Tyrannos — apex predator, green aura */
   {names:["Grovador","Grovador","Grovador"],type:"Legendary",body:"#2e8b57",accent:"#9be38f",mane:"shadow",maneCols:["#2e8b57","#1f5e3a","#9be38f"],aura:"purple"},   /* Grovador — grove guardian, purple aura */
   {names:["Dragonos","Dragonos","Dragonos"],type:"Legendary",body:"#c0392b",accent:"#ff9f43",mane:"shadow",maneCols:["#c0392b","#7a1f12","#ff9f43"],aura:"red"},   /* Dragonos — fire dragon, red aura */
+  /* ===== Meme Dynasty legendaries (idx 15–20) — same battle mechanics, obtained from Meme Legendary Eggs ===== */
+  {names:["Popcat","Popcat","Popcat"],type:"Legendary",body:"#c98b5e",accent:"#ffffff",mane:"shadow",maneCols:["#c98b5e","#7a4a2a","#ffffff"],aura:"purple"},
+  {names:["Moo Deng","Moo Deng","Moo Deng"],type:"Legendary",body:"#8a8f99",accent:"#c9b3e0",mane:"shadow",maneCols:["#8a8f99","#5a5f69","#c9b3e0"],aura:"blue"},
+  {names:["Doge","Doge","Doge"],type:"Legendary",body:"#d9a441",accent:"#fff3b0",mane:"shadow",maneCols:["#d9a441","#a97b25","#fff3b0"],aura:"green"},
+  {names:["Pepe","Pepe","Pepe"],type:"Legendary",body:"#5fa830",accent:"#d7f59a",mane:"shadow",maneCols:["#5fa830","#3a6b1d","#d7f59a"],aura:"gold"},
+  {names:["Chill Guy","Chill Guy","Chill Guy"],type:"Legendary",body:"#b98a5e",accent:"#9fb0d8",mane:"shadow",maneCols:["#b98a5e","#7a553a","#9fb0d8"],aura:"red"},
+  {names:["Alon","Alon","Alon"],type:"Legendary",body:"#caa54a",accent:"#222222",mane:"shadow",maneCols:["#caa54a","#8a6f2a","#f0e2b8"],aura:"purple"},
 ];
-const DEX_IMG=["mushrow","electrox","jellox","firix","owzard","forestle","drolax","healix","solarix","scorplex","galador","adalor","tyrannos","grovador","dragonos"];  /* species idx -> chikidex png */
+const DEX_IMG=["mushrow","electrox","jellox","firix","owzard","forestle","drolax","healix","solarix","scorplex","galador","adalor","tyrannos","grovador","dragonos","popcat","moodeng","doge","pepe","chillguy","alon"];  /* species idx -> chikidex png */
 /* shared Chi-skill names per species (emoji,name) + descriptions — used by the Arena and Ancient-Egg hatch */
 const CHI_DESC=["Reliable hit","Big hit · blocked by Guard","Ignores Guard","Block 60% + reflect","Next hit +70%","Heal 60% of dmg","Huge hit · 7 recoil"];
 const CHI_PN=[
@@ -1471,9 +1505,18 @@ const CHI_PN=[
  [["✨","Holy Smite"],["♨️","Intense Heat"],["🌟","Blinding Light"],["🛡️","Radiant Shield"],["☀️","Solar Charge"],["💖","Divine Heal"],["💥","Sunburst"],["☀️","Searing Ray"],["✨","Flash Bang"],["🌟","Ascension"],["🌑","Eclipse Veil"],["🛡️","Aegis of Dawn"]],
  [["🦷","Bite"],["🦶","Trample"],["💨","Tail Whip"],["😱","Fear"],["🗣️","Savage Roar"],["🩸","Devour"],["💥","Apex Crush"],["🐾","Claw Rake"],["🦶","Ground Stomp"],["🩸","Bloodlust"],["😱","Terrify"],["🛡️","Thick Hide"]],
  [["🌑","Ambush"],["⚡","Roar of Thunder"],["🐺","Pack Attack"],["🛡️","Howl"],["🔋","Storm Surge"],["🩸","Thunder Fang"],["🌩️","Thunderstorm"],["⚡","Lightning Rend"],["🔌","Static Shock"],["🌩️","Gathering Storm"],["🌑","Gloom"],["🛡️","Stormwall"]],
- [["🔥","Fire Whip"],["🐉","Breath of Fire"],["💨","Fire Dash"],["🛡️","Scale Guard"],["🔥","Blaze Charge"],["🔥","Ember Drain"],["💥","Inferno"],["🔥","Searing Claw"],["⚡","Spark Lash"],["♨️","Overheat"],["🌑","Smolder"],["🛡️","Magma Shell"]]
+ [["🔥","Fire Whip"],["🐉","Breath of Fire"],["💨","Fire Dash"],["🛡️","Scale Guard"],["🔥","Blaze Charge"],["🔥","Ember Drain"],["💥","Inferno"],["🔥","Searing Claw"],["⚡","Spark Lash"],["♨️","Overheat"],["🌑","Smolder"],["🛡️","Magma Shell"]],
+ /* 15 Popcat (Storm) */   [["⚡","Click Strike"],["💥","Pop Blast"],["🐾","Quick Paws"],["🛡️","Lid Guard"],["🔋","Charge Up"],["💧","Meme Drain"],["🌟","Mega Pop"],["⚡","Static Claw"],["🔌","Jolt"],["📣","Hype Roar"],["😾","Hiss"],["🛡️","Popwall"]],
+ /* 16 Moo Deng (Water) */ [["💧","Splash"],["🌊","Tidal Bonk"],["💨","Bouncy Dash"],["🛡️","Mud Guard"],["🔋","Soak Up"],["💦","Hydro Drain"],["🌊","Tsunami Bonk"],["🦛","Chomp"],["⚡","Splash Jolt"],["📣","Cute Roar"],["🌀","Whirl"],["🛡️","Hide Shell"]],
+ /* 17 Doge (Beast) */     [["🐕","Wow Bite"],["💥","Much Blast"],["💨","Such Speed"],["🛡️","Doge Guard"],["🔋","Very Charge"],["🩸","Bork Drain"],["🌟","Amaze Nova"],["🦴","Bone Rend"],["⚡","Zoomies"],["📣","Loud Bork"],["😤","Grr"],["🛡️","Shibe Wall"]],
+ /* 18 Pepe (Light) */     [["✨","Feels Smite"],["🔆","Rare Beam"],["💨","Sad Hop"],["🛡️","Smug Guard"],["☀️","Hope Charge"],["💚","Copium Drain"],["💥","Rare Burst"],["🐸","Tongue Lash"],["⚡","Kek Jolt"],["📣","Ribbit Roar"],["😢","Despair"],["🛡️","Feelswall"]],
+ /* 19 Chill Guy (Fire) */ [["🔥","Chill Jab"],["☄️","Hot Take"],["💨","Casual Dash"],["🛡️","Hoodie Guard"],["♨️","Warm Up"],["🔥","Vibe Drain"],["💥","Unbothered Blast"],["😎","Cool Strike"],["⚡","Spark"],["📣","Whatever Roar"],["🥶","Cold Shoulder"],["🛡️","Chillwall"]],
+ /* 20 Alon (Storm) */     [["⚡","Cap Snap"],["💥","Rich Blast"],["💨","Hustle Dash"],["🛡️","Cap Guard"],["🔋","Grind Charge"],["💸","Wealth Drain"],["🌩️","Tendie Storm"],["🧢","Cap Bonk"],["🔌","Static"],["📣","Flex Roar"],["😤","Poor Shame"],["🛡️","Cashwall"]]
 ];
 const LEGEND_IDXS=SPECIES.map((s,i)=>s.type==="Legendary"?i:-1).filter(i=>i>=0);   /* legendary species indices */
+const MEME_IDXS=[15,16,17,18,19,20];                                                /* Meme Dynasty legendaries — full battle mechanics, but obtained ONLY from Meme Legendary Eggs */
+const MEME_KEY_SP={popcat:15,moodeng:16,doge:17,pepe:18,chillguy:19,alon:20};
+const CORE_LEGEND_IDXS=LEGEND_IDXS.filter(i=>MEME_IDXS.indexOf(i)<0);               /* the 5 original legendaries — used for random/free grants */
 const LEGEND_SCALE=1.0;                                                            /* legendaries are the SAME size as normal Chikis */
 const LEGEND_SCALE_ADJ={13:0.82};                                                 /* Grovador's model is long — trim it so no Chiki towers over the rest */
 const legendScale=spIdx=>LEGEND_IDXS.indexOf(spIdx)>=0?LEGEND_SCALE*(LEGEND_SCALE_ADJ[spIdx]||1):1;
@@ -1633,7 +1676,7 @@ function hatchEgg(noLegend){   /* noLegend=true → guaranteed normal (no legend
     }
     function hatch(){ if(hatched)return; hatched=true;
       const legend=!noLegend && lucky.indexOf(taps)>-1;
-      const sp=legend?LEGEND_IDXS[ri(0,LEGEND_IDXS.length-1)]:NONLEGEND_IDXS[ri(0,NONLEGEND_IDXS.length-1)];
+      const sp=legend?CORE_LEGEND_IDXS[ri(0,CORE_LEGEND_IDXS.length-1)]:NONLEGEND_IDXS[ri(0,NONLEGEND_IDXS.length-1)];
       egg.classList.add("pop");btn.style.display="none";hint.textContent="";tapsEl.style.display="none";mw.style.display="none";
       if(window.playSfx)window.playSfx("reward");
       setTimeout(()=>{                                   /* transition: egg → the actual Chiki */
@@ -2987,7 +3030,7 @@ setInterval(updateWhaleTab,1000);
   const g=id=>document.getElementById(id);
   /* ===== DRAWN-HAND battle (Axie-style): energy · draw a hand · Attack vs Shield · combos · crits · Last Stand. 1 Legendary each. ===== */
   const KIND=["atk","atk","atk","shi","util","atk","atk","atk","atk","util","atk","shi"];   /* +Rend/Jolt/Wither=atk, Rally=util, Bulwark=shi */
-  const LEG_ELEM={10:"Water",11:"Light",12:"Beast",13:"Storm",14:"Fire"};
+  const LEG_ELEM={10:"Water",11:"Light",12:"Beast",13:"Storm",14:"Fire",15:"Storm",16:"Water",17:"Beast",18:"Light",19:"Fire",20:"Storm"};
   const ELEM_NEXT={Water:"Fire",Fire:"Beast",Beast:"Storm",Storm:"Light",Light:"Water"};   /* triangle: Water→Fire→Beast→Storm→Light→(Water); each beats the next */
   const legElem=si=>LEG_ELEM[si]||"Chi";
   const elemMult=(a,b)=>ELEM_NEXT[a]===b?1.5:ELEM_NEXT[b]===a?0.7:1;
@@ -3002,18 +3045,20 @@ setInterval(updateWhaleTab,1000);
     return {c,si,name:(typeof nameOf==="function"?nameOf(c):c.sp.names[0]),img:"chikidex/"+(DEX_IMG[si]||"mushrow")+".png",
       st,hp:st.hp,maxhp:st.hp,shield:0,energy:0,buff:1,draw:deck,hand:[],disc:[],ls:0,started:false,isYou,playedThisTurn:0};
   }
-  function aiFoe(br){const sp=SPECIES[LEGEND_IDXS[ri(0,LEGEND_IDXS.length-1)]];const c={sp,isLegend:true,br:Math.max(1,br+ri(-2,2))};c.arenaSkills=roll3();ensureBattle(c);const tier=Math.min(5,1+Math.floor(c.br/6));c.arenaSkills.forEach(s=>c.cardTier[s]=tier);return c;}
+  function aiFoe(br){const sp=SPECIES[CORE_LEGEND_IDXS[ri(0,CORE_LEGEND_IDXS.length-1)]];const c={sp,isLegend:true,br:Math.max(1,br+ri(-2,2))};c.arenaSkills=roll3();ensureBattle(c);const tier=Math.min(5,1+Math.floor(c.br/6));c.arenaSkills.forEach(s=>c.cardTier[s]=tier);return c;}
   let B=null;
   function log(h){g("arenaLog").innerHTML=h;}
-  function sideHTML(side,who,label){
+  function sideHTML(side,who,playerName){
     const pct=Math.max(0,side.hp/side.maxhp*100);
     const ls=side.ls>0?` · <span style="color:#ff7a7a">🛡LS ${side.ls}</span>`:"";
+    const chiki=side.name||(side.c&&typeof nameOf==="function"?nameOf(side.c):"Chiki");
+    const sub=(playerName?("👤 "+playerName+" · "):"")+"BR "+(side.c.br||1);
     return `<div class="aPlate">
-        <div class="aNm" style="color:${who==='foe'?'#ffd93d':'#7fd0ff'}">${label} <small>${legElem(side.si)} · BR ${side.c.br||1}</small></div>
+        <div class="aNm" style="color:${who==='foe'?'#ffd93d':'#7fd0ff'}">${chiki} <small>${sub}</small></div>
         <div class="aHPbar"><div class="aHP ${who==='foe'?'foe':''}" style="width:${pct}%"></div><span class="aHPtxt">${Math.max(0,Math.round(side.hp))}/${side.maxhp}</span></div>
         <div class="aBadges"><span style="color:#62b9ff">🛡${side.shield}</span> &nbsp; <span style="color:#ffd93d">⚡${side.energy}</span>${ls}</div>
       </div>
-      <img src="${side.img}" alt="${side.name}">
+      <img src="${side.img}" alt="${chiki}">
       <div class="aShadow"></div>`;
   }
   const LEFT_FACERS=new Set([10]);   /* Galador's art faces LEFT; everyone else faces RIGHT */
@@ -3021,7 +3066,7 @@ setInterval(updateWhaleTab,1000);
     const yEl=g("aFyou"),fEl=g("aFfoe"); if(!yEl||!fEl)return;
     if(!B){yEl.innerHTML="";fEl.innerHTML="";return;}
     yEl.innerHTML=sideHTML(B.you,"you",(player&&player.handle)?player.handle:"You");
-    fEl.innerHTML=sideHTML(B.foe,"foe","🤖 Rival");
+    fEl.innerHTML=sideHTML(B.foe,"foe", B.foe.handle||(B.pvp?"Opponent":null));
     /* you must face RIGHT, foe must face LEFT — flip per the sprite's natural direction */
     yEl.style.setProperty("--face", LEFT_FACERS.has(B.you.si)? -1 : 1);
     fEl.style.setProperty("--face", LEFT_FACERS.has(B.foe.si)? 1 : -1);
@@ -3058,7 +3103,7 @@ setInterval(updateWhaleTab,1000);
   }
   /* ---- hub 3D legendary viewer (HD .glb) ---- */
   let _h3dR,_h3dS,_h3dC,_h3dM,_h3dRAF,_h3dSi=null;
-  const LEG_GLB=["galador","adalor","tyrannos","grovador","dragonos"];
+  const LEG_GLB=["galador","adalor","tyrannos","grovador","dragonos","popcat_build","moodeng_build","doge_build","pepe_build","chillguy_build","alon_build"];   /* idx 5–10 = Meme Dynasty voxel builds */
   function initHub3D(si){
     const host=g("hub3d"); if(!host||typeof THREE==="undefined"||typeof THREE.GLTFLoader==="undefined")return;
     const sz=()=>[host.clientWidth||260, host.clientHeight||260];
@@ -3082,8 +3127,11 @@ setInterval(updateWhaleTab,1000);
       const onFail=()=>{ const l=host.querySelector(".ld"); if(l){ l.textContent=""; l.style.background="url('chikidex/"+spriteName+".png') center/contain no-repeat"; l.style.display="flex"; } };   /* fall back to the 2D portrait so something always shows */
       const loader=new THREE.GLTFLoader();
       try{ if(THREE.DRACOLoader){ const dl=new THREE.DRACOLoader(); dl.setDecoderPath("https://www.gstatic.com/draco/v1/decoders/"); loader.setDRACOLoader(dl); } }catch(e){}
+      try{ if(window.MeshoptDecoder)loader.setMeshoptDecoder(window.MeshoptDecoder); }catch(e){}
       loader.load(LEG_GLB[si-10]+".glb?v="+(window.GLB_VER||"1"),gltf=>{
         const m=gltf.scene;
+        m.traverse(o=>{ if(!o.isMesh)return; const hasVC=o.geometry&&o.geometry.attributes&&o.geometry.attributes.color;   /* Meme voxel builds ship without normals → flat-shade so they aren't dark */
+          if(hasVC){ if(!o.geometry.attributes.normal){ try{ const ni=o.geometry.toNonIndexed(); ni.computeVertexNormals(); o.geometry=ni; }catch(e){} } o.material=new THREE.MeshLambertMaterial({vertexColors:true}); } });
         const box=new THREE.Box3().setFromObject(m),size=box.getSize(new THREE.Vector3()),ctr=box.getCenter(new THREE.Vector3());
         const md=Math.max(size.x,size.y,size.z)||1;
         m.position.sub(ctr);                                  /* center the model's geometry at origin */
@@ -3141,7 +3189,9 @@ setInterval(updateWhaleTab,1000);
         `<div id="aTimerBox" class="${showT?'on':''}${tl<=10?' low':''}"><div class="tv" id="aTimer">0:${tl<10?'0':''}${tl}</div></div>`+
         `<div class="aMatch2">${matchTxt}</div>`;
     }
-    if(B.turn!=="you"){ if(ac)ac.innerHTML="<div style='font-size:13px;color:#8fa6c9'>🤖 Rival is planning…</div>"; return; }
+    pvpTop();   /* keep the top-center info panel current (matchup + status) for AI & PvP */
+    if(B.turn!=="you"){ if(!B.pvp)pvpStatus("🤖 "+((B.foe&&B.foe.name)||"Opponent")+" is planning…","#8fa6c9"); if(ac)ac.innerHTML=""; return; }
+    if(!B.pvp)pvpStatus("🎯 Your move — plan up to 3 cards","#9fc4ff");
     B.you.hand.forEach((slot,idx)=>{const t=cardTier(B.you.c,slot),k=ARCHK[slot];
       const qpos=q.indexOf(idx), selected=qpos>-1;
       const canSelect=selected||(q.length<3&&remain>=CARD_COST[slot]&&!B._resolving);
@@ -3166,7 +3216,8 @@ setInterval(updateWhaleTab,1000);
     });
     if(ac){ac.innerHTML=""; if(!B._resolving){const et=document.createElement("button");et.className="aLockBtn";et.setAttribute("aria-label","Lock in");et.innerHTML=q.length?`<span class="lkN">${q.length}</span>`:"";et.onclick=()=>resolveTurn();ac.appendChild(et);}}
   }
-  function startBattle(){
+  function startBattle(skipIntro){
+    if(!skipIntro){ playBattleIntro(()=>startBattle(true)); return; }   /* play the battle intro first */
     clearTurnTimer();
     const legs=myLegends().map(ensureLegendSkills); if(!legs.length)return;
     const me=legs[0]; const foeC=aiFoe(me.br||1);
@@ -3247,7 +3298,7 @@ setInterval(updateWhaleTab,1000);
     else if(k==="jolt"){r=dealDamage(side,foe,TVAL.joltDmg[t],0);foe._joltNext=(foe._joltNext||0)+1;r+=` · ⚡drain`;}
     else if(k==="wither"){r=dealDamage(side,foe,TVAL.witherDmg[t],0);foe._weaken=Math.max(foe._weaken||0,TVAL.witherAmt[t]);r+=` · −${Math.round(TVAL.witherAmt[t]*100)}% next`;}
     else {r=dealDamage(side,foe,(k==="strike"?TVAL.strike[t]:TVAL.blast[t]),0);}
-    log(`${side.isYou?"You":"Rival"}: <b>${nm[0]} ${nm[1]}</b> ${r}`);
+    log(`${side.isYou?"You":((B.foe&&B.foe.name)||"Opponent")}: <b>${nm[0]} ${nm[1]}</b> ${r}`);
   }
   function flash(targetWho){const a=g(targetWho==="foe"?"aFfoe":"aFyou");if(a){a.classList.add("hit");setTimeout(()=>a.classList.remove("hit"),300);} const at=g(targetWho==="foe"?"aFyou":"aFfoe");if(at){at.classList.add("lunge");setTimeout(()=>at.classList.remove("lunge"),200);}}
   /* SELECTION: tap a card to add it to your turn plan (max 3, limited by energy); tap again to remove */
@@ -3276,7 +3327,7 @@ setInterval(updateWhaleTab,1000);
     const first=B.firstAttacker||"you", second=first==="you"?"foe":"you";
     const lists={you:yourSlots,foe:foeSlots}, seq=[], mx=Math.max(yourSlots.length,foeSlots.length);
     for(let i=0;i<mx;i++){ if(lists[first][i]!=null)seq.push([first,lists[first][i]]); if(lists[second][i]!=null)seq.push([second,lists[second][i]]); }
-    log(`⚔️ <b style="color:#ffd93d">${first==="you"?"You":"Rival"}</b> strike first this round!`);
+    log(`⚔️ <b style="color:#ffd93d">${first==="you"?"You":((B.foe&&B.foe.name)||"Opponent")}</b> strike first this round!`);
     render();
     let k=0;
     const step=()=>{
@@ -3291,6 +3342,7 @@ setInterval(updateWhaleTab,1000);
   function checkEnd(){ if(!B||B.over)return; if(B.foe.hp<=0&&B.foe.ls<=0)return end(true); if(B.you.hp<=0&&B.you.ls<=0)return end(false); }
   function end(win){
     B.over=true; clearTurnTimer(); B._resolving=false; g("arenaPowers").innerHTML=""; const keyEl=g("arenaKey"); if(keyEl)keyEl.innerHTML="";
+    const sp=g("pvpSeries"); if(sp)sp.style.display="none";   /* clear the top-center info panel when the battle ends */
     if(B.spectate){   /* Cup spectate: just show the outcome and hand control back to the Cup (no arena glory/stamina) */
       g("arenaResult").innerHTML = win ? "🏆 <span style='color:#3ddc84'>YOU WIN!</span>" : "💀 <span style='color:#ff6b6b'>You lost…</span>";
       log(win ? "🏆 You won this Cup match!" : "💀 You lost this Cup match.");
@@ -3319,7 +3371,12 @@ setInterval(updateWhaleTab,1000);
       log("💀 Defeated… you earned a little Battle EXP. Upgrade your cards &amp; try again!"); }
     renderArenaMeta();
     const again=document.createElement("button");again.className="aAgainBtn";again.setAttribute("aria-label","Battle again");again.onclick=findMatch;hideZoom();
-    g("arenaCenter").innerHTML=""; g("arenaCenter").appendChild(again);
+    const hub=document.createElement("button");
+    hub.textContent="🏛️ Chikiseum Hub";
+    hub.style.cssText="font-family:'Nunito',sans-serif;font-weight:800;font-size:14px;padding:11px 20px;border:none;border-radius:12px;background:linear-gradient(180deg,#7aa9ff,#3a6ad0);color:#fff;cursor:pointer;box-shadow:0 4px 0 #2a4a9a;margin-top:10px";
+    hub.onclick=()=>{ B=null; const ar=g("arenaResult"); if(ar)ar.innerHTML=""; const ac0=g("arenaCenter"); if(ac0)ac0.innerHTML=""; const sp2=g("pvpSeries"); if(sp2)sp2.style.display="none"; showArenaIntro(); if(typeof renderHubCards==="function")renderHubCards(); if(typeof renderArenaMeta==="function")renderArenaMeta(); };
+    const ac=g("arenaCenter"); ac.innerHTML="";
+    const wrap=document.createElement("div"); wrap.style.cssText="display:flex;flex-direction:column;align-items:center;gap:2px"; wrap.appendChild(again); wrap.appendChild(hub); ac.appendChild(wrap);
   }
   const myLegends=()=>(typeof myChikis==="function")?myChikis().filter(c=>c.isLegend):[];
   /* Cup spectate: watch YOUR Legendary auto-battle a Cup opponent (BR foeBr) in the real arena; calls onEnd(youWon). */
@@ -3379,29 +3436,81 @@ setInterval(updateWhaleTab,1000);
   }
   function pvpFoeSide(f){
     const si=ELEM_SI[f.element]!=null?ELEM_SI[f.element]:14;
-    return { c:{br:f.br||1, sp:SPECIES[si]}, si, name:f.name||"Rival", img:"chikidex/"+(DEX_IMG[si]||"mushrow")+".png",
+    return { c:{br:f.br||1, sp:SPECIES[si]}, si, name:f.name||"Opponent", handle:f.handle||null, img:"chikidex/"+(DEX_IMG[si]||"mushrow")+".png",
       st:{spd:42+(f.br||1)*2, mor:30, hp:f.maxhp, skill:30}, hp:f.hp, maxhp:f.maxhp, shield:f.shield||0, energy:0, buff:1, draw:[], hand:[], disc:[], ls:0, started:true, isYou:false, playedThisTurn:0 };
   }
   /* find a live opponent, then run the battle */
   function pvpMatchmake(c){
     if(!CHAIN.BACKEND||!player||!player.pk){ startBattle(); return; }                 /* no backend / guest → AI rival */
-    const snap={ name:nameOf(c), element:legElem(SPECIES.indexOf(c.sp)), br:c.br||1, arenaSkills:c.arenaSkills||[0,1,2], cardTier:c.cardTier||{} };
-    let cancelled=false; const ac=g("arenaCenter");
-    const stop=()=>{ cancelled=true; try{fetch(CHAIN.BACKEND+"/pvp/cancel",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({wallet:player.pk})});}catch(e){} };
+    const snap={ name:nameOf(c), handle:(player.handle||player.addr||"Trainer"), element:legElem(SPECIES.indexOf(c.sp)), br:c.br||1, arenaSkills:c.arenaSkills||[0,1,2], cardTier:c.cardTier||{} };
+    let cancelled=false; const ac=g("arenaCenter"); _pvpSearching=true;
+    const stop=()=>{ cancelled=true; _pvpSearching=false; try{fetch(CHAIN.BACKEND+"/pvp/cancel",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({wallet:player.pk})});}catch(e){} };
     ac.innerHTML=`<div style="font-size:14px;color:#cdd8ee">🔎 Searching for a live opponent…</div>
+      <div id="pvpOnline" style="font-size:12.5px;color:#3ddc84;font-weight:700;margin-top:4px">🟢 checking who's online…</div>
       <div style="margin-top:8px"><button class="aBtn" id="pvpCancel">Cancel</button> <button class="aBtn" id="pvpAi">⚔️ Battle a rival</button></div>`;
     const cb=g("pvpCancel"); if(cb)cb.onclick=()=>{ stop(); ac.innerHTML='<button class="aBtn" id="pvpRetry">⚔️ Find a Match</button>'; const rt=g("pvpRetry"); if(rt)rt.onclick=findMatch; };
     const ab=g("pvpAi"); if(ab)ab.onclick=()=>{ stop(); startBattle(); renderArenaMeta(); };
     const poll=async()=>{ if(cancelled)return;
-      try{ const r=await fetch(CHAIN.BACKEND+"/pvp/queue",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({wallet:player.pk,snap})});
-        const j=await r.json(); if(cancelled)return; if(j&&j.status==="matched"){ startPvp(j.matchId,j.side); return; } }catch(e){}
+      try{
+        let r=await fetch(CHAIN.BACKEND+"/pvp/available",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({wallet:player.pk,name:(player.handle||player.addr||"Trainer"),snap,searching:true})});
+        if(r.ok){ const j=await r.json(); if(cancelled)return;
+          if(j&&j.matched){ _pvpSearching=false; startPvp(j.matched.matchId,j.matched.side); return; }
+          const on=g("pvpOnline"); if(on){ const ps=(j&&j.players)||[]; const others=ps.length, searchers=ps.filter(p=>p.searching).length;
+            on.innerHTML=others?("🟢 <b>"+others+"</b> Trainer"+(others===1?"":"s")+" in the Chikiseum"+(searchers?" · <b>"+searchers+"</b> also searching ⚔️":" — challenge them or wait")):"🔎 Waiting for another Trainer to enter the Chikiseum…"; }
+        } else {   /* older backend without /pvp/available → fall back to the classic queue (always pairs two searchers) */
+          const r2=await fetch(CHAIN.BACKEND+"/pvp/queue",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({wallet:player.pk,snap})});
+          const j2=await r2.json(); if(cancelled)return; if(j2&&j2.status==="matched"){ _pvpSearching=false; startPvp(j2.matchId,j2.side); return; }
+          const on=g("pvpOnline"); if(on&&j2){ const e=j2.eligible|0,q=j2.queued|0; on.innerHTML="🟢 <b>"+e+"</b> eligible online"+(q>1?" · <b>"+q+"</b> searching ⚔️":" · waiting for an opponent…"); }
+        }
+      }catch(e){}
       if(!cancelled)setTimeout(poll,2000);
     };
     poll();
   }
-  function startPvp(matchId, side, fromCup){
+  /* ===== "Trainers ready to battle" lobby — see who's available & challenge them directly ===== */
+  let _lobbyChallenged={}, _pvpSearching=false;
+  function legendSnap(){ const ls=myLegends().map(ensureLegendSkills); if(!ls.length)return null; const c=ls[0]; return {name:nameOf(c),handle:(player.handle||player.addr||"Trainer"),element:legElem(SPECIES.indexOf(c.sp)),br:c.br||1,arenaSkills:c.arenaSkills||[0,1,2],cardTier:c.cardTier||{}}; }
+  function lobbyActive(){ const ov=g("arenaOverlay"),bx=g("arenaBox"); return !!(ov&&ov.style.display!=="none"&&bx&&bx.classList.contains("introMode")&&!B&&CHAIN.BACKEND&&player&&player.pk); }
+  async function pvpLobbyTick(){
+    const panel=g("pvpLobby");
+    if(!lobbyActive()){ if(panel)panel.style.display="none"; return; }
+    const snap=legendSnap(); if(!snap){ if(panel)panel.style.display="none"; return; }
+    const now=Date.now(); for(const k in _lobbyChallenged) if(now-_lobbyChallenged[k]>28000)delete _lobbyChallenged[k];
+    try{
+      const r=await fetch(CHAIN.BACKEND+"/pvp/available",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({wallet:player.pk,name:(player.handle||player.addr||"Trainer"),snap,searching:_pvpSearching})});
+      const j=await r.json(); if(!lobbyActive())return;
+      if(j&&j.matched){ startPvp(j.matched.matchId,j.matched.side); return; }   /* a challenge you sent was accepted */
+      pvpLobbyRender(j||{});
+    }catch(e){}
+  }
+  function pvpLobbyRender(j){
+    const panel=g("pvpLobby"); if(!panel)return; panel.style.display="block";
+    const players=j.players||[], chs=j.challenges||[];
+    let h='<div class="lobHd">⚔️ Trainers ready to battle <span class="lobN">'+players.length+'</span></div>';
+    if(chs.length)h+=chs.map(c=>'<div class="lobRow chal"><span>🔔 <b>'+esc(c.fromName)+'</b> challenges you!</span><span><button class="lobBtn acc" data-acc="'+c.id+'">Accept</button> <button class="lobBtn dec" data-dec="'+c.id+'">✕</button></span></div>').join("");
+    if(players.length)h+=players.map(p=>{ const sent=!!_lobbyChallenged[p.wallet]; return '<div class="lobRow"><span>'+(p.searching?"🔍":"🟢")+' '+esc(p.name)+(p.searching?' <small style="color:#ffd166;font-weight:700">searching</small>':'')+'</span><button class="lobBtn'+(sent?' sent':'')+'" data-ch="'+p.wallet+'" data-nm="'+esc(p.name)+'"'+(sent?' disabled':'')+'>'+(sent?'Challenged ✓':'⚔️ Challenge')+'</button></div>'; }).join("");
+    else if(!chs.length)h+='<div class="lobEmpty">No other Trainers ready right now. Keep the Chikiseum open — anyone who opens it appears here, and you\'ll match instantly. 🌊</div>';
+    panel.innerHTML=h;
+    panel.querySelectorAll("[data-ch]").forEach(b=>b.onclick=()=>pvpChallengeSend(b.getAttribute("data-ch"),b.getAttribute("data-nm")));
+    panel.querySelectorAll("[data-acc]").forEach(b=>b.onclick=()=>pvpChallengeAccept(b.getAttribute("data-acc")));
+    panel.querySelectorAll("[data-dec]").forEach(b=>b.onclick=()=>pvpChallengeDecline(b.getAttribute("data-dec")));
+  }
+  function pvpChallengeSend(to,nm){ const snap=legendSnap(); if(!snap||!player)return; _lobbyChallenged[to]=Date.now();
+    fetch(CHAIN.BACKEND+"/pvp/challenge",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({from:player.pk,fromName:(player.handle||player.addr||"Trainer"),to,snap})}).catch(()=>{});
+    if(typeof showBanner==="function")showBanner("⚔️ Challenge sent to "+nm+"! Waiting for them to accept…","info"); pvpLobbyTick();
+  }
+  function pvpChallengeAccept(id){ const snap=legendSnap(); if(!snap||!player)return;
+    fetch(CHAIN.BACKEND+"/pvp/challenge/accept",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({wallet:player.pk,challengeId:id,snap})})
+      .then(r=>r.json()).then(j=>{ if(j&&j.matchId)startPvp(j.matchId,j.side); else if(typeof showBanner==="function")showBanner("⚠️ "+((j&&j.error)||"challenge expired"),"error"); }).catch(()=>{});
+  }
+  function pvpChallengeDecline(id){ if(player)fetch(CHAIN.BACKEND+"/pvp/challenge/decline",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({wallet:player.pk,challengeId:id})}).catch(()=>{}); pvpLobbyTick(); }
+  setInterval(pvpLobbyTick, 4000);
+
+  function startPvp(matchId, side, fromCup, skipIntro){
+    if(!skipIntro){ playBattleIntro(()=>startPvp(matchId, side, fromCup, true)); return; }   /* play the battle intro first */
     clearTurnTimer(); const legs=myLegends().map(ensureLegendSkills); if(!legs.length)return;
-    B={ you:makeSide(legs[0],true), foe:null, over:false, turn:null, pvp:{matchId,side,fromCup:!!fromCup}, foeBr:1 };
+    B={ you:makeSide(legs[0],true), foe:null, over:false, turn:null, pvp:{matchId,side,fromCup:!!fromCup}, foeBr:1, series:null, _lastGameShown:-1, _pvpStatus:"" };
+    const sp0=g("pvpSeries"); if(sp0){ sp0.style.display="none"; sp0.innerHTML=""; }
     const bx=g("arenaBox"); if(bx)bx.classList.remove("introMode"); const ai=g("arenaIntro"); if(ai)ai.style.display="none";
     g("arenaOverlay").style.display="flex";
     log(`⚔️ <b style="color:#7fd0ff">${B.you.name}</b> faces a <b style="color:#ffd93d">LIVE</b> challenger! Lock in your cards.`);
@@ -3422,6 +3531,26 @@ setInterval(updateWhaleTab,1000);
     }catch(e){}
     if(B&&B.pvp&&!B.over)_pvpPoll=setTimeout(pvpTickLoop,1200);
   }
+  /* top-center info panel for ANY battle (AI + PvP): matchup + round/element (line 2) + live status (line 3) */
+  function pvpTop(){
+    if(!B||!B.foe){ const old=g("pvpSeries"); if(old)old.style.display="none"; return; }
+    let el=g("pvpSeries");
+    if(!el){ const box=g("arenaBox"); if(!box)return; el=document.createElement("div"); el.id="pvpSeries";
+      el.style.cssText="position:absolute;top:8px;left:50%;transform:translateX(-50%);z-index:20;text-align:center;min-width:200px;max-width:min(56vw,440px);background:rgba(10,14,30,.86);border:1px solid #b98a2e;border-radius:0 0 15px 15px;padding:6px 18px 8px;box-shadow:0 6px 16px rgba(0,0,0,.55);-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px)"; box.appendChild(el); }
+    const foeNm=(B.foe&&B.foe.name)?(typeof esc==="function"?esc(B.foe.name):B.foe.name):"Opponent";
+    const youNm=(B.you&&B.you.name)?(typeof esc==="function"?esc(B.you.name):B.you.name):"You";
+    const vs="<div style='font-size:13px;font-weight:800;color:#fff'>⚔️ "+youNm+" <span style='color:#9fb3d6;font-weight:700'>vs</span> <span style='color:#ff9a6b'>"+foeNm+"</span></div>";
+    let mid;
+    if(B.series){ mid="🏆 Best of "+B.series.bestOf+" · <b style='color:#fff'>Game "+B.series.game+"</b> · You <b style='color:#fff'>"+B.series.you+"</b> – <b style='color:#fff'>"+B.series.foe+"</b> Foe"; }
+    else { let em=1; try{ em=elemMult(legElem(B.you.si),legElem(B.foe.si)); }catch(e){}
+      const emc=em>1?"#3ddc84":em<1?"#ff8a8a":"#cfe0ff";
+      mid=legElem(B.you.si)+" <span style='color:#9fb3d6'>▸</span> "+legElem(B.foe.si)+(em!==1?" <span style='color:"+emc+"'>×"+em+"</span>":""); }
+    el.innerHTML=vs+
+      "<div style='font-size:11.5px;font-weight:800;color:#ffe27a;letter-spacing:.2px;margin-top:2px'>"+mid+"</div>"+
+      (B._pvpStatus?"<div style='font-size:12px;font-weight:700;margin-top:3px;color:"+(B._pvpStatusCol||"#cfe0ff")+"'>"+B._pvpStatus+"</div>":"");
+    el.style.display="block";
+  }
+  function pvpStatus(txt,col){ if(!B)return; B._pvpStatus=txt||""; B._pvpStatusCol=col||"#cfe0ff"; pvpTop(); }
   function applyPvpState(s){
     B.foe=pvpFoeSide(s.foe); B.foeBr=s.foe.br||1;
     B.you.hp=s.you.hp; B.you.maxhp=s.you.maxhp; B.you.shield=s.you.shield||0; B.you.energy=s.you.energy;
@@ -3429,21 +3558,33 @@ setInterval(updateWhaleTab,1000);
     B._left=Math.max(0,Math.ceil((s.deadlineInMs||0)/1000));
     if(!B.you.queue)B.you.queue=[]; B.you.queue=B.you.queue.filter(i=>i<B.you.hand.length);
     B._foeSub=!!s.foeSubmitted;
+    if(s.bestOf>1){ B.series={bestOf:s.bestOf,game:s.game,you:(s.score&&s.score.you)||0,foe:(s.score&&s.score.foe)||0}; }
+    pvpTop();
     if(_pvpAnimating)return;
+    if(s.between){   /* inter-game break in the best-of series */
+      if(s.gameResult && B._lastGameShown!==s.game){ B._lastGameShown=s.game; const won=!!s.gameResult.youWonGame;
+        if(typeof showBanner==="function")showBanner((won?"🏆 You won game "+s.gameResult.game+"!":"💢 You lost game "+s.gameResult.game)+" — Series "+B.series.you+"–"+B.series.foe,"info");
+        if(window.playSfx)window.playSfx(won?"reward":"lose"); }
+      B.turn=null; B._resolving=false;
+      const secs=Math.max(1,Math.ceil((s.breakInMs||0)/1000));
+      pvpStatus("⚔️ Next game starting in "+secs+"s…","#ffd166");
+      const ac=g("arenaCenter"); if(ac)ac.innerHTML="";
+      render(); return;
+    }
     if(s.over){ B.turn=null; render(); }
-    else if(s.youSubmitted){ B.turn="foe"; B._resolving=false; render();
-      const ac=g("arenaCenter"); if(ac)ac.innerHTML=s.foeSubmitted
-        ?"<div style='font-size:13px;color:#3ddc84'>⚔️ Both locked in — resolving…</div>"
-        :"<div style='font-size:13px;color:#8fa6c9'>🔒 Locked in — waiting for opponent…</div>"; }
-    else { B.turn="you"; B._resolving=false; render();
-      if(s.foeSubmitted){ const ac=g("arenaCenter"); if(ac)ac.insertAdjacentHTML("afterbegin","<div style='font-size:12px;color:#ffd166;margin-bottom:4px'>⏳ Opponent locked in — your move!</div>"); } }
+    else if(s.youSubmitted){ B.turn="foe"; B._resolving=false;
+      pvpStatus(s.foeSubmitted?"⚔️ Both locked in — resolving…":"🔒 Locked in — waiting for opponent…", s.foeSubmitted?"#3ddc84":"#8fa6c9");
+      const ac=g("arenaCenter"); if(ac)ac.innerHTML=""; render(); }
+    else { B.turn="you"; B._resolving=false;
+      pvpStatus(s.foeSubmitted?"⏳ Opponent locked in — your move!":"🎯 Your move — plan up to 3 cards", s.foeSubmitted?"#ffd166":"#9fc4ff");
+      const ac=g("arenaCenter"); if(ac)ac.innerHTML=""; render(); }
   }
   function pvpLockIn(){
     if(!B||!B.pvp||B.over||B.turn!=="you"||B._resolving)return;
     const cards=(B.you.queue||[]).slice(); B._resolving=true; render();
     fetch(CHAIN.BACKEND+"/pvp/move",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({matchId:B.pvp.matchId,wallet:player.pk,cards})})
       .then(r=>r.json()).then(j=>{ if(!B||!B.pvp)return; if(j&&j.error){ showBanner("⚠️ "+j.error,"error"); B._resolving=false; render(); return; }
-        B.you.queue=[]; B.turn="foe"; B._resolving=false; if(g("arenaCenter"))g("arenaCenter").innerHTML="<div style='font-size:13px;color:#8fa6c9'>🔒 Locked in — waiting for your opponent…</div>"; })
+        B.you.queue=[]; B.turn="foe"; B._resolving=false; if(g("arenaCenter"))g("arenaCenter").innerHTML=""; pvpStatus("🔒 Locked in — waiting for your opponent…","#8fa6c9"); })
       .catch(()=>{ if(B){B._resolving=false;render();} });
   }
   async function pvpAnimate(lt){
@@ -3456,7 +3597,7 @@ setInterval(updateWhaleTab,1000);
       B.you.hp=mySide==="a"?step.aHp:step.bHp; if(B.foe)B.foe.hp=mySide==="a"?step.bHp:step.aHp;
       const dMy=Math.round(prevMy-B.you.hp), dFoe=Math.round(prevFoe-(B.foe?B.foe.hp:0));
       const si=who==="you"?B.you.si:(B.foe?B.foe.si:14), nm=(PN[si]&&PN[si][step.slot])?PN[si][step.slot]:null;
-      log(`${who==="you"?"You":"Rival"}: <b>${ARCH_EMOJI[step.slot]||""} ${nm?nm[1]:step.card}</b>${step.crit?" <span style='color:#ffd93d'>💥CRIT</span>":""}`);
+      log(`${who==="you"?"You":((B.foe&&B.foe.name)||"Opponent")}: <b>${ARCH_EMOJI[step.slot]||""} ${nm?nm[1]:step.card}</b>${step.crit?" <span style='color:#ffd93d'>💥CRIT</span>":""}`);
       flash(who==="you"?"foe":"you"); renderTeams();
       if(dFoe>0)pvpFloat("foe","−"+dFoe+(step.crit?"💥":""),"#ff6b6b");
       if(dMy>0)pvpFloat("you","−"+dMy+(step.crit?"💥":""),"#ff6b6b");
@@ -3470,10 +3611,19 @@ setInterval(updateWhaleTab,1000);
     if(_pvpPoll){clearTimeout(_pvpPoll);_pvpPoll=null;}
     pvpClockStop();
     if(!B)return; const fromCup=B.pvp&&B.pvp.fromCup; B.pvp=null; B.over=true;
+    const sp=g("pvpSeries"); if(sp)sp.style.display="none";
+    if(B.series&&B.series.bestOf>1)log("🏁 <b>Best-of-"+B.series.bestOf+" series:</b> "+B.series.you+"–"+B.series.foe+(win?" — series won! 🏆":" — series lost."));
     if(reason==="forfeit")log(win?"🏳️ <b style='color:#3ddc84'>Opponent forfeited — you win!</b>":"🏳️ You forfeited the match.");
     else if(reason==="time")log(win?"⏱️ <b style='color:#3ddc84'>Time! You had more HP — you win!</b>":"⏱️ Time — your opponent had more HP.");
     if(window.playSfx)window.playSfx(win?"reward":"lose");
-    try{ end(win); }catch(e){ g("arenaResult").innerHTML=win?"🏆 <span style='color:#3ddc84'>VICTORY!</span>":"💀 <span style='color:#ff6b6b'>Defeated…</span>"; }
+    try{ end(win); }catch(e){
+      const ar=g("arenaResult"); if(ar)ar.innerHTML=win?"🏆 <span style='color:#3ddc84'>VICTORY!</span>":"💀 <span style='color:#ff6b6b'>Defeated…</span>";
+      const ac=g("arenaCenter"); if(ac){ ac.innerHTML="";
+        const hub=document.createElement("button"); hub.textContent="🏛️ Back to Chikiseum";
+        hub.style.cssText="font-family:'Nunito',sans-serif;font-weight:800;font-size:15px;padding:11px 22px;border:none;border-radius:12px;background:linear-gradient(180deg,#7aa9ff,#3a6ad0);color:#fff;cursor:pointer;box-shadow:0 4px 0 #2a4a9a";
+        hub.onclick=()=>{ B=null; if(ar)ar.innerHTML=""; ac.innerHTML=""; const sp2=g("pvpSeries"); if(sp2)sp2.style.display="none"; showArenaIntro(); };
+        ac.appendChild(hub); }
+    }
     if(fromCup){   /* Cup match → don't offer "Battle again"; send the player back to the Cup to await the round result */
       g("arenaResult").innerHTML=win?"🏆 <span style='color:#3ddc84'>YOU WIN!</span>":"💀 <span style='color:#ff6b6b'>You lost…</span>";
       const back=document.createElement("button"); back.className="aAgainBtn"; back.setAttribute("aria-label","Back to Cup");
@@ -3662,11 +3812,30 @@ setInterval(updateWhaleTab,1000);
       const p=vid.play(); if(p&&p.catch)p.catch(()=>{ vid.muted=true; vid.play().catch(()=>{}); });
       vid.onended=close; skip.onclick=close;
     }
+    /* fullscreen "battle intro" movie played right before every fight (Chikiseum + Cup), then runs done() */
+    function playBattleIntro(done){
+      const run=()=>{ if(typeof done==="function")done(); };
+      let ov=g("battleIntroVid");
+      if(!ov){
+        ov=document.createElement("div"); ov.id="battleIntroVid";
+        ov.style.cssText="position:fixed;inset:0;z-index:4200;background:#000;display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .2s";
+        ov.innerHTML='<video id="battleIntroVidEl" src="ui/battle-intro.mp4" playsinline preload="auto" style="width:100%;height:100%;object-fit:contain;background:#000"></video>'
+          +'<button id="battleIntroSkip" style="position:absolute;right:16px;bottom:16px;z-index:1;padding:9px 16px;border:none;border-radius:999px;background:rgba(0,0,0,.55);color:#fff;font:600 14px Nunito,sans-serif;cursor:pointer;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)">Skip ▸</button>';
+        document.body.appendChild(ov);
+      }
+      const vid=g("battleIntroVidEl"), skip=g("battleIntroSkip");
+      let ended=false; const finish=()=>{ if(ended)return; ended=true; ov.style.opacity="0"; try{vid.pause();}catch(e){} setTimeout(()=>{ ov.style.display="none"; run(); },200); };
+      ov.style.display="flex"; requestAnimationFrame(()=>{ ov.style.opacity="1"; });
+      vid.muted=false; try{vid.currentTime=0;}catch(e){}
+      const p=vid.play(); if(p&&p.catch)p.catch(()=>{ vid.muted=true; vid.play().catch(()=>{}); });
+      vid.onended=finish; skip.onclick=finish;
+      setTimeout(()=>{ if(!ended && (vid.error|| (vid.readyState===0 && vid.networkState===3))) finish(); }, 1200);   /* fail-safe: if the video can't load, don't block the battle */
+    }
     /* reconnect: if you have a LIVE PvP battle in progress (e.g. you refreshed), drop straight back into it */
     async function checkPvpResume(){
       if(!CHAIN.BACKEND||!player||!player.pk||B)return;
       try{ const r=await fetch(CHAIN.BACKEND+"/pvp/queue?wallet="+player.pk,{cache:"no-store"}); const j=await r.json();
-        if(j&&j.status==="matched"&&!j.over&&typeof startPvp==="function"){ showArenaIntro&&showArenaIntro(); startPvp(j.matchId,j.side); } }catch(e){}
+        if(j&&j.status==="matched"&&!j.over&&typeof startPvp==="function"){ showArenaIntro&&showArenaIntro(); startPvp(j.matchId,j.side,false,true); } }catch(e){}   /* skipIntro on reconnect */
     }
     ab.onclick=()=>{
       g("arenaOverlay").style.display="flex";
@@ -3858,7 +4027,7 @@ setInterval(updateWhaleTab,1000);
     const e=player&&player.ancientEgg; if(!e||(e.careMin||0)<(e.need||careNeed(player))||revealing)return;
     if(!isCreator(player.pk)&&holderCounts(player).legend>=MAX_LEGEND){showBanner("You already have a Legendary (max 1) — cannot hatch another.","error");return;}
     revealing=true;
-    const idx=LEGEND_IDXS[ri(0,LEGEND_IDXS.length-1)];
+    const idx=CORE_LEGEND_IDXS[ri(0,CORE_LEGEND_IDXS.length-1)];
     const c=spawnCreature(player,10,idx);
     c.isLegend=true; c.arenaSkills=rollSkills();
     c.nick=SPECIES[idx].names[stageOf(10)-1]; c.named=true;
@@ -7125,7 +7294,7 @@ requestAnimationFrame(frame);
 <script>
 (function(){
   if(window.__memeDexInit)return; window.__memeDexInit=true;
-  const GLB_VER="3";
+  const GLB_VER="4";
   /* The Meme Dynasty roster (the new generation). Add a row here as each member is confirmed. */
   const ROSTER=[
     {key:"popcat",  name:"Popcat",  emoji:"😺", tag:"the Click King", confirmed:true, voxel:true},
@@ -7133,6 +7302,7 @@ requestAnimationFrame(frame);
     {key:"doge",    name:"Doge",    emoji:"🐕", tag:"the OG", confirmed:true, voxel:true},
     {key:"pepe",    name:"Pepe",    emoji:"🐸", tag:"the Legend", confirmed:true, voxel:true},
     {key:"chillguy",name:"Chill Guy",emoji:"😎", tag:"just a chill guy", confirmed:true, voxel:true},
+    {key:"alon",    name:"Alon",     emoji:"🧢", tag:"stop being poor", confirmed:true, voxel:true},
   ];
 
   const css=document.createElement("style");
@@ -7171,8 +7341,43 @@ requestAnimationFrame(frame);
   .mgCard .tg{font-size:11.5px;color:#a99cd6;font-weight:700;margin-top:1px}
   .mgCard .vf{display:inline-block;margin-top:6px;font-size:10px;font-weight:800;color:#7ee68f;background:rgba(50,180,90,.16);border:1px solid #2f8a3e;border-radius:999px;padding:2px 8px}
   .mgCard.soon{display:flex;flex-direction:column;align-items:center;justify-content:center;border-style:dashed;color:#b9a4ff;font-weight:800;font-size:13px;min-height:150px;line-height:1.4}
-  #memeBack{display:inline-flex;align-items:center;gap:6px;background:rgba(40,28,70,.7);border:1px solid #5a47a0;color:#d9c6ff;font-family:inherit;font-weight:800;font-size:13px;padding:8px 14px;border-radius:11px;cursor:pointer;margin-bottom:6px}
-  #memeBack:hover{border-color:#9b6bff;color:#fff}`;
+  #memeBack,#memeMineBack,#memeBazaarBack{display:inline-flex;align-items:center;gap:6px;background:rgba(40,28,70,.7);border:1px solid #5a47a0;color:#d9c6ff;font-family:inherit;font-weight:800;font-size:13px;padding:8px 14px;border-radius:11px;cursor:pointer;margin-bottom:6px}
+  #memeBack:hover,#memeMineBack:hover,#memeBazaarBack:hover{border-color:#9b6bff;color:#fff}
+  .meSell{font-family:inherit;font-weight:800;font-size:11.5px;padding:6px 11px;border-radius:9px;border:1px solid #5a47a0;background:rgba(40,28,70,.8);color:#d9c6ff;cursor:pointer}
+  .meSell:hover{border-color:#9b6bff;color:#fff}
+  .meSell.unlist{border-color:#8a6a2f;color:#ffd166;background:rgba(60,45,12,.6)}
+  .meNft .meSell.buy{background:linear-gradient(180deg,#5fe08a,#28a55a);color:#06210f;border:none;font-size:13px;padding:8px 14px}
+  #memeEgg{background:radial-gradient(120% 100% at 50% 0%,#3a2a66,#1c1436);border:1px solid #7a5ad0;border-radius:16px;padding:13px;margin:0 0 14px}
+  #memeEgg .meRow{display:flex;gap:12px;align-items:center}
+  #memeEgg .meEgg{width:92px;height:92px;flex:0 0 auto;background:url('ui/meme-egg.png') center/contain no-repeat;animation:meBob 2.4s ease-in-out infinite;position:relative}
+  #memeEgg .meEgg canvas{position:absolute;inset:0}
+  @keyframes meBob{0%,100%{transform:translateY(0) rotate(-4deg)}50%{transform:translateY(-5px) rotate(4deg)}}
+  #memeEgg .meTitle{font-weight:900;color:#ffd966;font-size:16px}
+  #memeEgg .meSub{font-size:12px;color:#c9bdf0;line-height:1.45;margin-top:1px}
+  #memeEgg .meSupply{font-size:11.5px;color:#9fe6b0;font-weight:700;margin-top:5px}
+  #memeEgg .meBtns{display:flex;gap:8px;margin-top:11px}
+  #memeEgg button{flex:1;font-family:inherit;font-weight:800;font-size:13.5px;padding:11px;border-radius:12px;border:none;cursor:pointer;background:linear-gradient(180deg,#ffd54a,#e0a800);color:#3a2a06;box-shadow:0 4px 0 #a87c00}
+  #memeEgg button:active{transform:translateY(2px);box-shadow:0 2px 0 #a87c00}
+  #memeEgg button.meGhost{background:rgba(40,28,70,.8);color:#d9c6ff;border:1px solid #5a47a0;box-shadow:none}
+  #memeEgg button:disabled{opacity:.55;cursor:not-allowed}
+  .meNft{display:flex;gap:11px;align-items:center;background:rgba(20,15,40,.7);border:1px solid #4a3a80;border-radius:12px;padding:9px;margin-bottom:8px}
+  .meNft img{width:52px;height:52px;border-radius:9px;object-fit:contain;background:rgba(0,0,0,.25)}
+  .meNft .nn{font-weight:800;color:#fff;font-size:14px}
+  .meNft .ne{font-size:11.5px;color:#a99cd6}
+  .meNft .ns{margin-left:auto;font-size:11px;font-weight:800;padding:4px 9px;border-radius:999px;white-space:nowrap}
+  .meNft .ns.minted{color:#7ee68f;background:rgba(50,180,90,.16);border:1px solid #2f8a3e}
+  .meNft .ns.pending{color:#ffd166;background:rgba(180,140,40,.16);border:1px solid #8a6a2f}
+  #memeReveal{position:fixed;inset:0;z-index:240;display:none;align-items:center;justify-content:center;background:rgba(6,4,16,.86);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+  #memeReveal .rv{text-align:center;color:#fff;font-family:'Nunito',sans-serif;max-width:340px;padding:20px}
+  #memeReveal .egg{font-size:120px;animation:shake .5s ease-in-out infinite}
+  #memeReveal img.egg{width:160px;height:auto;font-size:0;filter:drop-shadow(0 10px 22px rgba(0,0,0,.5))}
+  @keyframes shake{0%,100%{transform:rotate(-9deg)}50%{transform:rotate(9deg)}}
+  #memeReveal img{width:210px;max-width:72vw;filter:drop-shadow(0 12px 28px rgba(0,0,0,.6));animation:pop .5s cubic-bezier(.2,1.4,.4,1)}
+  @keyframes pop{0%{transform:scale(.3);opacity:0}100%{transform:scale(1);opacity:1}}
+  #memeReveal .rvName{font-size:24px;font-weight:900;margin-top:8px}
+  #memeReveal .rvEd{font-size:14px;color:#ffd966;font-weight:800}
+  #memeReveal .rvMsg{font-size:13px;color:#b9a4ff;margin-top:8px;line-height:1.5}
+  #memeReveal button{margin-top:16px;font-family:inherit;font-weight:800;font-size:15px;padding:11px 26px;border:none;border-radius:12px;background:linear-gradient(180deg,#9b6bff,#6a3ad0);color:#fff;cursor:pointer;box-shadow:0 4px 0 #4a25a0}`;
   document.head.appendChild(css);
 
   const btn=document.createElement("div"); btn.id="memeDexBtn"; btn.innerHTML="🧬 Meme Dex"; document.body.appendChild(btn);
@@ -7181,6 +7386,14 @@ requestAnimationFrame(frame);
     <div class="hd"><div><h1>🧬 Meme Dynasty <small>Generation Roster · tap a Chiki to verify</small></h1></div><span class="x" id="memeClose">✕</span></div>
     <div id="memeGrid">
       <div class="sub">The newest generation of Chikis — born from the memes that built crypto. Tap a card to view its <b>voxel build</b> in full 3D. 🌊</div>
+      <div id="memeEgg">
+        <div class="meRow"><div class="meEgg" id="memeEggHost"></div>
+          <div class="meInfo"><div class="meTitle">Meme Legendary Egg</div>
+            <div class="meSub">Hatch a <b>random</b> Meme Dynasty Chiki — minted as a <b>tradable NFT</b> on Solana. Limited editions each. 🌊</div>
+            <div class="meSupply" id="meSupply">Loading supply…</div></div></div>
+        <div class="meBtns"><button id="meHatch">🥚 Hatch Egg · <span id="meCost"></span></button></div>
+        <div class="meBtns"><button id="meMine" class="meGhost">🎒 My NFTs</button><button id="meBazaar" class="meGhost">🏪 NFT Bazaar</button></div>
+      </div>
       <div class="mgCards" id="mgCards"></div>
       <div id="memeFoot">🎨 <b>The roster isn't finished.</b> Want your favourite meme immortalised as a Chiki? Submit fan art or a suggestion with <b>#MemeDynasty</b> — the best picks join the dynasty, locked in forever. 🐾👑</div>
     </div>
@@ -7189,6 +7402,17 @@ requestAnimationFrame(frame);
       <div id="memeName"></div>
       <div id="memeTabs"></div>
       <div id="memeStage"><div class="ld">Loading…</div></div>
+    </div>
+    <div id="memeMine" style="display:none">
+      <button id="memeMineBack">← Back</button>
+      <h3 style="margin:8px 0 2px;color:#d9c6ff;font-size:18px">🎒 My Meme NFTs</h3>
+      <div id="memeMineList" style="margin-top:8px"></div>
+    </div>
+    <div id="memeBazaar" style="display:none">
+      <button id="memeBazaarBack">← Back</button>
+      <h3 style="margin:8px 0 2px;color:#d9c6ff;font-size:18px">🏪 Mystic Market · NFT Bazaar</h3>
+      <div style="font-size:12px;color:#a99cd6;margin:2px 0 8px">Buy & sell Meme Dynasty NFTs. Priced in SOL · devnet. 🌊</div>
+      <div id="memeBazaarList" style="margin-top:4px"></div>
     </div>
   </div>`;
   document.body.appendChild(ov);
@@ -7258,7 +7482,107 @@ requestAnimationFrame(frame);
     renderTabs(m); showModel(key,_view);
     requestAnimationFrame(_resize); setTimeout(_resize,140);
   }
-  function backToGrid(){ $("memeDetail").style.display="none"; $("memeGrid").style.display="block"; if(_model){ try{_s.remove(_model);}catch(e){} _model=null; } _cur=null; }
+  function backToGrid(){ $("memeDetail").style.display="none"; const mm=$("memeMine"); if(mm)mm.style.display="none"; const bz=$("memeBazaar"); if(bz)bz.style.display="none"; $("memeGrid").style.display="block"; if(_model){ try{_s.remove(_model);}catch(e){} _model=null; } _cur=null; }
+  /* ===== Meme Legendary Egg → hatch a random Meme Dynasty NFT ===== */
+  const EGG_PRICE=1000000;   // $CHIKI per egg
+  const ROSTER_BY=Object.fromEntries(ROSTER.map(m=>[m.key,m]));
+  function eggRefresh(){
+    const cost=$("meCost"); if(cost)cost.textContent=EGG_PRICE.toLocaleString()+" $CHIKI";
+    const BK=(window.CHAIN&&CHAIN.BACKEND)||""; if(!BK)return;
+    fetch(BK+"/meme/supply").then(r=>r.json()).then(s=>{ const el=$("meSupply"); if(el&&s&&s.totalLeft!=null) el.textContent="🥚 "+s.totalLeft.toLocaleString()+" of "+(s.cap*ROSTER.length).toLocaleString()+" eggs left to hatch"; }).catch(()=>{});
+  }
+  async function hatchEgg(){
+    const BK=(window.CHAIN&&CHAIN.BACKEND)||"";
+    if(!BK){ if(typeof showBanner==="function")showBanner("Backend offline — try again later.","error"); return; }
+    if(!window.player||!player.pk){ if(typeof showBanner==="function")showBanner("👛 Connect your wallet to hatch a Meme Egg.","error"); return; }
+    const minHold=(typeof MIN_HOLD!=="undefined")?MIN_HOLD:0;
+    if((player.bal||0)-EGG_PRICE<minHold){ if(typeof showBanner==="function")showBanner("Need "+EGG_PRICE.toLocaleString()+" $CHIKI (keep ≥"+minHold.toLocaleString()+") to hatch.","error"); return; }
+    const hb=$("meHatch"); if(hb)hb.disabled=true;
+    try{
+      if(window.CHAIN&&CHAIN.ONCHAIN_SPENDS&&player.pk){ try{ await chikiSpend(EGG_PRICE,"Meme Legendary Egg"); }catch(e){ if(typeof showBanner==="function")showBanner("Payment failed: "+(e.message||e),"error"); if(hb)hb.disabled=false; return; } }
+      try{ player.bal-=EGG_PRICE; if(typeof burnedChiki!=="undefined")burnedChiki+=EGG_PRICE*0.01; }catch(e){}
+      if(typeof refreshUI==="function")refreshUI();
+      const r=await fetch(BK+"/meme/hatch",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({wallet:player.pk})});
+      const j=await r.json();
+      if(!j||j.error){ if(typeof showBanner==="function")showBanner("⚠️ "+((j&&j.error)||"hatch failed"),"error"); if(hb)hb.disabled=false; return; }
+      showReveal(j.hatch); eggRefresh();
+    }catch(e){ if(typeof showBanner==="function")showBanner("⚠️ "+(e.message||e),"error"); }
+    if(hb)hb.disabled=false;
+  }
+  function grantMemeLegendary(key){   /* the hatched Chiki becomes a real, playable Legendary in your roster */
+    try{
+      if(!window.player||typeof spawnCreature!=="function"||typeof MEME_KEY_SP==="undefined")return null;
+      const idx=MEME_KEY_SP[key]; if(idx==null)return null;
+      /* enforce 1 Meme Legendary: drop any meme legendary already in the roster before adding the new one */
+      try{ if(typeof creatures!=="undefined"&&window.MEME_IDXS){ for(let i=creatures.length-1;i>=0;i--){ const x=creatures[i]; if(x&&x.holder===player&&MEME_IDXS.indexOf(SPECIES.indexOf(x.sp))>=0)creatures.splice(i,1); } } }catch(e){}
+      const c=spawnCreature(player,10,idx);
+      c.isLegend=true; if(typeof ensureLegendSkills==="function")ensureLegendSkills(c);
+      try{ c.nick=SPECIES[idx].names[0]; c.named=true; }catch(e){}
+      if(player.pk&&typeof saveProfile==="function")saveProfile(player);
+      if(typeof refreshUI==="function")refreshUI();
+      if(typeof updateLegendHud==="function")updateLegendHud();
+      if(typeof addFeed==="function")addFeed("🧬 A <b>Meme Dynasty Legendary</b> joined your roster — battle it in the ⚔️ Chikiseum!");
+      return c;
+    }catch(e){ return null; }
+  }
+  function showReveal(h){
+    let r2=$("memeReveal"); if(!r2){ r2=document.createElement("div"); r2.id="memeReveal"; document.body.appendChild(r2); }
+    r2.innerHTML='<div class="rv"><img class="egg" src="ui/meme-egg.png" onerror="this.outerHTML=\'<div class=&quot;egg&quot;>🥚</div>\'"><div class="rvMsg">Hatching your Meme Legendary Egg…</div></div>';
+    r2.style.display="flex"; if(window.playSfx)window.playSfx("open");
+    const granted=grantMemeLegendary(h.char);
+    setTimeout(()=>{ const m=ROSTER_BY[h.char]||{name:h.name,emoji:"❓"};
+      r2.innerHTML='<div class="rv"><img src="'+h.char+'_art.png" alt="'+h.name+'" onerror="this.style.display=\'none\'">'
+        +'<div class="rvName">'+(m.emoji||"")+' '+h.name+'</div>'
+        +'<div class="rvEd">Edition #'+String(h.edition).padStart(3,"0")+' / '+h.cap+'</div>'
+        +'<div class="rvMsg">🎉 A <b>Meme Dynasty Legendary</b> is yours!'+(granted?'<br>⚔️ It\'s in your roster — battle it in the Chikiseum.':'')+'<br>💎 Minting as an NFT on-chain — see <b>🎒 My Meme NFTs</b>.</div>'
+        +'<button id="rvClose">Awesome ✨</button></div>';
+      if(window.playSfx)window.playSfx("reward");
+      const rc=$("rvClose"); if(rc)rc.onclick=()=>{ r2.style.display="none"; };
+    },1700);
+  }
+  function showMyNfts(){
+    $("memeGrid").style.display="none"; $("memeDetail").style.display="none"; $("memeMine").style.display="block";
+    const list=$("memeMineList"), BK=(window.CHAIN&&CHAIN.BACKEND)||"";
+    if(!window.player||!player.pk){ list.innerHTML="<div style='color:#a99cd6;font-size:13px'>Connect your wallet to see your Meme NFTs.</div>"; return; }
+    list.innerHTML="<div style='color:#a99cd6;font-size:13px'>Loading…</div>";
+    fetch(BK+"/meme/mine?wallet="+player.pk).then(r=>r.json()).then(j=>{ const items=(j&&j.items)||[];
+      if(!items.length){ list.innerHTML="<div style='color:#a99cd6;font-size:13px'>No Meme NFTs yet — hatch a Meme Legendary Egg! 🥚</div>"; return; }
+      list.innerHTML=items.map(it=>{ const m=ROSTER_BY[it.char]||{emoji:"❓"};
+        const st=it.status==="minted"?'<a class="ns minted" href="https://explorer.solana.com/address/'+(it.mintAddr||"")+'?cluster=devnet" target="_blank" rel="noopener" style="text-decoration:none">✅ On-chain ↗</a>':'<span class="ns pending">⏳ Minting…</span>';
+        const trade=it.listed?'<button class="meSell unlist" data-unlist="'+it.id+'">🏷️ Listed '+it.listed.price+' ◎ · Unlist</button>':'<button class="meSell" data-list="'+it.id+'">🏪 List for sale</button>';
+        return '<div class="meNft"><img src="'+it.char+'_art.png" onerror="this.style.visibility=\'hidden\'"><div style="flex:1"><div class="nn">'+(m.emoji||"")+' '+it.name+'</div><div class="ne">Edition #'+String(it.edition).padStart(3,"0")+'</div><div style="margin-top:5px">'+trade+'</div></div>'+st+'</div>'; }).join("");
+      list.querySelectorAll("[data-list]").forEach(b=>b.onclick=()=>listNft(b.getAttribute("data-list")));
+      list.querySelectorAll("[data-unlist]").forEach(b=>b.onclick=()=>unlistNft(b.getAttribute("data-unlist")));
+    }).catch(()=>{ list.innerHTML="<div style='color:#ff8a8a;font-size:13px'>Couldn't load your NFTs.</div>"; });
+  }
+  function showBazaar(){
+    $("memeGrid").style.display="none"; $("memeDetail").style.display="none"; $("memeMine").style.display="none"; $("memeBazaar").style.display="block";
+    const list=$("memeBazaarList"), BK=(window.CHAIN&&CHAIN.BACKEND)||"";
+    list.innerHTML="<div style='color:#a99cd6;font-size:13px'>Loading the Bazaar…</div>";
+    fetch(BK+"/meme/market").then(r=>r.json()).then(j=>{ const items=(j&&j.items)||[];
+      if(!items.length){ list.innerHTML="<div style='color:#a99cd6;font-size:13px'>No NFTs listed yet. List one of yours from <b>🎒 My NFTs</b>! 🌊</div>"; return; }
+      const mine=window.player&&player.pk;
+      list.innerHTML=items.map(it=>{ const m=ROSTER_BY[it.char]||{emoji:"❓"}; const own=mine&&it.seller===player.pk;
+        const btn=own?'<span class="ns pending">your listing</span>':'<button class="meSell buy" data-buy="'+it.id+'">Buy · '+it.price+' ◎</button>';
+        return '<div class="meNft"><img src="'+it.char+'_art.png" onerror="this.style.visibility=\'hidden\'"><div style="flex:1"><div class="nn">'+(m.emoji||"")+' '+it.name+'</div><div class="ne">Edition #'+String(it.edition).padStart(3,"0")+' · <b style="color:#ffd966">'+it.price+' ◎</b></div></div>'+btn+'</div>'; }).join("");
+      list.querySelectorAll("[data-buy]").forEach(b=>b.onclick=()=>buyNft(b.getAttribute("data-buy")));
+    }).catch(()=>{ list.innerHTML="<div style='color:#ff8a8a;font-size:13px'>Couldn't load the Bazaar.</div>"; });
+  }
+  function buyNft(id){
+    if(!window.player||!player.pk){ if(typeof showBanner==="function")showBanner("👛 Connect your wallet to buy.","error"); return; }
+    const BK=(window.CHAIN&&CHAIN.BACKEND)||"";
+    fetch(BK+"/meme/buy",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({wallet:player.pk,hatchId:id})})
+      .then(r=>r.json()).then(j=>{ if(j&&j.ok){ if(typeof showBanner==="function")showBanner("🎉 Bought "+j.name+" #"+String(j.edition).padStart(3,"0")+" for "+j.price+" ◎!","info"); if(window.playSfx)window.playSfx("reward"); grantMemeLegendary(j.char); showBazaar(); }
+        else if(typeof showBanner==="function")showBanner("⚠️ "+((j&&j.error)||"buy failed"),"error"); }).catch(()=>{});
+  }
+  function listNft(id){
+    const px=prompt("List this NFT for how many SOL? (e.g. 0.25)"); if(px==null)return; const p=Number(px);
+    if(!(p>0)){ if(typeof showBanner==="function")showBanner("Enter a price greater than 0.","error"); return; }
+    const BK=(window.CHAIN&&CHAIN.BACKEND)||"";
+    fetch(BK+"/meme/list",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({wallet:player.pk,hatchId:id,price:p})})
+      .then(r=>r.json()).then(j=>{ if(j&&j.ok){ if(typeof showBanner==="function")showBanner("🏪 Listed for "+p+" ◎ in the Bazaar!","info"); showMyNfts(); } else if(typeof showBanner==="function")showBanner("⚠️ "+((j&&j.error)||"list failed"),"error"); }).catch(()=>{});
+  }
+  function unlistNft(id){ const BK=(window.CHAIN&&CHAIN.BACKEND)||""; fetch(BK+"/meme/unlist",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({wallet:player.pk,hatchId:id})}).then(r=>r.json()).then(()=>showMyNfts()).catch(()=>{}); }
   function renderGrid(){
     $("mgCards").innerHTML=ROSTER.map(m=>`<div class="mgCard" data-k="${m.key}"><img src="${m.key}_art.png" alt="${m.name}" onerror="this.style.visibility='hidden'"><div class="nm">${m.emoji} ${m.name}</div><div class="tg">${m.tag}</div><div class="vf">✅ Verified</div></div>`).join("")
       +`<div class="mgCard soon" id="memeSoon">❓<div>More coming…</div><div style="font-size:11px;opacity:.8">#MemeDynasty</div></div>`;
@@ -7266,10 +7590,26 @@ requestAnimationFrame(frame);
     const sn=$("memeSoon"); if(sn)sn.onclick=()=>{ if(typeof showBanner==="function")showBanner("🎨 The roster's still open — submit your meme legend with #MemeDynasty!","info"); };
   }
 
-  function open(){ ov.style.display="flex"; backToGrid(); renderGrid(); }
+  /* 3D spinning Meme Egg (the uploaded GLB) in the egg panel — png shows as the fallback */
+  function mountEgg(){
+    const host=$("memeEggHost"); if(!host||host._egg||typeof THREE==="undefined"||!THREE.WebGLRenderer||!THREE.GLTFLoader)return;
+    const w=host.clientWidth||92,h=host.clientHeight||92; let r;
+    try{ r=new THREE.WebGLRenderer({antialias:true,alpha:true}); }catch(e){ return; }
+    r.setPixelRatio(Math.min(2,window.devicePixelRatio||1)); r.setSize(w,h); host.appendChild(r.domElement); host._egg=true;
+    const sc=new THREE.Scene(), cam=new THREE.PerspectiveCamera(38,w/h,0.1,100); cam.position.set(0,0,3.3); cam.lookAt(0,0,0);
+    sc.add(new THREE.AmbientLight(0xffffff,1.0)); const d=new THREE.DirectionalLight(0xffffff,1.05); d.position.set(2,4,3); sc.add(d);
+    let m=null; const loader=new THREE.GLTFLoader(); try{ if(window.MeshoptDecoder)loader.setMeshoptDecoder(window.MeshoptDecoder); }catch(e){}
+    loader.load("memeegg.glb?v=1", g=>{ const root=g.scene; const box=new THREE.Box3().setFromObject(root),sz=new THREE.Vector3(); box.getSize(sz);
+      root.scale.setScalar(2.0/(sz.y||1)); const b2=new THREE.Box3().setFromObject(root),c2=new THREE.Vector3(); b2.getCenter(c2); root.position.sub(c2);
+      m=root; sc.add(m); host.style.backgroundImage="none"; }, undefined, ()=>{});
+    (function loop(){ if(!host.isConnected){ try{r.forceContextLoss&&r.forceContextLoss();r.dispose();}catch(e){} host._egg=false; return; } if(m)m.rotation.y+=0.012; r.render(sc,cam); requestAnimationFrame(loop); })();
+  }
+  function open(){ ov.style.display="flex"; backToGrid(); renderGrid(); eggRefresh(); requestAnimationFrame(mountEgg); setTimeout(mountEgg,120); }
   function close(){ ov.style.display="none"; }
   btn.onclick=open; $("memeClose").onclick=close;
   $("memeBack").onclick=backToGrid;
+  { const hb=$("meHatch"); if(hb)hb.onclick=hatchEgg; const mb=$("meMine"); if(mb)mb.onclick=showMyNfts; const mbk=$("memeMineBack"); if(mbk)mbk.onclick=backToGrid;
+    const bz=$("meBazaar"); if(bz)bz.onclick=showBazaar; const bzk=$("memeBazaarBack"); if(bzk)bzk.onclick=backToGrid; }
   ov.addEventListener("click",e=>{ if(e.target===ov)close(); });   /* tap the dim backdrop to close */
   window.addEventListener("resize",()=>{ if(ov.style.display!=="none"&&$("memeDetail").style.display!=="none")_resize(); });
 
