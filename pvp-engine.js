@@ -27,6 +27,8 @@ const ELEM_NEXT = { Water:"Fire", Fire:"Beast", Beast:"Storm", Storm:"Light", Li
 const CFG = { strong:1.10, weak:0.92, hpBase:240, hpPerBr:12, dmgScale:0.7 };
 const TURN_MS_DEFAULT = 30000;     // seconds to lock in each turn
 const MAX_TURNS = 60, FORFEIT_MISSES = 3;
+const BEST_OF_DEFAULT = 3;         // a PvP match is best-of-3 games (first to 2 wins)
+const INTERMISSION_MS = 4000;      // pause between games so both clients see the result
 
 const elemMult = (a,b) => ELEM_NEXT[a]===b ? CFG.strong : ELEM_NEXT[b]===a ? CFG.weak : 1;
 const tier = (snap,slot) => Math.min(5, Math.max(1, (snap.cardTier && snap.cardTier[slot]) || 1));
@@ -138,19 +140,41 @@ function resolveTurn(m){
     const att=m.sides[who], def=m.sides[who==="a"?"b":"a"];
     const crit=applyCard(att, def, slot, m.rng);
     log.push({ who, slot, card:ARCHK[slot], crit:!!crit, aHp:Math.round(A.hp), bHp:Math.round(B.hp) });
-    if(dead(B)){ return finish(m, "a", "ko", log); }
-    if(dead(A)){ return finish(m, "b", "ko", log); }
+    if(dead(B)){ return endGame(m, "a", "ko", log); }
+    if(dead(A)){ return endGame(m, "b", "ko", log); }
   }
   m.first = second;
   m.lastTurn = { turn:m.turn, first, seq:log };
-  if(m.turn>=MAX_TURNS){ const fa=A.hp/A.maxhp, fb=B.hp/B.maxhp; return finish(m, fa>=fb?"a":"b", "time", log); }
+  if(m.turn>=MAX_TURNS){ const fa=A.hp/A.maxhp, fb=B.hp/B.maxhp; return endGame(m, fa>=fb?"a":"b", "time", log); }
   startTurn(m);
   return m.lastTurn;
 }
 
-function finish(m, winner, reason, log){
-  m.status="finished"; m.winner=winner; m.reason=reason;
-  m.lastTurn = { turn:m.turn, first:m.first, seq:log||[], final:true };
+// One GAME ended (KO or time). Tally the score; finish the MATCH at winsNeeded, else go to intermission.
+function endGame(m, gameWinner, reason, log){
+  m.score[gameWinner] = (m.score[gameWinner]||0) + 1;
+  const matchOver = m.score[gameWinner] >= m.winsNeeded;
+  const lt = { turn:m.turn, first:m.first, seq:log||[], final:true, gameOver:true,
+               gameWinner, gameReason:reason, game:m.game, score:{a:m.score.a,b:m.score.b}, matchOver };
+  m.lastTurn = lt;
+  if(matchOver){ m.status="finished"; m.winner=gameWinner; m.reason=reason; }
+  else { m.between=true; m.betweenUntil=Date.now()+INTERMISSION_MS;
+         m.gameResult={ winner:gameWinner, game:m.game, score:{a:m.score.a,b:m.score.b} }; }
+  return lt;
+}
+// Reset both sides for the next game in the series.
+function startNextGame(m){
+  m.sides = { a:makeSide(m.aSnap,"a",m.rng), b:makeSide(m.bSnap,"b",m.rng) };
+  m.turn=0; m.first = m.rng()<0.5?"a":"b"; m.deadline=0; m.lastTurn=null;
+  m.game++; m.between=false; m.gameResult=null;
+  startTurn(m);
+}
+// Whole MATCH ends immediately (used for forfeits / disconnects).
+function finishMatch(m, winner, reason, log){
+  if(m.score[winner]<m.winsNeeded) m.score[winner]=m.winsNeeded;   // reflect the awarded series win
+  m.status="finished"; m.winner=winner; m.reason=reason; m.between=false;
+  m.lastTurn = { turn:m.turn, first:m.first, seq:log||[], final:true, gameOver:true, matchOver:true,
+                 gameWinner:winner, gameReason:reason, game:m.game, score:{a:m.score.a,b:m.score.b} };
   return m.lastTurn;
 }
 
@@ -161,8 +185,10 @@ function createMatch(aSnap, bSnap, opts={}){
     id: opts.id || ("m"+Math.random().toString(36).slice(2,9)),
     seed, status:"active", turnMs: opts.turnMs || TURN_MS_DEFAULT,
     walletA: aSnap.wallet||null, walletB: bSnap.wallet||null,
-    rng, sides:{ a:makeSide(aSnap,"a",rng), b:makeSide(bSnap,"b",rng) },
+    rng, aSnap, bSnap, sides:{ a:makeSide(aSnap,"a",rng), b:makeSide(bSnap,"b",rng) },
     turn:0, first: rng()<0.5?"a":"b", deadline:0, winner:null, reason:"", lastTurn:null,
+    bestOf: opts.bestOf||BEST_OF_DEFAULT, winsNeeded: Math.ceil((opts.bestOf||BEST_OF_DEFAULT)/2),
+    score:{a:0,b:0}, game:1, between:false, betweenUntil:0, gameResult:null,
   };
   startTurn(m);
   return m;
@@ -170,6 +196,7 @@ function createMatch(aSnap, bSnap, opts={}){
 
 function submit(m, who, indices){
   if(m.status!=="active") return { ok:false, error:"match is over" };
+  if(m.between) return { ok:false, error:"next game is starting…" };
   const s=m.sides[who]; if(!s) return { ok:false, error:"not in this match" };
   s.lastSeen=Date.now();
   if(s.submitted) return { ok:false, error:"already locked in this turn" };
@@ -182,14 +209,15 @@ function submit(m, who, indices){
 // Call periodically. On a turn deadline, auto-play any side that hasn't locked in; forfeit after repeated misses.
 function tick(m, now=Date.now()){
   if(m.status!=="active") return false;
+  if(m.between){ if(now>=m.betweenUntil){ startNextGame(m); return true; } return false; }   // between games → start the next when the break ends
   if(now < m.deadline) return false;
   let changed=false;
   for(const w of ["a","b"]){ const s=m.sides[w];
     if(!s.submitted){ s.misses=(s.misses||0)+1; s.queue=plan(s); s.submitted=true; changed=true; }   // timed out → AI plays this turn
   }
-  // a side that has missed too many turns in a row has disconnected → forfeit
+  // a side that has missed too many turns in a row has disconnected → forfeit the whole match
   const fa=m.sides.a.misses>=FORFEIT_MISSES, fb=m.sides.b.misses>=FORFEIT_MISSES;
-  if(fa||fb){ finish(m, fa&&!fb?"b":fb&&!fa?"a":(m.sides.a.hp>=m.sides.b.hp?"a":"b"), "forfeit", []); return true; }
+  if(fa||fb){ finishMatch(m, fa&&!fb?"b":fb&&!fa?"a":(m.sides.a.hp>=m.sides.b.hp?"a":"b"), "forfeit", []); return true; }
   if(changed) resolveTurn(m);
   return true;
 }
@@ -203,7 +231,7 @@ function sideView(s, isYou){
 // A player explicitly leaves → instant loss, opponent wins.
 function forfeit(m, who){
   if(!m || m.status!=="active") return false;
-  finish(m, who==="a"?"b":"a", "forfeit", []);
+  finishMatch(m, who==="a"?"b":"a", "forfeit", []);
   return true;
 }
 function viewFor(m, who){
@@ -218,6 +246,12 @@ function viewFor(m, who){
     over: m.status==="finished",
     result: m.status==="finished" ? (m.winner===who ? "win" : "loss") : null,
     reason: m.reason || null,
+    // best-of series state
+    bestOf: m.bestOf, game: m.game,
+    score: { you: who==="a"?m.score.a:m.score.b, foe: who==="a"?m.score.b:m.score.a },
+    between: !!m.between,
+    breakInMs: m.between ? Math.max(0, m.betweenUntil-Date.now()) : 0,
+    gameResult: m.between && m.gameResult ? { youWonGame: m.gameResult.winner===who, game:m.gameResult.game } : null,
   };
 }
 
@@ -232,17 +266,22 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     const hand=v.you.hand.slice().sort((x,y)=>y.cost-x.cost);
     for(const c of hand){ if(q.length>=3)break; if(c.cost<=budget&&!used.has(c.i)){ used.add(c.i); q.push(c.i); budget-=c.cost; if(c.slot===4)budget+=1; } } return q; };
 
-  // 1) full match where BOTH players submit every turn
+  // 1) full best-of-3 match where BOTH players submit every turn
   let m=createMatch(A,B,{seed:"t1"}); let turns=0;
-  while(m.status==="active" && turns<80){ submit(m,"a",pick(viewFor(m,"a"))); submit(m,"b",pick(viewFor(m,"b"))); turns++; }
-  console.log("both-submit match:", m.status, "winner", m.winner, "reason", m.reason, "turns", m.turn, "| PASS", m.status==="finished"?"✅":"❌");
+  while(m.status==="active" && turns<400){
+    if(m.between){ tick(m, m.betweenUntil); }                 // advance the inter-game break
+    else { submit(m,"a",pick(viewFor(m,"a"))); submit(m,"b",pick(viewFor(m,"b"))); }
+    turns++;
+  }
+  console.log("best-of-3 match:", m.status, "winner", m.winner, "score", JSON.stringify(m.score), "games", m.game,
+    "| PASS", (m.status==="finished" && (m.score.a===2||m.score.b===2))?"✅":"❌");
   // anti-cheat: can't submit a card you don't have / can't afford
   let m2=createMatch(A,B,{seed:"t2"}); const r=submit(m2,"a",[0,1,2,3]); console.log("4-card reject:", r.error?"PASS ✅":"FAIL ❌", "("+r.error+")");
   const big=submit(m2,"a",[99]); console.log("bad-index reject:", big.error?"PASS ✅":"FAIL ❌");
   // deadline auto-play: B never submits → tick auto-plays B; match still completes
   let m3=createMatch(A,B,{seed:"t3",turnMs:1}); let t3=0;
-  while(m3.status==="active" && t3<200){ submit(m3,"a",pick(viewFor(m3,"a"))); tick(m3, Date.now()+10); t3++; }
-  console.log("deadline auto-play completes:", m3.status==="finished"?"PASS ✅":"FAIL ❌", "(winner "+m3.winner+", reason "+m3.reason+")");
+  while(m3.status==="active" && t3<600){ if(!m3.between)submit(m3,"a",pick(viewFor(m3,"a"))); tick(m3, (m3.between?m3.betweenUntil:Date.now())+10); t3++; }
+  console.log("deadline auto-play completes:", m3.status==="finished"?"PASS ✅":"FAIL ❌", "(winner "+m3.winner+", reason "+m3.reason+", score "+JSON.stringify(m3.score)+")");
   // forfeit: neither side acts for 3 turns → forfeit
   let m4=createMatch(A,B,{seed:"t4",turnMs:1}); for(let i=0;i<5 && m4.status==="active";i++) tick(m4, Date.now()+10);
   console.log("idle forfeit:", m4.status==="finished"&&m4.reason==="forfeit"?"PASS ✅":"FAIL ❌");
