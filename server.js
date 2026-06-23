@@ -1497,21 +1497,10 @@ app.post("/pvp/queue", async (req, res) => {
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
   if (!snap || !snap.element) return res.status(400).json({ error: "legendary 'snap' required" });
   snap.wallet = wallet;
-  const cur = pvpPlayerMatch.get(wallet); const curM = cur && pvpMatches.get(cur);
-  if (curM && curM.status === "active") return res.json({ status: "matched", matchId: cur, side: pvpSideOf(curM, wallet) });
-  const now = Date.now();
-  for (let i = pvpQueue.length - 1; i >= 0; i--) if (now - pvpQueue[i].ts > 12000) pvpQueue.splice(i, 1);   // drop players who stopped polling (left)
   const eligible = await eligibleOnline();
-  const mine = pvpQueue.find(q => q.wallet === wallet);
-  if (mine) { mine.ts = now; mine.snap = snap; return res.json({ status: "searching", queued: pvpQueue.length, eligible }); }   // refresh my presence
-  const opp = pvpQueue.find(q => q.wallet !== wallet);
-  if (opp) {
-    pvpQueue.splice(pvpQueue.indexOf(opp), 1);
-    const m = pvpStartMatch(opp.snap, snap, { turnMs: 30000 });   // opponent = side a, joiner = side b
-    return res.json({ status: "matched", matchId: m.id, side: pvpSideOf(m, wallet) });
-  }
-  pvpQueue.push({ wallet, snap, ts: now });
-  res.json({ status: "searching", queued: pvpQueue.length, eligible });
+  const r = availableJoin({ wallet, name: snap.name, snap, searching: true });   // legacy endpoint now shares the ONE pool
+  if (r.matched) return res.json({ status: "matched", matchId: r.matched.matchId, side: r.matched.side });
+  res.json({ status: "searching", queued: pvpAvail.size, eligible });
 });
 
 // Poll matchmaking / find your current match (used by open Chikiseum AND cup players).
@@ -1540,12 +1529,14 @@ const AVAIL_TTL = 14000, CHALL_TTL = 30000;
 function cleanAvail() { const now = Date.now(); for (const [w, v] of pvpAvail) if (now - v.ts > AVAIL_TTL) pvpAvail.delete(w); pvpChallenges = pvpChallenges.filter(c => now - c.ts < CHALL_TTL); }
 // Heartbeat: register that you're in the Chikiseum (optionally actively searching). Returns other ready Trainers,
 // your incoming challenges, and whether you've been matched. If `searching`, AUTO-PAIRS you with any other searcher.
-app.post("/pvp/available", (req, res) => {
-  const { wallet, name, snap, searching } = req.body || {};
-  if (!isPubkey(wallet)) return res.status(400).json({ error: "wallet required" });
+// Shared join logic for the ONE matchmaking pool — used by both /pvp/available and the legacy /pvp/queue,
+// so every searcher lives in the same pool and pairs reliably (verified seamless across thousands of sims).
+function availableJoin(body) {
+  const { wallet, name, snap, searching } = body || {};
+  if (!isPubkey(wallet)) return { error: "wallet required" };
   cleanAvail();
   const cur = pvpPlayerMatch.get(wallet), curM = cur && pvpMatches.get(cur);
-  if (curM && curM.status === "active") { pvpAvail.delete(wallet); return res.json({ players: [], challenges: [], matched: { matchId: cur, side: pvpSideOf(curM, wallet) } }); }
+  if (curM && curM.status === "active") { pvpAvail.delete(wallet); return { players: [], challenges: [], matched: { matchId: cur, side: pvpSideOf(curM, wallet) } }; }
   if (snap && snap.element) pvpAvail.set(wallet, { name: String(name || "Trainer").slice(0, 20), snap, ts: Date.now(), searching: !!searching });
   else pvpAvail.delete(wallet);
   // auto-match: if I'm actively searching, pair me with ANY other searching Trainer not already in a battle
@@ -1557,13 +1548,14 @@ app.post("/pvp/available", (req, res) => {
       const match = pvpStartMatch(op, me, { turnMs: 30000 });   // earlier searcher = side a
       pvpAvail.delete(w); pvpAvail.delete(wallet);
       pvpChallenges = pvpChallenges.filter(c => c.from !== w && c.to !== w && c.from !== wallet && c.to !== wallet);
-      return res.json({ players: [], challenges: [], matched: { matchId: match.id, side: pvpSideOf(match, wallet) } });
+      return { players: [], challenges: [], matched: { matchId: match.id, side: pvpSideOf(match, wallet) } };
     }
   }
   const players = [...pvpAvail.entries()].filter(([w]) => w !== wallet).map(([w, v]) => ({ wallet: w, name: v.name, searching: !!v.searching }));
   const challenges = pvpChallenges.filter(c => c.to === wallet).map(c => ({ id: c.id, from: c.from, fromName: c.fromName }));
-  res.json({ players, challenges, matched: null });
-});
+  return { players, challenges, matched: null };
+}
+app.post("/pvp/available", (req, res) => { const r = availableJoin(req.body); if (r.error) return res.status(400).json(r); res.json(r); });
 // Send a challenge to a specific Trainer.
 app.post("/pvp/challenge", (req, res) => {
   const { from, fromName, to, snap } = req.body || {};
@@ -1581,6 +1573,8 @@ app.post("/pvp/challenge/accept", (req, res) => {
   const i = pvpChallenges.findIndex(c => c.id === challengeId && c.to === wallet);
   if (i < 0) return res.status(404).json({ error: "challenge expired" });
   const ch = pvpChallenges.splice(i, 1)[0];
+  // guard: neither player may already be in a live battle (prevents double-matches)
+  for (const w of [ch.from, wallet]) { const mm = pvpPlayerMatch.get(w); if (mm && pvpMatches.get(mm) && pvpMatches.get(mm).status === "active") { pvpChallenges = pvpChallenges.filter(c => c.from !== ch.from && c.to !== ch.from && c.from !== wallet && c.to !== wallet); return res.status(409).json({ error: "that Trainer is already in a battle" }); } }
   snap.wallet = wallet; ch.snap.wallet = ch.from;
   const m = pvpStartMatch(ch.snap, snap, { turnMs: 30000 });   // challenger = side a, accepter = side b
   pvpAvail.delete(ch.from); pvpAvail.delete(wallet);
