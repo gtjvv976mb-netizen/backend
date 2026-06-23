@@ -545,6 +545,31 @@ function crownChampion() {   // capture the winner of the just-finished cup as t
     if (c && isPubkey(c.wallet)) { cupChampion = { wallet: c.wallet, name: (c.snap && c.snap.name) || "Champion", ts: Date.now() }; saveCupChampion(); }
   } catch (e) {}
 }
+
+// ===== Meme Dynasty NFT eggs: buy egg -> hatch a RANDOM member (limited editions) -> mint worker turns it into an NFT =====
+const MEME_CHARS = [
+  { key: "popcat",  name: "Popcat",    weight: 1 }, { key: "moodeng", name: "Moo Deng",  weight: 1 },
+  { key: "doge",    name: "Doge",      weight: 1 }, { key: "pepe",    name: "Pepe",      weight: 1 },
+  { key: "chillguy",name: "Chill Guy", weight: 1 }, { key: "alon",    name: "Alon",      weight: 1 },
+];
+const MEME_KEYS = new Set(MEME_CHARS.map(c => c.key));
+const MEME_CAP = Number(process.env.MEME_EDITION_CAP || 100);   // editions per character
+let memeMinted = {};       // char -> editions handed out
+let memeHatches = [];       // [{id, wallet, char, name, edition, status, mintAddr, ts}]
+const _memeLastHatch = new Map();
+async function saveMeme() { try { await store.kvSet("meme_minted", memeMinted); await store.kvSet("meme_hatches", memeHatches); } catch (e) {} }
+function memeSupply() {
+  const chars = {}; let totalLeft = 0;
+  for (const c of MEME_CHARS) { const m = memeMinted[c.key] || 0, left = Math.max(0, MEME_CAP - m); chars[c.key] = { name: c.name, minted: m, cap: MEME_CAP, left }; totalLeft += left; }
+  return { chars, totalLeft, cap: MEME_CAP };
+}
+function pickMeme() {
+  const avail = MEME_CHARS.filter(c => (memeMinted[c.key] || 0) < MEME_CAP);
+  if (!avail.length) return null;
+  let tot = avail.reduce((s, c) => s + (c.weight || 1), 0), r = Math.random() * tot;
+  for (const c of avail) { r -= (c.weight || 1); if (r <= 0) return c; }
+  return avail[avail.length - 1];
+}
 async function loadCupState() {
   try { const p = await store.kvGet("cup_prizes"); if (p && typeof p === "object") for (const k in p) { const v = Number(p[k]) || 0; if (v > 0) cupPrizes.set(k, v); } } catch (e) {}
   try { const v = await store.kvGet("cup_public"); if (v !== null && v !== undefined) cupPublic = !!v; } catch (e) {}   // honor an explicit admin toggle; otherwise keep the default (public)
@@ -552,6 +577,8 @@ async function loadCupState() {
   try { const gc = await store.kvGet("glory_credits"); if (gc && typeof gc === "object") for (const k in gc) { const v = Number(gc[k]) || 0; if (v > 0) gloryCredits.set(k, v); } } catch (e) {}
   try { const ta = await store.kvGet("cup_total_awarded"); if (ta != null) cupTotalAwarded = Number(ta) || 0; } catch (e) {}
   try { const ch = await store.kvGet("cup_champion"); if (ch != null) cupChampion = ch; } catch (e) {}
+  try { const mm = await store.kvGet("meme_minted"); if (mm && typeof mm === "object") memeMinted = mm; } catch (e) {}
+  try { const mh = await store.kvGet("meme_hatches"); if (Array.isArray(mh)) memeHatches = mh; } catch (e) {}
   try { const cs = await store.kvGet("cup_state"); if (cs && cs.status) liveCup = createCup({}, cs); } catch (e) { console.error("cup_state restore failed:", e?.message || e); }   // resume an in-progress bracket after a restart
 }
 async function saveCupPrizes() { const o = {}; for (const [k, v] of cupPrizes) if (v > 0) o[k] = v; try { await store.kvSet("cup_prizes", o); } catch (e) {} }
@@ -1338,6 +1365,47 @@ async function setChampionHandler(req, res) {
 app.get("/cup/set-champion", setChampionHandler);
 app.post("/cup/set-champion", setChampionHandler);
 
+// ----- Meme Dynasty NFT eggs -----
+// Buy + hatch a Meme Legendary Egg → assigns a RANDOM member + edition; the mint worker turns it into an on-chain NFT.
+// (Payment is taken client-side in $CHIKI like other game spends; production should verify payment on-chain.)
+app.post("/meme/hatch", async (req, res) => {
+  const wallet = req.body && req.body.wallet;
+  if (!isPubkey(wallet)) return res.status(400).json({ error: "valid wallet required" });
+  const now = Date.now(), last = _memeLastHatch.get(wallet) || 0;
+  if (now - last < 4000) return res.status(429).json({ error: "slow down — one egg at a time" });
+  const c = pickMeme();
+  if (!c) return res.status(409).json({ error: "sold out — every Meme Dynasty edition has hatched" });
+  _memeLastHatch.set(wallet, now);
+  const edition = (memeMinted[c.key] || 0) + 1; memeMinted[c.key] = edition;
+  const h = { id: "h" + now.toString(36) + Math.random().toString(36).slice(2, 6), wallet, char: c.key, name: c.name, edition, status: "pending", mintAddr: null, ts: now };
+  memeHatches.push(h); await saveMeme();
+  res.json({ ok: true, hatch: { id: h.id, char: c.key, name: c.name, edition, cap: MEME_CAP, status: "pending" }, supply: memeSupply() });
+});
+// A wallet's hatched Meme NFTs (with mint status) + live supply.
+app.get("/meme/mine", (req, res) => {
+  const wallet = req.query && req.query.wallet;
+  if (!isPubkey(wallet)) return res.status(400).json({ error: "wallet required" });
+  const items = memeHatches.filter(h => h.wallet === wallet)
+    .map(h => ({ id: h.id, char: h.char, name: h.name, edition: h.edition, status: h.status, mintAddr: h.mintAddr, ts: h.ts }))
+    .sort((a, b) => b.ts - a.ts);
+  res.json({ items, supply: memeSupply() });
+});
+app.get("/meme/supply", (req, res) => res.json(memeSupply()));
+// Worker: list hatches awaiting an on-chain mint.
+app.get("/meme/pending", (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  res.json({ pending: memeHatches.filter(h => h.status === "pending").slice(0, 50) });
+});
+// Worker: mark a hatch minted (records the on-chain asset address).
+app.post("/meme/minted", async (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  const { hatchId, mintAddr } = req.body || {};
+  const h = memeHatches.find(x => x.id === hatchId);
+  if (!h) return res.status(404).json({ error: "hatch not found" });
+  h.status = "minted"; h.mintAddr = mintAddr || null; await saveMeme();
+  res.json({ ok: true });
+});
+
 // Admin: AUDIT the owed-prize ledger (read-only) — who is still owed Cup SOL, and how much.
 app.get("/cup/prizes", async (req, res) => {
   if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
@@ -1461,6 +1529,68 @@ app.get("/pvp/online", async (req, res) => res.json({ eligible: await eligibleOn
 app.post("/pvp/cancel", (req, res) => {
   const wallet = req.body?.wallet; const i = pvpQueue.findIndex(q => q.wallet === wallet);
   if (i >= 0) pvpQueue.splice(i, 1);
+  pvpAvail.delete(wallet);
+  res.json({ ok: true });
+});
+
+// ----- Direct challenge: see who's ready & challenge them (fixes "no one is searching at the same instant") -----
+const pvpAvail = new Map();        // wallet -> {name, snap, ts} : Trainers with the Chikiseum open, ready to battle
+let pvpChallenges = [];            // {id, from, fromName, to, snap, ts}
+const AVAIL_TTL = 14000, CHALL_TTL = 30000;
+function cleanAvail() { const now = Date.now(); for (const [w, v] of pvpAvail) if (now - v.ts > AVAIL_TTL) pvpAvail.delete(w); pvpChallenges = pvpChallenges.filter(c => now - c.ts < CHALL_TTL); }
+// Heartbeat: register that you're in the Chikiseum (optionally actively searching). Returns other ready Trainers,
+// your incoming challenges, and whether you've been matched. If `searching`, AUTO-PAIRS you with any other searcher.
+app.post("/pvp/available", (req, res) => {
+  const { wallet, name, snap, searching } = req.body || {};
+  if (!isPubkey(wallet)) return res.status(400).json({ error: "wallet required" });
+  cleanAvail();
+  const cur = pvpPlayerMatch.get(wallet), curM = cur && pvpMatches.get(cur);
+  if (curM && curM.status === "active") { pvpAvail.delete(wallet); return res.json({ players: [], challenges: [], matched: { matchId: cur, side: pvpSideOf(curM, wallet) } }); }
+  if (snap && snap.element) pvpAvail.set(wallet, { name: String(name || "Trainer").slice(0, 20), snap, ts: Date.now(), searching: !!searching });
+  else pvpAvail.delete(wallet);
+  // auto-match: if I'm actively searching, pair me with ANY other searching Trainer not already in a battle
+  if (searching && snap && snap.element) {
+    for (const [w, v] of pvpAvail) {
+      if (w === wallet || !v.searching) continue;
+      const m = pvpPlayerMatch.get(w); if (m && pvpMatches.get(m) && pvpMatches.get(m).status === "active") continue;
+      const me = { ...snap, wallet }, op = { ...v.snap, wallet: w };
+      const match = pvpStartMatch(op, me, { turnMs: 30000 });   // earlier searcher = side a
+      pvpAvail.delete(w); pvpAvail.delete(wallet);
+      pvpChallenges = pvpChallenges.filter(c => c.from !== w && c.to !== w && c.from !== wallet && c.to !== wallet);
+      return res.json({ players: [], challenges: [], matched: { matchId: match.id, side: pvpSideOf(match, wallet) } });
+    }
+  }
+  const players = [...pvpAvail.entries()].filter(([w]) => w !== wallet).map(([w, v]) => ({ wallet: w, name: v.name, searching: !!v.searching }));
+  const challenges = pvpChallenges.filter(c => c.to === wallet).map(c => ({ id: c.id, from: c.from, fromName: c.fromName }));
+  res.json({ players, challenges, matched: null });
+});
+// Send a challenge to a specific Trainer.
+app.post("/pvp/challenge", (req, res) => {
+  const { from, fromName, to, snap } = req.body || {};
+  if (!isPubkey(from) || !isPubkey(to)) return res.status(400).json({ error: "valid wallets required" });
+  if (!snap || !snap.element) return res.status(400).json({ error: "legendary snap required" });
+  cleanAvail();
+  if (pvpChallenges.some(c => c.from === from && c.to === to)) return res.json({ ok: true });   // dedupe
+  pvpChallenges.push({ id: "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), from, fromName: String(fromName || "Trainer").slice(0, 20), to, snap, ts: Date.now() });
+  res.json({ ok: true });
+});
+// Accept a challenge -> starts the live match; both sides learn via /pvp/available (matched) or this response.
+app.post("/pvp/challenge/accept", (req, res) => {
+  const { wallet, challengeId, snap } = req.body || {};
+  if (!snap || !snap.element) return res.status(400).json({ error: "legendary snap required" });
+  const i = pvpChallenges.findIndex(c => c.id === challengeId && c.to === wallet);
+  if (i < 0) return res.status(404).json({ error: "challenge expired" });
+  const ch = pvpChallenges.splice(i, 1)[0];
+  snap.wallet = wallet; ch.snap.wallet = ch.from;
+  const m = pvpStartMatch(ch.snap, snap, { turnMs: 30000 });   // challenger = side a, accepter = side b
+  pvpAvail.delete(ch.from); pvpAvail.delete(wallet);
+  pvpChallenges = pvpChallenges.filter(c => c.from !== ch.from && c.to !== ch.from && c.from !== wallet && c.to !== wallet);
+  res.json({ ok: true, matchId: m.id, side: pvpSideOf(m, wallet) });
+});
+// Decline / clear a challenge.
+app.post("/pvp/challenge/decline", (req, res) => {
+  const { wallet, challengeId } = req.body || {};
+  pvpChallenges = pvpChallenges.filter(c => !(c.id === challengeId && c.to === wallet));
   res.json({ ok: true });
 });
 
