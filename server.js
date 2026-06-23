@@ -547,26 +547,66 @@ function crownChampion() {   // capture the winner of the just-finished cup as t
 }
 
 // ===== Meme Dynasty NFT eggs: buy egg -> hatch a RANDOM member (limited editions) -> mint worker turns it into an NFT =====
+// Per-character supply = rarity. Fewer editions = rarer. `weight` = pull odds (set to the cap so each
+// character depletes proportionally and the scarcer ones are genuinely harder to hatch).
 const MEME_CHARS = [
-  { key: "popcat",  name: "Popcat",    weight: 1 }, { key: "moodeng", name: "Moo Deng",  weight: 1 },
-  { key: "doge",    name: "Doge",      weight: 1 }, { key: "pepe",    name: "Pepe",      weight: 1 },
-  { key: "chillguy",name: "Chill Guy", weight: 1 }, { key: "alon",    name: "Alon",      weight: 1 },
+  { key: "pepe",    name: "Pepe",      cap: 25, weight: 25, rarity: "Meme Legendary" },
+  { key: "popcat",  name: "Popcat",    cap: 20, weight: 20, rarity: "Meme Legendary" },
+  { key: "moodeng", name: "Moo Deng",  cap: 20, weight: 20, rarity: "Meme Legendary" },
+  { key: "doge",    name: "Doge",      cap: 15, weight: 15, rarity: "Meme Legendary" },
+  { key: "chillguy",name: "Chill Guy", cap: 15, weight: 15, rarity: "Meme Legendary" },
+  { key: "alon",    name: "Alon",      cap: 10, weight: 10, rarity: "Founder's Edition" },  // rarest — its own tier
 ];
 const MEME_KEYS = new Set(MEME_CHARS.map(c => c.key));
-const MEME_CAP = Number(process.env.MEME_EDITION_CAP || 100);   // editions per character
+const MEME_CAP = Number(process.env.MEME_EDITION_CAP || 10);   // fallback cap if a character has none
+const capOf = (key) => { const c = MEME_CHARS.find(x => x.key === key); return (c && c.cap) || MEME_CAP; };
+const rarityOf = (key) => { const c = MEME_CHARS.find(x => x.key === key); return (c && c.rarity) || "Meme Legendary"; };
+const MEME_TOTAL = MEME_CHARS.reduce((s, c) => s + (c.cap || MEME_CAP), 0);   // 105
+const MEME_EGG_PRICE = Number(process.env.MEME_EGG_PRICE || 1000000);   // $CHIKI per egg
+// Verify the on-chain $CHIKI payment before minting. ON by default because $CHIKI is a real (mainnet) token —
+// without this, anyone could POST /meme/hatch and mint NFTs for free. Set MEME_VERIFY_PAY=false only for local testing.
+const MEME_VERIFY_PAY = String(process.env.MEME_VERIFY_PAY ?? "true").toLowerCase() === "true";
+// When a Tensor (or Magic Eden) collection URL is configured, real trading happens there — the custom in-game
+// escrow ledger (/meme/buy) is disabled so we never settle real-money trades off-chain.
+const TENSOR_URL = process.env.TENSOR_URL || "";
+const MEME_TRADE_TENSOR = !!TENSOR_URL;
 let memeMinted = {};       // char -> editions handed out
 let memeHatches = [];       // [{id, wallet, char, name, edition, status, mintAddr, ts}]
+let memeUsedSigs = {};      // payment signature -> {wallet, ts}  (replay protection: a paid tx can hatch exactly one egg)
 const _memeLastHatch = new Map();
-async function saveMeme() { try { await store.kvSet("meme_minted", memeMinted); await store.kvSet("meme_hatches", memeHatches); } catch (e) {} }
+async function saveMeme() { try { await store.kvSet("meme_minted", memeMinted); await store.kvSet("meme_hatches", memeHatches); await store.kvSet("meme_used_sigs", memeUsedSigs); } catch (e) {} }
+// Verify a $CHIKI egg payment on-chain: the buyer signed it, it succeeded, they spent >= the price, and the treasury received funds.
+async function verifyEggPayment(sig, wallet) {
+  if (!MINT) return { ok: false, error: "server has no CHIKI mint configured" };
+  if (!sig || typeof sig !== "string" || sig.length < 32) return { ok: false, error: "missing payment signature" };
+  let tx;
+  try { tx = await conn.getParsedTransaction(sig, { commitment: "confirmed", maxSupportedTransactionVersion: 0 }); }
+  catch (e) { return { ok: false, error: "could not fetch payment transaction" }; }
+  if (!tx || !tx.meta) return { ok: false, error: "payment not found yet — wait a moment and retry" };
+  if (tx.meta.err) return { ok: false, error: "payment transaction failed on-chain" };
+  // the buyer's wallet must have signed (so it's their payment, not a replayed third-party tx)
+  const keys = (tx.transaction && tx.transaction.message && tx.transaction.message.accountKeys) || [];
+  const signed = keys.some(k => k && k.signer && (k.pubkey?.toString?.() || String(k.pubkey)) === wallet);
+  if (!signed) return { ok: false, error: "payment was not signed by your wallet" };
+  // compare CHIKI token-balance deltas for the buyer (must spend >= price) and the treasury (must receive funds)
+  const mintStr = MINT.toString(), treasStr = treasury.publicKey.toString();
+  const pre = tx.meta.preTokenBalances || [], post = tx.meta.postTokenBalances || [];
+  const bal = (arr, owner) => { const e = arr.find(b => b.mint === mintStr && b.owner === owner); return e ? Number(e.uiTokenAmount.uiAmount || 0) : 0; };
+  const spent = bal(pre, wallet) - bal(post, wallet);
+  const treasuryGain = bal(post, treasStr) - bal(pre, treasStr);
+  if (spent < MEME_EGG_PRICE * 0.999) return { ok: false, error: `payment too small — ${MEME_EGG_PRICE.toLocaleString()} $CHIKI required` };
+  if (treasuryGain <= 0) return { ok: false, error: "payment did not reach the treasury" };
+  return { ok: true, spent, treasuryGain };
+}
 function memeSupply() {
   const chars = {}; let totalLeft = 0;
-  for (const c of MEME_CHARS) { const m = memeMinted[c.key] || 0, left = Math.max(0, MEME_CAP - m); chars[c.key] = { name: c.name, minted: m, cap: MEME_CAP, left }; totalLeft += left; }
-  return { chars, totalLeft, cap: MEME_CAP };
+  for (const c of MEME_CHARS) { const cap = capOf(c.key), m = memeMinted[c.key] || 0, left = Math.max(0, cap - m); chars[c.key] = { name: c.name, minted: m, cap, left, rarity: c.rarity }; totalLeft += left; }
+  return { chars, totalLeft, total: MEME_TOTAL, cap: MEME_CAP };
 }
 // A player may hold only ONE Meme Legendary that isn't up for sale. To get another, list (sell) the current one first.
 function memeOwnedActive(wallet) { return memeHatches.filter(h => h.wallet === wallet && !h.listed).length; }
 function pickMeme() {
-  const avail = MEME_CHARS.filter(c => (memeMinted[c.key] || 0) < MEME_CAP);
+  const avail = MEME_CHARS.filter(c => (memeMinted[c.key] || 0) < capOf(c.key));
   if (!avail.length) return null;
   let tot = avail.reduce((s, c) => s + (c.weight || 1), 0), r = Math.random() * tot;
   for (const c of avail) { r -= (c.weight || 1); if (r <= 0) return c; }
@@ -581,6 +621,7 @@ async function loadCupState() {
   try { const ch = await store.kvGet("cup_champion"); if (ch != null) cupChampion = ch; } catch (e) {}
   try { const mm = await store.kvGet("meme_minted"); if (mm && typeof mm === "object") memeMinted = mm; } catch (e) {}
   try { const mh = await store.kvGet("meme_hatches"); if (Array.isArray(mh)) memeHatches = mh; } catch (e) {}
+  try { const us = await store.kvGet("meme_used_sigs"); if (us && typeof us === "object") memeUsedSigs = us; } catch (e) {}
   try { const cs = await store.kvGet("cup_state"); if (cs && cs.status) liveCup = createCup({}, cs); } catch (e) { console.error("cup_state restore failed:", e?.message || e); }   // resume an in-progress bracket after a restart
 }
 async function saveCupPrizes() { const o = {}; for (const [k, v] of cupPrizes) if (v > 0) o[k] = v; try { await store.kvSet("cup_prizes", o); } catch (e) {} }
@@ -1372,17 +1413,26 @@ app.post("/cup/set-champion", setChampionHandler);
 // (Payment is taken client-side in $CHIKI like other game spends; production should verify payment on-chain.)
 app.post("/meme/hatch", async (req, res) => {
   const wallet = req.body && req.body.wallet;
+  const paySig = req.body && req.body.paySig;
   if (!isPubkey(wallet)) return res.status(400).json({ error: "valid wallet required" });
   const now = Date.now(), last = _memeLastHatch.get(wallet) || 0;
   if (now - last < 4000) return res.status(429).json({ error: "slow down — one egg at a time" });
   if (memeOwnedActive(wallet) >= 1) return res.status(409).json({ error: "You already own a Meme Legendary — list it in the Bazaar (put it up for sale) before hatching another." });
+  // PAYMENT GATE: real $CHIKI must have changed hands on-chain before we mint anything.
+  if (MEME_VERIFY_PAY) {
+    if (!paySig || typeof paySig !== "string") return res.status(402).json({ error: "payment required — include your $CHIKI payment signature" });
+    if (memeUsedSigs[paySig]) return res.status(409).json({ error: "that payment was already used to hatch an egg" });
+    const v = await verifyEggPayment(paySig, wallet);
+    if (!v.ok) return res.status(402).json({ error: v.error });
+    memeUsedSigs[paySig] = { wallet, ts: now };   // burn the signature so it can't hatch a second egg
+  }
   const c = pickMeme();
-  if (!c) return res.status(409).json({ error: "sold out — every Meme Dynasty edition has hatched" });
+  if (!c) { if (MEME_VERIFY_PAY && paySig) delete memeUsedSigs[paySig]; return res.status(409).json({ error: "sold out — every Meme Dynasty edition has hatched" }); }
   _memeLastHatch.set(wallet, now);
   const edition = (memeMinted[c.key] || 0) + 1; memeMinted[c.key] = edition;
-  const h = { id: "h" + now.toString(36) + Math.random().toString(36).slice(2, 6), wallet, char: c.key, name: c.name, edition, status: "pending", mintAddr: null, ts: now };
+  const h = { id: "h" + now.toString(36) + Math.random().toString(36).slice(2, 6), wallet, char: c.key, name: c.name, edition, status: "pending", mintAddr: null, ts: now, paySig: paySig || null };
   memeHatches.push(h); await saveMeme();
-  res.json({ ok: true, hatch: { id: h.id, char: c.key, name: c.name, edition, cap: MEME_CAP, status: "pending" }, supply: memeSupply() });
+  res.json({ ok: true, hatch: { id: h.id, char: c.key, name: c.name, edition, cap: capOf(c.key), rarity: rarityOf(c.key), status: "pending" }, supply: memeSupply() });
 });
 // A wallet's hatched Meme NFTs (with mint status) + live supply.
 app.get("/meme/mine", (req, res) => {
@@ -1393,7 +1443,7 @@ app.get("/meme/mine", (req, res) => {
     .sort((a, b) => b.ts - a.ts);
   res.json({ items, supply: memeSupply() });
 });
-app.get("/meme/supply", (req, res) => res.json(memeSupply()));
+app.get("/meme/supply", (req, res) => res.json({ ...memeSupply(), eggPrice: MEME_EGG_PRICE, verifyPay: MEME_VERIFY_PAY, tradeTensor: MEME_TRADE_TENSOR, tensorUrl: TENSOR_URL || null }));
 // Worker: list hatches awaiting an on-chain mint.
 app.get("/meme/pending", (req, res) => {
   if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
@@ -1413,6 +1463,7 @@ app.post("/meme/minted", async (req, res) => {
 // (Off-chain ownership ledger for the devnet demo. Mainnet should use Metaplex Auction House / Tensor for
 //  escrowless on-chain trades + royalties — never a custom escrow.)
 app.post("/meme/list", async (req, res) => {
+  if (MEME_TRADE_TENSOR) return res.status(410).json({ error: "Trading is on Tensor now — list your NFT there.", tensorUrl: TENSOR_URL });
   const { wallet, hatchId, price } = req.body || {};
   if (!isPubkey(wallet)) return res.status(400).json({ error: "wallet required" });
   const h = memeHatches.find(x => x.id === hatchId);
@@ -1437,6 +1488,7 @@ app.get("/meme/market", (req, res) => {
 });
 // Buy a listed NFT — transfers in-game ownership + records the sale. (Payment settled client-side for the devnet demo.)
 app.post("/meme/buy", async (req, res) => {
+  if (MEME_TRADE_TENSOR) return res.status(410).json({ error: "Buying happens on Tensor now — settle the trade on-chain there.", tensorUrl: TENSOR_URL });
   const { wallet, hatchId } = req.body || {};
   if (!isPubkey(wallet)) return res.status(400).json({ error: "wallet required" });
   const h = memeHatches.find(x => x.id === hatchId);
