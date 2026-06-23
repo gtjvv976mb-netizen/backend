@@ -538,12 +538,20 @@ const gloryCredits = new Map();      // wallet -> pending Glory to ADD on the pl
                                      // Lives OUTSIDE the profile so client saves can't clobber it (Glory is client-authoritative).
 let cupTotalAwarded = Number(process.env.CUP_AWARDED_SEED || 8);   // DURABLE cumulative SOL ever rewarded as Cup prizes; seeded with the 2 cups already run (4 SOL each). New cups add to it.
 async function saveCupAwarded() { try { await store.kvSet("cup_total_awarded", cupTotalAwarded); } catch (e) {} }
+let cupChampion = null;   // {wallet, name, ts} — the REIGNING Chikoria Cup champion (latest only)
+async function saveCupChampion() { try { await store.kvSet("cup_champion", cupChampion); } catch (e) {} }
+function crownChampion() {   // capture the winner of the just-finished cup as the reigning champion
+  try { const c = liveCup && liveCup.state && liveCup.state.champion;
+    if (c && isPubkey(c.wallet)) { cupChampion = { wallet: c.wallet, name: (c.snap && c.snap.name) || "Champion", ts: Date.now() }; saveCupChampion(); }
+  } catch (e) {}
+}
 async function loadCupState() {
   try { const p = await store.kvGet("cup_prizes"); if (p && typeof p === "object") for (const k in p) { const v = Number(p[k]) || 0; if (v > 0) cupPrizes.set(k, v); } } catch (e) {}
   try { const v = await store.kvGet("cup_public"); if (v !== null && v !== undefined) cupPublic = !!v; } catch (e) {}   // honor an explicit admin toggle; otherwise keep the default (public)
   try { const py = await store.kvGet("cup_payers"); if (py && typeof py === "object") for (const k in py) cupPayers.set(k, Number(py[k]) || 0); } catch (e) {}
   try { const gc = await store.kvGet("glory_credits"); if (gc && typeof gc === "object") for (const k in gc) { const v = Number(gc[k]) || 0; if (v > 0) gloryCredits.set(k, v); } } catch (e) {}
   try { const ta = await store.kvGet("cup_total_awarded"); if (ta != null) cupTotalAwarded = Number(ta) || 0; } catch (e) {}
+  try { const ch = await store.kvGet("cup_champion"); if (ch != null) cupChampion = ch; } catch (e) {}
   try { const cs = await store.kvGet("cup_state"); if (cs && cs.status) liveCup = createCup({}, cs); } catch (e) { console.error("cup_state restore failed:", e?.message || e); }   // resume an in-progress bracket after a restart
 }
 async function saveCupPrizes() { const o = {}; for (const [k, v] of cupPrizes) if (v > 0) o[k] = v; try { await store.kvSet("cup_prizes", o); } catch (e) {} }
@@ -770,6 +778,7 @@ async function getStats() {
   let cupOwed = 0; for (const v of cupPrizes.values()) cupOwed += v; // prizes credited but not yet claimed
   out.cupOwedSol = +cupOwed.toFixed(4);
   out.cupAwardedSol = +Number(cupTotalAwarded || 0).toFixed(4);       // ALL-TIME SOL rewarded in the Chikoria Cup
+  out.cupChampion = cupChampion;                                     // {wallet, name, ts} reigning champion (or null)
   _statsCache = { t: Date.now(), data: out };
   return out;
 }
@@ -1255,6 +1264,7 @@ app.post("/cup/resolve-round", async (req, res) => {
       for (const row of liveCup.results()) { if (row.sol > 0 && isPubkey(row.wallet)) { cupPrizes.set(row.wallet, (cupPrizes.get(row.wallet) || 0) + row.sol); awarded += row.sol; } }
       cupTotalAwarded = +(cupTotalAwarded + awarded).toFixed(4);
       await saveCupPrizes(); await saveCupAwarded();
+      crownChampion();
     }
     await persistCup();
     res.json({ ok: true, result: r, ...cupSnapshot(req.body?.wallet) });
@@ -1306,11 +1316,27 @@ app.post("/cup/finalize-round", async (req, res) => {
       for (const row of liveCup.results()) { if (row.sol > 0 && isPubkey(row.wallet)) { cupPrizes.set(row.wallet, (cupPrizes.get(row.wallet) || 0) + row.sol); awarded += row.sol; } }
       cupTotalAwarded = +(cupTotalAwarded + awarded).toFixed(4);
       await saveCupPrizes(); await saveCupAwarded();
+      crownChampion();
     }
     cupRound = null; await persistCup();
     res.json({ ok: true, result: r, ...cupSnapshot(req.body?.wallet) });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
+
+// Public: the reigning Chikoria Cup champion (for the floating world trophy + profile badge).
+app.get("/cup/champion", (req, res) => res.json(cupChampion || { wallet: null, name: null, ts: 0 }));
+// Admin: manually set/clear the reigning champion (GET or POST; e.g., for cups run before this feature).
+async function setChampionHandler(req, res) {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  const src = req.method === "GET" ? req.query : (req.body || {});
+  const wallet = src.wallet, name = src.name || "Champion";
+  if (!wallet || wallet === "none" || wallet === "clear") { cupChampion = null; await saveCupChampion(); return res.json({ ok: true, cupChampion: null }); }
+  if (!isPubkey(wallet)) return res.status(400).json({ error: "valid wallet required" });
+  cupChampion = { wallet, name, ts: Date.now() }; await saveCupChampion();
+  res.json({ ok: true, cupChampion });
+}
+app.get("/cup/set-champion", setChampionHandler);
+app.post("/cup/set-champion", setChampionHandler);
 
 // Admin: AUDIT the owed-prize ledger (read-only) — who is still owed Cup SOL, and how much.
 app.get("/cup/prizes", async (req, res) => {
