@@ -1523,7 +1523,7 @@ app.get("/pvp/queue", async (req, res) => {
 });
 
 // Online Chikiseum-eligible player count (owns a Legendary) — shown before/while queuing.
-app.get("/pvp/online", async (req, res) => res.json({ eligible: await eligibleOnline(), queued: pvpQueue.length }));
+app.get("/pvp/online", async (req, res) => { cleanAvail(); res.json({ eligible: await eligibleOnline(), queued: pvpQueue.length, inChikiseum: pvpAvail.size, searching: [...pvpAvail.values()].filter(v => v.searching).length, names: [...pvpAvail.values()].map(v => v.name) }); });
 
 // Leave the matchmaking queue.
 app.post("/pvp/cancel", (req, res) => {
