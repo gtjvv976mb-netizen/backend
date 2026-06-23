@@ -1394,6 +1394,20 @@ setInterval(() => {
 
 const pvpQueue = [];                  // [{wallet, snap, ts}] players waiting for a live opponent
 const pvpPlayerMatch = new Map();     // wallet -> their current matchId (so cup + queued players can find their battle)
+// Count of ONLINE players who own a Legendary (= eligible to battle in the Chikiseum). Cached to avoid DB load.
+const PVP_LEGEND_SP = new Set([10, 11, 12, 13, 14]);   // legendary species indices
+let _pvpOnlineCache = { n: 0, t: 0 };
+async function eligibleOnline() {
+  const now = Date.now();
+  if (now - _pvpOnlineCache.t < 4000) return _pvpOnlineCache.n;
+  try {
+    const rows = await store.world(PRESENCE_WINDOW, "", 5000);   // [{wallet, sp, level}]
+    const set = new Set();
+    for (const r of rows) if (PVP_LEGEND_SP.has(r.sp | 0)) set.add(r.wallet);
+    _pvpOnlineCache = { n: set.size, t: now };
+  } catch (e) {}
+  return _pvpOnlineCache.n;
+}
 function pvpStartMatch(a, b, opts) {  // a,b = snapshots with .wallet
   const m = pvpCreate(a, b, opts || { turnMs: 30000 });
   pvpMatches.set(m.id, m); pvpPlayerMatch.set(m.walletA, m.id); pvpPlayerMatch.set(m.walletB, m.id);
@@ -1410,7 +1424,7 @@ app.post("/pvp/create", async (req, res) => {
 });
 
 // Open Chikiseum matchmaking: join the queue; pairs with the next waiting player into a live match.
-app.post("/pvp/queue", (req, res) => {
+app.post("/pvp/queue", async (req, res) => {
   const wallet = req.body?.wallet, snap = req.body?.snap;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
   if (!snap || !snap.element) return res.status(400).json({ error: "legendary 'snap' required" });
@@ -1419,8 +1433,9 @@ app.post("/pvp/queue", (req, res) => {
   if (curM && curM.status === "active") return res.json({ status: "matched", matchId: cur, side: pvpSideOf(curM, wallet) });
   const now = Date.now();
   for (let i = pvpQueue.length - 1; i >= 0; i--) if (now - pvpQueue[i].ts > 12000) pvpQueue.splice(i, 1);   // drop players who stopped polling (left)
+  const eligible = await eligibleOnline();
   const mine = pvpQueue.find(q => q.wallet === wallet);
-  if (mine) { mine.ts = now; mine.snap = snap; return res.json({ status: "searching", queued: pvpQueue.length }); }   // refresh my presence
+  if (mine) { mine.ts = now; mine.snap = snap; return res.json({ status: "searching", queued: pvpQueue.length, eligible }); }   // refresh my presence
   const opp = pvpQueue.find(q => q.wallet !== wallet);
   if (opp) {
     pvpQueue.splice(pvpQueue.indexOf(opp), 1);
@@ -1428,16 +1443,19 @@ app.post("/pvp/queue", (req, res) => {
     return res.json({ status: "matched", matchId: m.id, side: pvpSideOf(m, wallet) });
   }
   pvpQueue.push({ wallet, snap, ts: now });
-  res.json({ status: "searching", queued: pvpQueue.length });
+  res.json({ status: "searching", queued: pvpQueue.length, eligible });
 });
 
 // Poll matchmaking / find your current match (used by open Chikiseum AND cup players).
-app.get("/pvp/queue", (req, res) => {
+app.get("/pvp/queue", async (req, res) => {
   const wallet = req.query?.wallet; if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "wallet required" });
   const cur = pvpPlayerMatch.get(wallet); const m = cur && pvpMatches.get(cur);
   if (m) return res.json({ status: "matched", matchId: cur, side: pvpSideOf(m, wallet), over: m.status === "finished" });
-  res.json({ status: pvpQueue.find(q => q.wallet === wallet) ? "searching" : "idle", queued: pvpQueue.length });
+  res.json({ status: pvpQueue.find(q => q.wallet === wallet) ? "searching" : "idle", queued: pvpQueue.length, eligible: await eligibleOnline() });
 });
+
+// Online Chikiseum-eligible player count (owns a Legendary) — shown before/while queuing.
+app.get("/pvp/online", async (req, res) => res.json({ eligible: await eligibleOnline(), queued: pvpQueue.length }));
 
 // Leave the matchmaking queue.
 app.post("/pvp/cancel", (req, res) => {
