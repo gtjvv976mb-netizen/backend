@@ -1523,6 +1523,7 @@ const legendScale=spIdx=>LEGEND_IDXS.indexOf(spIdx)>=0?LEGEND_SCALE*(LEGEND_SCAL
 /* limb rigs for the legendaries (segmentation maps body→head→tail→wings, then animates) */
 window.RIG_MODE=window.RIG_MODE||{};
 Object.assign(window.RIG_MODE,{11:"wingsonly",12:"legs",13:"legs",14:"dragon"});   /* Adalor wings-only · Tyrannos/Grovador walk + tail · Dragonos wings + tail */
+Object.assign(window.RIG_MODE,{15:"legs",16:"legs",17:"legs",18:"biped",19:"biped",20:"biped"});   /* Meme Dynasty: Popcat/MooDeng/Doge walk on 4 · Pepe/ChillGuy/Alon walk on 2 */
 const NONLEGEND_IDXS=SPECIES.map((s,i)=>s.type!=="Legendary"?i:-1).filter(i=>i>=0); /* normal (non-legendary) species indices */
 const ANCIENT_EGG_ENABLED=true;  /* Mithra's Mystic Market is OPEN */
 const ARENA_ENABLED=true;        /* ⚔️ Chikiseum LIVE — battles, Glory & card upgrades open */
@@ -6512,7 +6513,7 @@ function frame(now){
       }
       /* legs/tentacles rigs have NO head joint — so for "working" tasks we lean
          the WHOLE creature (head stays attached, no pixels separate) */
-      if(rigMode==="legs"||rigMode==="tentacles"){
+      if(rigMode==="legs"||rigMode==="tentacles"||rigMode==="biped"){
         let want=0;
         if(!sleeping2&&c.state==="working")want=0.14+Math.sin(t*5+c.bob)*0.10; /* lean in & nod */
         const cur=c.mesh.userData.workTilt||0;
@@ -6751,7 +6752,7 @@ function segmentMesh(mesh,mode){
   const bb=geo.boundingBox,size=new THREE.Vector3();bb.getSize(size);
   const min=bb.min;
   const pos=geo.attributes.position;
-  const legY=min.y+size.y*0.30;          /* below = legs (kept low so the body never deforms) */
+  const legY=min.y+size.y*(mode==="biped"?0.42:0.30);   /* below = legs (bipeds stand taller) */
   const tailZ=min.z+size.z*0.26;         /* rear band  = tail  */
   const headZ=min.z+size.z*0.60;         /* front+high = head  */
   const headY=min.y+size.y*0.42;
@@ -6783,6 +6784,11 @@ function segmentMesh(mesh,mode){
       else if(cz<tailZ&&cy<headY)r="tail";                              /* 3. tail (rear-low) */
       else if(cz>headZ&&cy>headY)r="head";                             /* 4. head (front + high) */
       else r="body";                                                    /* 5. torso stays welded */
+    }else if(mode==="biped"){
+      /* upright BIPEDS (Pepe / Chill Guy / Alon): only the TWO legs swing (left vs right, opposite phase).
+         Arms + head + torso stay welded as ONE rigid bobbing body so nothing tears or moves weird. */
+      if(cy<legY)r=(cx<midX?"L":"R")+"F";   /* LF = left leg, RF = right leg → swing opposite */
+      else r="body";
     }else{
       /* legs / tentacles / default: ONLY the bottom limbs + the tail move.
          The head and the whole torso stay welded as ONE rigid piece — the body
@@ -6833,6 +6839,7 @@ function segmentMesh(mesh,mode){
     else if(k2==="head")pv=new THREE.Vector3(midX,headY,headZ);
     else pv=new THREE.Vector3(0,0,0);
     g2.translate(-pv.x,-pv.y,-pv.z);
+    if(!g2.attributes.normal)g2.computeVertexNormals();   /* voxel builds ship without normals → flat-shade so they light up */
     const part=new THREE.Mesh(g2,mesh.material);
     part.castShadow=true;
     const pivot=new THREE.Group();
@@ -6913,7 +6920,8 @@ setTimeout(()=>{
     }
   }
   /* large built-in models kept as separate files (out of models.js to stay light) */
-  const EXTERNAL_GLB={11:"adalor_voxel.glb",12:"tyrannos_voxel.glb",13:"grovador_voxel.glb",14:"dragonos_voxel.glb"};   /* in-game legendaries — voxel models, procedural limb rigs (see RIG_MODE above) */
+  const EXTERNAL_GLB={11:"adalor_voxel.glb",12:"tyrannos_voxel.glb",13:"grovador_voxel.glb",14:"dragonos_voxel.glb",
+    15:"popcat_build.glb",16:"moodeng_build.glb",17:"doge_build.glb",18:"pepe_build.glb",19:"chillguy_build.glb",20:"alon_build.glb"};   /* in-game legendaries — voxel models, procedural limb rigs (see RIG_MODE above) */
   const GLB_VER="2";   /* bump this whenever a voxel GLB is re-exported, to bust the browser cache */
   for(const i in EXTERNAL_GLB){
     const idx=+i;
