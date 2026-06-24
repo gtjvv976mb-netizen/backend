@@ -563,6 +563,10 @@ const capOf = (key) => { const c = MEME_CHARS.find(x => x.key === key); return (
 const rarityOf = (key) => { const c = MEME_CHARS.find(x => x.key === key); return (c && c.rarity) || "Meme Legendary"; };
 const MEME_TOTAL = MEME_CHARS.reduce((s, c) => s + (c.cap || MEME_CAP), 0);   // 105
 const MEME_EGG_PRICE = Number(process.env.MEME_EGG_PRICE || 1000000);   // $CHIKI per egg
+// 🔒 SALE SWITCH — hard server-side lock. CLOSED by default. Flip MEME_SALE_OPEN=true on Render at your X launch.
+// While closed, /meme/hatch is rejected for everyone EXCEPT admin wallets (so you can still dry-run).
+const MEME_SALE_OPEN = String(process.env.MEME_SALE_OPEN ?? "false").toLowerCase() === "true";
+const MEME_ADMIN_WALLETS = new Set((process.env.MEME_ADMIN_WALLETS || TEAM_WALLET || "").split(",").map(s => s.trim()).filter(Boolean));
 // Verify the on-chain $CHIKI payment before minting. ON by default because $CHIKI is a real (mainnet) token —
 // without this, anyone could POST /meme/hatch and mint NFTs for free. Set MEME_VERIFY_PAY=false only for local testing.
 const MEME_VERIFY_PAY = String(process.env.MEME_VERIFY_PAY ?? "true").toLowerCase() === "true";
@@ -1415,6 +1419,8 @@ app.post("/meme/hatch", async (req, res) => {
   const wallet = req.body && req.body.wallet;
   const paySig = req.body && req.body.paySig;
   if (!isPubkey(wallet)) return res.status(400).json({ error: "valid wallet required" });
+  // 🔒 SALE LOCK: closed to the public until launch; admin wallets bypass so the dry-run works.
+  if (!MEME_SALE_OPEN && !MEME_ADMIN_WALLETS.has(wallet)) return res.status(403).json({ error: "Meme Dynasty hatching opens at official launch — stay tuned on X! 🥚" });
   const now = Date.now(), last = _memeLastHatch.get(wallet) || 0;
   if (now - last < 4000) return res.status(429).json({ error: "slow down — one egg at a time" });
   if (memeOwnedActive(wallet) >= 1) return res.status(409).json({ error: "You already own a Meme Legendary — list it in the Bazaar (put it up for sale) before hatching another." });
@@ -1443,7 +1449,7 @@ app.get("/meme/mine", (req, res) => {
     .sort((a, b) => b.ts - a.ts);
   res.json({ items, supply: memeSupply() });
 });
-app.get("/meme/supply", (req, res) => res.json({ ...memeSupply(), eggPrice: MEME_EGG_PRICE, verifyPay: MEME_VERIFY_PAY, tradeTensor: MEME_TRADE_TENSOR, tensorUrl: TENSOR_URL || null }));
+app.get("/meme/supply", (req, res) => res.json({ ...memeSupply(), eggPrice: MEME_EGG_PRICE, verifyPay: MEME_VERIFY_PAY, saleOpen: MEME_SALE_OPEN, tradeTensor: MEME_TRADE_TENSOR, tensorUrl: TENSOR_URL || null }));
 // Worker: list hatches awaiting an on-chain mint.
 app.get("/meme/pending", (req, res) => {
   if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
