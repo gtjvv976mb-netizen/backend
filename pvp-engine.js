@@ -223,7 +223,7 @@ function tick(m, now=Date.now()){
 }
 
 function sideView(s, isYou){
-  const base = { name:s.snap.name, element:s.snap.element, br:s.snap.br, hp:Math.max(0,Math.round(s.hp)), maxhp:s.maxhp, shield:Math.round(s.shield), submitted:s.submitted };
+  const base = { name:s.snap.name, handle:s.snap.handle||null, element:s.snap.element, br:s.snap.br, hp:Math.max(0,Math.round(s.hp)), maxhp:s.maxhp, shield:Math.round(s.shield), submitted:s.submitted };
   if(isYou){ base.energy=s.energy;
     base.hand = s.hand.map((slot,i)=>({ i, slot, type:ARCHK[slot], cost:CARD_COST[slot], tier:tier(s.snap,slot) })); }
   return base;
@@ -255,7 +255,22 @@ function viewFor(m, who){
   };
 }
 
-export { createMatch, submit, tick, viewFor, forfeit, ARCHK, CARD_COST };
+// Public, no-secrets view for SPECTATORS — both sides' HP/shield/score and the shared turn log, no hands.
+function spectatorView(m){
+  const pub = s => ({ name: s.snap.name, player: s.snap.player || s.snap.handle || null, element: s.snap.element, br: s.snap.br,
+    hp: Math.max(0, Math.round(s.hp)), maxhp: s.maxhp, shield: Math.round(s.shield), submitted: !!s.submitted });
+  return {
+    matchId:m.id, turn:m.turn, status:m.status, turnMs:m.turnMs,
+    deadlineInMs: Math.max(0, m.deadline-Date.now()),
+    a: pub(m.sides.a), b: pub(m.sides.b), walletA:m.walletA, walletB:m.walletB,
+    lastTurn: m.lastTurn, over: m.status==="finished",
+    winner: m.status==="finished" ? m.winner : null, reason: m.reason || null,
+    bestOf:m.bestOf, game:m.game, score:{ a:m.score.a, b:m.score.b },
+    between: !!m.between, breakInMs: m.between ? Math.max(0, m.betweenUntil-Date.now()) : 0,
+  };
+}
+
+export { createMatch, submit, tick, viewFor, forfeit, spectatorView, ARCHK, CARD_COST };
 
 /* ---------- self-test (node pvp-engine.js) ---------- */
 if (import.meta.url === `file://${process.argv[1]}`) {

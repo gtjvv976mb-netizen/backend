@@ -10,7 +10,7 @@ import {
   Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
 import { createCup } from "./cup-live.js";   // Chikoria Cup live orchestrator (double-elim, deterministic resolver)
-import { createMatch as pvpCreate, submit as pvpSubmit, tick as pvpTick, viewFor as pvpView, forfeit as pvpForfeit } from "./pvp-engine.js";   // live PvP battles
+import { createMatch as pvpCreate, submit as pvpSubmit, tick as pvpTick, viewFor as pvpView, forfeit as pvpForfeit, spectatorView as pvpSpectate } from "./pvp-engine.js";   // live PvP battles
 
 dotenv.config();
 const {
@@ -661,12 +661,20 @@ function cupSnapshot(forWallet) {
     exists: !!liveCup, public: cupPublic,
     status: s ? s.status : "none",
     entryGlory: s ? s.entryGlory : 100, prizePool: s ? s.prizePool : 4.0, cap: s ? s.cap : 10,
-    entrants: s ? s.entrants.map(e => ({ name: e.snap.name, br: e.snap.br, element: e.snap.element, bot: !!e.bot, ready: !!e.ready })) : [],
+    entrants: s ? s.entrants.map(e => ({ name: e.snap.name, player: e.snap.player || null, br: e.snap.br, element: e.snap.element, bot: !!e.bot, ready: !!e.ready })) : [],
     round: live ? liveCup.roundName : null,
     matches: live ? liveCup.currentMatches() : [],
-    champion: s && s.champion ? s.champion.snap.name : null,
+    champion: s && s.champion ? (s.champion.snap.player || s.champion.snap.name) : null,
     results: (s && s.status === "finished") ? liveCup.results() : null,
   };
+  // Live PvP matches anyone can spectate this round (profile names + matchId + live status).
+  if (cupRound && cupRound.battling && Array.isArray(cupRound.matches)) {
+    const entName = w => { const e = s && s.entrants.find(x => x.wallet === w); return e ? (e.snap.player || e.snap.name) : "Player"; };
+    const entEl = w => { const e = s && s.entrants.find(x => x.wallet === w); return e ? e.snap.element : "Fire"; };
+    out.liveMatches = cupRound.matches.map(mm => { const m = pvpMatches.get(mm.matchId);
+      return { matchId: mm.matchId, a: entName(mm.a), b: entName(mm.b), aEl: entEl(mm.a), bEl: entEl(mm.b),
+        status: m ? m.status : "active", winner: m && m.status === "finished" ? m.winner : null }; });
+  } else out.liveMatches = [];
   if (forWallet) {
     const me = s && s.entrants.find(e => e.wallet === forWallet);
     out.youRegistered = !!me; out.youReady = !!(me && me.ready);
@@ -694,7 +702,8 @@ async function cupSnapFromBody(wallet, snap) {
   const ct = {}; if (snap?.cardTier && typeof snap.cardTier === "object") for (const k in snap.cardTier) { const sl = k | 0; if (sl >= 0 && sl < 12) ct[sl] = Math.max(1, Math.min(5, Number(snap.cardTier[k]) || 1)); }
   const br = Math.max(1, Math.min(MAX_BR, Math.min(Number(snap?.br) || bestBr, bestBr)));   // can't claim a higher BR than your best legendary
   const name = stripTags(snap?.name || (prof?.handle) || wallet.slice(0, 4)).slice(0, 18) || wallet.slice(0, 4);
-  return { snap: { name, element: el, br, arenaSkills: skills, cardTier: ct, glory: 0 } };
+  const player = stripTags(prof?.handle || "").slice(0, 18) || null;   // the PLAYER's profile name (shown in the Hub, not the Chikimon's name)
+  return { snap: { name, player, element: el, br, arenaSkills: skills, cardTier: ct, glory: 0 } };
 }
 
 const CHAT_WINDOW = 120000;                   // a wallet shows as "online" for 2 min after its last beat
@@ -1299,6 +1308,47 @@ app.post("/cup/public", async (req, res) => {
   res.json({ ok: true, public: cupPublic });
 });
 
+// Admin: change the lobby SIZE live (8 / 10 / 16) WITHOUT recreating — keeps everyone already seated.
+// Only during registration, and never below the number already registered.
+app.post("/cup/resize", async (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  if (!liveCup) return res.status(409).json({ error: "no cup created yet" });
+  if (liveCup.state.status !== "registration") return res.status(409).json({ error: "can only resize during registration" });
+  const cap = Number(req.body?.cap);
+  if (![8, 10, 16].includes(cap)) return res.status(400).json({ error: "cap must be 8, 10, or 16" });
+  const seated = liveCup.state.entrants.length;
+  if (cap < seated) return res.status(409).json({ error: `${seated} players already registered — can't shrink below that` });
+  liveCup.state.cap = cap;
+  await persistCup();
+  res.json({ ok: true, cap, ...cupSnapshot(req.body?.wallet) });
+});
+
+// ---- Cup chat: lightweight, ephemeral, in-memory live chat for the tournament ----
+const cupChat = [];                 // ring buffer of {id,name,wallet,text,ts}
+let cupChatId = 1;
+const cupChatRate = new Map();      // wallet -> last-post ms (basic anti-spam)
+const cleanChat = (s) => String(s || "").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
+
+app.get("/cup/chat", (req, res) => {
+  const since = Number(req.query?.since) || 0;
+  res.json({ ok: true, messages: cupChat.filter(m => m.ts > since).slice(-60), now: Date.now() });
+});
+
+app.post("/cup/chat", (req, res) => {
+  const wallet = req.body?.wallet;
+  if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  const text = cleanChat(req.body?.text).slice(0, 240);
+  if (!text) return res.status(400).json({ error: "empty message" });
+  const now = Date.now(), last = cupChatRate.get(wallet) || 0;
+  if (now - last < 1200) return res.status(429).json({ error: "slow down a sec" });
+  cupChatRate.set(wallet, now);
+  const name = (cleanChat(req.body?.name).slice(0, 24)) || (wallet.slice(0, 4) + "…");
+  const msg = { id: cupChatId++, name, wallet, text, ts: now };   // text stored raw; clients MUST escape on render
+  cupChat.push(msg);
+  if (cupChat.length > 200) cupChat.splice(0, cupChat.length - 200);
+  res.json({ ok: true, message: msg });
+});
+
 // Admin: fill empty seats with bots (for a dry run). Bots auto-ready every round.
 app.post("/cup/fill", async (req, res) => {
   if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
@@ -1706,6 +1756,13 @@ app.get("/pvp/state", (req, res) => {
   const who = pvpSideOf(m, req.query?.wallet); if (!who) return res.status(403).json({ error: "not your match" });
   try { pvpTick(m); } catch (e) {}
   res.json(pvpView(m, who));
+});
+
+// SPECTATORS: anyone can watch a live match (public view — HP/shield/score/log, no hands).
+app.get("/pvp/spectate", (req, res) => {
+  const m = pvpMatches.get(req.query?.matchId); if (!m) return res.status(404).json({ error: "match not found" });
+  try { pvpTick(m); } catch (e) {}
+  res.json(pvpSpectate(m));
 });
 
 // Player: lock in your cards for the current turn. body: { matchId, wallet, cards:[handIndex,...] }

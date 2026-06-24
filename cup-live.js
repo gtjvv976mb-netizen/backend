@@ -97,8 +97,8 @@ function createCup(opts={}, snap=null){
 
     // the matches players must ready up for THIS round (pairs of {wallet,name})
     currentMatches(){
-      return this._pairs().map(([a,b])=>({ a:{wallet:a.wallet,name:a.snap.name,br:a.snap.br,element:a.snap.element},
-                                           b:{wallet:b.wallet,name:b.snap.name,br:b.snap.br,element:b.snap.element} }));
+      return this._pairs().map(([a,b])=>({ a:{wallet:a.wallet,name:a.snap.name,player:a.snap.player||null,br:a.snap.br,element:a.snap.element},
+                                           b:{wallet:b.wallet,name:b.snap.name,player:b.snap.player||null,br:b.snap.br,element:b.snap.element} }));
     },
 
     // resolve the current round (call when the lock-in window closes), advance the bracket.
