@@ -1436,9 +1436,20 @@ app.post("/meme/hatch", async (req, res) => {
   if (!c) { if (MEME_VERIFY_PAY && paySig) delete memeUsedSigs[paySig]; return res.status(409).json({ error: "sold out — every Meme Dynasty edition has hatched" }); }
   _memeLastHatch.set(wallet, now);
   const edition = (memeMinted[c.key] || 0) + 1; memeMinted[c.key] = edition;
-  const h = { id: "h" + now.toString(36) + Math.random().toString(36).slice(2, 6), wallet, char: c.key, name: c.name, edition, status: "pending", mintAddr: null, ts: now, paySig: paySig || null };
+  // status "incubating" → reserves the edition + counts toward 1-per-player, but the worker does NOT mint yet.
+  // The in-game egg hatches after the tended incubation, then POST /meme/hatched flips it to "pending" to mint.
+  const h = { id: "h" + now.toString(36) + Math.random().toString(36).slice(2, 6), wallet, char: c.key, name: c.name, edition, status: "incubating", mintAddr: null, ts: now, paySig: paySig || null };
   memeHatches.push(h); await saveMeme();
-  res.json({ ok: true, hatch: { id: h.id, char: c.key, name: c.name, edition, cap: capOf(c.key), rarity: rarityOf(c.key), status: "pending" }, supply: memeSupply() });
+  res.json({ ok: true, hatch: { id: h.id, char: c.key, name: c.name, edition, cap: capOf(c.key), rarity: rarityOf(c.key), status: "incubating" }, supply: memeSupply() });
+});
+// The in-game egg finished its tended incubation → flip "incubating" → "pending" so the worker mints the NFT.
+app.post("/meme/hatched", async (req, res) => {
+  const { wallet, hatchId } = req.body || {};
+  if (!isPubkey(wallet)) return res.status(400).json({ error: "wallet required" });
+  const h = memeHatches.find(x => x.id === hatchId && x.wallet === wallet);
+  if (!h) return res.status(404).json({ error: "hatch not found" });
+  if (h.status === "incubating") { h.status = "pending"; h.hatchedAt = Date.now(); await saveMeme(); }
+  res.json({ ok: true, status: h.status });
 });
 // A wallet's hatched Meme NFTs (with mint status) + live supply.
 app.get("/meme/mine", (req, res) => {
