@@ -532,6 +532,11 @@ const CUP_ELEMS = ["Water", "Fire", "Beast", "Storm", "Light"];
 let liveCup = null;                  // in-memory orchestrator (null until an admin creates one)
 let cupRound = null;                 // transient: the current round's LIVE PvP matches { battling, matchByWallet, side, matches }
 let cupPublic = true;                // true = open to ALL players (launched). Admin can flip to admin-only via /cup/public.
+let cupAuto = true;                  // AUTO-RUN: server starts/finalizes each round on its own (no admin clicking). Toggle via /cup/auto.
+let cupRoundStartedAt = 0;           // when the current battling round began (for the round time-limit)
+let cupAutoNextAt = 0;               // earliest time the auto-runner may act again (inter-round pause)
+const CUP_ROUND_MAX_MS = 4 * 60 * 1000;   // a round auto-finalizes after this even if a match is stuck (idle players forfeit far sooner)
+const CUP_ROUND_GAP_MS = 7000;            // pause between finalizing a round and starting the next, so results are visible
 const cupPrizes = new Map();         // wallet -> owed SOL (DURABLE — these are real funds; persisted to kv)
 const cupPayers = new Map();         // wallet -> Glory paid in entry fees (DURABLE log, so we can refund on a reset)
 const gloryCredits = new Map();      // wallet -> pending Glory to ADD on the player's next login/refresh.
@@ -619,6 +624,7 @@ function pickMeme() {
 async function loadCupState() {
   try { const p = await store.kvGet("cup_prizes"); if (p && typeof p === "object") for (const k in p) { const v = Number(p[k]) || 0; if (v > 0) cupPrizes.set(k, v); } } catch (e) {}
   try { const v = await store.kvGet("cup_public"); if (v !== null && v !== undefined) cupPublic = !!v; } catch (e) {}   // honor an explicit admin toggle; otherwise keep the default (public)
+  try { const a = await store.kvGet("cup_auto"); if (a !== null && a !== undefined) cupAuto = !!a; } catch (e) {}   // auto-run setting persists across restarts
   try { const py = await store.kvGet("cup_payers"); if (py && typeof py === "object") for (const k in py) cupPayers.set(k, Number(py[k]) || 0); } catch (e) {}
   try { const gc = await store.kvGet("glory_credits"); if (gc && typeof gc === "object") for (const k in gc) { const v = Number(gc[k]) || 0; if (v > 0) gloryCredits.set(k, v); } } catch (e) {}
   try { const ta = await store.kvGet("cup_total_awarded"); if (ta != null) cupTotalAwarded = Number(ta) || 0; } catch (e) {}
@@ -658,7 +664,7 @@ function cupSnapshot(forWallet) {
   const s = liveCup ? liveCup.state : null;
   const live = !!liveCup && s.status === "live";
   const out = {
-    exists: !!liveCup, public: cupPublic,
+    exists: !!liveCup, public: cupPublic, auto: cupAuto,
     status: s ? s.status : "none",
     entryGlory: s ? s.entryGlory : 100, prizePool: s ? s.prizePool : 4.0, cap: s ? s.cap : 10,
     entrants: s ? s.entrants.map(e => ({ name: e.snap.name, player: e.snap.player || null, br: e.snap.br, element: e.snap.element, bot: !!e.bot, ready: !!e.ready })) : [],
@@ -1397,26 +1403,74 @@ app.post("/cup/resolve-round", async (req, res) => {
 
 // Admin: START the current round as LIVE PvP — spin up a real battle for every real-vs-real pair.
 // Players then fight; byes/bots resolve automatically at finalize.
+// Shared: spin up LIVE PvP matches for the current round's real-vs-real pairs. Returns # of live matches.
+async function cupStartRoundLive() {
+  const S = liveCup.state;
+  const entOf = w => S.entrants.find(x => x.wallet === w);
+  const isReal = w => { const e = entOf(w); return !!(e && !e.bot && isPubkey(w)); };
+  const round = { battling: true, matchByWallet: new Map(), side: new Map(), matches: [] };
+  for (const m of liveCup.currentMatches()) {
+    const aw = m.a.wallet, bw = m.b.wallet, ea = entOf(aw), eb = entOf(bw);
+    if (ea) ea.ready = true; if (eb) eb.ready = true;   // mark seated so resolveRound runs the decide() path
+    if (isReal(aw) && isReal(bw)) {
+      const match = pvpStartMatch({ ...ea.snap, wallet: aw }, { ...eb.snap, wallet: bw }, { turnMs: 30000 });
+      round.matchByWallet.set(aw, match.id); round.matchByWallet.set(bw, match.id);
+      round.side.set(aw, "a"); round.side.set(bw, "b");
+      round.matches.push({ matchId: match.id, a: aw, b: bw });
+    }
+  }
+  cupRound = round; cupRoundStartedAt = Date.now(); await persistCup();
+  return round.matches.length;
+}
+// Shared: advance the bracket using live PvP winners (unfinished matches fall back to the deterministic engine).
+async function cupFinalizeRoundLive() {
+  const round = cupRound;
+  liveCup.state.entrants.forEach(e => { if (e.bot) e.ready = true; });
+  const decide = (a, b) => {
+    if (!round) return null;
+    const mid = round.matchByWallet.get(a.wallet); if (!mid) return null;
+    const m = pvpMatches.get(mid); if (!m || m.status !== "finished") return null;   // not done → deterministic fallback
+    const winWallet = m.winner === "a" ? m.walletA : m.walletB;
+    return winWallet === a.wallet ? "a" : "b";
+  };
+  const r = liveCup.resolveRound(decide);
+  if (r.finished) {
+    let awarded = 0;
+    for (const row of liveCup.results()) { if (row.sol > 0 && isPubkey(row.wallet)) { cupPrizes.set(row.wallet, (cupPrizes.get(row.wallet) || 0) + row.sol); awarded += row.sol; } }
+    cupTotalAwarded = +(cupTotalAwarded + awarded).toFixed(4);
+    await saveCupPrizes(); await saveCupAwarded();
+    crownChampion();
+  }
+  cupRound = null; await persistCup();
+  return r;
+}
+
+// AUTO-RUNNER: when enabled, the server drives the whole tournament — starts the cup once the lobby is full,
+// starts each round, ticks idle matches so they resolve, and finalizes when all battles are done (or time out).
+async function cupAutoTick() {
+  if (!cupAuto || !liveCup) return;
+  const S = liveCup.state;
+  if (S.status === "registration") {
+    if (S.entrants.length === S.cap) { try { liveCup.start(); cupAutoNextAt = Date.now() + CUP_ROUND_GAP_MS; await persistCup(); } catch (e) {} }
+    return;
+  }
+  if (S.status !== "live") return;
+  if (Date.now() < cupAutoNextAt) return;                       // respect the inter-round pause
+  if (!cupRound || !cupRound.battling) { await cupStartRoundLive(); return; }
+  // a round is underway — tick every active match so idle players auto-play/forfeit even if nobody is polling
+  for (const mm of cupRound.matches) { const m = pvpMatches.get(mm.matchId); if (m && m.status === "active") { try { pvpTick(m); } catch (e) {} } }
+  const allDone = (cupRound.matches || []).every(mm => { const m = pvpMatches.get(mm.matchId); return m && m.status === "finished"; });
+  const timedOut = (Date.now() - cupRoundStartedAt) > CUP_ROUND_MAX_MS;
+  if (allDone || timedOut) { await cupFinalizeRoundLive(); cupAutoNextAt = Date.now() + CUP_ROUND_GAP_MS; }
+}
+setInterval(() => { cupAutoTick().catch(() => {}); }, 4000);
+
 app.post("/cup/start-round", async (req, res) => {
   if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
   if (!liveCup || liveCup.state.status !== "live") return res.status(409).json({ error: "no live round" });
   try {
-    const S = liveCup.state;
-    const entOf = w => S.entrants.find(x => x.wallet === w);
-    const isReal = w => { const e = entOf(w); return !!(e && !e.bot && isPubkey(w)); };
-    const round = { battling: true, matchByWallet: new Map(), side: new Map(), matches: [] };
-    for (const m of liveCup.currentMatches()) {
-      const aw = m.a.wallet, bw = m.b.wallet, ea = entOf(aw), eb = entOf(bw);
-      if (ea) ea.ready = true; if (eb) eb.ready = true;   // mark seated so resolveRound runs the decide() path
-      if (isReal(aw) && isReal(bw)) {
-        const match = pvpStartMatch({ ...ea.snap, wallet: aw }, { ...eb.snap, wallet: bw }, { turnMs: 30000 });
-        round.matchByWallet.set(aw, match.id); round.matchByWallet.set(bw, match.id);
-        round.side.set(aw, "a"); round.side.set(bw, "b");
-        round.matches.push({ matchId: match.id, a: aw, b: bw });
-      }
-    }
-    cupRound = round; await persistCup();
-    res.json({ ok: true, liveMatches: round.matches.length, ...cupSnapshot(req.body?.wallet) });
+    const n = await cupStartRoundLive();
+    res.json({ ok: true, liveMatches: n, ...cupSnapshot(req.body?.wallet) });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
@@ -1425,26 +1479,17 @@ app.post("/cup/finalize-round", async (req, res) => {
   if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
   if (!liveCup || liveCup.state.status !== "live") return res.status(409).json({ error: "no live round" });
   try {
-    const round = cupRound;
-    liveCup.state.entrants.forEach(e => { if (e.bot) e.ready = true; });
-    const decide = (a, b) => {
-      if (!round) return null;
-      const mid = round.matchByWallet.get(a.wallet); if (!mid) return null;
-      const m = pvpMatches.get(mid); if (!m || m.status !== "finished") return null;   // not done → deterministic fallback
-      const winWallet = m.winner === "a" ? m.walletA : m.walletB;
-      return winWallet === a.wallet ? "a" : "b";
-    };
-    const r = liveCup.resolveRound(decide);
-    if (r.finished) {
-      let awarded = 0;
-      for (const row of liveCup.results()) { if (row.sol > 0 && isPubkey(row.wallet)) { cupPrizes.set(row.wallet, (cupPrizes.get(row.wallet) || 0) + row.sol); awarded += row.sol; } }
-      cupTotalAwarded = +(cupTotalAwarded + awarded).toFixed(4);
-      await saveCupPrizes(); await saveCupAwarded();
-      crownChampion();
-    }
-    cupRound = null; await persistCup();
+    const r = await cupFinalizeRoundLive();
     res.json({ ok: true, result: r, ...cupSnapshot(req.body?.wallet) });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Admin: toggle AUTO-RUN on/off. When on, the server runs the whole tournament hands-free.
+app.post("/cup/auto", async (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  cupAuto = !!req.body?.auto;
+  try { await store.kvSet("cup_auto", cupAuto); } catch (e) {}
+  res.json({ ok: true, auto: cupAuto });
 });
 
 // Public: the reigning Chikoria Cup champion (for the floating world trophy + profile badge).
@@ -1511,6 +1556,14 @@ app.get("/meme/mine", (req, res) => {
   res.json({ items, supply: memeSupply() });
 });
 app.get("/meme/supply", (req, res) => res.json({ ...memeSupply(), eggPrice: MEME_EGG_PRICE, verifyPay: MEME_VERIFY_PAY, saleOpen: MEME_SALE_OPEN, tradeTensor: MEME_TRADE_TENSOR, tensorUrl: TENSOR_URL || null }));
+// Public: the most recent hatches — drives a live "just hatched!" ticker for hype/engagement.
+app.get("/meme/recent", (req, res) => {
+  const items = memeHatches.filter(h => h.status !== "incubating")
+    .slice(-12).reverse()
+    .map(h => ({ char: h.char, name: h.name, edition: h.edition, cap: capOf(h.char), rarity: rarityOf(h.char), ts: h.hatchedAt || h.ts }));
+  const sup = memeSupply();
+  res.json({ items, minted: sup.total - sup.totalLeft, total: sup.total });
+});
 // Worker: list hatches awaiting an on-chain mint.
 app.get("/meme/pending", (req, res) => {
   if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
@@ -1536,6 +1589,7 @@ app.post("/meme/list", async (req, res) => {
   const h = memeHatches.find(x => x.id === hatchId);
   if (!h) return res.status(404).json({ error: "NFT not found" });
   if (h.wallet !== wallet) return res.status(403).json({ error: "not your NFT" });
+  if (h.status !== "minted") return res.status(409).json({ error: "this Legendary is still hatching — you can list it once it's minted on-chain. 🥚" });
   const p = Number(price); if (!(p > 0)) return res.status(400).json({ error: "price must be greater than 0" });
   h.listed = { price: +p.toFixed(4), ts: Date.now() }; await saveMeme();
   res.json({ ok: true });
@@ -1560,6 +1614,7 @@ app.post("/meme/buy", async (req, res) => {
   if (!isPubkey(wallet)) return res.status(400).json({ error: "wallet required" });
   const h = memeHatches.find(x => x.id === hatchId);
   if (!h || !h.listed) return res.status(409).json({ error: "this NFT is no longer for sale" });
+  if (h.status !== "minted") return res.status(409).json({ error: "this NFT isn't minted on-chain yet — can't buy it" });
   if (h.wallet === wallet) return res.status(400).json({ error: "you can't buy your own listing" });
   if (memeOwnedActive(wallet) >= 1) return res.status(409).json({ error: "You already own a Meme Legendary — list yours for sale before buying another." });
   const price = h.listed.price, seller = h.wallet;
