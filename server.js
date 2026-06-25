@@ -607,10 +607,26 @@ async function verifyEggPayment(sig, wallet) {
   if (treasuryGain <= 0) return { ok: false, error: "payment did not reach the treasury" };
   return { ok: true, spent, treasuryGain };
 }
+// how many eggs are claimed (bought) — incubating(mystery) + pending + minted all hold a slot against the 105 total.
+function memeReserved() { return memeHatches.filter(h => h.status === "incubating" || h.status === "pending" || h.status === "minted").length; }
 function memeSupply() {
-  const chars = {}; let totalLeft = 0;
-  for (const c of MEME_CHARS) { const cap = capOf(c.key), m = memeMinted[c.key] || 0, left = Math.max(0, cap - m); chars[c.key] = { name: c.name, minted: m, cap, left, rarity: c.rarity }; totalLeft += left; }
-  return { chars, totalLeft, total: MEME_TOTAL, cap: MEME_CAP };
+  const chars = {}; let hatched = 0;
+  // per-character "minted" = species ROLLED at hatch (determined). Incubating eggs are a mystery and not counted per-character yet.
+  for (const c of MEME_CHARS) { const cap = capOf(c.key), m = memeMinted[c.key] || 0; chars[c.key] = { name: c.name, minted: m, cap, left: Math.max(0, cap - m), rarity: c.rarity }; hatched += m; }
+  const reserved = memeReserved();
+  return { chars, totalLeft: Math.max(0, MEME_TOTAL - reserved), total: MEME_TOTAL, reserved, hatched, cap: MEME_CAP };
+}
+// MIGRATION: reset any already-bought (incubating) egg back to a MYSTERY so its species is re-rolled at hatch,
+// and recompute per-character counts from only the determined (pending/minted) hatches. Idempotent.
+async function migrateMemeRandomize() {
+  let changed = false;
+  for (const h of memeHatches) {
+    if (h.status === "incubating" && (h.char || !h.undetermined)) { h.char = null; h.name = "Mystery Meme Egg"; h.edition = null; h.undetermined = true; changed = true; }
+  }
+  const recomputed = {};
+  for (const h of memeHatches) { if ((h.status === "pending" || h.status === "minted") && h.char) recomputed[h.char] = (recomputed[h.char] || 0) + 1; }
+  if (JSON.stringify(recomputed) !== JSON.stringify(memeMinted)) { memeMinted = recomputed; changed = true; }
+  if (changed) { try { await saveMeme(); } catch (e) {} console.log("meme: randomize migration applied — incubating eggs reset to mystery; per-char counts recomputed"); }
 }
 // A player may hold only ONE Meme Legendary that isn't up for sale. To get another, list (sell) the current one first.
 function memeOwnedActive(wallet) { return memeHatches.filter(h => h.wallet === wallet && !h.listed).length; }
@@ -632,6 +648,7 @@ async function loadCupState() {
   try { const mm = await store.kvGet("meme_minted"); if (mm && typeof mm === "object") memeMinted = mm; } catch (e) {}
   try { const mh = await store.kvGet("meme_hatches"); if (Array.isArray(mh)) memeHatches = mh; } catch (e) {}
   try { const us = await store.kvGet("meme_used_sigs"); if (us && typeof us === "object") memeUsedSigs = us; } catch (e) {}
+  try { await migrateMemeRandomize(); } catch (e) {}   // reset predetermined eggs → species rolls at hatch
   try { const cs = await store.kvGet("cup_state"); if (cs && cs.status) liveCup = createCup({}, cs); } catch (e) { console.error("cup_state restore failed:", e?.message || e); }   // resume an in-progress bracket after a restart
 }
 async function saveCupPrizes() { const o = {}; for (const [k, v] of cupPrizes) if (v > 0) o[k] = v; try { await store.kvSet("cup_prizes", o); } catch (e) {} }
@@ -1527,24 +1544,29 @@ app.post("/meme/hatch", async (req, res) => {
     if (!v.ok) return res.status(402).json({ error: v.error });
     memeUsedSigs[paySig] = { wallet, ts: now };   // burn the signature so it can't hatch a second egg
   }
-  const c = pickMeme();
-  if (!c) { if (MEME_VERIFY_PAY && paySig) delete memeUsedSigs[paySig]; return res.status(409).json({ error: "sold out — every Meme Dynasty edition has hatched" }); }
+  // 🎲 The species is NOT chosen here — it stays a MYSTERY and is rolled at hatch time (POST /meme/hatched).
+  // We only RESERVE a slot against the 105 total here.
+  if (memeReserved() >= MEME_TOTAL) { if (MEME_VERIFY_PAY && paySig) delete memeUsedSigs[paySig]; return res.status(409).json({ error: "sold out — every Meme Dynasty egg has been claimed" }); }
   _memeLastHatch.set(wallet, now);
-  const edition = (memeMinted[c.key] || 0) + 1; memeMinted[c.key] = edition;
-  // status "incubating" → reserves the edition + counts toward 1-per-player, but the worker does NOT mint yet.
-  // The in-game egg hatches after the tended incubation, then POST /meme/hatched flips it to "pending" to mint.
-  const h = { id: "h" + now.toString(36) + Math.random().toString(36).slice(2, 6), wallet, char: c.key, name: c.name, edition, status: "incubating", mintAddr: null, ts: now, paySig: paySig || null };
+  const h = { id: "h" + now.toString(36) + Math.random().toString(36).slice(2, 6), wallet, char: null, name: "Mystery Meme Egg", edition: null, status: "incubating", undetermined: true, mintAddr: null, ts: now, paySig: paySig || null };
   memeHatches.push(h); await saveMeme();
-  res.json({ ok: true, hatch: { id: h.id, char: c.key, name: c.name, edition, cap: capOf(c.key), rarity: rarityOf(c.key), status: "incubating" }, supply: memeSupply() });
+  res.json({ ok: true, hatch: { id: h.id, status: "incubating", mystery: true }, supply: memeSupply() });
 });
-// The in-game egg finished its tended incubation → flip "incubating" → "pending" so the worker mints the NFT.
+// The in-game egg finished its tended incubation → ROLL the random species now, then flip "incubating" → "pending" so the worker mints the NFT.
 app.post("/meme/hatched", async (req, res) => {
   const { wallet, hatchId } = req.body || {};
   if (!isPubkey(wallet)) return res.status(400).json({ error: "wallet required" });
   const h = memeHatches.find(x => x.id === hatchId && x.wallet === wallet);
   if (!h) return res.status(404).json({ error: "hatch not found" });
-  if (h.status === "incubating") { h.status = "pending"; h.hatchedAt = Date.now(); await saveMeme(); }
-  res.json({ ok: true, status: h.status });
+  if (h.status === "incubating") {
+    if (!h.char) {   // roll the random Meme Legendary NOW (respecting remaining per-character caps)
+      const c = pickMeme();
+      if (!c) return res.status(409).json({ error: "the dynasty is fully hatched" });
+      h.char = c.key; h.name = c.name; h.edition = (memeMinted[c.key] || 0) + 1; memeMinted[c.key] = h.edition; h.undetermined = false;
+    }
+    h.status = "pending"; h.hatchedAt = Date.now(); await saveMeme();
+  }
+  res.json({ ok: true, status: h.status, char: h.char, name: h.name, edition: h.edition, cap: capOf(h.char), rarity: rarityOf(h.char) });
 });
 // A wallet's hatched Meme NFTs (with mint status) + live supply.
 app.get("/meme/mine", (req, res) => {
