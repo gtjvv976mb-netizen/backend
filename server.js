@@ -144,6 +144,10 @@ const MAX_LEVEL = 50, MAX_BR = 30;
 const maxStamOf  = lv => 80 + lv * 12;
 const foodMaxSec = lv => Math.round(30 + (Math.min(lv, MAX_LEVEL) - 1) / 49 * 690) * 60;
 const xpNeed     = lv => Math.round(140 + (Math.max(1, lv) - 1) * 95 + Math.pow(Math.max(1, lv), 2) * 0.8);
+// Fastest LEGITIMATE seconds to fill ONE level (offline work model: 32 XP/task · 72s/task · NO naps). This is an
+// UPPER BOUND on any real XP rate — online play is slower and naps add more — so a genuine grinder is never
+// clamped, but a client that injects/spams levels can't beat this real-time floor. ~94h cumulative to reach L50.
+const minSecForLevel = lv => Math.ceil(xpNeed(Math.max(1, lv)) / 32) * 72;
 const legStamMax = lv => Math.round(120 + (Math.min(Math.max(lv, 1), MAX_LEVEL) - 1) / 49 * 780);
 const stripTags  = s => String(s == null ? "" : s).replace(/[<>]/g, "");          // no HTML tags ⇒ no stored XSS
 const clampNum   = (v, lo, hi, def) => { v = Number(v); return isFinite(v) ? Math.max(lo, Math.min(hi, v)) : def; };
@@ -151,6 +155,7 @@ const clampNum   = (v, lo, hi, def) => { v = Number(v); return isFinite(v) ? Mat
 // Returns a sanitized copy of the incoming profile, using the previously-stored one to block roll-backs / jumps.
 function sanitizeProfile(prev, p) {
   const out = { ...p };
+  const now = Date.now();
   if (out.handle != null) out.handle = stripTags(out.handle).slice(0, 16);
   out.glory   = clampNum(out.glory, 0, 1e12, 0);
   out.renames = clampNum(out.renames, 0, 99, 0);
@@ -171,9 +176,17 @@ function sanitizeProfile(prev, p) {
       const src = ic || pc;                                                    // prefer the incoming (latest) data; fall back to stored
       const isLegend = !!(src.isLegend || pc.isLegend);
       if (isLegend) { if (legs >= 1) continue; legs++; } else { if (normals >= 2) continue; normals++; }   // caps drop EXCESS NEW ones, never originals
+      // ===== LEVEL: monotonic + TIME-GATED to the fastest legitimate grind rate (kills injected/instant levels) =====
       const prevLv = clampNum(pc.level, 1, MAX_LEVEL, 1);
       let lv = clampNum(src.level, 1, MAX_LEVEL, 1);
-      if (pc.level != null) lv = Math.min(Math.max(lv, prevLv), prevLv + 4);   // level monotonic, no jumps
+      let lvAt = Number(pc._lvlAt) || now;                 // server-set timestamp of when this Chiki reached prevLv
+      if (pc.level == null) { lv = 1; lvAt = now; }        // a Chiki the server has NEVER seen starts the grind at L1 (admin gifts are pre-written to the stored profile, so they're not "new" here; admin wallets skip sanitize entirely)
+      else if (lv > prevLv) {                              // a level INCREASE is only honored as fast as real time allows
+        let allowed = prevLv, budget = Math.max(0, now - lvAt);
+        while (allowed < lv && allowed < MAX_LEVEL) { const need = minSecForLevel(allowed) * 1000; if (budget < need) break; budget -= need; allowed++; }
+        lv = Math.max(prevLv, Math.min(lv, allowed));
+        if (lv > prevLv) lvAt = now - budget;              // carry leftover earned time so a legit grind isn't penalized
+      } else { lv = Math.max(lv, prevLv); }                // monotonic — a Chiki's level never drops
       // BR can't be injected — it only rises gradually via Battle EXP; cap the per-save jump
       const brP = clampNum(pc.br, 1, MAX_BR, 1);
       let brF = Math.max(clampNum(src.br, 1, MAX_BR, 1), brP);
@@ -184,7 +197,7 @@ function sanitizeProfile(prev, p) {
       let ctF = null;
       if (rawCT) { ctF = {}; for (const k in rawCT) { const slot = k | 0; if (slot >= 0 && slot < 12) ctF[slot] = clampNum(rawCT[k], 1, 5, 1); } }
       kept.push({
-        sp, level: lv, isLegend, hungry: !!src.hungry, tending: !!src.tending,
+        sp, level: lv, isLegend, _lvlAt: lvAt, hungry: !!src.hungry, tending: !!src.tending,
         nick: src.nick != null ? stripTags(src.nick).slice(0, 16) : (pc.nick != null ? stripTags(pc.nick).slice(0, 16) : null),
         xp: clampNum(src.xp, 0, xpNeed(lv), 0),
         food: clampNum(src.food, 0, foodMaxSec(lv), 0),
@@ -1096,17 +1109,25 @@ app.post("/admin/gift-legendary", adminGiftChiki);   // back-compat alias
 
 // Admin: ban / unban a wallet from ALL reward-pool payouts (accrual claims + Cup prizes).
 // Auth via ?key=ADMIN_KEY or an admin wallet (cupAdminOk). Works as POST {wallet} or GET ?wallet=.
+// Admin auth for bans: a browser URL with ?key=ADMIN_KEY, OR an in-game admin who SIGNED in (spoof-proof —
+// the bare-wallet path is NOT accepted here, since an unban could let a drainer back into the pool).
+function banAuthOk(req) {
+  if (ADMIN_KEY && (req.query?.key === ADMIN_KEY || req.body?.key === ADMIN_KEY)) return true;
+  const { adminWallet, authMsg, authSig } = req.body || {};
+  return isPubkey(adminWallet) && verifyWalletSig(adminWallet, authMsg, authSig) && isAdminWallet(adminWallet);
+}
+// `target` = wallet to (un)ban — separate from the admin's own `wallet`/`adminWallet`.
 async function adminBan(req, res) {
-  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
-  const w = req.body?.wallet || req.query?.wallet;
-  if (!isPubkey(w)) return res.status(400).json({ error: "valid 'wallet' required" });
+  if (!banAuthOk(req)) return res.status(403).json({ error: "admin sign-in or key required" });
+  const w = req.body?.target || req.query?.target || req.query?.wallet;
+  if (!isPubkey(w)) return res.status(400).json({ error: "valid target wallet required" });
   bannedWallets.add(w); await saveBanned();
   res.json({ ok: true, banned: w, total: bannedWallets.size, list: [...bannedWallets] });
 }
 async function adminUnban(req, res) {
-  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
-  const w = req.body?.wallet || req.query?.wallet;
-  if (!isPubkey(w)) return res.status(400).json({ error: "valid 'wallet' required" });
+  if (!banAuthOk(req)) return res.status(403).json({ error: "admin sign-in or key required" });
+  const w = req.body?.target || req.query?.target || req.query?.wallet;
+  if (!isPubkey(w)) return res.status(400).json({ error: "valid target wallet required" });
   const had = bannedWallets.delete(w); await saveBanned();
   res.json({ ok: true, unbanned: w, was: had, total: bannedWallets.size, list: [...bannedWallets] });
 }
