@@ -1657,6 +1657,13 @@ app.get("/meme/pending", (req, res) => {
   if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
   res.json({ pending: memeHatches.filter(h => h.status === "pending").slice(0, 50) });
 });
+// Worker/admin: list every ALREADY-MINTED asset (id, char, edition, wallet, mintAddr) so a one-time
+// metadata "recase" pass can re-point each on-chain NFT at the new display-case art.
+app.get("/meme/minted-list", (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  res.json({ minted: memeHatches.filter(h => h.status === "minted" && h.mintAddr)
+    .map(h => ({ id: h.id, char: h.char, name: h.name, edition: h.edition, wallet: h.wallet, mintAddr: h.mintAddr })) });
+});
 // Worker: mark a hatch minted (records the on-chain asset address).
 app.post("/meme/minted", async (req, res) => {
   if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });

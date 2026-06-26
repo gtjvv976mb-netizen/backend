@@ -26,7 +26,7 @@ const BACKEND = (process.env.BACKEND || "https://backend-wffd.onrender.com").rep
 const ADMIN_KEY = process.env.ADMIN_KEY || "";
 const KEYFILE = path.join(__dirname, `mint-authority-${NETWORK}.json`);   // keep mainnet & devnet authorities separate
 const COLLFILE = path.join(__dirname, `collection-${NETWORK}.json`);
-const ARTCACHE = path.join(__dirname, `art-uris-${NETWORK}.json`);        // devnet/mainnet uploads have different URIs
+const ARTCACHE = path.join(__dirname, `art-uris-${NETWORK}-case.json`);    // v2: collectible "display case" art (separate cache from the old flat _art.png uploads)
 const POLL_MS = Number(process.env.POLL_MS || 8000);
 // 💰 SALES TAX / ROYALTY — enforced on every secondary sale by Tensor / Magic Eden (Metaplex Core Royalties plugin).
 const ROYALTY_BP = Number(process.env.MEME_ROYALTY_BP || CFG.royaltyBasisPoints || 2000);   // 2000 bps = 20%
@@ -80,20 +80,29 @@ async function setup() {
   return { umi, collection, royaltyPlugin };
 }
 
+// Upload the per-character image used as the NFT's on-chain art. Prefer the collectible "display case"
+// art (ui/nft-case/<key>.jpg) so the casing shows EVERYWHERE — in-game AND on Tensor / Magic Eden / wallets —
+// falling back to the flat <key>_art.png if a case image isn't present. Returns { uri, type }.
 async function artUriFor(umi, key) {
   if (artUris[key]) return artUris[key];
-  const file = path.join(__dirname, CFG.artDir, key + "_art.png");
+  const caseFile = path.join(__dirname, CFG.artDir, "ui", "nft-case", key + ".jpg");
+  const flatFile = path.join(__dirname, CFG.artDir, key + "_art.png");
+  const useCase = fs.existsSync(caseFile);
+  const file = useCase ? caseFile : flatFile;
+  const ext = useCase ? "jpg" : "png";
+  const ctype = useCase ? "image/jpeg" : "image/png";
   const buf = fs.readFileSync(file);
-  const up = { buffer: buf, fileName: key + ".png", displayName: charByKey[key].name, uniqueName: "chikimeme-" + key, contentType: "image/png", extension: "png", tags: [{ name: "Content-Type", value: "image/png" }] };
+  const up = { buffer: buf, fileName: key + "." + ext, displayName: charByKey[key].name, uniqueName: "chikimeme-" + key + (useCase ? "-case" : ""), contentType: ctype, extension: ext, tags: [{ name: "Content-Type", value: ctype }] };
   const [uri] = await umi.uploader.upload([up]);
-  artUris[key] = uri; saveArt(); log("uploaded art", key, "→", uri);
-  return uri;
+  const out = { uri, type: ctype };
+  artUris[key] = out; saveArt(); log("uploaded", useCase ? "case art" : "art", key, "→", uri);
+  return out;
 }
 
 async function mintOne(ctx, h) {
   const { umi, collection, royaltyPlugin } = ctx;
   const c = charByKey[h.char]; if (!c) throw new Error("unknown char " + h.char);
-  const image = await artUriFor(umi, h.char);
+  const { uri: image, type: imageType } = await artUriFor(umi, h.char);
   const cap = c.cap || CFG.editionCap;                 // per-character supply
   const rarity = c.rarity || "Meme Legendary";         // Alon = "Founder's Edition"
   const name = `${c.name} #${String(h.edition).padStart(3, "0")}`;
@@ -107,7 +116,7 @@ async function mintOne(ctx, h) {
       { trait_type: "Edition Of", value: String(cap) },
       { trait_type: "Rarity", value: rarity },
     ],
-    properties: { files: [{ uri: image, type: "image/png" }], category: "image" },
+    properties: { files: [{ uri: image, type: imageType }], category: "image" },
   };
   const uri = await umi.uploader.uploadJson(metadata);
   const asset = generateSigner(umi);
