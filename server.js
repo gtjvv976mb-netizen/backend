@@ -59,7 +59,9 @@ const DAILY_FRAC = Math.min(1, Math.max(0, Number(DAILY_CAP_FRAC)));
 // This is a pure fraction of the LIVE pool — it scales DOWN as the pool drains and UP as it refills (no stuck floor).
 // Because every payout is read against the current pool and bounded by the RESERVE floor, the pool asymptotes toward
 // the reserve but never crosses it: the treasury can never go into debt, and rewards self-correct without a fixed cap.
-const poolFactor = (pool) => (Number(pool) || 0) / POOL_REF;
+// RETUNE: cap the reward-scaling multiplier so a flush pool can't pay runaway amounts (sustainability + safety).
+const POOL_FACTOR_MAX = Math.max(1, Number(process.env.POOL_FACTOR_MAX || 3));
+const poolFactor = (pool) => Math.max(0, Math.min(POOL_FACTOR_MAX, (Number(pool) || 0) / POOL_REF));
 const MULT = Number(EARN_MULT), TASK_SEC = Math.max(5, Number(TASK_SECONDS)), ACCRUAL_CAP = Number(ACCRUAL_CAP_MIN);
 const WHALE_MIN = Number(WHALE_MIN_HOLD), WHALE_HOLD_MS = Number(WHALE_HOLD_HOURS) * 3600_000;
 const CLAIM_TAX = Math.min(0.95, Math.max(0, Number(process.env.CLAIM_TAX_PCT || 20) / 100));   /* SOL claim tax — withheld from payout, stays in treasury (1% burn / 39% pool / 60% team bookkeeping) */
@@ -109,6 +111,8 @@ function seededEarn(wallet, lastClaim, chikis, minutes){
   return sol * MULT;
 }
 const WALLET_DAILY = Number(PER_WALLET_DAILY_SOL);
+// RETUNE: dust guard — a pure-accrual claim must clear this floor so a tiny claim never costs more in tx fee than it pays. Cup prizes are exempt.
+const MIN_CLAIM = Math.max(0, Number(process.env.MIN_CLAIM_SOL || 0.001));
 const verifyOn = String(VERIFY_HOLDERS).toLowerCase() === "true";
 
 const isPubkey = (s) => { try { new PublicKey(s); return true; } catch { return false; } };
@@ -527,6 +531,14 @@ const ADMIN_SET = new Set(String(ADMIN_WALLETS || "").split(",").map(s => s.trim
 if (TEAM_WALLET) ADMIN_SET.add(TEAM_WALLET.trim());
 const isAdminWallet = (w) => ADMIN_SET.has(w);
 
+// ----- Reward-pool BAN LIST -----
+// A banned wallet is blocked from EVERY treasury payout — both accrual claims AND Cup prizes (all SOL leaves the
+// treasury, so one check covers the whole reward pool + team payouts). Seeded from BANNED_WALLETS env + persisted
+// admin bans; managed live via /admin/ban + /admin/unban.
+let bannedWallets = new Set(String(process.env.BANNED_WALLETS || "").split(/[,\s]+/).filter(s => isPubkey(s)));
+const isBanned = (w) => bannedWallets.has(w);
+async function saveBanned() { try { await store.kvSet("banned_wallets", [...bannedWallets]); } catch (e) {} }
+
 /* ----------------------------- Chikoria Cup (live event) ----------------------------- */
 const CUP_ELEMS = ["Water", "Fire", "Beast", "Storm", "Light"];
 let liveCup = null;                  // in-memory orchestrator (null until an admin creates one)
@@ -649,6 +661,7 @@ async function loadCupState() {
   try { const gc = await store.kvGet("glory_credits"); if (gc && typeof gc === "object") for (const k in gc) { const v = Number(gc[k]) || 0; if (v > 0) gloryCredits.set(k, v); } } catch (e) {}
   try { const ta = await store.kvGet("cup_total_awarded"); if (ta != null) cupTotalAwarded = Number(ta) || 0; } catch (e) {}
   try { const ch = await store.kvGet("cup_champion"); if (ch != null) cupChampion = ch; } catch (e) {}
+  try { const bw = await store.kvGet("banned_wallets"); if (Array.isArray(bw)) for (const w of bw) if (isPubkey(w)) bannedWallets.add(w); } catch (e) {}   // reward-pool bans persist across restarts
   try { const mm = await store.kvGet("meme_minted"); if (mm && typeof mm === "object") memeMinted = mm; } catch (e) {}
   try { const mh = await store.kvGet("meme_hatches"); if (Array.isArray(mh)) memeHatches = mh; } catch (e) {}
   try { const us = await store.kvGet("meme_used_sigs"); if (us && typeof us === "object") memeUsedSigs = us; } catch (e) {}
@@ -1081,6 +1094,26 @@ async function adminGiftChiki(req, res) {
 app.post("/admin/gift-chiki", adminGiftChiki);
 app.post("/admin/gift-legendary", adminGiftChiki);   // back-compat alias
 
+// Admin: ban / unban a wallet from ALL reward-pool payouts (accrual claims + Cup prizes).
+// Auth via ?key=ADMIN_KEY or an admin wallet (cupAdminOk). Works as POST {wallet} or GET ?wallet=.
+async function adminBan(req, res) {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  const w = req.body?.wallet || req.query?.wallet;
+  if (!isPubkey(w)) return res.status(400).json({ error: "valid 'wallet' required" });
+  bannedWallets.add(w); await saveBanned();
+  res.json({ ok: true, banned: w, total: bannedWallets.size, list: [...bannedWallets] });
+}
+async function adminUnban(req, res) {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  const w = req.body?.wallet || req.query?.wallet;
+  if (!isPubkey(w)) return res.status(400).json({ error: "valid 'wallet' required" });
+  const had = bannedWallets.delete(w); await saveBanned();
+  res.json({ ok: true, unbanned: w, was: had, total: bannedWallets.size, list: [...bannedWallets] });
+}
+app.post("/admin/ban", adminBan);   app.get("/admin/ban", adminBan);
+app.post("/admin/unban", adminUnban); app.get("/admin/unban", adminUnban);
+app.get("/admin/banned", (req, res) => { if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" }); res.json({ banned: [...bannedWallets] }); });
+
 // Recipient: see pending gift offers (shown in-game when at capacity).
 app.get("/gift/pending", (req, res) => {
   const w = req.query?.wallet; if (!isPubkey(w)) return res.status(400).json({ error: "wallet required" });
@@ -1119,6 +1152,7 @@ app.get("/earned", async (req, res) => {
 app.get("/claimable", async (req, res) => {
   const wallet = req.query?.wallet;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  if (isBanned(wallet)) return res.json({ wallet, banned: true, eligible: false, claimableSol: 0, accruedSol: 0, cupPrizeSol: 0 });   // banned → pouch shows 0, no claim button
   try {
     let bal = 0; try { bal = await chikiBalance(wallet); } catch (e) {}
     const p = await store.touch(wallet, bal >= MIN, bal);
@@ -1136,7 +1170,9 @@ app.get("/claimable", async (req, res) => {
     const claimable = Math.floor((accrued + cupPrize) * 1e6) / 1e6;
     /* seed params let the client mirror the EXACT same rarity sequence it will be paid for */
     res.json({ wallet, claimableSol: claimable, accruedSol: accrued, cupPrizeSol: cupPrize, claimGrossSol: Math.floor(gross*1e6)/1e6, claimTaxPct: Math.round(CLAIM_TAX*100), lifetimePaid: await store.earned(wallet),
-      eligible, minHold: MIN, balance: bal, lastClaim, chikis, taskSec: TASK_SEC, mult: MULT, accrualCap: ACCRUAL_CAP, raritySol: RARITY_SOL, poolFactor: pf, activeMin: minutes, poolSol: Math.floor(poolBal*1e6)/1e6, poolRef: POOL_REF });
+      eligible, minHold: MIN, balance: bal, lastClaim, chikis, taskSec: TASK_SEC, mult: MULT, accrualCap: ACCRUAL_CAP, raritySol: RARITY_SOL, poolFactor: pf, activeMin: minutes, poolSol: Math.floor(poolBal*1e6)/1e6, poolRef: POOL_REF,
+      // FULL model so the client mirrors the EXACT economics (no display↔payout drift): distribution + exact tax fraction + claim floor.
+      rarityDist: RARITY_DIST, claimTaxFrac: CLAIM_TAX, minClaimSol: MIN_CLAIM, poolFactorMax: POOL_FACTOR_MAX });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
@@ -1264,6 +1300,7 @@ app.get("/allchikis", async (req, res) => {
 app.post("/claim", async (req, res) => {
   const wallet = req.body?.wallet;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  if (isBanned(wallet)) return res.status(403).json({ error: "this wallet is not eligible for reward-pool payouts", banned: true });   // banned → no claims, no Cup prizes
 
   let bal = 0;
   try { bal = await chikiBalance(wallet); } catch (e) {}
@@ -1309,6 +1346,8 @@ app.post("/claim", async (req, res) => {
   const prizePay = Math.floor(Math.min(prizeOwed, Math.max(0, pool - RESERVE - base)) * 1e6) / 1e6;   // prize comes from the same treasury; never breach the reserve floor
   const total = Math.floor((base + prizePay) * 1e6) / 1e6;
   if (!(total > 0)) return res.status(409).json({ error: "nothing to claim yet (or pool/cap empty)", poolSol: pool });
+  // Dust guard: a pure-accrual claim must clear MIN_CLAIM (a Cup prize is always claimable regardless).
+  if (prizePay <= 0 && total < MIN_CLAIM) return res.status(409).json({ error: `keep earning — claims start at ${MIN_CLAIM} ◎ (you have ${total.toFixed(6)})`, minClaimSol: MIN_CLAIM, haveSol: total });
 
   try {
     const tx = new Transaction().add(SystemProgram.transfer({
