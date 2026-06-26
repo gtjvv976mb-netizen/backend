@@ -122,7 +122,7 @@ function createCup(opts={}, snap=null){
         else if(b.ready){ w=b; l=a; ff=a.wallet; }
         else { w=(a.snap.br||1)>=(b.snap.br||1)?a:b; l=w===a?b:a; ff="both"; }  // double no-show
         winners.push(w); losers.push(l); if(ff)forfeits.push({match:a.snap.name+" vs "+b.snap.name, ff});
-        S.log.push({round:SCHEDULE[S.roundIdx], winner:w.snap.name, loser:l.snap.name, forfeit:ff});
+        S.log.push({round:SCHEDULE[S.roundIdx], winner:w.snap.name, loser:l.snap.name, wW:w.wallet, lW:l.wallet, forfeit:ff});
       }
       this._consume(winners, losers);
       S.entrants.forEach(e=>e.ready=false);                    // must re-ready next round
@@ -139,6 +139,40 @@ function createCup(opts={}, snap=null){
     results(){
       return S.entrants.map(e=>{ const pl=S.place[e.wallet]; const sol=payout(pl, S.cap); return {wallet:e.wallet, name:e.snap.name, place:pl, sol:+sol.toFixed(4)}; })
                        .sort((a,b)=>a.place-b.place);
+    },
+
+    // Full double-elimination TREE for the bracket UI: every round in play order, each with its
+    // matches (resolved → winner known; live → pairing known, winner null; upcoming → empty/TBD).
+    bracketView(){
+      const TITLE = { WB1:"Winners · Round 1", LB1:"Losers · Round 1", WB2:"Winners · Round 2",
+        LB2:"Losers · Round 2", WB3:"Winners · Semifinal", LB3:"Losers · Round 3", WF:"Winners Final",
+        LB4:"Losers · Round 4", LB5:"Losers · Round 5", LF:"Losers Final", GF:"Grand Final" };
+      const SIDE = { WB1:"W",WB2:"W",WB3:"W",WF:"W",GF:"G",LB1:"L",LB2:"L",LB3:"L",LB4:"L",LB5:"L",LF:"L" };
+      const byW=new Map(), byN=new Map();
+      for(const e of [...S.entrants, ...(S.byes||[])]){ byW.set(e.wallet,e); if(!byN.has(e.snap.name)) byN.set(e.snap.name,e); }
+      const meta=(name,wallet)=>{ const e=(wallet&&byW.get(wallet))||byN.get(name)||null;
+        if(!e) return { name:name||"TBD", player:null, br:null, element:null, wallet:wallet||null, bye:/\(bye\)/i.test(name||"") };
+        return { name:e.snap.name, player:e.snap.player||null, br:e.snap.br||null, element:e.snap.element||null, wallet:e.wallet, bye:!!e.bye }; };
+      const logByRound={}; for(const L of (S.log||[])){ (logByRound[L.round]=logByRound[L.round]||[]).push(L); }
+      const liveIdx = S.status==="live" ? S.roundIdx : -1;
+      const rounds = SCHEDULE.map((r,idx)=>{
+        let state = "upcoming";
+        if(logByRound[r]) state="done";
+        else if(idx===liveIdx) state="live";
+        else if(S.status==="finished") state="done";
+        let matches=[];
+        if(logByRound[r]){
+          matches = logByRound[r].map(L=>({ a:meta(L.winner,L.wW), b:meta(L.loser,L.lW), winner:"a", forfeit:L.forfeit||null }));
+        } else if(idx===liveIdx){
+          try { matches = this._pairs().map(([a,b])=>({ a:meta(a.snap.name,a.wallet), b:meta(b.snap.name,b.wallet), winner:null, forfeit:null })); }
+          catch(e){ matches=[]; }
+        }
+        return { key:r, title:TITLE[r]||r, side:SIDE[r]||"W", state, matches };
+      });
+      const placements = Object.keys(S.place||{}).map(w=>{ const e=byW.get(w); return e&&!e.bye ? { wallet:w, name:e.snap.player||e.snap.name, place:S.place[w] } : null; })
+                               .filter(Boolean).sort((a,b)=>a.place-b.place);
+      return { cap:S.cap, status:S.status, roundIdx:S.roundIdx, roundName:this.roundName, schedule:SCHEDULE.slice(),
+               rounds, champion: S.champion ? meta(S.champion.snap.name, S.champion.wallet) : null, placements };
     },
 
     // ---- internals: which matches this round, and how results flow ----

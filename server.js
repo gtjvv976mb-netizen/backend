@@ -690,6 +690,7 @@ function cupSnapshot(forWallet) {
     matches: live ? liveCup.currentMatches() : [],
     champion: s && s.champion ? (s.champion.snap.player || s.champion.snap.name) : null,
     results: (s && s.status === "finished") ? liveCup.results() : null,
+    bracket: (liveCup && s && s.status !== "registration") ? liveCup.bracketView() : null,
   };
   // Live PvP matches anyone can spectate this round (profile names + matchId + live status).
   if (cupRound && cupRound.battling && Array.isArray(cupRound.matches)) {
