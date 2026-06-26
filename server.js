@@ -630,6 +630,10 @@ async function migrateMemeRandomize() {
 }
 // A player may hold only ONE Meme Legendary that isn't up for sale. To get another, list (sell) the current one first.
 function memeOwnedActive(wallet) { return memeHatches.filter(h => h.wallet === wallet && !h.listed).length; }
+// Lifetime cap: a wallet may HATCH at most MEME_MAX_HATCH eggs ever — counted by the ORIGINAL hatcher so
+// selling/transferring an NFT never refunds a slot. Falls back to h.wallet for legacy rows without `hatcher`.
+const MEME_MAX_HATCH = 5;
+function memeLifetimeHatched(wallet) { return memeHatches.filter(h => (h.hatcher || h.wallet) === wallet).length; }
 function pickMeme() {
   const avail = MEME_CHARS.filter(c => (memeMinted[c.key] || 0) < capOf(c.key));
   if (!avail.length) return null;
@@ -1488,10 +1492,12 @@ app.post("/cup/resolve-round", async (req, res) => {
 // Players then fight; byes/bots resolve automatically at finalize.
 // Shared: spin up LIVE PvP matches for the current round's real-vs-real pairs. Returns # of live matches.
 async function cupStartRoundLive() {
+  if (cupRound && cupRound.battling) return cupRound.matches.length;   // round already live — don't spin a second set of matches
   const S = liveCup.state;
   const entOf = w => S.entrants.find(x => x.wallet === w);
   const isReal = w => { const e = entOf(w); return !!(e && !e.bot && isPubkey(w)); };
   const round = { battling: true, matchByWallet: new Map(), side: new Map(), matches: [] };
+  cupRound = round;             // CLAIM synchronously (before any await) so two callers can't both start the round
   for (const m of liveCup.currentMatches()) {
     const aw = m.a.wallet, bw = m.b.wallet, ea = entOf(aw), eb = entOf(bw);
     if (ea) ea.ready = true; if (eb) eb.ready = true;   // mark seated so resolveRound runs the decide() path
@@ -1508,6 +1514,8 @@ async function cupStartRoundLive() {
 // Shared: advance the bracket using live PvP winners (unfinished matches fall back to the deterministic engine).
 async function cupFinalizeRoundLive() {
   const round = cupRound;
+  if (!round) return null;     // already finalized — a concurrent auto-tick or a manual call beat us here
+  cupRound = null;             // CLAIM the round SYNCHRONOUSLY (before any await) so two callers can't both resolveRound → double-pay prizes
   liveCup.state.entrants.forEach(e => { if (e.bot) e.ready = true; });
   const decide = (a, b) => {
     if (!round) return null;
@@ -1524,29 +1532,34 @@ async function cupFinalizeRoundLive() {
     await saveCupPrizes(); await saveCupAwarded();
     crownChampion();
   }
-  cupRound = null; await persistCup();
+  await persistCup();           // cupRound was already cleared synchronously at the top
   return r;
 }
 
 // AUTO-RUNNER: when enabled, the server drives the whole tournament — starts the cup once the lobby is full,
 // starts each round, ticks idle matches so they resolve, and finalizes when all battles are done (or time out).
+let cupTickBusy = false;
 async function cupAutoTick() {
   if (!cupAuto || !liveCup) return;
-  const S = liveCup.state;
-  if (S.status === "registration") {
-    if (S.entrants.length === S.cap) { try { liveCup.start(); cupAutoNextAt = Date.now() + CUP_ROUND_GAP_MS; await persistCup(); } catch (e) {} }
-    return;
-  }
-  if (S.status !== "live") return;
-  if (Date.now() < cupAutoNextAt) return;                       // respect the inter-round pause
-  if (!cupRound || !cupRound.battling) { await cupStartRoundLive(); return; }
-  // a round is underway — tick every active match so idle players auto-play/forfeit even if nobody is polling
-  for (const mm of cupRound.matches) { const m = pvpMatches.get(mm.matchId); if (m && m.status === "active") { try { pvpTick(m); } catch (e) {} } }
-  const allDone = (cupRound.matches || []).every(mm => { const m = pvpMatches.get(mm.matchId); return m && m.status === "finished"; });
-  const timedOut = (Date.now() - cupRoundStartedAt) > CUP_ROUND_MAX_MS;
-  if (allDone || timedOut) { await cupFinalizeRoundLive(); cupAutoNextAt = Date.now() + CUP_ROUND_GAP_MS; }
+  if (cupTickBusy) return;                                       // a previous tick is still awaiting — never run two at once (would double-start/double-finalize)
+  cupTickBusy = true;
+  try {
+    const S = liveCup.state;
+    if (S.status === "registration") {
+      if (S.entrants.length === S.cap) { try { liveCup.start(); cupAutoNextAt = Date.now() + CUP_ROUND_GAP_MS; await persistCup(); } catch (e) {} }
+      return;
+    }
+    if (S.status !== "live") return;
+    if (Date.now() < cupAutoNextAt) return;                     // respect the inter-round pause
+    if (!cupRound || !cupRound.battling) { await cupStartRoundLive(); return; }
+    // a round is underway — tick every active match so idle players auto-play/forfeit even if nobody is polling
+    for (const mm of cupRound.matches) { const m = pvpMatches.get(mm.matchId); if (m && m.status === "active") { try { pvpTick(m); } catch (e) {} } }
+    const allDone = (cupRound.matches || []).every(mm => { const m = pvpMatches.get(mm.matchId); return m && m.status === "finished"; });
+    const timedOut = (Date.now() - cupRoundStartedAt) > CUP_ROUND_MAX_MS;
+    if (allDone || timedOut) { await cupFinalizeRoundLive(); cupAutoNextAt = Date.now() + CUP_ROUND_GAP_MS; }
+  } finally { cupTickBusy = false; }
 }
-setInterval(() => { cupAutoTick().catch(() => {}); }, 4000);
+setInterval(() => { cupAutoTick().catch(() => { cupTickBusy = false; }); }, 4000);
 
 app.post("/cup/start-round", async (req, res) => {
   if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
@@ -1602,6 +1615,9 @@ app.post("/meme/hatch", async (req, res) => {
   const now = Date.now(), last = _memeLastHatch.get(wallet) || 0;
   if (now - last < 4000) return res.status(429).json({ error: "slow down — one egg at a time" });
   if (memeOwnedActive(wallet) >= 1) return res.status(409).json({ error: "You already own a Meme Legendary — list it in the Bazaar (put it up for sale) before hatching another." });
+  // LIFETIME CAP: at most 5 hatches ever per wallet (admins bypass for testing/dry-runs).
+  if (!MEME_ADMIN_WALLETS.has(wallet) && memeLifetimeHatched(wallet) >= MEME_MAX_HATCH)
+    return res.status(409).json({ error: `You've reached the lifetime limit of ${MEME_MAX_HATCH} Meme Egg hatches.` });
   // PAYMENT GATE: real $CHIKI must have changed hands on-chain before we mint anything.
   if (MEME_VERIFY_PAY) {
     if (!paySig || typeof paySig !== "string") return res.status(402).json({ error: "payment required — include your $CHIKI payment signature" });
@@ -1614,7 +1630,7 @@ app.post("/meme/hatch", async (req, res) => {
   // We only RESERVE a slot against the 105 total here.
   if (memeReserved() >= MEME_TOTAL) { if (MEME_VERIFY_PAY && paySig) delete memeUsedSigs[paySig]; return res.status(409).json({ error: "sold out — every Meme Dynasty egg has been claimed" }); }
   _memeLastHatch.set(wallet, now);
-  const h = { id: "h" + now.toString(36) + Math.random().toString(36).slice(2, 6), wallet, char: null, name: "Mystery Meme Egg", edition: null, status: "incubating", undetermined: true, mintAddr: null, ts: now, paySig: paySig || null };
+  const h = { id: "h" + now.toString(36) + Math.random().toString(36).slice(2, 6), wallet, hatcher: wallet, char: null, name: "Mystery Meme Egg", edition: null, status: "incubating", undetermined: true, mintAddr: null, ts: now, paySig: paySig || null };
   memeHatches.push(h); await saveMeme();
   res.json({ ok: true, hatch: { id: h.id, status: "incubating", mystery: true }, supply: memeSupply() });
 });
@@ -1641,7 +1657,10 @@ app.get("/meme/mine", (req, res) => {
   const items = memeHatches.filter(h => h.wallet === wallet)
     .map(h => ({ id: h.id, char: h.char, name: h.name, edition: h.edition, status: h.status, mintAddr: h.mintAddr, ts: h.ts, listed: h.listed || null }))
     .sort((a, b) => b.ts - a.ts);
-  res.json({ items, supply: memeSupply() });
+  const hatchesUsed = memeLifetimeHatched(wallet), ownedActive = memeOwnedActive(wallet);
+  res.json({ items, supply: memeSupply(),
+    hatchesUsed, hatchesLeft: Math.max(0, MEME_MAX_HATCH - hatchesUsed), maxHatch: MEME_MAX_HATCH,
+    ownsActive: ownedActive >= 1, canHatch: ownedActive < 1 && hatchesUsed < MEME_MAX_HATCH });
 });
 app.get("/meme/supply", (req, res) => res.json({ ...memeSupply(), eggPrice: MEME_EGG_PRICE, verifyPay: MEME_VERIFY_PAY, saleOpen: MEME_SALE_OPEN, tradeTensor: MEME_TRADE_TENSOR, tensorUrl: TENSOR_URL || null }));
 // Public: the most recent hatches — drives a live "just hatched!" ticker for hype/engagement.
@@ -1768,7 +1787,10 @@ setInterval(() => {
   const now = Date.now();
   for (const [id, m] of pvpMatches) {
     try { pvpTick(m, now); } catch (e) {}
-    if (m.status === "finished") { if (!m._doneAt) m._doneAt = now; else if (now - m._doneAt > 180000) pvpMatches.delete(id); }
+    if (m.status === "finished") { if (!m._doneAt) m._doneAt = now;
+      else if (now - m._doneAt > 180000) { pvpMatches.delete(id);   // also clear the wallet→match pointers so the maps don't grow unbounded
+        if (pvpPlayerMatch.get(m.walletA) === id) pvpPlayerMatch.delete(m.walletA);
+        if (pvpPlayerMatch.get(m.walletB) === id) pvpPlayerMatch.delete(m.walletB); } }
   }
 }, 1000);
 
@@ -1872,6 +1894,7 @@ app.post("/pvp/available", (req, res) => { const r = availableJoin(req.body); if
 app.post("/pvp/challenge", (req, res) => {
   const { from, fromName, to, snap } = req.body || {};
   if (!isPubkey(from) || !isPubkey(to)) return res.status(400).json({ error: "valid wallets required" });
+  if (from === to) return res.status(400).json({ error: "you can't challenge yourself" });
   if (!snap || !snap.element) return res.status(400).json({ error: "legendary snap required" });
   cleanAvail();
   if (pvpChallenges.some(c => c.from === from && c.to === to)) return res.json({ ok: true });   // dedupe

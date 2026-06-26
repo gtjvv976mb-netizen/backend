@@ -77,7 +77,7 @@ function applyCard(side, foe, slot, rng){
   else if(k==="charge"){ side.energy+=1; side.buff=Math.max(side.buff,TVAL.charge[t]); }
   else if(k==="rally"){ side._turnBuff=Math.max(side._turnBuff||1,TVAL.rally[t]); }
   else if(k==="drain"){ dealDamage(side,foe,TVAL.drainDmg[t],0,rng); side.hp=Math.min(side.maxhp, side.hp+Math.round(TVAL.drainDmg[t]*TVAL.drainHeal[t])); }
-  else if(k==="nova"){ dealDamage(side,foe,TVAL.novaDmg[t],0,rng); side.hp-=TVAL.novaRecoil[t]; }
+  else if(k==="nova"){ dealDamage(side,foe,TVAL.novaDmg[t],0,rng); applyHP(side,TVAL.novaRecoil[t],rng); }   /* recoil through applyHP so the life-shield (morale save) applies to self-damage too */
   else if(k==="quick"){ dealDamage(side,foe,TVAL.quick[t],1,rng); }
   else if(k==="rend"){ dealDamage(side,foe,TVAL.rendDmg[t],0.5,rng); }
   else if(k==="jolt"){ dealDamage(side,foe,TVAL.joltDmg[t],0,rng); foe._joltNext=(foe._joltNext||0)+1; }
@@ -217,7 +217,8 @@ function tick(m, now=Date.now()){
   }
   // a side that has missed too many turns in a row has disconnected → forfeit the whole match
   const fa=m.sides.a.misses>=FORFEIT_MISSES, fb=m.sides.b.misses>=FORFEIT_MISSES;
-  if(fa||fb){ finishMatch(m, fa&&!fb?"b":fb&&!fa?"a":(m.sides.a.hp>=m.sides.b.hp?"a":"b"), "forfeit", []); return true; }
+  if(fa||fb){ const alive=s=>(Math.max(0,s.hp)+((s.ls||0)>0?s.maxhp:0))/Math.max(1,s.maxhp);   // double-DC tiebreak: HP fraction, life-shield = still standing
+    finishMatch(m, fa&&!fb?"b":fb&&!fa?"a":(alive(m.sides.a)>=alive(m.sides.b)?"a":"b"), "forfeit", []); return true; }
   if(changed) resolveTurn(m);
   return true;
 }

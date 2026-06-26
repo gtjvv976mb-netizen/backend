@@ -10,6 +10,7 @@ const SEED16 = [1,16,8,9,5,12,4,13,3,14,6,11,7,10,2,15];
 function payout(place, cap){
   // Each table totals exactly 4.00 SOL with a 1.00 SOL champion. The 16-slot bracket pads with byes,
   // so the REAL finishing-place sets are: 8p {1,2,3,4,5,5,7,7} · 10p {…,9,9} · 16p {…,9×4,13×4}.
+  if(!Number.isInteger(place) || place < 1) return 0;   // unplaced/undefined entrant pays nothing (never mint SOL by accident)
   cap = cap || 10;
   if(cap <= 8){                                   // 8 players
     if(place===1) return 1.00; if(place===2) return 0.85; if(place===3) return 0.60; if(place===4) return 0.45;
