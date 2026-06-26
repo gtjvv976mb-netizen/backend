@@ -147,15 +147,22 @@ const xpNeed     = lv => Math.round(140 + (Math.max(1, lv) - 1) * 95 + Math.pow(
 // Fastest LEGITIMATE seconds to fill ONE level (offline work model: 32 XP/task · 72s/task · NO naps). This is an
 // UPPER BOUND on any real XP rate — online play is slower and naps add more — so a genuine grinder is never
 // clamped, but a client that injects/spams levels can't beat this real-time floor. ~94h cumulative to reach L50.
+const brNeed     = br => Math.round(60 + (Math.max(1, br) - 1) * 45);   // battle-XP to the next Battle Rank (mirrors the client)
 const minSecForLevel = lv => Math.ceil(xpNeed(Math.max(1, lv)) / 32) * 72;
+// Min real seconds the server will allow per Battle-Rating point and per card-tier point. BR rises only by winning
+// real (server-resolved) battles; card tiers cost skill points (from BR) + $CHIKI — both inherently slow, so these
+// floors never clamp a genuine player but make injected/instant battle power impossible.
+const BR_MIN_SEC   = Math.max(1, Number(process.env.BR_MIN_SEC   || 90));
+const CARD_MIN_SEC = Math.max(1, Number(process.env.CARD_MIN_SEC || 60));
 const legStamMax = lv => Math.round(120 + (Math.min(Math.max(lv, 1), MAX_LEVEL) - 1) / 49 * 780);
 const stripTags  = s => String(s == null ? "" : s).replace(/[<>]/g, "");          // no HTML tags ⇒ no stored XSS
 const clampNum   = (v, lo, hi, def) => { v = Number(v); return isFinite(v) ? Math.max(lo, Math.min(hi, v)) : def; };
 
 // Returns a sanitized copy of the incoming profile, using the previously-stored one to block roll-backs / jumps.
-function sanitizeProfile(prev, p) {
+function sanitizeProfile(prev, p, wallet) {
   const out = { ...p };
   const now = Date.now();
+  const totalWins = winsOf(wallet);   // server-authoritative count of real battle wins (BR headroom)
   if (out.handle != null) out.handle = stripTags(out.handle).slice(0, 16);
   out.glory   = clampNum(out.glory, 0, 1e12, 0);
   out.renames = clampNum(out.renames, 0, 99, 0);
@@ -187,15 +194,50 @@ function sanitizeProfile(prev, p) {
         lv = Math.max(prevLv, Math.min(lv, allowed));
         if (lv > prevLv) lvAt = now - budget;              // carry leftover earned time so a legit grind isn't penalized
       } else { lv = Math.max(lv, prevLv); }                // monotonic — a Chiki's level never drops
-      // BR can't be injected — it only rises gradually via Battle EXP; cap the per-save jump
+      // ===== BR (battle rating): SERVER-AUTHORITATIVE — can only rise via REAL, server-resolved battle wins. =====
+      // Existing BR is grandfathered (the first time we see this Chiki we snapshot the unconsumed win count as its
+      // base), then every new server win grants exactly +1 BR of headroom. No client edit / idle / time-spam can move it.
       const brP = clampNum(pc.br, 1, MAX_BR, 1);
-      let brF = Math.max(clampNum(src.br, 1, MAX_BR, 1), brP);
-      if (pc.br != null) brF = Math.min(brF, brP + 3);
-      // skill-card tiers must be a clean {slot:1..5} map — never accept arbitrary values
+      let brF = clampNum(src.br, 1, MAX_BR, 1);
+      let brAt = Number(pc._brAt) || now;
+      let brWinBase = (pc._brWinBase != null) ? Number(pc._brWinBase) : totalWins;   // snapshot wins at the moment of grandfathering
+      const winCeil = Math.min(MAX_BR, brP + Math.max(0, totalWins - brWinBase));     // grandfathered base + NEW real wins
+      if (pc.br == null) { brF = 1; brAt = now; brWinBase = totalWins; }              // brand-new Chiki: BR starts at 1
+      else if (brF > brP) {
+        let allowed = brP, budget = Math.max(0, now - brAt);
+        while (allowed < brF && allowed < MAX_BR && budget >= BR_MIN_SEC * 1000) { budget -= BR_MIN_SEC * 1000; allowed++; }
+        brF = Math.max(brP, Math.min(brF, brP + 3, allowed, winCeil));    // +3/save cap · real-time floor · AND the real-win ceiling
+        if (brF > brP) { brAt = now - budget; brWinBase += (brF - brP); } // consume the wins that were just spent on BR
+      } else { brF = Math.max(brF, brP); }                                // monotonic
+      // skillPts are granted +1 per BR level-up (and spent on upgrades) → can never exceed the BR levels earned
+      const skF = Math.min(clampNum(src.skillPts, 0, 999, 0), Math.max(0, brF - 1));
+      // battleXp is just the progress bar toward the next BR point — bound it so it can't be inflated
+      const bxF = clampNum(src.battleXp, 0, brNeed(brF), 0);
+      // ===== card tiers {slot:1..5}: new cards start at tier 1; the TOTAL tier sum is time-gated (upgrades cost BR + $CHIKI) =====
       const rawCT = (src.cardTier && typeof src.cardTier === "object" && !Array.isArray(src.cardTier)) ? src.cardTier
                   : ((pc.cardTier && typeof pc.cardTier === "object" && !Array.isArray(pc.cardTier)) ? pc.cardTier : null);
-      let ctF = null;
-      if (rawCT) { ctF = {}; for (const k in rawCT) { const slot = k | 0; if (slot >= 0 && slot < 12) ctF[slot] = clampNum(rawCT[k], 1, 5, 1); } }
+      const prevCT = (pc.cardTier && typeof pc.cardTier === "object" && !Array.isArray(pc.cardTier)) ? pc.cardTier : {};
+      const prevSum = Object.keys(prevCT).reduce((s, k) => s + clampNum(prevCT[k], 1, 5, 1), 0);
+      let ctF = null, reqSum = 0;
+      if (rawCT) { ctF = {}; for (const k in rawCT) { const slot = k | 0; if (slot >= 0 && slot < 12) { ctF[slot] = clampNum(rawCT[k], 1, 5, 1); reqSum += ctF[slot]; } } }
+      let ctAt = Number(pc._ctAt) || now;
+      if (pc.cardTier == null) { ctAt = now; if (ctF) for (const k in ctF) ctF[k] = 1; }   // brand-new Chiki: every card starts at tier 1
+      else if (ctF && reqSum > prevSum) {
+        let allowedSum = prevSum, budget = Math.max(0, now - ctAt);
+        while (allowedSum < reqSum && budget >= CARD_MIN_SEC * 1000) { budget -= CARD_MIN_SEC * 1000; allowedSum++; }
+        if (reqSum > allowedSum) { ctF = { ...prevCT }; }                 // grew faster than legit → reject, keep previous tiers
+        else { ctAt = now - budget; }                                     // accepted; carry leftover time
+      }
+      // deck size (number of arena skills) can only grow one card per CARD_MIN_SEC; new Chikis keep their starting deck (≤3)
+      const prevSkills = Array.isArray(pc.arenaSkills) ? pc.arenaSkills.slice(0, 12).map(s => clampNum(s, 0, 11, 0)) : null;
+      let skillsF = Array.isArray(src.arenaSkills) ? src.arenaSkills.slice(0, 12).map(s => clampNum(s, 0, 11, 0)) : prevSkills;
+      let dkAt = Number(pc._dkAt) || now;
+      if (prevSkills == null) { dkAt = now; if (skillsF && skillsF.length > 3) skillsF = skillsF.slice(0, 3); }
+      else if (skillsF && skillsF.length > prevSkills.length) {
+        const grew = Math.floor(Math.max(0, now - dkAt) / (CARD_MIN_SEC * 1000));
+        if (skillsF.length - prevSkills.length > grew) skillsF = prevSkills;   // added cards faster than legit → keep previous deck
+        else dkAt = now;
+      }
       kept.push({
         sp, level: lv, isLegend, _lvlAt: lvAt, hungry: !!src.hungry, tending: !!src.tending,
         nick: src.nick != null ? stripTags(src.nick).slice(0, 16) : (pc.nick != null ? stripTags(pc.nick).slice(0, 16) : null),
@@ -205,11 +247,10 @@ function sanitizeProfile(prev, p) {
         tasksDone:   Math.max(clampNum(src.tasksDone, 0, 1e12, 0),  clampNum(pc.tasksDone, 0, 1e12, 0)),    // monotonic
         sleepCycles: Math.max(clampNum(src.sleepCycles, 0, 1e9, 0), clampNum(pc.sleepCycles, 0, 1e9, 0)),
         renames: clampNum(src.renames, 0, 9, 0),
-        br: brF,
-        battleXp: clampNum(src.battleXp, 0, 1e12, 0),
-        skillPts: clampNum(src.skillPts, 0, 999, 0),
-        arenaSkills: Array.isArray(src.arenaSkills) ? src.arenaSkills.slice(0, 12).map(s => clampNum(s, 0, 11, 0))
-                   : (Array.isArray(pc.arenaSkills) ? pc.arenaSkills.slice(0, 12).map(s => clampNum(s, 0, 11, 0)) : null),
+        br: brF, _brAt: brAt, _brWinBase: brWinBase, _ctAt: ctAt, _dkAt: dkAt,
+        battleXp: bxF,
+        skillPts: skF,
+        arenaSkills: skillsF,
         cardTier: ctF,
         arenaStam: src.arenaStam != null ? clampNum(src.arenaStam, 0, legStamMax(lv), legStamMax(lv))
                  : (pc.arenaStam != null ? clampNum(pc.arenaStam, 0, legStamMax(lv), legStamMax(lv)) : null),
@@ -552,6 +593,17 @@ let bannedWallets = new Set(String(process.env.BANNED_WALLETS || "").split(/[,\s
 const isBanned = (w) => bannedWallets.has(w);
 async function saveBanned() { try { await store.kvSet("banned_wallets", [...bannedWallets]); } catch (e) {} }
 
+// ----- Server-authoritative BATTLE WINS -----
+// The ONLY way Battle Rating (BR) can rise is by winning REAL, server-resolved battles (live PvP + Cup matches).
+// Each win here grants one BR point of headroom; the profile sanitizer clamps a Chiki's BR to (grandfathered base
+// + new wins), so a client can never inflate BR by idling, time-spamming, or editing its own state.
+let battleWins = {};   // wallet -> count of server-resolved match wins
+const winsOf = (w) => Number(battleWins[w] || 0);
+let _winsDirty = false;
+function recordWin(wallet) { if (!isPubkey(wallet)) return; battleWins[wallet] = winsOf(wallet) + 1; _winsDirty = true; }
+async function saveBattleWins() { if (!_winsDirty) return; _winsDirty = false; try { await store.kvSet("battle_wins", battleWins); } catch (e) {} }
+setInterval(() => { saveBattleWins().catch(() => {}); }, 15000);   // flush the win ledger periodically
+
 /* ----------------------------- Chikoria Cup (live event) ----------------------------- */
 const CUP_ELEMS = ["Water", "Fire", "Beast", "Storm", "Light"];
 let liveCup = null;                  // in-memory orchestrator (null until an admin creates one)
@@ -675,6 +727,7 @@ async function loadCupState() {
   try { const ta = await store.kvGet("cup_total_awarded"); if (ta != null) cupTotalAwarded = Number(ta) || 0; } catch (e) {}
   try { const ch = await store.kvGet("cup_champion"); if (ch != null) cupChampion = ch; } catch (e) {}
   try { const bw = await store.kvGet("banned_wallets"); if (Array.isArray(bw)) for (const w of bw) if (isPubkey(w)) bannedWallets.add(w); } catch (e) {}   // reward-pool bans persist across restarts
+  try { const wins = await store.kvGet("battle_wins"); if (wins && typeof wins === "object") battleWins = wins; } catch (e) {}   // server-authoritative BR win ledger
   try { const mm = await store.kvGet("meme_minted"); if (mm && typeof mm === "object") memeMinted = mm; } catch (e) {}
   try { const mh = await store.kvGet("meme_hatches"); if (Array.isArray(mh)) memeHatches = mh; } catch (e) {}
   try { const us = await store.kvGet("meme_used_sigs"); if (us && typeof us === "object") memeUsedSigs = us; } catch (e) {}
@@ -992,7 +1045,7 @@ app.post("/profile", async (req, res) => {
   try {
     const prev = await store.getProfile(wallet);
     // admins are trusted (creator testing); everyone else is clamped to legal values
-    const safe = isAdminWallet(wallet) ? profile : sanitizeProfile(prev, profile);
+    const safe = isAdminWallet(wallet) ? profile : sanitizeProfile(prev, profile, wallet);
     safe._serverSavedAt = now;   // authoritative "last seen" for offline progression
     await store.setProfile(wallet, safe);
     res.json({ ok: true, serverSavedAt: safe._serverSavedAt });
@@ -1847,7 +1900,9 @@ setInterval(() => {
   const now = Date.now();
   for (const [id, m] of pvpMatches) {
     try { pvpTick(m, now); } catch (e) {}
-    if (m.status === "finished") { if (!m._doneAt) m._doneAt = now;
+    if (m.status === "finished") {
+      if (!m._winRecorded) { m._winRecorded = true; const ww = m.winner === "a" ? m.walletA : m.winner === "b" ? m.walletB : null; if (ww) recordWin(ww); }   // credit the BR win ONCE, server-side
+      if (!m._doneAt) m._doneAt = now;
       else if (now - m._doneAt > 180000) { pvpMatches.delete(id);   // also clear the wallet→match pointers so the maps don't grow unbounded
         if (pvpPlayerMatch.get(m.walletA) === id) pvpPlayerMatch.delete(m.walletA);
         if (pvpPlayerMatch.get(m.walletB) === id) pvpPlayerMatch.delete(m.walletB); } }
