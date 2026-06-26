@@ -648,6 +648,7 @@ async function loadCupState() {
   try { const mm = await store.kvGet("meme_minted"); if (mm && typeof mm === "object") memeMinted = mm; } catch (e) {}
   try { const mh = await store.kvGet("meme_hatches"); if (Array.isArray(mh)) memeHatches = mh; } catch (e) {}
   try { const us = await store.kvGet("meme_used_sigs"); if (us && typeof us === "object") memeUsedSigs = us; } catch (e) {}
+  try { const pg = await store.kvGet("pending_gifts"); if (pg && typeof pg === "object") pendingGifts = pg; } catch (e) {}   // pending gift offers
   try { await migrateMemeRandomize(); } catch (e) {}   // reset predetermined eggs → species rolls at hatch
   try { const cs = await store.kvGet("cup_state"); if (cs && cs.status) liveCup = createCup({}, cs); } catch (e) { console.error("cup_state restore failed:", e?.message || e); }   // resume an in-progress bracket after a restart
 }
@@ -1037,27 +1038,67 @@ app.get("/admin/restore-chikis", async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
-// ADMIN: gift a Legendary to a wallet — authenticated by the admin's WALLET SIGNATURE (no ADMIN_KEY in the browser).
-// Only wallets in the admin set can do this. Body: { adminWallet, authMsg, authSig, wallet, sp(10-14), level, nick }
-app.post("/admin/gift-legendary", async (req, res) => {
+// ADMIN: gift a Chiki (normal sp 0-9, or Legendary sp 10-14) to a wallet at any level — authenticated by the
+// admin's WALLET SIGNATURE (no ADMIN_KEY in the browser). Body: { adminWallet, authMsg, authSig, wallet, sp(0-14), level, nick }
+let pendingGifts = {};   // wallet -> [ {id, sp, level, isLegend, nick, ts} ]  (offers awaiting accept/decline when the recipient is at cap)
+async function savePendingGifts() { try { await store.kvSet("pending_gifts", pendingGifts); } catch (e) {} }
+function chikiFromGift(g) { const lv = g.level;
+  return { sp: g.sp, level: lv, isLegend: !!g.isLegend, hungry: false, tending: false, nick: g.nick || null, xp: 0,
+    food: foodMaxSec(lv), stamina: g.isLegend ? legStamMax(lv) : maxStamOf(lv), tasksDone: 0, sleepCycles: 0, renames: 0,
+    br: 1, battleXp: 0, skillPts: 0, arenaSkills: null, cardTier: null, arenaStam: g.isLegend ? legStamMax(lv) : null, arenaSleepUntil: 0 };
+}
+async function adminGiftChiki(req, res) {
   const { adminWallet, authMsg, authSig, wallet, sp, level, nick } = req.body || {};
   if (!isPubkey(adminWallet) || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'adminWallet' and target 'wallet' required" });
   if (!verifyWalletSig(adminWallet, authMsg, authSig)) return res.status(401).json({ error: "wallet sign-in required (approve the signature)" });
   if (!isAdminWallet(adminWallet)) return res.status(403).json({ error: "admin only" });
   const si = Number(sp);
-  if (!(Number.isInteger(si) && si >= 10 && si <= 14)) return res.status(400).json({ error: "sp must be 10–14 (a Legendary)" });
+  if (!(Number.isInteger(si) && si >= 0 && si <= 14)) return res.status(400).json({ error: "sp must be 0–14 (0–9 normal, 10–14 Legendary)" });
   const lv = Math.max(1, Math.min(MAX_LEVEL, Number(level) || 1));
+  const isLegend = si >= 10;
+  const gift = { id: "g" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), sp: si, level: lv, isLegend, nick: nick ? stripTags(String(nick)).slice(0, 16) : null, ts: Date.now() };
   try {
     const profile = (await store.getProfile(wallet)) || {};
     if (!Array.isArray(profile.chikis)) profile.chikis = [];
-    if (profile.chikis.some(c => c.isLegend)) return res.status(409).json({ error: "that wallet already holds a Legendary (max 1)" });
-    profile.chikis.push({ sp: si, level: lv, isLegend: true, hungry: false, tending: false,
-      nick: nick ? stripTags(String(nick)).slice(0, 16) : null, xp: 0, food: foodMaxSec(lv),
-      stamina: legStamMax(lv), tasksDone: 0, sleepCycles: 0, renames: 0, br: 1, battleXp: 0,
-      skillPts: 0, arenaSkills: null, cardTier: null, arenaStam: legStamMax(lv), arenaSleepUntil: 0 });
+    const atCap = isLegend ? profile.chikis.some(c => c.isLegend) : profile.chikis.filter(c => !c.isLegend).length >= 2;
+    if (atCap) {   // recipient is full → queue an OFFER; they accept (choose which to replace) or decline in-game
+      if (!pendingGifts[wallet]) pendingGifts[wallet] = [];
+      pendingGifts[wallet].push(gift); if (pendingGifts[wallet].length > 5) pendingGifts[wallet] = pendingGifts[wallet].slice(-5);
+      await savePendingGifts();
+      return res.json({ ok: true, pending: true, message: "recipient is at capacity — they'll be asked to accept (and pick which Chiki to replace) or decline." });
+    }
+    profile.chikis.push(chikiFromGift(gift));
     profile._serverSavedAt = Date.now();
     await store.setProfile(wallet, profile);
-    res.json({ ok: true, wallet, granted: { sp: si, level: lv, nick: nick || null } });
+    res.json({ ok: true, pending: false, granted: { sp: si, level: lv, isLegend, nick: gift.nick } });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+}
+app.post("/admin/gift-chiki", adminGiftChiki);
+app.post("/admin/gift-legendary", adminGiftChiki);   // back-compat alias
+
+// Recipient: see pending gift offers (shown in-game when at capacity).
+app.get("/gift/pending", (req, res) => {
+  const w = req.query?.wallet; if (!isPubkey(w)) return res.status(400).json({ error: "wallet required" });
+  res.json({ gifts: pendingGifts[w] || [] });
+});
+// Recipient: accept a gift (replacing one of their Chikis) or decline. Signature proves it's really them.
+app.post("/gift/claim", async (req, res) => {
+  const { wallet, authMsg, authSig, giftId, action, replaceIndex } = req.body || {};
+  if (!isPubkey(wallet)) return res.status(400).json({ error: "wallet required" });
+  if (!verifyWalletSig(wallet, authMsg, authSig)) return res.status(401).json({ error: "sign-in required (approve the signature)" });
+  const list = pendingGifts[wallet] || [];
+  const gi = list.findIndex(g => g.id === giftId); if (gi < 0) return res.status(404).json({ error: "gift not found" });
+  const g = list[gi];
+  if (action === "decline") { list.splice(gi, 1); if (!list.length) delete pendingGifts[wallet]; await savePendingGifts(); return res.json({ ok: true, declined: true }); }
+  try {
+    const profile = (await store.getProfile(wallet)) || {}; if (!Array.isArray(profile.chikis)) profile.chikis = [];
+    const ri = Number(replaceIndex);
+    if (!(Number.isInteger(ri) && ri >= 0 && ri < profile.chikis.length)) return res.status(400).json({ error: "choose which Chiki to replace" });
+    if (!!profile.chikis[ri].isLegend !== !!g.isLegend) return res.status(400).json({ error: "you must replace a " + (g.isLegend ? "Legendary" : "normal") + " Chiki with this " + (g.isLegend ? "Legendary" : "normal") + " gift" });
+    profile.chikis[ri] = chikiFromGift(g);
+    profile._serverSavedAt = Date.now(); await store.setProfile(wallet, profile);
+    list.splice(gi, 1); if (!list.length) delete pendingGifts[wallet]; await savePendingGifts();
+    res.json({ ok: true, accepted: true, replaced: ri, granted: { sp: g.sp, level: g.level, isLegend: g.isLegend } });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
