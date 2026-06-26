@@ -1037,6 +1037,30 @@ app.get("/admin/restore-chikis", async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// ADMIN: gift a Legendary to a wallet — authenticated by the admin's WALLET SIGNATURE (no ADMIN_KEY in the browser).
+// Only wallets in the admin set can do this. Body: { adminWallet, authMsg, authSig, wallet, sp(10-14), level, nick }
+app.post("/admin/gift-legendary", async (req, res) => {
+  const { adminWallet, authMsg, authSig, wallet, sp, level, nick } = req.body || {};
+  if (!isPubkey(adminWallet) || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'adminWallet' and target 'wallet' required" });
+  if (!verifyWalletSig(adminWallet, authMsg, authSig)) return res.status(401).json({ error: "wallet sign-in required (approve the signature)" });
+  if (!isAdminWallet(adminWallet)) return res.status(403).json({ error: "admin only" });
+  const si = Number(sp);
+  if (!(Number.isInteger(si) && si >= 10 && si <= 14)) return res.status(400).json({ error: "sp must be 10–14 (a Legendary)" });
+  const lv = Math.max(1, Math.min(MAX_LEVEL, Number(level) || 1));
+  try {
+    const profile = (await store.getProfile(wallet)) || {};
+    if (!Array.isArray(profile.chikis)) profile.chikis = [];
+    if (profile.chikis.some(c => c.isLegend)) return res.status(409).json({ error: "that wallet already holds a Legendary (max 1)" });
+    profile.chikis.push({ sp: si, level: lv, isLegend: true, hungry: false, tending: false,
+      nick: nick ? stripTags(String(nick)).slice(0, 16) : null, xp: 0, food: foodMaxSec(lv),
+      stamina: legStamMax(lv), tasksDone: 0, sleepCycles: 0, renames: 0, br: 1, battleXp: 0,
+      skillPts: 0, arenaSkills: null, cardTier: null, arenaStam: legStamMax(lv), arenaSleepUntil: 0 });
+    profile._serverSavedAt = Date.now();
+    await store.setProfile(wallet, profile);
+    res.json({ ok: true, wallet, granted: { sp: si, level: lv, nick: nick || null } });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // Real SOL paid out to a wallet (authentic "earned" figure for the profile).
 app.get("/earned", async (req, res) => {
   const wallet = req.query?.wallet;
