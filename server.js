@@ -654,8 +654,12 @@ const MEME_ADMIN_WALLETS = new Set((process.env.MEME_ADMIN_WALLETS || TEAM_WALLE
 const MEME_VERIFY_PAY = String(process.env.MEME_VERIFY_PAY ?? "true").toLowerCase() === "true";
 // When a Tensor (or Magic Eden) collection URL is configured, real trading happens there — the custom in-game
 // escrow ledger (/meme/buy) is disabled so we never settle real-money trades off-chain.
-const TENSOR_URL = process.env.TENSOR_URL || "";
-const MEME_TRADE_TENSOR = !!TENSOR_URL;
+// Marketplace link for real on-chain trading. Configurable so it can point at Magic Eden, Tensor, etc.
+// MARKET_URL/MARKET_NAME take precedence; TENSOR_URL is kept for back-compat.
+const MARKET_URL = process.env.MARKET_URL || process.env.TENSOR_URL || "";
+const MARKET_NAME = process.env.MARKET_NAME || (MARKET_URL.includes("magiceden") ? "Magic Eden" : "Tensor");
+const TENSOR_URL = MARKET_URL;                 // back-compat alias used by older fields
+const MEME_TRADE_TENSOR = !!MARKET_URL;        // any market URL set ⇒ route trading to that marketplace
 let memeMinted = {};       // char -> editions handed out
 let memeHatches = [];       // [{id, wallet, char, name, edition, status, mintAddr, ts}]
 let memeUsedSigs = {};      // payment signature -> {wallet, ts}  (replay protection: a paid tx can hatch exactly one egg)
@@ -1775,7 +1779,7 @@ app.get("/meme/mine", (req, res) => {
     hatchesUsed, hatchesLeft: Math.max(0, MEME_MAX_HATCH - hatchesUsed), maxHatch: MEME_MAX_HATCH,
     ownsActive: ownedActive >= 1, canHatch: ownedActive < 1 && hatchesUsed < MEME_MAX_HATCH });
 });
-app.get("/meme/supply", (req, res) => res.json({ ...memeSupply(), eggPrice: MEME_EGG_PRICE, verifyPay: MEME_VERIFY_PAY, saleOpen: MEME_SALE_OPEN, tradeTensor: MEME_TRADE_TENSOR, tensorUrl: TENSOR_URL || null }));
+app.get("/meme/supply", (req, res) => res.json({ ...memeSupply(), eggPrice: MEME_EGG_PRICE, verifyPay: MEME_VERIFY_PAY, saleOpen: MEME_SALE_OPEN, tradeTensor: MEME_TRADE_TENSOR, tensorUrl: TENSOR_URL || null, marketName: MARKET_NAME, marketUrl: MARKET_URL || null }));
 // Public: the most recent hatches — drives a live "just hatched!" ticker for hype/engagement.
 app.get("/meme/recent", (req, res) => {
   const items = memeHatches.filter(h => h.status !== "incubating")
@@ -1810,7 +1814,7 @@ app.post("/meme/minted", async (req, res) => {
 // (Off-chain ownership ledger for the devnet demo. Mainnet should use Metaplex Auction House / Tensor for
 //  escrowless on-chain trades + royalties — never a custom escrow.)
 app.post("/meme/list", async (req, res) => {
-  if (MEME_TRADE_TENSOR) return res.status(410).json({ error: "Trading is on Tensor now — list your NFT there.", tensorUrl: TENSOR_URL });
+  if (MEME_TRADE_TENSOR) return res.status(410).json({ error: `Trading is on ${MARKET_NAME} now — list your NFT there.`, marketUrl: MARKET_URL, marketName: MARKET_NAME, tensorUrl: TENSOR_URL });
   const { wallet, hatchId, price } = req.body || {};
   if (!isPubkey(wallet)) return res.status(400).json({ error: "wallet required" });
   const h = memeHatches.find(x => x.id === hatchId);
@@ -1836,7 +1840,7 @@ app.get("/meme/market", (req, res) => {
 });
 // Buy a listed NFT — transfers in-game ownership + records the sale. (Payment settled client-side for the devnet demo.)
 app.post("/meme/buy", async (req, res) => {
-  if (MEME_TRADE_TENSOR) return res.status(410).json({ error: "Buying happens on Tensor now — settle the trade on-chain there.", tensorUrl: TENSOR_URL });
+  if (MEME_TRADE_TENSOR) return res.status(410).json({ error: `Buying happens on ${MARKET_NAME} now — settle the trade on-chain there.`, marketUrl: MARKET_URL, marketName: MARKET_NAME, tensorUrl: TENSOR_URL });
   const { wallet, hatchId } = req.body || {};
   if (!isPubkey(wallet)) return res.status(400).json({ error: "wallet required" });
   const h = memeHatches.find(x => x.id === hatchId);
