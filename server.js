@@ -2128,6 +2128,17 @@ app.get("/world/players", (req, res) => {
 });
 setInterval(() => { const now = Date.now(); for (const [w, p] of worldPlayers) if (now - p.ts > WORLD_TTL_MS) worldPlayers.delete(w); }, 10000);
 
+// Shared-world chat (in-memory ring buffer). Lightweight — the open-world social channel.
+const worldChat = [];
+app.post("/world/chat", (req, res) => {
+  const b = req.body || {};
+  if (!isPubkey(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
+  const text = stripTags(String(b.text || "")).slice(0, 200).trim();
+  if (text) { worldChat.push({ handle: stripTags(String(b.handle || "Trainer")).slice(0, 20), short: b.wallet.slice(0, 4) + "…" + b.wallet.slice(-4), text, ts: Date.now() }); if (worldChat.length > 200) worldChat.shift(); }
+  res.json({ ok: true, messages: worldChat.slice(-40) });
+});
+app.get("/world/chat", (_q, res) => res.json({ messages: worldChat.slice(-40) }));
+
 // Open the port FIRST so Render detects it immediately (no "No open ports" timeout on a cold DB),
 // then initialize the DB in the background (errors logged, not fatal — the server stays up and recovers).
 app.listen(Number(PORT), () => {
