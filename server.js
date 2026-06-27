@@ -2089,6 +2089,45 @@ app.get("/fund", async (req, res) => {
   res.status(502).json({ error: "airdrop failed (devnet faucets are rate-limited) — reload to retry" });
 });
 
+/* ============================ MMORPG — shared-world presence (Phase 0) ============================ */
+// Lightweight real-time layer: trainers broadcast their position + companion Legendary; everyone fetches the
+// nearby online players to render them live. In-memory + TTL-pruned (mirrors the PvP lobby). No DB, no rewards.
+const worldPlayers = new Map();   // wallet -> { x, z, dir, handle, leg, el, br, ts }
+const WORLD_TTL_MS = 12000;       // drop a trainer who hasn't pinged in 12s
+const WORLD_RADIUS = 4000;        // only return players within this distance (interest management)
+const clampF = (v, lo, hi, d) => { v = Number(v); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d; };
+function worldSnapshot(wallet, x, z) {
+  const now = Date.now(), out = [];
+  for (const [w, p] of worldPlayers) {
+    if (now - p.ts > WORLD_TTL_MS) { worldPlayers.delete(w); continue; }
+    if (w === wallet) continue;
+    if (Math.hypot((p.x || 0) - x, (p.z || 0) - z) > WORLD_RADIUS) continue;
+    out.push({ wallet: w, x: p.x, z: p.z, dir: p.dir, handle: p.handle, leg: p.leg, el: p.el, br: p.br });
+  }
+  return out.slice(0, 60);   // cap payload
+}
+// Broadcast my position (and get nearby players back in one round-trip).
+app.post("/world/move", (req, res) => {
+  const b = req.body || {}, wallet = b.wallet;
+  if (!isPubkey(wallet)) return res.status(400).json({ error: "valid wallet required" });
+  const x = clampF(b.x, -100000, 100000, 0), z = clampF(b.z, -100000, 100000, 0);
+  worldPlayers.set(wallet, {
+    x, z, dir: clampF(b.dir, -7, 7, 0),
+    handle: stripTags(String(b.handle || "Trainer")).slice(0, 20),
+    leg: clampF(b.leg, 0, 20, 14) | 0,                 // companion species index
+    el: stripTags(String(b.el || "Fire")).slice(0, 10),
+    br: clampF(b.br, 1, 30, 1) | 0,
+    ts: Date.now(),
+  });
+  res.json({ ok: true, players: worldSnapshot(wallet, x, z), online: worldPlayers.size });
+});
+// Read-only: nearby online trainers (for spectators / light polling).
+app.get("/world/players", (req, res) => {
+  const wallet = req.query?.wallet || "", x = clampF(req.query?.x, -100000, 100000, 0), z = clampF(req.query?.z, -100000, 100000, 0);
+  res.json({ players: worldSnapshot(wallet, x, z), online: worldPlayers.size });
+});
+setInterval(() => { const now = Date.now(); for (const [w, p] of worldPlayers) if (now - p.ts > WORLD_TTL_MS) worldPlayers.delete(w); }, 10000);
+
 // Open the port FIRST so Render detects it immediately (no "No open ports" timeout on a cold DB),
 // then initialize the DB in the background (errors logged, not fatal — the server stays up and recovers).
 app.listen(Number(PORT), () => {
