@@ -715,6 +715,34 @@ function memeOwnedActive(wallet) { return memeHatches.filter(h => h.wallet === w
 // selling/transferring an NFT never refunds a slot. Falls back to h.wallet for legacy rows without `hatcher`.
 const MEME_MAX_HATCH = 5;
 function memeLifetimeHatched(wallet) { return memeHatches.filter(h => (h.hatcher || h.wallet) === wallet).length; }
+
+// ----- ON-CHAIN OWNERSHIP RECONCILE -----
+// When trading is on Magic Eden (MEME_TRADE_TENSOR), transfers happen on-chain and the backend can't see them.
+// This reads each minted asset's REAL owner via the DAS `getAsset` RPC and updates the ledger, so in-game ownership,
+// the "1 at a time" rule, and the playable-Chiki grant all follow the true on-chain owner after any Magic Eden sale.
+async function dasOwner(mintAddr) {
+  try {
+    const r = await fetch(RPC_URL, { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: "own", method: "getAsset", params: { id: mintAddr } }) });
+    const j = await r.json();
+    return (j && j.result && j.result.ownership && j.result.ownership.owner) || null;
+  } catch (e) { return null; }
+}
+let _memeSyncBusy = false, _memeSyncAt = 0, _dasUnsupported = false;
+async function reconcileMemeOwners() {
+  if (!MEME_TRADE_TENSOR || _memeSyncBusy || _dasUnsupported) return;   // only meaningful in on-chain (Magic Eden) mode
+  _memeSyncBusy = true; let changed = false, checked = 0;
+  try {
+    for (const h of memeHatches) {
+      if (h.status !== "minted" || !h.mintAddr) continue;
+      const owner = await dasOwner(h.mintAddr); checked++;
+      if (owner && isPubkey(owner)) { if (owner !== h.wallet) { h.wallet = owner; h.listed = null; h._syncedAt = Date.now(); changed = true; } }
+    }
+    if (checked === 0) { /* nothing minted */ }
+    else if (changed) await saveMeme();
+  } finally { _memeSyncBusy = false; _memeSyncAt = Date.now(); }
+}
+setInterval(() => { reconcileMemeOwners().catch(() => {}); }, 5 * 60 * 1000);   // background reconcile every 5 min
 function pickMeme() {
   const avail = MEME_CHARS.filter(c => (memeMinted[c.key] || 0) < capOf(c.key));
   if (!avail.length) return null;
@@ -1771,13 +1799,24 @@ app.post("/meme/hatched", async (req, res) => {
 app.get("/meme/mine", (req, res) => {
   const wallet = req.query && req.query.wallet;
   if (!isPubkey(wallet)) return res.status(400).json({ error: "wallet required" });
+  // In Magic Eden mode, keep the ledger in sync with on-chain owners (throttled, non-blocking) so a bought NFT shows up.
+  if (MEME_TRADE_TENSOR && Date.now() - _memeSyncAt > 60000) reconcileMemeOwners().catch(() => {});
   const items = memeHatches.filter(h => h.wallet === wallet)
     .map(h => ({ id: h.id, char: h.char, name: h.name, edition: h.edition, status: h.status, mintAddr: h.mintAddr, ts: h.ts, listed: h.listed || null }))
     .sort((a, b) => b.ts - a.ts);
   const hatchesUsed = memeLifetimeHatched(wallet), ownedActive = memeOwnedActive(wallet);
-  res.json({ items, supply: memeSupply(),
+  // `ownedChars` = the species this wallet currently owns on-chain → the client grants/keeps exactly these playable Chikis.
+  const ownedChars = [...new Set(memeHatches.filter(h => h.wallet === wallet && h.status === "minted" && h.char).map(h => h.char))];
+  res.json({ items, supply: memeSupply(), ownedChars,
     hatchesUsed, hatchesLeft: Math.max(0, MEME_MAX_HATCH - hatchesUsed), maxHatch: MEME_MAX_HATCH,
     ownsActive: ownedActive >= 1, canHatch: ownedActive < 1 && hatchesUsed < MEME_MAX_HATCH });
+});
+// Admin: force an immediate on-chain ownership reconcile.
+app.get("/meme/sync", async (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  if (!MEME_TRADE_TENSOR) return res.json({ ok: true, skipped: "not in on-chain (Magic Eden) trade mode" });
+  await reconcileMemeOwners();
+  res.json({ ok: true, syncedAt: _memeSyncAt, minted: memeHatches.filter(h => h.status === "minted").length });
 });
 app.get("/meme/supply", (req, res) => res.json({ ...memeSupply(), eggPrice: MEME_EGG_PRICE, verifyPay: MEME_VERIFY_PAY, saleOpen: MEME_SALE_OPEN, tradeTensor: MEME_TRADE_TENSOR, tensorUrl: TENSOR_URL || null, marketName: MARKET_NAME, marketUrl: MARKET_URL || null }));
 // Public: the most recent hatches — drives a live "just hatched!" ticker for hype/engagement.
