@@ -39,6 +39,15 @@ const charByKey = Object.fromEntries(CFG.characters.map(c => [c.key, c]));
 const artUris = fs.existsSync(ARTCACHE) ? JSON.parse(fs.readFileSync(ARTCACHE)) : {};
 const saveArt = () => fs.writeFileSync(ARTCACHE, JSON.stringify(artUris, null, 2));
 
+// 🛡️ IDEMPOTENCY LEDGER — the on-chain mint is irreversible, so we record every successful
+// mint locally (hatchId → mintAddr) the instant it lands, BEFORE telling the backend. If the
+// backend callback then fails (Render cold-start/timeout), the next poll sees the hatch is
+// already in the ledger and re-confirms instead of minting a second copy. This is what stops
+// the duplicate-edition problem.
+const LEDGERFILE = path.join(__dirname, `mint-ledger-${NETWORK}.json`);
+let ledger = fs.existsSync(LEDGERFILE) ? JSON.parse(fs.readFileSync(LEDGERFILE)) : {};
+const saveLedger = () => fs.writeFileSync(LEDGERFILE, JSON.stringify(ledger, null, 2));
+
 async function setup() {
   const umi = createUmi(RPC).use(mplCore()).use(irysUploader({ address: IRYS }));
   let kp;
@@ -136,6 +145,18 @@ async function mintOne(ctx, h) {
 
 async function api(p, opts) { const r = await fetch(BACKEND + p, opts); if (!r.ok) throw new Error(p + " → " + r.status); return r.json(); }
 
+// Tell the backend a hatch is minted, retrying so a successful mint is ALWAYS recorded
+// even when Render is cold-starting. Returns true once the backend acknowledges.
+async function markMinted(h, addr) {
+  for (let i = 0; i < 6; i++) {
+    try {
+      await api("/meme/minted", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: ADMIN_KEY, hatchId: h.id, mintAddr: String(addr) }) });
+      return true;
+    } catch (e) { log("  /meme/minted retry", i + 1, "→", e.message); await new Promise(r => setTimeout(r, 2000 * (i + 1))); }
+  }
+  return false;
+}
+
 async function loop(ctx) {
   let pend = [];
   try { const j = await api(`/meme/pending?key=${encodeURIComponent(ADMIN_KEY)}`); pend = j.pending || []; }
@@ -143,10 +164,21 @@ async function loop(ctx) {
   if (!pend.length) return;
   log(`${pend.length} egg(s) to mint…`);
   for (const h of pend) {
+    // 🛡️ Already minted this hatch? Never mint again — just re-confirm with the backend
+    // so it stops handing the hatch back as "pending".
+    if (ledger[h.id]) {
+      log(`↺ ${h.id} already minted (${ledger[h.id].mintAddr.slice(0, 6)}…) — reconfirming, not re-minting`);
+      await markMinted(h, ledger[h.id].mintAddr);
+      continue;
+    }
     try {
       const addr = await mintOne(ctx, h);
-      await api("/meme/minted", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: ADMIN_KEY, hatchId: h.id, mintAddr: addr }) });
-      log(`✅ ${charByKey[h.char].name} #${h.edition} → ${h.wallet.slice(0, 6)}…  ${addr}`);
+      // Record locally the instant the mint lands, BEFORE the backend callback, so a
+      // callback failure can never cause a duplicate on the next poll.
+      ledger[h.id] = { mintAddr: String(addr), wallet: h.wallet, char: h.char, edition: h.edition, at: new Date().toISOString() };
+      saveLedger();
+      const ok = await markMinted(h, addr);
+      log(`✅ ${charByKey[h.char].name} #${h.edition} → ${h.wallet.slice(0, 6)}…  ${addr}${ok ? "" : "  ⚠️ backend callback still failing — will retry next poll"}`);
     } catch (e) { log("mint failed for", h.id, e.message); }
   }
 }

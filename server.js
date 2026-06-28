@@ -1845,6 +1845,11 @@ app.post("/meme/minted", async (req, res) => {
   const { hatchId, mintAddr } = req.body || {};
   const h = memeHatches.find(x => x.id === hatchId);
   if (!h) return res.status(404).json({ error: "hatch not found" });
+  // Idempotent: if this hatch is already minted on-chain, keep the original mint address
+  // and don't reprocess. Prevents a late/duplicate worker callback from clobbering it.
+  if (h.status === "minted" && h.mintAddr) {
+    return res.json({ ok: true, already: true, mintAddr: h.mintAddr });
+  }
   h.status = "minted"; h.mintAddr = mintAddr || null; await saveMeme();
   res.json({ ok: true });
 });
