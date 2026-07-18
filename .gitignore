@@ -1,0 +1,14 @@
+# secrets — NEVER commit
+.env
+.env.*
+!.env.example
+*.key
+hot.json
+cold.json
+treasury*.json
+secret*.json
+
+# deps + noise
+node_modules/
+npm-debug.log*
+.DS_Store

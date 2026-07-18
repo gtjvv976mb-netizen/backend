@@ -11,6 +11,7 @@ import {
 } from "@solana/web3.js";
 import { createCup } from "./cup-live.js";   // Chikoria Cup live orchestrator (double-elim, deterministic resolver)
 import { createMatch as pvpCreate, submit as pvpSubmit, tick as pvpTick, viewFor as pvpView, forfeit as pvpForfeit, spectatorView as pvpSpectate } from "./pvp-engine.js";   // live PvP battles
+import { getAssociatedTokenAddress, createTransferCheckedInstruction } from "@solana/spl-token";   // $CHIKI quest-reward payouts
 
 dotenv.config();
 const {
@@ -104,7 +105,11 @@ function slotRarity(wallet, lastClaim, ci, slot){
   for (const [name, w] of RARITY_DIST){ x -= w; if (x <= 0) return name; }
   return "common";
 }
+// Rewards are now QUEST-ONLY (paid as real $CHIKI via /quest/claim). The old time-based SOL
+// accrual is disabled so there is no second, unearned reward path.
+const REWARDS_QUEST_ONLY = String(process.env.REWARDS_QUEST_ONLY || "true").toLowerCase() === "true";
 function seededEarn(wallet, lastClaim, chikis, minutes){
+  if (REWARDS_QUEST_ONLY) return 0;
   const slots = Math.min(4000, Math.floor(minutes * 60 / TASK_SEC));
   let sol = 0;
   for (let ci = 0; ci < chikis; ci++) for (let s = 0; s < slots; s++) sol += RARITY_SOL[slotRarity(wallet, lastClaim, ci, s)];
@@ -1484,6 +1489,148 @@ app.post("/claim", async (req, res) => {
     if (r.status === "ok") await store.fail(r.payoutId, wallet, r.prevLastClaim, r.amount); // refund cooldown so a failed payout isn't lost; prize stays owed
     res.status(500).json({ error: "payout failed: " + String(e.message || e) });
   }
+});
+
+/* ============================================================================
+   SERVER-AUTHORITATIVE QUEST REWARDS  →  real $CHIKI (SPL) payout
+   The SERVER, not the client, decides what each wallet has earned:
+     · each main quest pays a FIXED amount, exactly ONCE, only IN ORDER
+     · a minimum real-time gap between completions (anti-bot pacing)
+     · a hard per-wallet ceiling = the sum of all quest rewards
+   Payout destination is ALWAYS the earning wallet (never client-chosen), the
+   amount is ALWAYS the server ledger (never client-sent), and every payout
+   passes per-claim / per-wallet-daily / pool-reserve caps AND a global hourly
+   circuit breaker that auto-halts if outflow spikes. Write-before-send + a
+   per-wallet lock make double-claims impossible.
+   ============================================================================ */
+const CHIKI_DECIMALS = Math.max(0, Number(process.env.CHIKI_DECIMALS || 6));   // pump.fun = 6
+// MUST stay in sync with the client's Econ story chain (ids + order). Amounts are the server's truth.
+const MAIN_QUESTS = [
+  { id: "s_meet",  chiki: 20  },
+  { id: "s_kill",  chiki: 30  },
+  { id: "s_craft", chiki: 50  },
+  { id: "s_hunt",  chiki: 120 },
+  { id: "s_gear",  chiki: 100 },
+  { id: "s_chiki", chiki: 100 },
+  { id: "s_raid",  chiki: 300 },
+];
+const QUEST_IDX    = new Map(MAIN_QUESTS.map((q, i) => [q.id, i]));
+const QUEST_REWARD = new Map(MAIN_QUESTS.map(q => [q.id, q.chiki]));
+const QUEST_CEIL   = MAIN_QUESTS.reduce((a, q) => a + q.chiki, 0);             // hard per-wallet max
+const QUEST_MIN_GAP_MS   = Math.max(0, Number(process.env.QUEST_MIN_GAP_SEC || 20)) * 1000;
+const MIN_CLAIM_CHIKI    = Math.max(0, Number(process.env.MIN_CLAIM_CHIKI    || 20));
+const PER_CLAIM_CHIKI    = Math.max(0, Number(process.env.PER_CLAIM_CHIKI    || 1000));
+const WALLET_DAILY_CHIKI = Math.max(0, Number(process.env.WALLET_DAILY_CHIKI || 2000));
+const POOL_RESERVE_CHIKI = Math.max(0, Number(process.env.POOL_RESERVE_CHIKI || 0));   // never pay the pool below this
+const BREAKER_MAX_CHIKI  = Math.max(0, Number(process.env.BREAKER_HOURLY_CHIKI || 100000));   // global rolling-hour cap
+const _payoutLog = [];   // {t, chiki} — rolling window for the circuit breaker
+function _breakerWouldTrip(add) {
+  const now = Date.now(), cutoff = now - 3600_000;
+  while (_payoutLog.length && _payoutLog[0].t < cutoff) _payoutLog.shift();
+  const sum = _payoutLog.reduce((a, p) => a + p.chiki, 0);
+  return BREAKER_MAX_CHIKI > 0 && sum + add > BREAKER_MAX_CHIKI;
+}
+const _questLocks = new Set();   // per-wallet in-flight claim lock (blocks double-submit races)
+const QKEY = (w) => "quest:" + w;
+async function _questLoad(wallet) {
+  let led = null;
+  try { led = await store.kvGet(QKEY(wallet)); } catch (e) {}
+  if (!led || typeof led !== "object") led = {};
+  led.done     = (led.done && typeof led.done === "object") ? led.done : {};
+  led.pouch    = Math.max(0, Math.min(QUEST_CEIL, Number(led.pouch) || 0));
+  led.earned   = Math.max(0, Number(led.earned) || 0);
+  led.lastAt   = Number(led.lastAt) || 0;
+  led.dayPaid  = Math.max(0, Number(led.dayPaid) || 0);
+  led.dayStart = Number(led.dayStart) || 0;
+  return led;
+}
+async function _questSave(wallet, led) { try { await store.kvSet(QKEY(wallet), led); } catch (e) {} }
+function _rollDay(led, now) { if (now - led.dayStart >= 86400_000) { led.dayStart = now; led.dayPaid = 0; } }
+async function chikiPool() { try { return await chikiBalance(treasury.publicKey.toBase58()); } catch (e) { return 0; } }
+// send `amt` whole $CHIKI from the treasury ATA to the wallet ATA. The wallet MUST already hold
+// $CHIKI (the play-gate guarantees its ATA exists) — we never create ATAs (avoids rent + spam).
+async function payChiki(destWallet, amt) {
+  const src = await getAssociatedTokenAddress(MINT, treasury.publicKey);
+  const dst = await getAssociatedTokenAddress(MINT, new PublicKey(destWallet));
+  const raw = BigInt(Math.round(amt * 10 ** CHIKI_DECIMALS));
+  const tx  = new Transaction().add(createTransferCheckedInstruction(src, MINT, dst, treasury.publicKey, raw, CHIKI_DECIMALS));
+  const sig = await conn.sendTransaction(tx, [treasury]);
+  await conn.confirmTransaction(sig, "confirmed");
+  return sig;
+}
+
+// POST /quest/complete — credit a FIXED quest reward to the server pouch (client cannot fake it)
+app.post("/quest/complete", async (req, res) => {
+  const wallet = req.body?.wallet;
+  const questId = String(req.body?.questId || "");
+  if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  if (!QUEST_IDX.has(questId)) return res.status(400).json({ error: "unknown quest" });
+  if (isBanned(wallet)) return res.status(403).json({ error: "not eligible", banned: true });
+  try {
+    if (verifyOn) { const bal = await chikiBalance(wallet); if (bal < MIN) return res.status(403).json({ error: `below ${MIN} $CHIKI threshold` }); }
+    const led = await _questLoad(wallet);
+    const idx = QUEST_IDX.get(questId);
+    if (led.done[questId]) return res.json({ ok: true, already: true, questId, pouchChiki: led.pouch, done: Object.keys(led.done) });
+    for (let i = 0; i < idx; i++) if (!led.done[MAIN_QUESTS[i].id]) return res.status(409).json({ error: "complete earlier chapters first", need: MAIN_QUESTS[i].id });
+    const now = Date.now();
+    if (now - led.lastAt < QUEST_MIN_GAP_MS) return res.status(429).json({ error: "too fast — pace yourself", retryInMs: QUEST_MIN_GAP_MS - (now - led.lastAt) });
+    const reward = QUEST_REWARD.get(questId);
+    led.done[questId] = now;
+    led.pouch  = Math.min(QUEST_CEIL, led.pouch + reward);
+    led.earned = led.earned + reward;
+    led.lastAt = now;
+    await _questSave(wallet, led);
+    res.json({ ok: true, questId, reward, pouchChiki: led.pouch, done: Object.keys(led.done) });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// GET /quest/state — the server's authoritative pouch + completed quests for this wallet
+app.get("/quest/state", async (req, res) => {
+  const wallet = req.query?.wallet;
+  if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  try {
+    const led = await _questLoad(wallet); _rollDay(led, Date.now());
+    res.json({ wallet, pouchChiki: led.pouch, earnedChiki: led.earned, done: Object.keys(led.done),
+      questTotal: QUEST_CEIL, minClaim: MIN_CLAIM_CHIKI, perClaimCap: PER_CLAIM_CHIKI,
+      walletDailyCap: WALLET_DAILY_CHIKI, dayPaidChiki: led.dayPaid });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// POST /quest/claim — pay the server pouch out as REAL $CHIKI (SPL) to the earner's own wallet
+app.post("/quest/claim", async (req, res) => {
+  const wallet = req.body?.wallet;
+  if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  if (isBanned(wallet)) return res.status(403).json({ error: "not eligible", banned: true });
+  if (!MINT) return res.status(503).json({ error: "token payouts are not configured" });
+  if (_questLocks.has(wallet)) return res.status(429).json({ error: "a claim is already in flight" });
+  _questLocks.add(wallet);
+  try {
+    const led = await _questLoad(wallet);
+    const now = Date.now(); _rollDay(led, now);
+    if (led.pouch < MIN_CLAIM_CHIKI) return res.status(409).json({ error: `keep questing — claims start at ${MIN_CLAIM_CHIKI} $CHIKI`, pouchChiki: led.pouch });
+    const pool = await chikiPool();
+    let pay = Math.min(
+      led.pouch,
+      PER_CLAIM_CHIKI    > 0 ? PER_CLAIM_CHIKI : Infinity,
+      WALLET_DAILY_CHIKI > 0 ? Math.max(0, WALLET_DAILY_CHIKI - led.dayPaid) : Infinity,
+      Math.max(0, pool - POOL_RESERVE_CHIKI)
+    );
+    pay = Math.floor(pay);
+    if (pay < MIN_CLAIM_CHIKI) return res.status(409).json({ error: "pool low or daily cap reached — try later", poolChiki: Math.floor(pool), dayPaidChiki: led.dayPaid });
+    if (_breakerWouldTrip(pay)) return res.status(503).json({ error: "reward payouts are temporarily paused (safety limit) — try again soon" });
+    // WRITE-BEFORE-SEND: decrement first so a crash/double-submit can never double-pay; restore on failure
+    led.pouch   -= pay;
+    led.dayPaid += pay;
+    await _questSave(wallet, led);
+    let sig;
+    try { sig = await payChiki(wallet, pay); }
+    catch (e) { led.pouch += pay; led.dayPaid -= pay; await _questSave(wallet, led); return res.status(500).json({ error: "payout failed: " + String(e.message || e) }); }
+    _payoutLog.push({ t: now, chiki: pay });
+    pushFeed("questclaim", { wallet, short: wallet.slice(0, 4) + "…" + wallet.slice(-4), chikiPaid: pay, signature: sig });
+    res.json({ ok: true, wallet, chikiPaid: pay, pouchChiki: led.pouch, signature: sig,
+      explorer: `https://explorer.solana.com/tx/${sig}?cluster=${NETWORK}` });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  finally { _questLocks.delete(wallet); }
 });
 
 /* ----------------------------- Chikoria Cup endpoints ----------------------------- */
