@@ -1054,14 +1054,27 @@ app.post("/verify", async (req, res) => {
   const wallet = req.body?.wallet;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
   try {
+    // 1) The wallet GATE = the on-chain balance. This is the only thing the connect flow truly
+    //    needs, and it never touches the database.
     let balance = 0, eligible = true;
     if (verifyOn) { balance = await chikiBalance(wallet); eligible = balance >= MIN; }
-    const p = await store.touch(wallet, eligible, balance);
-    const chikis = eligible ? (chikiCount(balance, p.whale_since) || 1) : 0;
+    // 2) DB-backed EXTRAS (whale hold-timer + cross-device roster/Glory). Degrade gracefully if
+    //    the database is unreachable — a dead/expired Postgres must NEVER zero out a real holder's
+    //    balance (previously store.touch() threw and 500'd the whole request → "0 $CHIKI").
+    let whaleSince = null, firstSeen = 0, profile = null, dbOk = true;
+    try {
+      const p = await store.touch(wallet, eligible, balance);
+      whaleSince = p?.whale_since ?? null;
+      firstSeen = Number(p?.first_seen) || 0;
+      profile = await applyGloryCredit(wallet, p?.profile || null);   // pending Glory gift on login (clobber-proof)
+    } catch (dbErr) {
+      dbOk = false;
+      console.warn("verify: DB unavailable — serving chain-only result:", String(dbErr?.message || dbErr));
+    }
+    const chikis = eligible ? (chikiCount(balance, whaleSince) || 1) : 0;
     const whalePending = eligible && balance >= WHALE_MIN && chikis < 2;
-    const whaleReadyInMs = whalePending && p.whale_since ? Math.max(0, WHALE_HOLD_MS - (Date.now() - Number(p.whale_since))) : 0;
-    const profile = await applyGloryCredit(wallet, p.profile || null);   // deliver any pending Glory gift on this login (clobber-proof)
-    res.json({ wallet, eligible, balance, chikis, whalePending, whaleReadyInMs, minHold: MIN, verified: verifyOn, firstSeen: Number(p.first_seen), profile: profile || null });
+    const whaleReadyInMs = whalePending && whaleSince ? Math.max(0, WHALE_HOLD_MS - (Date.now() - Number(whaleSince))) : 0;
+    res.json({ wallet, eligible, balance, chikis, whalePending, whaleReadyInMs, minHold: MIN, verified: verifyOn, firstSeen, profile: profile || null, dbOk });
   } catch (e) { res.status(500).json({ error: "verify failed: " + String(e.message || e) }); }
 });
 
