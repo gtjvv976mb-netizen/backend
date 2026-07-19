@@ -1624,20 +1624,30 @@ app.post("/claim", async (req, res) => {
    ============================================================================ */
 const CHIKI_DECIMALS = Math.max(0, Number(process.env.CHIKI_DECIMALS || 6));   // pump.fun = 6
 // MUST stay in sync with the client's Econ story chain (ids + order).
+// CHIKORIA · THE BROKEN WHEEL — ACT I (21 chapters, 3 parts). MUST match the client's Econ.STORY
+// ids + order exactly (the server enforces in-order completion). Amounts sum to 100,000/player.
 const MAIN_QUESTS = [
-  { id: "s_meet",   chiki: 2000 },
-  { id: "s_kill",   chiki: 3000 },
-  { id: "s_gather", chiki: 4000 },
-  { id: "s_craft",  chiki: 5000 },
-  { id: "s_forage", chiki: 5000 },
-  { id: "s_fish",   chiki: 6000 },
-  { id: "s_hunt",   chiki: 8000 },
-  { id: "s_gear",   chiki: 8000 },
-  { id: "s_stock",  chiki: 9000 },
-  { id: "s_chiki",  chiki: 10000 },
-  { id: "s_angler", chiki: 10000 },
-  { id: "s_forge2", chiki: 12000 },
-  { id: "s_ascend", chiki: 18000 },
+  { id: "s_meet",    chiki: 1000 },
+  { id: "s_kill",    chiki: 1500 },
+  { id: "s_gather",  chiki: 2000 },
+  { id: "s_stone",   chiki: 2500 },
+  { id: "s_craft",   chiki: 2500 },
+  { id: "s_forage",  chiki: 3500 },
+  { id: "s_fish",    chiki: 4000 },
+  { id: "s_hunt",    chiki: 5000 },
+  { id: "s_shell",   chiki: 3500 },
+  { id: "s_gear",    chiki: 4000 },
+  { id: "s_meat",    chiki: 4500 },
+  { id: "s_stock",   chiki: 5000 },
+  { id: "s_chiki",   chiki: 5500 },
+  { id: "s_honey",   chiki: 5500 },
+  { id: "s_ore",     chiki: 5500 },
+  { id: "s_angler",  chiki: 6000 },
+  { id: "s_slayer",  chiki: 7500 },
+  { id: "s_forge2",  chiki: 7000 },
+  { id: "s_crystal", chiki: 7500 },
+  { id: "s_train",   chiki: 7500 },
+  { id: "s_ascend",  chiki: 9000 },
 ];
 // Per-quest $CHIKI rewards accrue to a per-player pouch (admin-released, SEPARATE from the grand prize).
 const QUEST_REWARD_AMT   = new Map(MAIN_QUESTS.map(q => [q.id, q.chiki || 0]));
