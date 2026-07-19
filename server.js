@@ -273,7 +273,7 @@ const _lastChat = new Map();   // light per-wallet chat throttle
 
 // Per-wallet $CHIKI balance — CACHED 30s so 500+ polling clients don't spam Helius (429s).
 const _balCache = new Map();
-async function chikiBalance(owner) {
+async function chikiBalance(owner, strict = false) {
   if (!MINT) return 0;
   const c = _balCache.get(owner);
   if (c && Date.now() - c.t < 30000) return c.v;
@@ -283,7 +283,11 @@ async function chikiBalance(owner) {
     _balCache.set(owner, { t: Date.now(), v: b });
     if (_balCache.size > 5000) _balCache.clear();   // simple bound
     return b;
-  } catch { return c ? c.v : 0; }
+  } catch (e) {
+    if (c) return c.v;
+    if (strict) throw e;   // eligibility gates must FAIL CLOSED (503), not read "holds zero"
+    return 0;
+  }
 }
 // Treasury (reward pool) SOL — CACHED 20s. Pool changes slowly; this kills the per-request getBalance spam.
 let _poolCache = { t: 0, v: 0 };
@@ -1692,7 +1696,7 @@ const WINNER_CAP    = Math.max(0, Number(process.env.WINNER_CAP    || 10));
 const WINNER_REWARD = Math.max(0, Number(process.env.WINNER_REWARD || 1000000));
 const FINAL_QUEST   = MAIN_QUESTS[MAIN_QUESTS.length - 1].id;
 const QUEST_IDX     = new Map(MAIN_QUESTS.map((q, i) => [q.id, i]));
-const QUEST_MIN_GAP_MS = Math.max(0, Number(process.env.QUEST_MIN_GAP_SEC || 20)) * 1000;
+const QUEST_MIN_GAP_MS = Math.max(0, Number(process.env.QUEST_MIN_GAP_SEC ?? 20)) * 1000;
 // Winner eligibility — FAIL-CLOSED (enforced on the reward path regardless of VERIFY_HOLDERS):
 const QUEST_MIN_HOLD = Math.max(0, Number(process.env.QUEST_MIN_HOLD || MIN));                       // must hold >= this $CHIKI
 const QUEST_HOLD_MS  = Math.max(0, Number(process.env.QUEST_MIN_HOLD_MINUTES || 60)) * 60_000;       // wallet must be aged-in (anti-sybil)
@@ -1780,7 +1784,7 @@ app.post("/quest/complete", async (req, res) => {
       if (MINT && store.kind !== "postgres") return res.status(503).json({ error: "reward campaign temporarily unavailable (a database is required)" });
       // FAIL-CLOSED eligibility, independent of VERIFY_HOLDERS: must currently hold the stake AND be aged-in.
       let bal = 0;
-      try { bal = await chikiBalance(wallet); } catch (e) { return res.status(503).json({ error: "eligibility check unavailable — try again" }); }
+      try { bal = await chikiBalance(wallet, true); } catch (e) { return res.status(503).json({ error: "eligibility check unavailable — try again" }); }
       if (bal < QUEST_MIN_HOLD) return res.status(403).json({ error: `hold at least ${QUEST_MIN_HOLD} $CHIKI to qualify for a winner slot`, balance: bal });
       if (QUEST_HOLD_MS > 0) { const fs = await store.firstSeen(wallet);
         if (!fs || now - fs < QUEST_HOLD_MS) return res.status(403).json({ error: "wallet too new to qualify — winner slots require an aged wallet (anti-sybil)", waitMs: fs ? QUEST_HOLD_MS - (now - fs) : QUEST_HOLD_MS }); }
