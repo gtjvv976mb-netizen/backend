@@ -1241,6 +1241,7 @@ app.post("/profile", async (req, res) => {
     // admins are trusted (creator testing); everyone else is clamped to legal values
     const safe = isAdminWallet(wallet) ? profile : sanitizeProfile(prev, profile, wallet);
     if (hasMmo) safe.mmo = profile.mmo;   // the signed MMO cloud-save rides through verbatim
+    else if (prev && prev.mmo) safe.mmo = prev.mmo;   // SECURITY: legacy (unsigned) writes must NOT wipe the owner's cloud-save — carry it forward
     safe._serverSavedAt = now;   // authoritative "last seen" for offline progression
     await store.setProfile(wallet, safe);
     res.json({ ok: true, serverSavedAt: safe._serverSavedAt });
@@ -2513,7 +2514,10 @@ setInterval(() => {
   for (const [id, m] of pvpMatches) {
     try { pvpTick(m, now); } catch (e) {}
     if (m.status === "finished") {
-      if (!m._winRecorded) { m._winRecorded = true; const ww = m.winner === "a" ? m.walletA : m.winner === "b" ? m.walletB : null; if (ww) recordWin(ww); }   // credit the BR win ONCE, server-side
+      if (!m._winRecorded) { m._winRecorded = true; const ww = m.winner === "a" ? m.walletA : m.winner === "b" ? m.walletB : null;
+        // SECURITY: only credit a win when a REAL turn resolved (both sides submitted) and the wallets differ —
+        // an instant forfeit at turn 0 (self-match farming) or a self-vs-self match earns nothing
+        if (ww && (m.turn | 0) >= 1 && m.walletA !== m.walletB) recordWin(ww); }
       if (!m._doneAt) m._doneAt = now;
       else if (now - m._doneAt > 180000) { pvpMatches.delete(id);   // also clear the wallet→match pointers so the maps don't grow unbounded
         if (pvpPlayerMatch.get(m.walletA) === id) pvpPlayerMatch.delete(m.walletA);
@@ -2761,9 +2765,17 @@ function saveMarket() { store.kvSet("market_listings", marketListings.slice(-400
 function pruneMarket() {
   const now = Date.now();
   marketListings = marketListings.filter(l => now - (l.ts || 0) < MARKET_TTL_MS);
-  for (const sid of Object.keys(marketSales)) {
+  const sids = Object.keys(marketSales);
+  for (const sid of sids) {
     marketSales[sid] = (marketSales[sid] || []).filter(s => now - (s.ts || 0) < 7 * 24 * 3600 * 1000);
     if (!marketSales[sid].length) delete marketSales[sid];
+  }
+  // SECURITY: hard cap on distinct seller buckets — drop the oldest so a flood of fake sids can't grow memory unbounded
+  const keys = Object.keys(marketSales);
+  if (keys.length > 5000) {
+    keys.map(k => [k, Math.max(...(marketSales[k] || [{ts:0}]).map(s => s.ts || 0))])
+        .sort((a, b) => a[1] - b[1]).slice(0, keys.length - 5000)
+        .forEach(([k]) => delete marketSales[k]);
   }
 }
 app.get("/market/list", (_q, res) => { pruneMarket(); res.json({ listings: marketListings.slice(-300) }); });
