@@ -305,6 +305,7 @@ function makeStore() {
 // ---- quest winner state helpers (admin-gated reward campaign) ----
 function _advSub(s){ let h=0; for(let i=0;i<String(s).length;i++){ h=(h*31 + String(s).charCodeAt(i))|0; } return h; }
 const _memWinners = new Map();   // memStore only: wallet -> {wallet,rank,won_at,balance_at_win,paid,payout_sig,payout_at}
+const _memQR = new Map();         // memStore only: wallet -> {wallet,done_mask,paid_amount,payout_sig,payout_at,payout_lvbh,payout_amount}
 let _memWLock = Promise.resolve();
 function _memWith(fn){ const r=_memWLock.then(fn,fn); _memWLock=r.catch(()=>{}); return r; }
 
@@ -350,6 +351,12 @@ function pgStore() {
         payout_lvbh BIGINT
       )`);
       await pool.query(`ALTER TABLE quest_winners ADD COLUMN IF NOT EXISTS payout_lvbh BIGINT`);
+      await pool.query(`CREATE TABLE IF NOT EXISTS quest_rewards(
+        wallet TEXT PRIMARY KEY,
+        done_mask INT NOT NULL DEFAULT 0,
+        paid_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+        payout_sig TEXT, payout_at BIGINT, payout_lvbh BIGINT, payout_amount DOUBLE PRECISION
+      )`);
     },
     async kvGet(k) { const r = await pool.query(`SELECT v FROM kv WHERE k=$1`, [k]); return r.rows[0]?.v ?? null; },
     async kvSet(k, v) { await pool.query(`INSERT INTO kv(k,v) VALUES($1,$2::jsonb) ON CONFLICT(k) DO UPDATE SET v=$2::jsonb`, [k, JSON.stringify(v)]); },
@@ -397,6 +404,29 @@ function pgStore() {
     async payoutRecordSig(wallet, sig, lvbh, now) { await pool.query(`UPDATE quest_winners SET payout_sig=$2, payout_lvbh=$3::bigint, payout_at=$4::bigint WHERE wallet=$1 AND paid=false`, [wallet, sig, Math.floor(Number(lvbh) || 0), now]); },
     async payoutConfirm(wallet, sig) { await pool.query(`UPDATE quest_winners SET paid=true, payout_sig=$2 WHERE wallet=$1`, [wallet, sig]); },
     async payoutClear(wallet) { await pool.query(`UPDATE quest_winners SET payout_at=0, payout_sig=NULL, payout_lvbh=0 WHERE wallet=$1 AND paid=false`, [wallet]); },
+    // ---- per-quest reward pouch: idempotent accrual (done_mask bit-OR) + variable-amount admin payout ----
+    async qrAccrue(wallet, bit) { await pool.query(`INSERT INTO quest_rewards(wallet,done_mask) VALUES($1,$2) ON CONFLICT(wallet) DO UPDATE SET done_mask = quest_rewards.done_mask | $2`, [wallet, bit|0]); },
+    async qrGet(wallet) { const r = await pool.query(`SELECT wallet,done_mask,paid_amount,payout_sig,payout_at,payout_lvbh,payout_amount FROM quest_rewards WHERE wallet=$1`, [wallet]); return r.rows[0] || null; },
+    async qrList(limit) { const r = await pool.query(`SELECT wallet,done_mask,paid_amount FROM quest_rewards WHERE done_mask > 0 ORDER BY wallet LIMIT $1`, [Math.max(1, limit|0)]); return r.rows; },
+    async qrPayoutBegin(wallet) {
+      const c = await pool.connect();
+      try {
+        await c.query("BEGIN");
+        await c.query("SELECT pg_advisory_xact_lock($1,$2)", [4210003, _advSub(wallet)]);
+        const r = await c.query("SELECT done_mask,paid_amount,payout_sig,payout_at,payout_lvbh,payout_amount FROM quest_rewards WHERE wallet=$1 FOR UPDATE", [wallet]);
+        const row = r.rows[0];
+        if (!row) { await c.query("COMMIT"); return { state: "none" }; }
+        const now = Date.now(); const pat = Number(row.payout_at) || 0;
+        if (pat && now - pat < 120000 && row.payout_sig) { await c.query("COMMIT"); return { state: "inflight", sig: row.payout_sig }; }
+        await c.query("UPDATE quest_rewards SET payout_at=$2::bigint WHERE wallet=$1", [wallet, now]);
+        await c.query("COMMIT");
+        return { state: "proceed", doneMask: Number(row.done_mask)||0, paidAmount: Number(row.paid_amount)||0,
+                 priorSig: row.payout_sig||null, priorAt: pat, priorLvbh: row.payout_lvbh?Number(row.payout_lvbh):0, priorAmount: Number(row.payout_amount)||0 };
+      } catch (e) { try { await c.query("ROLLBACK"); } catch(_){} throw e; } finally { c.release(); }
+    },
+    async qrPayoutRecordSig(wallet, sig, lvbh, amount, now) { await pool.query(`UPDATE quest_rewards SET payout_sig=$2, payout_lvbh=$3::bigint, payout_amount=$4, payout_at=$5::bigint WHERE wallet=$1`, [wallet, sig, Math.floor(Number(lvbh)||0), amount, now]); },
+    async qrPayoutConfirm(wallet, amount) { await pool.query(`UPDATE quest_rewards SET paid_amount = paid_amount + COALESCE(payout_amount, $2), payout_sig=NULL, payout_lvbh=0, payout_amount=NULL, payout_at=0 WHERE wallet=$1 AND (payout_sig IS NOT NULL OR payout_at <> 0)`, [wallet, amount]); },
+    async qrPayoutClear(wallet) { await pool.query(`UPDATE quest_rewards SET payout_sig=NULL, payout_lvbh=0, payout_amount=NULL, payout_at=0 WHERE wallet=$1`, [wallet]); },
     async heartbeat(wallet, chikis, roster) {
       await pool.query(
         `INSERT INTO presence(wallet,last_active,chikis,roster) VALUES($1,$2::bigint,$3,$4::jsonb)
@@ -566,6 +596,16 @@ function memStore() {
     async payoutRecordSig(wallet, sig, lvbh, now) { const r=_memWinners.get(wallet); if(r&&!r.paid){ r.payout_sig=sig; r.payout_lvbh=lvbh||0; r.payout_at=now; } },
     async payoutConfirm(wallet, sig) { const r=_memWinners.get(wallet); if(r){ r.paid=true; r.payout_sig=sig; } },
     async payoutClear(wallet) { const r=_memWinners.get(wallet); if(r&&!r.paid){ r.payout_at=0; r.payout_sig=null; r.payout_lvbh=0; } },
+    async qrAccrue(wallet, bit) { const r=_memQR.get(wallet)||{wallet,done_mask:0,paid_amount:0,payout_sig:null,payout_at:0,payout_lvbh:0,payout_amount:0}; r.done_mask=(r.done_mask|0)|(bit|0); _memQR.set(wallet,r); },
+    async qrGet(wallet) { return _memQR.get(wallet)||null; },
+    async qrList(limit) { return [..._memQR.values()].filter(r=>r.done_mask>0).slice(0,Math.max(1,limit|0)); },
+    async qrPayoutBegin(wallet) { return _memWith(async()=>{ const r=_memQR.get(wallet); if(!r) return {state:"none"};
+      const now=Date.now(), pat=r.payout_at||0; if(pat && now-pat<120000 && r.payout_sig) return {state:"inflight",sig:r.payout_sig};
+      const prior={priorSig:r.payout_sig||null,priorAt:pat,priorLvbh:r.payout_lvbh||0,priorAmount:r.payout_amount||0}; r.payout_at=now;
+      return {state:"proceed",doneMask:r.done_mask|0,paidAmount:r.paid_amount||0,...prior}; }); },
+    async qrPayoutRecordSig(wallet, sig, lvbh, amount, now) { const r=_memQR.get(wallet); if(r){ r.payout_sig=sig; r.payout_lvbh=lvbh||0; r.payout_amount=amount; r.payout_at=now; } },
+    async qrPayoutConfirm(wallet, amount) { const r=_memQR.get(wallet); if(r && (r.payout_sig || r.payout_at)){ r.paid_amount=(r.paid_amount||0)+((r.payout_amount||0)>=1?r.payout_amount:amount); r.payout_sig=null; r.payout_lvbh=0; r.payout_amount=0; r.payout_at=0; } },
+    async qrPayoutClear(wallet) { const r=_memQR.get(wallet); if(r){ r.payout_sig=null; r.payout_lvbh=0; r.payout_amount=0; r.payout_at=0; } },
     async touch(wallet, eligible, balance) {
       const now = Date.now();
       const p = get(wallet) || { wallet, first_seen: now, last_claim: now - 60000, lifetime_paid: 0, profile: null };
@@ -1646,7 +1686,7 @@ async function sigLanded(sig) {   // true = confirmed on-chain with no error; fa
 }
 // True only if `sig` is a SUCCESSFUL tx that moved >= `amount` of MINT FROM the treasury TO `wallet`.
 // Guards admin reconcile paths so a random/mismatched sig can't falsely mark a payout done (prize-denial).
-async function txPaid(sig, wallet, amount) {
+async function txPaid(sig, wallet, amount, exact) {
   try {
     const tx = await conn.getParsedTransaction(sig, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
     if (!tx || (tx.meta && tx.meta.err)) return false;
@@ -1655,16 +1695,17 @@ async function txPaid(sig, wallet, amount) {
     const amt = (arr, owner) => { const e = arr.find(b => b.owner === owner && b.mint === mint); return e ? Number((e.uiTokenAmount && e.uiTokenAmount.uiAmount) || 0) : 0; };
     const dWallet = amt(post, wallet) - amt(pre, wallet);
     const dTreas  = amt(post, treas)  - amt(pre, treas);
+    if (exact) return Math.abs(dWallet - amount) <= 0.5 && dTreas <= -(amount - 0.5);
     return dWallet >= amount - 0.5 && dTreas <= -(amount - 0.5);
   } catch (e) { return false; }
 }
 // Scan the winner's $CHIKI token account for an existing treasury->winner reward transfer; returns its sig or null.
 // Lets reconcile POSITIVELY confirm a sent-but-unrecorded payout so `clear` can never wipe an already-paid winner.
-async function findTreasuryPayment(wallet, amount) {
+async function findTreasuryPayment(wallet, amount, exact) {
   try {
     const dst = await getAssociatedTokenAddress(MINT, new PublicKey(wallet));
     const sigs = await conn.getSignaturesForAddress(dst, { limit: 40 });
-    for (const s of sigs) { if (s.err) continue; if (await txPaid(s.signature, wallet, amount)) return s.signature; }
+    for (const s of sigs) { if (s.err) continue; if (await txPaid(s.signature, wallet, amount, exact)) return s.signature; }
   } catch (e) {}
   return null;
 }
@@ -1677,9 +1718,12 @@ app.post("/quest/complete", async (req, res) => {
   if (!QUEST_IDX.has(questId)) return res.status(400).json({ error: "unknown quest" });
   if (isBanned(wallet)) return res.status(403).json({ error: "not eligible", banned: true });
   const isFinal = questId === FINAL_QUEST;
-  // The money-granting action (final quest -> winner slot) requires PROOF OF WALLET OWNERSHIP.
-  if (isFinal && !verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig))
-    return res.status(401).json({ error: "wallet sign-in required to claim a winner slot (approve the signature)" });
+  // AUTH MODEL: this game connects wallets by PUBLIC ADDRESS ONLY — it promises users it never asks for a
+  // signature. So quest completion CANNOT prove wallet ownership by signature. Reward integrity therefore
+  // rests on: the HOLDER GATE (>= QUEST_MIN_HOLD, re-checked at payout), the HOLD-TIME (aged wallet), and
+  // ADMIN REVIEW before any payout is released (a 3rd party can complete quests for any holder's address,
+  // so the admin must eyeball the winner/pouch lists before releasing). Admin PAYOUT endpoints ARE
+  // signature-gated (the operator signs with a tool, not the game). See REWARD_SECURITY.md.
   try {
     const led = await _questLoad(wallet);
     const idx = QUEST_IDX.get(questId);
@@ -1705,11 +1749,103 @@ app.post("/quest/complete", async (req, res) => {
     }
     led.done[questId] = now;
     led.lastAt = now;
+    // Accrue this quest's per-quest reward to the admin-released pouch (idempotent via the done_mask bit).
+    try { await store.qrAccrue(wallet, QUEST_BIT.get(questId) || 0); } catch (e) {}
     await _questSave(wallet, led);
     res.json({ ok: true, questId, finished: isFinal,
       won: !!(award && award.won), rank: award ? (award.rank || 0) : 0,
       winnersRemaining: await store.winnersRemaining(WINNER_CAP),
       poolFull: !!(award && !award.won), done: Object.keys(led.done) });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// ---- Per-quest reward pouch payout (admin-released, variable amount = earned - already paid) ----
+// Mirrors _payoutOne: history-aware reconcile, blockhash-expiry-gated resend, payout-time balance
+// re-check, never-blind-resend guard. The amount is variable (owed), so the in-flight amount is
+// recorded with the sig and confirmed exactly.
+async function _payoutQuestReward(wallet) {
+  let begin;
+  try { begin = await store.qrPayoutBegin(wallet); }
+  catch (e) { return { error: "lock failed: " + String(e.message || e) }; }
+  if (begin.state === "none")     return { skipped: "no quest rewards accrued" };
+  if (begin.state === "inflight") return { pending: true, signature: begin.sig, note: "a payout attempt is in flight — retry shortly" };
+  if (begin.priorSig) {
+    if (await sigLanded(begin.priorSig)) { await store.qrPayoutConfirm(wallet, begin.priorAmount || 0); return { paid: true, reconciled: true, signature: begin.priorSig, amount: begin.priorAmount }; }
+    const bh = await conn.getBlockHeight("finalized").catch(() => 0);
+    if (!begin.priorLvbh || bh <= Number(begin.priorLvbh)) return { pending: true, signature: begin.priorSig, note: "prior tx not yet expired — retry shortly" };
+  } else if (begin.priorAt) {
+    return { pending: true, needsReconcile: true, note: "a prior payout attempt was not durably recorded — resolve via /quest/rewards/reconcile before releasing (not auto-resending, to avoid a double-pay)" };
+  }
+  const owed = Math.floor(Math.min(QUEST_REWARD_TOTAL, questEarned(begin.doneMask)) - (begin.paidAmount || 0));
+  if (owed < 1) { await store.qrPayoutClear(wallet).catch(() => {}); return { skipped: "nothing owed", earned: questEarned(begin.doneMask), paid: begin.paidAmount }; }
+  let bal = 0;
+  try { bal = await chikiBalance(wallet); } catch (e) { await store.qrPayoutClear(wallet).catch(() => {}); return { error: "balance check failed — retry" }; }
+  if (bal < QUEST_MIN_HOLD) { await store.qrPayoutClear(wallet).catch(() => {}); return { skipped: `ineligible at payout — wallet no longer holds ${QUEST_MIN_HOLD} $CHIKI`, balance: bal }; }
+  const now = Date.now();
+  let out;
+  try { out = await sendChikiRaw(wallet, owed); }
+  catch (e) { return { error: "send failed: " + String(e.message || e), needsReconcile: true, note: "send errored and a tx MAY have broadcast — resolve via /quest/rewards/reconcile before retrying" }; }
+  let recorded = false;
+  for (let i = 0; i < 3 && !recorded; i++) { try { await store.qrPayoutRecordSig(wallet, out.sig, out.lastValidBlockHeight, owed, now); recorded = true; } catch (e) { await new Promise(r => setTimeout(r, 400 * (i + 1))); } }
+  let landed = false;
+  try { await conn.confirmTransaction(out.sig, "confirmed"); landed = true; } catch (e) { landed = await sigLanded(out.sig); }
+  if (landed) {
+    for (let i = 0; i < 3; i++) { try { await store.qrPayoutConfirm(wallet, owed); recorded = true; break; } catch (e) { await new Promise(r => setTimeout(r, 400 * (i + 1))); } }
+    pushFeed("questreward", { wallet, short: wallet.slice(0, 4) + "…" + wallet.slice(-4), chikiPaid: owed, signature: out.sig });
+    return { paid: true, signature: out.sig, amount: owed, recorded };
+  }
+  if (!recorded) return { sent: true, unrecorded: true, signature: out.sig, amount: owed, note: "SENT but the sig could not be recorded — reconcile via /quest/rewards/reconcile before re-running" };
+  return { sent: true, unconfirmed: true, signature: out.sig, amount: owed, note: "sent but not yet confirmed — re-run payout to reconcile" };
+}
+
+// POST /quest/rewards {adminWallet,authMsg,authSig} — list per-quest reward pouches + amounts owed (admin only)
+app.post("/quest/rewards", async (req, res) => {
+  if (!(await _questAdminOk(req.body, "quest_rewards"))) return res.status(401).json({ error: "admin signature required (action:quest_rewards + fresh nonce)" });
+  try {
+    const rows = await store.qrList(9999);
+    let owedTotal = 0;
+    const players = rows.map(r => { const earned = Math.min(QUEST_REWARD_TOTAL, questEarned(Number(r.done_mask) || 0)); const paid = Number(r.paid_amount) || 0; const owed = Math.max(0, Math.floor(earned - paid)); owedTotal += owed; return { wallet: r.wallet, earned, paid, owed }; });
+    res.json({ ok: true, count: players.length, owedTotalChiki: owedTotal, perPlayerMax: QUEST_REWARD_TOTAL, players });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// POST /quest/rewards/payout {adminWallet,authMsg,authSig, wallet?, max?} — release owed pouches (admin batch; idempotent)
+app.post("/quest/rewards/payout", async (req, res) => {
+  if (!(await _questAdminOk(req.body, "quest_rewards_payout"))) return res.status(401).json({ error: "admin signature required (action:quest_rewards_payout + fresh nonce)" });
+  if (!MINT) return res.status(503).json({ error: "token payouts are not configured" });
+  if (store.kind !== "postgres") return res.status(503).json({ error: "reward store unavailable — a database is required for payouts" });
+  try {
+    const only = (req.body?.wallet && isPubkey(req.body.wallet)) ? req.body.wallet : null;
+    const max = Math.max(1, Math.min(25, Number(req.body?.max) || 10));
+    const targets = only ? [only] : (await store.qrList(max)).map(r => r.wallet);
+    const results = [];
+    for (const w of targets) results.push({ wallet: w, ...(await _payoutQuestReward(w)) });
+    res.json({ ok: true, results });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// POST /quest/rewards/reconcile {adminWallet,authMsg,authSig, wallet, sig?, clear?} — resolve a stuck quest-reward payout
+app.post("/quest/rewards/reconcile", async (req, res) => {
+  if (!(await _questAdminOk(req.body, "quest_rewards_reconcile"))) return res.status(401).json({ error: "admin signature required (action:quest_rewards_reconcile + fresh nonce)" });
+  if (store.kind !== "postgres") return res.status(503).json({ error: "reward store unavailable — a database is required" });
+  const wallet = req.body?.wallet;
+  if (!isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  try {
+    const r = await store.qrGet(wallet);
+    if (!r) return res.status(404).json({ error: "no quest rewards for this wallet" });
+    // expected in-flight amount = recorded payout_amount, or (if the record write failed) the recomputed owed.
+    const owedNow = Math.floor(Math.min(QUEST_REWARD_TOTAL, questEarned(Number(r.done_mask) || 0)) - (Number(r.paid_amount) || 0));
+    const expectAmt = (Number(r.payout_amount) || 0) >= 1 ? Number(r.payout_amount) : owedNow;
+    const sig = req.body?.sig ? String(req.body.sig) : null;
+    if (sig) {
+      if (!(await sigLanded(sig))) return res.status(409).json({ error: "that signature did not land on-chain (or isn't final yet)" });
+      if (expectAmt < 1 || !(await txPaid(sig, wallet, expectAmt, true))) return res.status(409).json({ error: `that transaction is not an EXACT treasury→wallet transfer of ${expectAmt} $CHIKI to this wallet` });
+      await store.qrPayoutConfirm(wallet, expectAmt);
+      return res.json({ ok: true, markedPaid: true, amount: expectAmt, signature: sig });
+    }
+    if (expectAmt >= 1) { const found = await findTreasuryPayment(wallet, expectAmt, true); if (found) { await store.qrPayoutConfirm(wallet, expectAmt); return res.json({ ok: true, markedPaid: true, reconciled: true, amount: expectAmt, signature: found }); } }
+    if (req.body?.clear === true) { await store.qrPayoutClear(wallet); return res.json({ ok: true, cleared: true, note: "in-flight marker cleared — payout can be retried (only after verifying on-chain that the in-flight tx did NOT land)" }); }
+    return res.status(409).json({ error: "no matching on-chain payment found; if you've verified none landed, pass clear:true to re-arm a retry" });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
@@ -1720,9 +1856,12 @@ app.get("/quest/state", async (req, res) => {
   try {
     const led = await _questLoad(wallet);
     const wrow = await store.winnerGet(wallet);
+    const qr = (await store.qrGet(wallet)) || {};
+    const qrEarned = questEarned(Number(qr.done_mask) || 0), qrPaid = Number(qr.paid_amount) || 0;
     res.json({ wallet, done: Object.keys(led.done), finished: !!led.done[FINAL_QUEST],
       won: !!wrow, rank: wrow ? wrow.rank : 0, paid: !!(wrow && wrow.paid),
       payoutSig: (wrow && wrow.paid) ? wrow.payout_sig : null,
+      questRewardEarned: qrEarned, questRewardPaid: qrPaid, questRewardTotal: QUEST_REWARD_TOTAL,
       prize: WINNER_REWARD, winnerCap: WINNER_CAP, winnersRemaining: await store.winnersRemaining(WINNER_CAP) });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
