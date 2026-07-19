@@ -1585,15 +1585,31 @@ app.post("/claim", async (req, res) => {
 const CHIKI_DECIMALS = Math.max(0, Number(process.env.CHIKI_DECIMALS || 6));   // pump.fun = 6
 // MUST stay in sync with the client's Econ story chain (ids + order).
 const MAIN_QUESTS = [
-  { id: "s_meet" }, { id: "s_kill" }, { id: "s_craft" }, { id: "s_hunt" },
-  { id: "s_gear" }, { id: "s_chiki" }, { id: "s_raid" },
+  { id: "s_meet",   chiki: 2000 },
+  { id: "s_kill",   chiki: 3000 },
+  { id: "s_gather", chiki: 4000 },
+  { id: "s_craft",  chiki: 5000 },
+  { id: "s_forage", chiki: 5000 },
+  { id: "s_fish",   chiki: 6000 },
+  { id: "s_hunt",   chiki: 8000 },
+  { id: "s_gear",   chiki: 8000 },
+  { id: "s_stock",  chiki: 9000 },
+  { id: "s_chiki",  chiki: 10000 },
+  { id: "s_angler", chiki: 10000 },
+  { id: "s_forge2", chiki: 12000 },
+  { id: "s_ascend", chiki: 18000 },
 ];
+// Per-quest $CHIKI rewards accrue to a per-player pouch (admin-released, SEPARATE from the grand prize).
+const QUEST_REWARD_AMT   = new Map(MAIN_QUESTS.map(q => [q.id, q.chiki || 0]));
+const QUEST_BIT          = new Map(MAIN_QUESTS.map((q, i) => [q.id, 1 << i]));
+const QUEST_REWARD_TOTAL = MAIN_QUESTS.reduce((a, q) => a + (q.chiki || 0), 0);   // 100000 per player when all done
+function questEarned(mask) { let s = 0; MAIN_QUESTS.forEach((q, i) => { if (((mask | 0) & (1 << i))) s += (q.chiki || 0); }); return s; }
 // REWARD MODEL — race to finish, ADMIN-GATED payout. The first WINNER_CAP wallets to COMPLETE THE WHOLE
 // questline are recorded as winners atomically (cross-instance safe, once each). NO $CHIKI is sent on
 // completion. An admin reviews the list and releases the pool in one idempotent, on-chain-reconciled batch
-// (POST /quest/payout, admin-signed). Hard total = WINNER_CAP * WINNER_REWARD (default 100*100000 = 10,000,000).
-const WINNER_CAP    = Math.max(0, Number(process.env.WINNER_CAP    || 100));
-const WINNER_REWARD = Math.max(0, Number(process.env.WINNER_REWARD || 100000));
+// (POST /quest/payout, admin-signed). Hard total = WINNER_CAP * WINNER_REWARD (default 10*1,000,000 = 10,000,000).
+const WINNER_CAP    = Math.max(0, Number(process.env.WINNER_CAP    || 10));
+const WINNER_REWARD = Math.max(0, Number(process.env.WINNER_REWARD || 1000000));
 const FINAL_QUEST   = MAIN_QUESTS[MAIN_QUESTS.length - 1].id;
 const QUEST_IDX     = new Map(MAIN_QUESTS.map((q, i) => [q.id, i]));
 const QUEST_MIN_GAP_MS = Math.max(0, Number(process.env.QUEST_MIN_GAP_SEC || 20)) * 1000;
@@ -1628,9 +1644,9 @@ async function sigLanded(sig) {   // true = confirmed on-chain with no error; fa
     return !!(s && !s.err && (s.confirmationStatus === "confirmed" || s.confirmationStatus === "finalized")); }
   catch (e) { return false; }
 }
-// True only if `sig` is a SUCCESSFUL tx that moved >= WINNER_REWARD of MINT FROM the treasury TO `wallet`.
-// Guards the admin reconcile path so a random/mismatched sig can't falsely mark a winner paid (prize-denial).
-async function txPaidWinner(sig, wallet) {
+// True only if `sig` is a SUCCESSFUL tx that moved >= `amount` of MINT FROM the treasury TO `wallet`.
+// Guards admin reconcile paths so a random/mismatched sig can't falsely mark a payout done (prize-denial).
+async function txPaid(sig, wallet, amount) {
   try {
     const tx = await conn.getParsedTransaction(sig, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
     if (!tx || (tx.meta && tx.meta.err)) return false;
@@ -1639,16 +1655,16 @@ async function txPaidWinner(sig, wallet) {
     const amt = (arr, owner) => { const e = arr.find(b => b.owner === owner && b.mint === mint); return e ? Number((e.uiTokenAmount && e.uiTokenAmount.uiAmount) || 0) : 0; };
     const dWallet = amt(post, wallet) - amt(pre, wallet);
     const dTreas  = amt(post, treas)  - amt(pre, treas);
-    return dWallet >= WINNER_REWARD - 0.5 && dTreas <= -(WINNER_REWARD - 0.5);
+    return dWallet >= amount - 0.5 && dTreas <= -(amount - 0.5);
   } catch (e) { return false; }
 }
 // Scan the winner's $CHIKI token account for an existing treasury->winner reward transfer; returns its sig or null.
 // Lets reconcile POSITIVELY confirm a sent-but-unrecorded payout so `clear` can never wipe an already-paid winner.
-async function findTreasuryPayment(wallet) {
+async function findTreasuryPayment(wallet, amount) {
   try {
     const dst = await getAssociatedTokenAddress(MINT, new PublicKey(wallet));
     const sigs = await conn.getSignaturesForAddress(dst, { limit: 40 });
-    for (const s of sigs) { if (s.err) continue; if (await txPaidWinner(s.signature, wallet)) return s.signature; }
+    for (const s of sigs) { if (s.err) continue; if (await txPaid(s.signature, wallet, amount)) return s.signature; }
   } catch (e) {}
   return null;
 }
@@ -1779,12 +1795,12 @@ app.post("/quest/reconcile", async (req, res) => {
     const sig = req.body?.sig ? String(req.body.sig) : null;
     if (sig) {
       if (!(await sigLanded(sig))) return res.status(409).json({ error: "that signature did not land on-chain (or isn't final yet)" });
-      if (!(await txPaidWinner(sig, wallet))) return res.status(409).json({ error: `that transaction is not a treasury→wallet transfer of ${WINNER_REWARD} $CHIKI to this winner` });
+      if (!(await txPaid(sig, wallet, WINNER_REWARD))) return res.status(409).json({ error: `that transaction is not a treasury→wallet transfer of ${WINNER_REWARD} $CHIKI to this winner` });
       await store.payoutConfirm(wallet, sig);
       return res.json({ ok: true, markedPaid: true, signature: sig });
     }
     // No sig given: POSITIVELY scan the chain for an existing treasury->winner payment (covers sent-but-unrecorded).
-    const found = await findTreasuryPayment(wallet);
+    const found = await findTreasuryPayment(wallet, WINNER_REWARD);
     if (found) { await store.payoutConfirm(wallet, found); return res.json({ ok: true, markedPaid: true, reconciled: true, signature: found }); }
     if (req.body?.clear === true) { await store.payoutClear(wallet); return res.json({ ok: true, cleared: true, note: "no on-chain payment to this winner was found — marker cleared; a payout retry is now safe" }); }
     return res.status(409).json({ error: "no treasury payment to this winner found on-chain; if you've independently verified none landed, pass clear:true to re-arm a retry" });
