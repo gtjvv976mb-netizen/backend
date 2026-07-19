@@ -177,7 +177,7 @@ function sanitizeProfile(prev, p, wallet) {
   //       ADD new species within the hatch caps, but can never drop a previously-owned one. =====
   const inc = Array.isArray(out.chikis) ? out.chikis : [];
   if (inc.length || prevCh.length) {
-    const firstBySp = arr => { const m = new Map(); for (const c of arr) { const sp = clampNum(c.sp, 0, 14, 0); if (!m.has(sp)) m.set(sp, c); } return m; };
+    const firstBySp = arr => { const m = new Map(); for (const c of arr) { const sp = clampNum(c.sp, 0, 20, 0)   /* 21-species dex: 0-14 classic + 15-20 Meme Dynasty */; if (!m.has(sp)) m.set(sp, c); } return m; };
     const incBySp = firstBySp(inc), prevBySp = firstBySp(prevCh);
     const order = [];
     for (const sp of prevBySp.keys()) order.push(sp);                          // 1) preserve EVERY previously-owned species first
@@ -1212,7 +1212,16 @@ app.post("/profile", async (req, res) => {
   const wallet = req.body?.wallet, profile = req.body?.profile;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
   if (!profile || typeof profile !== "object") return res.status(400).json({ error: "'profile' object required" });
-  if (JSON.stringify(profile).length > 8000) return res.status(413).json({ error: "profile too large" });
+  // the MMO cloud-save rides under profile.mmo (whole client state, ~10-30KB). Writes that
+  // carry it MUST prove wallet ownership (web sign-in signature) — otherwise anyone could
+  // overwrite anyone's progress by knowing their address. Legacy web-game-shape writes
+  // (no mmo key) keep the old open behaviour for the original game's compatibility.
+  const hasMmo = profile.mmo && typeof profile.mmo === "object";
+  const cap = hasMmo ? 65000 : 8000;
+  if (JSON.stringify(profile).length > cap) return res.status(413).json({ error: "profile too large" });
+  if (hasMmo && !verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig)) {
+    return res.status(401).json({ error: "sign-in required to save progress" });
+  }
   const now = Date.now();
   if (now - (_lastSave.get(wallet) || 0) < 600) return res.json({ ok: true, throttled: true });   // ignore rapid-fire writes (anti-spam)
   _lastSave.set(wallet, now);
@@ -1220,6 +1229,7 @@ app.post("/profile", async (req, res) => {
     const prev = await store.getProfile(wallet);
     // admins are trusted (creator testing); everyone else is clamped to legal values
     const safe = isAdminWallet(wallet) ? profile : sanitizeProfile(prev, profile, wallet);
+    if (hasMmo) safe.mmo = profile.mmo;   // the signed MMO cloud-save rides through verbatim
     safe._serverSavedAt = now;   // authoritative "last seen" for offline progression
     await store.setProfile(wallet, safe);
     res.json({ ok: true, serverSavedAt: safe._serverSavedAt });
