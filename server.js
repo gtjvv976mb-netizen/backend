@@ -2743,6 +2743,76 @@ app.post("/world/chat", (req, res) => {
 });
 app.get("/world/chat", (_q, res) => res.json({ messages: worldChat.slice(-40) }));
 
+// ---- Trading Post: a shared player-to-player market of in-game items for in-game $CHIKI.
+// In-memory ring (persisted best-effort to kv). Items + soft-currency only — no on-chain funds.
+// SETTLEMENT: when a listing is bought, the sale is RECORDED for the seller; the seller's
+// client polls /market/sales and credits the price (minus the 5% burned market fee) to their
+// purse, then acks. Nothing is credited twice and nothing vanishes on a lost response.
+let marketListings = [];
+let marketSales = {};                        // seller sid -> [ {id,item,kind,qty,price,buyer,ts} ]
+const MARKET_TTL_MS = 24 * 60 * 60 * 1000;   // listings expire after a day
+store.kvGet("market_listings").then(v => { if (Array.isArray(v)) marketListings = v.filter(l => l && Date.now() - (l.ts || 0) < MARKET_TTL_MS); }).catch(() => {});
+store.kvGet("market_sales").then(v => { if (v && typeof v === "object") marketSales = v; }).catch(() => {});
+function saveMarket() { store.kvSet("market_listings", marketListings.slice(-400)).catch(() => {}); store.kvSet("market_sales", marketSales).catch(() => {}); }
+function pruneMarket() {
+  const now = Date.now();
+  marketListings = marketListings.filter(l => now - (l.ts || 0) < MARKET_TTL_MS);
+  for (const sid of Object.keys(marketSales)) {
+    marketSales[sid] = (marketSales[sid] || []).filter(s => now - (s.ts || 0) < 7 * 24 * 3600 * 1000);
+    if (!marketSales[sid].length) delete marketSales[sid];
+  }
+}
+app.get("/market/list", (_q, res) => { pruneMarket(); res.json({ listings: marketListings.slice(-300) }); });
+// pending sale proceeds for one seller — client credits then acks with the ids
+app.get("/market/sales", (req, res) => {
+  const sid = stripTags(String(req.query?.sid || "")).slice(0, 40);
+  if (!sid) return res.status(400).json({ error: "sid required" });
+  res.json({ sales: (marketSales[sid] || []).slice(0, 40) });
+});
+app.post("/market/op", (req, res) => {
+  const b = req.body || {};
+  const sid = stripTags(String(b.sid || "")).slice(0, 40);
+  const op = String(b.op || "");
+  const l = b.listing || {};
+  if (!sid) return res.status(400).json({ error: "sid required" });
+  pruneMarket();
+  if (op === "list") {
+    if (marketListings.filter(x => x.sid === sid).length >= 12) return res.status(429).json({ error: "too many listings" });
+    marketListings.push({
+      id: stripTags(String(l.id || ("S" + Date.now() + Math.floor(Math.random() * 1e4)))).slice(0, 40),
+      seller: stripTags(String(l.seller || "Trainer")).slice(0, 20), sid,
+      kind: (["chikimon", "ffish", "pot"].includes(String(l.kind)) ? String(l.kind) : "mat"),
+      item: stripTags(String(l.item || "wood")).slice(0, 24),
+      qty: clampF(l.qty, 1, 999999, 1) | 0, price: clampF(l.price, 1, 9999999, 1) | 0,
+      lvl: clampF(l.lvl, 1, 50, 1) | 0, xp: clampF(l.xp, 0, 1e9, 0) | 0, ts: Date.now(),
+    });
+    if (marketListings.length > 400) marketListings.shift();
+  } else if (op === "buy") {
+    const id = stripTags(String(l.id || "")).slice(0, 40);
+    const row = marketListings.find(x => x.id === id);
+    // record the sale for the seller BEFORE the listing disappears — this is the
+    // player-to-player settlement: without it the seller's goods vanish for nothing
+    if (row && row.sid && row.sid !== sid) {
+      const arr = marketSales[row.sid] || (marketSales[row.sid] = []);
+      if (!arr.some(s => s.id === row.id) && arr.length < 50)
+        arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, buyer: sid.slice(0, 8), ts: Date.now() });
+    }
+    marketListings = marketListings.filter(x => x.id !== id);
+  } else if (op === "cancel" || op === "sold") {
+    const id = stripTags(String(l.id || "")).slice(0, 40);
+    marketListings = marketListings.filter(x => !(x.id === id && x.sid === sid));
+  } else if (op === "sales_ack") {
+    const rawIds = Array.isArray(b.ids) ? b.ids : (b.listing && Array.isArray(b.listing.ids) ? b.listing.ids : []);
+    const ids = rawIds.map(x => String(x).slice(0, 40));
+    if (marketSales[sid]) {
+      marketSales[sid] = marketSales[sid].filter(s => !ids.includes(s.id));
+      if (!marketSales[sid].length) delete marketSales[sid];
+    }
+  }
+  saveMarket();
+  res.json({ ok: true, listings: marketListings.slice(-300) });
+});
+
 // Open the port FIRST so Render detects it immediately (no "No open ports" timeout on a cold DB),
 // then initialize the DB in the background (errors logged, not fatal — the server stays up and recovers).
 app.listen(Number(PORT), () => {
