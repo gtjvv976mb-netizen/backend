@@ -1178,6 +1178,11 @@ app.post("/verify", async (req, res) => {
   const wallet = req.body?.wallet;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
   try {
+    // SIGN-IN (web): the client may attach a Phantom-signed "Chikoria sign-in" message.
+    // A valid Ed25519 signature proves the caller OWNS this wallet (paste-any-address is
+    // read-only). Absence is not an error — desktop builds still link by public address.
+    const signedIn = verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig);
+    if (signedIn) { try { await store.kvSet("signin:" + wallet, { ts: Date.now() }); } catch (e) {} }
     // 1) The wallet GATE = the on-chain balance. This is the only thing the connect flow truly
     //    needs, and it never touches the database.
     let balance = 0, eligible = true;
@@ -1198,7 +1203,7 @@ app.post("/verify", async (req, res) => {
     const chikis = eligible ? (chikiCount(balance, whaleSince) || 1) : 0;
     const whalePending = eligible && balance >= WHALE_MIN && chikis < 2;
     const whaleReadyInMs = whalePending && whaleSince ? Math.max(0, WHALE_HOLD_MS - (Date.now() - Number(whaleSince))) : 0;
-    res.json({ wallet, eligible, balance, chikis, whalePending, whaleReadyInMs, minHold: MIN, verified: verifyOn, firstSeen, profile: profile || null, dbOk });
+    res.json({ wallet, eligible, balance, chikis, whalePending, whaleReadyInMs, minHold: MIN, verified: verifyOn, firstSeen, profile: profile || null, dbOk, signedIn });
   } catch (e) { res.status(500).json({ error: "verify failed: " + String(e.message || e) }); }
 });
 
