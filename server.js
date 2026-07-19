@@ -1200,6 +1200,13 @@ app.post("/verify", async (req, res) => {
       dbOk = false;
       console.warn("verify: DB unavailable — serving chain-only result:", String(dbErr?.message || dbErr));
     }
+    // PRIVACY: the MMO cloud-save (profile.mmo) is only sent to PROVEN owners — an
+    // address alone still gets the legacy web-game roster (the old import is address-trust
+    // by design) but never another player's full game state.
+    if (!signedIn && profile && typeof profile === "object" && profile.mmo) {
+      profile = { ...profile };
+      delete profile.mmo;
+    }
     const chikis = eligible ? (chikiCount(balance, whaleSince) || 1) : 0;
     const whalePending = eligible && balance >= WHALE_MIN && chikis < 2;
     const whaleReadyInMs = whalePending && whaleSince ? Math.max(0, WHALE_HOLD_MS - (Date.now() - Number(whaleSince))) : 0;
@@ -1239,7 +1246,15 @@ app.post("/profile", async (req, res) => {
 app.get("/profile", async (req, res) => {
   const wallet = req.query?.wallet;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
-  try { res.json({ wallet, profile: await store.getProfile(wallet) }); }
+  try {
+    let p = await store.getProfile(wallet);
+    // the MMO cloud-save is owner-only: strip it unless the caller proves ownership
+    if (p && typeof p === "object" && p.mmo && !verifyWalletSig(wallet, req.query?.authMsg, req.query?.authSig)) {
+      p = { ...p };
+      delete p.mmo;
+    }
+    res.json({ wallet, profile: p });
+  }
   catch (e) { res.status(500).json({ error: "load failed: " + String(e.message || e) }); }
 });
 
