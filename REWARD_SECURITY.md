@@ -21,11 +21,47 @@ loss came from the key, not the endpoint.
 
 ---
 
+## 1b. Reward model — race to finish, ADMIN-GATED payout (first 100 winners)
+
+The payout is a **fixed pool split among a capped number of winners**, released by **you**, not auto-sent:
+
+- The **first `WINNER_CAP` (100) wallets** to **complete the whole 7-quest line** are recorded as
+  winners, each entitled to `WINNER_REWARD` (**100,000**) $CHIKI. **Hard total = 100 × 100,000 =
+  10,000,000 $CHIKI** — the pool can never pay more.
+- **No $CHIKI is sent on completion.** Completing the final quest only *reserves a winner slot*. You
+  review the list and **release the pool yourself** via an admin-signed batch endpoint — a human
+  checkpoint before any token moves (catches obvious scripting/Sybil).
+- **Winner slots are reserved ATOMICALLY in Postgres** (`reserveWinner()`): a transaction takes a
+  global `pg_advisory_xact_lock`, checks `wallet` (PK) + `COUNT(*) < cap`, and inserts (`rank` UNIQUE).
+  This is **cross-instance safe** — a 101st winner is impossible even if Render runs multiple instances.
+  Unit-tested: 250 concurrent finishers → exactly 100 winners, unique ranks, total exactly 10,000,000.
+- **Winning requires a wallet signature** (`verifyWalletSig` on the final quest) — no anonymous
+  curl-to-win — plus **fail-closed eligibility**: the wallet must currently hold `QUEST_MIN_HOLD`
+  $CHIKI *and* be aged in (`QUEST_MIN_HOLD_MINUTES`, anti-Sybil), enforced regardless of `VERIFY_HOLDERS`.
+- **Payout is idempotent** (`_payoutOne`): each winner is paid **exactly once**. A per-wallet advisory
+  lock + a 2-minute in-flight window + **on-chain signature reconciliation** (the sig is recorded
+  *before* confirming) mean a confirm-timeout, a retry, or a crash **never double-pays**. Unit-tested.
+
+### Residual risk you should know
+The game is **client-authoritative** — the backend can't *prove* someone genuinely played vs. scripted
+the completion calls. The wallet signature proves *ownership*, and the hold-time raises Sybil cost, but
+a determined actor who owns wallets and holds `QUEST_MIN_HOLD` in each could still script the questline.
+**This is exactly why payout is admin-gated:** review `GET /quest/winners` before you release funds.
+
+### Admin runbook — releasing the pool
+1. Set `ADMIN_WALLETS` (Render env) to your admin wallet address(es).
+2. Fund the hot wallet with up to **10,000,000 $CHIKI** + ~0.05 SOL for fees.
+3. Review winners: `GET /quest/winners?adminWallet=<W>&authMsg=<M>&authSig=<S>` (admin-signed) — shows
+   rank, wallet, balance-at-win, paid status, and `poolNeededChiki`.
+4. Release in small idempotent batches: `POST /quest/payout {adminWallet,authMsg,authSig, max:10}` —
+   repeat until `remainingUnpaid` is 0. Pay one wallet with `{...,wallet:"<addr>"}`. Safe to re-run: it
+   skips already-paid, reconciles any unconfirmed tx, and never double-sends.
+
 ## 2. What the code already enforces (defense in depth)
 
-- **Server-authoritative rewards** — each main quest pays a **fixed** amount, **once**, **in order**,
-  with a minimum real-time gap. Hard per-wallet ceiling = the sum of quest rewards. The client can't
-  invent a balance.
+- **Server-authoritative rewards** — the prize is a **fixed** amount, granted **once per wallet**, only
+  after the full questline is completed **in order** with a minimum real-time gap. Hard per-wallet
+  ceiling = one prize (`WINNER_REWARD`). The client can't invent a balance.
 - **Payout dest = the earner** — `payChiki()` sends to the wallet's own ATA. Never a client param.
 - **Amount = server ledger** — never sent by the client.
 - **Caps**: per-claim (`PER_CLAIM_CHIKI`), per-wallet-daily (`WALLET_DAILY_CHIKI`), pool reserve
@@ -78,12 +114,19 @@ Payouts are $CHIKI (SPL), so the hot wallet needs:
 |---|---|---|
 | `REWARDS_QUEST_ONLY` | `true` | Disables the old time-based SOL accrual (rewards are quest-only). |
 | `CHIKI_DECIMALS` | `6` | $CHIKI SPL decimals (pump.fun = 6). |
+| `WINNER_CAP` | `100` | How many wallets get paid (first N to finish the questline). |
+| `WINNER_REWARD` | `100000` | $CHIKI each winner gets. `WINNER_CAP × WINNER_REWARD` = the hard total pool (10,000,000). |
+| `ADMIN_WALLETS` | *(empty)* | **Required to release funds.** Comma-separated admin wallet address(es) allowed to call `/quest/payout` (admin-signed). |
+| `QUEST_MIN_HOLD` | `MIN_HOLD` (500000) | Winner must currently hold ≥ this much $CHIKI (fail-closed, ignores `VERIFY_HOLDERS`). |
+| `QUEST_MIN_HOLD_MINUTES` | `60` | Anti-Sybil: wallet must have been first-seen this many minutes before it can win a slot. |
 | `QUEST_MIN_GAP_SEC` | `20` | Min real seconds between two quest completions (anti-bot). |
-| `MIN_CLAIM_CHIKI` | `20` | Smallest claimable pouch. |
-| `PER_CLAIM_CHIKI` | `1000` | Max $CHIKI paid in one claim. |
-| `WALLET_DAILY_CHIKI` | `2000` | Max $CHIKI a single wallet can claim per day. |
-| `POOL_RESERVE_CHIKI` | `0` | Never pay the pool below this $CHIKI floor. |
-| `BREAKER_HOURLY_CHIKI` | `100000` | Global circuit breaker: max $CHIKI out per rolling hour. |
+
+**To change the numbers** (e.g. 50 winners of 200k, or 200 winners of 50k) set `WINNER_CAP` and
+`WINNER_REWARD` on Render. Fund the hot wallet with up to `WINNER_CAP × WINNER_REWARD` $CHIKI.
+
+> The old per-claim/daily/breaker vars (`PER_CLAIM_CHIKI`, `WALLET_DAILY_CHIKI`, `BREAKER_HOURLY_CHIKI`,
+> `MIN_CLAIM_CHIKI`) no longer apply — there is no user-triggered claim. Payout is the admin batch
+> (`/quest/payout`), which is idempotent and paced by you.
 
 `RPC_URL`, `CHIKI_MINT`, `DATABASE_URL`, `VERIFY_HOLDERS` are unchanged from before.
 
