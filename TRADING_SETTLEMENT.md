@@ -79,3 +79,38 @@ as bookkeeping, no signature) — the safe default. `MARKET_ONCHAIN` stays unset
 
 ⚠️ Rail B moves REAL money. It must stay flagged OFF until the mainnet two-wallet test above
 passes with a real Phantom wallet — that test cannot be run headless/in CI.
+
+---
+
+## Rail B — FULL client + server BUILT (2026-07-21). Split is now 75% seller / 20% TEAM / 5% burn.
+
+The whole on-chain buy path now exists end-to-end; it stays **flagged off** (`MARKET_ONCHAIN` +
+`TEAM_WALLET` required) until the mainnet two-wallet test passes.
+
+**Client (shipped):**
+- `realm/solana-web3.js` — a vendored, minified `@solana/web3.js` + `@solana/spl-token` IIFE
+  (esbuild; ~345 KB; local so the page CSP allows it). Rebuilt into the bundle by the split script.
+- `web_shell.html` → `window.__chikiBuy(seller, team, mint, price, dec, rpc, sShare, tShare, bShare)`:
+  builds ONE tx — idempotent-create seller+team ATAs, `transferChecked` 75%→seller, 20%→team,
+  and a REAL `burnChecked` of 5% from the buyer (supply drops) — `phantom.signAndSendTransaction`,
+  stashes the signature for the Godot poller.
+- `Chain.gd` fetches `/stats` at boot → `market_onchain`, `team_wallet`, `chiki_mint`,
+  `chiki_decimals`, `client_rpc`, `market_split`; `market_onchain_ready()` gates the path.
+- `Market.gd.buy()` → when ready AND the listing carries the seller's `wallet`, runs `_onchain_flow`
+  (calls the bridge, polls ≤120 s, POSTs `/market/buy-onchain`), and only grants the goods after the
+  SERVER verifies the transfer. Otherwise falls back to the soft rail. Listings now carry the
+  seller's `wallet` (client `list_*` + backend list store + `/market/list` relay).
+
+**Server (shipped):** `txMarketSplit` verifies buyer≥100% ∧ seller≥75% ∧ **TEAM wallet**≥20% ∧ a real
+burn≥5% (fixed 2-$CHIKI tolerance, replay guard, TOCTOU-safe, kv-durable). `/stats` exposes the config.
+
+**TO ENABLE (real money — do the test FIRST):**
+1. On the backend service set `TEAM_WALLET=<pubkey>`, `CLIENT_RPC=<public mainnet RPC>` (a browser-
+   reachable endpoint for `getLatestBlockhash`), and (mainnet) `RPC_URL`/`CHIKI_MINT`.
+2. **Mainnet two-wallet test** (cannot be done headless/CI): wallets A + B, A lists → B buys via a
+   real Phantom approval → confirm on-chain that the seller got ~75%, the team wallet ~20%, mint
+   supply fell ~5%, the item released ONCE, and a replayed sig is rejected. Test the seller/team-
+   has-no-ATA path (buyer pays rent).
+3. Only then set `MARKET_ONCHAIN=1`. Until then every buy uses the safe soft rail.
+
+⚠️ I built this but cannot verify Phantom signing without a live wallet — run step 2 before enabling.

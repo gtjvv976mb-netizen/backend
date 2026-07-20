@@ -1109,7 +1109,7 @@ async function chikiHolderCount() {
 let _statsCache = { t: 0, data: null };
 async function getStats() {
   if (_statsCache.data && Date.now() - _statsCache.t < 15000) return _statsCache.data;
-  const out = { network: NETWORK, minHold: MIN, whaleMin: WHALE_MIN, poolReserveSol: RESERVE, marketOnchain: MARKET_ONCHAIN, marketSplit: { seller: MARKET_SELLER_SHARE, pool: MARKET_POOL_TAX, burn: MARKET_BURN }, rewardPool: MINT ? treasury.publicKey.toBase58() : null };
+  const out = { network: NETWORK, minHold: MIN, whaleMin: WHALE_MIN, poolReserveSol: RESERVE, marketOnchain: MARKET_ONCHAIN, marketSplit: { seller: MARKET_SELLER_SHARE, team: MARKET_TEAM_TAX, burn: MARKET_BURN }, teamWallet: TEAM_WALLET || null, chikiMint: MINT ? MINT.toBase58() : null, chikiDecimals: CHIKI_DECIMALS, clientRpc: (process.env.CLIENT_RPC || process.env.RPC_URL || "") };
   try { out.poolSol = await poolSol(); } catch (e) {}
   try { out.players = await store.count(); } catch (e) {}
   try { out.dailyPaidSol = await store.dailyTotal(); } catch (e) {}
@@ -2792,12 +2792,12 @@ app.get("/world/dm", (req, res) => {
 // PREREQ before enabling: the client must bundle @solana/web3.js to build+sign the transfer, and
 // the whole path needs a live mainnet Phantom test. Until then this returns 503 and the game uses
 // the safe in-game-$CHIKI rail (op:buy above).
-const MARKET_ONCHAIN = String(process.env.MARKET_ONCHAIN || "") === "1" && !!MINT;
+const MARKET_ONCHAIN = String(process.env.MARKET_ONCHAIN || "") === "1" && !!MINT && !!TEAM_WALLET;
 const _usedTxSigs = new Set();   // replay guard: a tx signature settles at most one listing
 (async () => { try { const v = await store.kvGet("market_used_sigs"); if (Array.isArray(v)) v.forEach(s => _usedTxSigs.add(String(s))); } catch (e) {} })();
 function saveUsedSigs() { try { store.kvSet("market_used_sigs", [..._usedTxSigs].slice(-20000)); } catch (e) {} }
-// Market fee split on every on-chain BUY (must sum to 1.0): 75% seller, 20% reward pool, 5% burn.
-const MARKET_SELLER_SHARE = 0.75, MARKET_POOL_TAX = 0.20, MARKET_BURN = 0.05;
+// Market fee split on every on-chain BUY (must sum to 1.0): 75% seller, 20% TEAM wallet, 5% burn.
+const MARKET_SELLER_SHARE = 0.75, MARKET_TEAM_TAX = 0.20, MARKET_BURN = 0.05;
 // Verify the buyer's SINGLE signed transaction pays the correct 3-way split of REAL $CHIKI:
 //   >= 75% to the seller, >= 20% to the reward-pool (treasury) wallet, and the full price left
 //   the buyer (the missing 5% is burned/removed from circulation). Balance-delta based, so it
@@ -2806,11 +2806,11 @@ async function txMarketSplit(sig, buyer, seller, price) {
   try {
     const tx = await conn.getParsedTransaction(sig, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
     if (!tx || (tx.meta && tx.meta.err)) return { ok: false, reason: "transaction not confirmed" };
-    const mint = MINT.toBase58(), poolStr = treasury.publicKey.toBase58();
+    const mint = MINT.toBase58(), teamStr = TEAM_WALLET;
     const pre = (tx.meta && tx.meta.preTokenBalances) || [], post = (tx.meta && tx.meta.postTokenBalances) || [];
     const amt = (arr, owner) => { const e = arr.find(b => b.owner === owner && b.mint === mint); return e ? Number((e.uiTokenAmount && e.uiTokenAmount.uiAmount) || 0) : 0; };
     const dSeller = amt(post, seller) - amt(pre, seller);
-    const dPool   = amt(post, poolStr) - amt(pre, poolStr);
+    const dTeam   = amt(post, teamStr) - amt(pre, teamStr);
     const dBuyer  = amt(pre, buyer) - amt(post, buyer);          // positive = spent
     // sum any REAL burn of the $CHIKI mint in this tx (top-level + inner instructions) so the 5%
     // can't be quietly redirected to an alt wallet — it must actually leave circulation
@@ -2829,9 +2829,9 @@ async function txMarketSplit(sig, buyer, seller, price) {
     const tol = 2.0;
     if (dBuyer  < price * 1.0                 - tol) return { ok: false, reason: `buyer paid ${dBuyer}, need ${price}` };
     if (dSeller < price * MARKET_SELLER_SHARE - tol) return { ok: false, reason: `seller got ${dSeller}, need ${price * MARKET_SELLER_SHARE}` };
-    if (dPool   < price * MARKET_POOL_TAX     - tol) return { ok: false, reason: `reward pool got ${dPool}, need ${price * MARKET_POOL_TAX}` };
+    if (dTeam   < price * MARKET_TEAM_TAX     - tol) return { ok: false, reason: `team wallet got ${dTeam}, need ${price * MARKET_TEAM_TAX}` };
     if (burned  < price * MARKET_BURN         - tol) return { ok: false, reason: `only ${burned} $CHIKI burned, need ${price * MARKET_BURN}` };
-    return { ok: true, seller: dSeller, pool: dPool, spent: dBuyer, burned };
+    return { ok: true, seller: dSeller, team: dTeam, spent: dBuyer, burned };
   } catch (e) { return { ok: false, reason: "rpc error verifying transfer" }; }
 }
 // verify sig is a confirmed SPL transfer of >= amount of the $CHIKI mint from `from` to `to`
@@ -2859,21 +2859,22 @@ app.post("/market/buy-onchain", async (req, res) => {
   pruneMarket();
   const row = marketListings.find(x => x.id === id);
   if (!row) return res.status(404).json({ error: "listing is gone" });
-  if (!isPubkey(row.sid)) return res.status(409).json({ error: "seller is not on-chain payable" });
-  if (row.sid === buyer) return res.status(400).json({ error: "that is your own listing" });
+  const sellerWallet = String(row.wallet || "");
+  if (!isPubkey(sellerWallet)) return res.status(409).json({ error: "seller has no on-chain wallet on this listing" });
+  if (sellerWallet === buyer) return res.status(400).json({ error: "that is your own listing" });
   // CLAIM the sig BEFORE the async verify so two concurrent requests can't both settle it (TOCTOU),
   // and so ONE payment can never settle a second listing. Released again only if verify fails.
   _usedTxSigs.add(sig);
   if (_usedTxSigs.size > 20000) { const it = _usedTxSigs.values(); for (let i = 0; i < 5000; i++) { const v = it.next().value; if (v === undefined) break; _usedTxSigs.delete(v); } }
   // the buyer's ONE signed transaction must pay the correct 3-way split of real $CHIKI:
   // 75% to the seller, 20% to the reward pool, 5% burned (full price left the buyer)
-  const split = await txMarketSplit(sig, buyer, row.sid, Number(row.price) || 0);
+  const split = await txMarketSplit(sig, buyer, sellerWallet, Number(row.price) || 0);
   if (!split.ok) { _usedTxSigs.delete(sig); return res.status(409).json({ error: `on-chain split for that signature failed: ${split.reason}` }); }
   saveUsedSigs();
   marketListings = marketListings.filter(x => x.id !== id);
   // record the sale so the SELLER'S client shows the on-chain proceeds landed
   const arr = marketSales[row.sid] || (marketSales[row.sid] = []);
-  if (!arr.some(s => s.id === row.id)) arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, buyer: buyer.slice(0, 8), onchain: true, txSig: sig, sellerNet: split.seller, poolTax: split.pool, ts: Date.now() });
+  if (!arr.some(s => s.id === row.id)) arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, buyer: buyer.slice(0, 8), onchain: true, txSig: sig, sellerNet: split.seller, teamTax: split.team, ts: Date.now() });
   saveMarket();
   res.json({ ok: true, released: { id: row.id, kind: row.kind, item: row.item, qty: row.qty, lvl: row.lvl, xp: row.xp }, txSig: sig });
 });
@@ -2928,6 +2929,7 @@ app.post("/market/op", (req, res) => {
       marketListings.push({
         id: lid,
         seller: stripTags(String(l.seller || "Trainer")).slice(0, 20), sid,
+        wallet: stripTags(String(l.wallet || "")).slice(0, 44),   // seller's on-chain wallet (for on-chain buys)
         kind: (["chikimon", "ffish", "pot"].includes(String(l.kind)) ? String(l.kind) : "mat"),
         item: stripTags(String(l.item || "wood")).slice(0, 24),
         qty: clampF(l.qty, 1, 999999, 1) | 0, price: clampF(l.price, 1, 9999999, 1) | 0,
