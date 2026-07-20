@@ -121,6 +121,8 @@ const MIN_CLAIM = Math.max(0, Number(process.env.MIN_CLAIM_SOL || 0.001));
 const verifyOn = String(VERIFY_HOLDERS).toLowerCase() === "true";
 
 const isPubkey = (s) => { try { new PublicKey(s); return true; } catch { return false; } };
+// world PRESENCE (cosmetic avatar + name) accepts a real pubkey OR a safe per-install id — presence is not identity; rewards/BR/cup stay pubkey+signature gated
+const isPresenceId = (s) => typeof s === "string" && (isPubkey(s) || /^[A-Za-z0-9_-]{6,44}$/.test(s));
 
 /* Prove the request really comes from the owner of `wallet`:
    the client signs "…wallet:<wallet>…ts:<ms>…" with their Phantom key; we verify it here.
@@ -2721,7 +2723,7 @@ function worldSnapshot(wallet, x, z) {
 // Broadcast my position (and get nearby players back in one round-trip).
 app.post("/world/move", (req, res) => {
   const b = req.body || {}, wallet = b.wallet;
-  if (!isPubkey(wallet)) return res.status(400).json({ error: "valid wallet required" });
+  if (!isPresenceId(wallet)) return res.status(400).json({ error: "valid wallet required" });
   const x = clampF(b.x, -100000, 100000, 0), z = clampF(b.z, -100000, 100000, 0);
   worldPlayers.set(wallet, {
     x, z, dir: clampF(b.dir, -7, 7, 0),
@@ -2744,7 +2746,7 @@ setInterval(() => { const now = Date.now(); for (const [w, p] of worldPlayers) i
 const worldChat = [];
 app.post("/world/chat", (req, res) => {
   const b = req.body || {};
-  if (!isPubkey(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
+  if (!isPresenceId(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
   const text = stripTags(String(b.text || "")).slice(0, 200).trim();
   if (text) { worldChat.push({ handle: stripTags(String(b.handle || "Trainer")).slice(0, 20), short: b.wallet.slice(0, 4) + "…" + b.wallet.slice(-4), text, ts: Date.now() }); if (worldChat.length > 200) worldChat.shift(); }
   res.json({ ok: true, messages: worldChat.slice(-40) });
