@@ -1109,7 +1109,7 @@ async function chikiHolderCount() {
 let _statsCache = { t: 0, data: null };
 async function getStats() {
   if (_statsCache.data && Date.now() - _statsCache.t < 15000) return _statsCache.data;
-  const out = { network: NETWORK, minHold: MIN, whaleMin: WHALE_MIN, poolReserveSol: RESERVE, marketOnchain: MARKET_ONCHAIN };
+  const out = { network: NETWORK, minHold: MIN, whaleMin: WHALE_MIN, poolReserveSol: RESERVE, marketOnchain: MARKET_ONCHAIN, marketSplit: { seller: MARKET_SELLER_SHARE, pool: MARKET_POOL_TAX, burn: MARKET_BURN }, rewardPool: MINT ? treasury.publicKey.toBase58() : null };
   try { out.poolSol = await poolSol(); } catch (e) {}
   try { out.players = await store.count(); } catch (e) {}
   try { out.dailyPaidSol = await store.dailyTotal(); } catch (e) {}
@@ -2793,6 +2793,46 @@ app.get("/world/dm", (req, res) => {
 // the safe in-game-$CHIKI rail (op:buy above).
 const MARKET_ONCHAIN = String(process.env.MARKET_ONCHAIN || "") === "1" && !!MINT;
 const _usedTxSigs = new Set();   // replay guard: a tx signature settles at most one listing
+(async () => { try { const v = await store.kvGet("market_used_sigs"); if (Array.isArray(v)) v.forEach(s => _usedTxSigs.add(String(s))); } catch (e) {} })();
+function saveUsedSigs() { try { store.kvSet("market_used_sigs", [..._usedTxSigs].slice(-20000)); } catch (e) {} }
+// Market fee split on every on-chain BUY (must sum to 1.0): 75% seller, 20% reward pool, 5% burn.
+const MARKET_SELLER_SHARE = 0.75, MARKET_POOL_TAX = 0.20, MARKET_BURN = 0.05;
+// Verify the buyer's SINGLE signed transaction pays the correct 3-way split of REAL $CHIKI:
+//   >= 75% to the seller, >= 20% to the reward-pool (treasury) wallet, and the full price left
+//   the buyer (the missing 5% is burned/removed from circulation). Balance-delta based, so it
+//   can't be spoofed by memo/instruction shape. Never moves money itself.
+async function txMarketSplit(sig, buyer, seller, price) {
+  try {
+    const tx = await conn.getParsedTransaction(sig, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
+    if (!tx || (tx.meta && tx.meta.err)) return { ok: false, reason: "transaction not confirmed" };
+    const mint = MINT.toBase58(), poolStr = treasury.publicKey.toBase58();
+    const pre = (tx.meta && tx.meta.preTokenBalances) || [], post = (tx.meta && tx.meta.postTokenBalances) || [];
+    const amt = (arr, owner) => { const e = arr.find(b => b.owner === owner && b.mint === mint); return e ? Number((e.uiTokenAmount && e.uiTokenAmount.uiAmount) || 0) : 0; };
+    const dSeller = amt(post, seller) - amt(pre, seller);
+    const dPool   = amt(post, poolStr) - amt(pre, poolStr);
+    const dBuyer  = amt(pre, buyer) - amt(post, buyer);          // positive = spent
+    // sum any REAL burn of the $CHIKI mint in this tx (top-level + inner instructions) so the 5%
+    // can't be quietly redirected to an alt wallet — it must actually leave circulation
+    let burned = 0;
+    const scanBurn = (ixs) => { for (const ix of (ixs || [])) {
+      const pr = ix && ix.parsed; if (!pr) continue;
+      if (ix.program !== "spl-token" && ix.program !== "spl-token-2022") continue;
+      if ((pr.type === "burn" || pr.type === "burnChecked") && pr.info && pr.info.mint === mint) {
+        const ta = pr.info.tokenAmount;
+        burned += ta ? Number(ta.uiAmount || 0) : Number(pr.info.amount || 0) / Math.pow(10, CHIKI_DECIMALS);
+      }
+    } };
+    scanBurn(tx.transaction && tx.transaction.message && tx.transaction.message.instructions);
+    for (const inner of ((tx.meta && tx.meta.innerInstructions) || [])) scanBurn(inner.instructions);
+    // tolerance = a couple whole $CHIKI (each leg is rounded to whole tokens client-side); NOT a % of price
+    const tol = 2.0;
+    if (dBuyer  < price * 1.0                 - tol) return { ok: false, reason: `buyer paid ${dBuyer}, need ${price}` };
+    if (dSeller < price * MARKET_SELLER_SHARE - tol) return { ok: false, reason: `seller got ${dSeller}, need ${price * MARKET_SELLER_SHARE}` };
+    if (dPool   < price * MARKET_POOL_TAX     - tol) return { ok: false, reason: `reward pool got ${dPool}, need ${price * MARKET_POOL_TAX}` };
+    if (burned  < price * MARKET_BURN         - tol) return { ok: false, reason: `only ${burned} $CHIKI burned, need ${price * MARKET_BURN}` };
+    return { ok: true, seller: dSeller, pool: dPool, spent: dBuyer, burned };
+  } catch (e) { return { ok: false, reason: "rpc error verifying transfer" }; }
+}
 // verify sig is a confirmed SPL transfer of >= amount of the $CHIKI mint from `from` to `to`
 async function txTransfer(sig, from, to, amount) {
   try {
@@ -2820,14 +2860,19 @@ app.post("/market/buy-onchain", async (req, res) => {
   if (!row) return res.status(404).json({ error: "listing is gone" });
   if (!isPubkey(row.sid)) return res.status(409).json({ error: "seller is not on-chain payable" });
   if (row.sid === buyer) return res.status(400).json({ error: "that is your own listing" });
-  // the buyer's signed transfer must pay the seller AT LEAST the listing price of real $CHIKI
-  const ok = await txTransfer(sig, buyer, row.sid, Number(row.price) || 0);
-  if (!ok) return res.status(409).json({ error: `no confirmed transfer of ${row.price} $CHIKI from you to the seller was found for that signature` });
-  _usedTxSigs.add(sig); if (_usedTxSigs.size > 20000) _usedTxSigs.clear();
+  // CLAIM the sig BEFORE the async verify so two concurrent requests can't both settle it (TOCTOU),
+  // and so ONE payment can never settle a second listing. Released again only if verify fails.
+  _usedTxSigs.add(sig);
+  if (_usedTxSigs.size > 20000) { const it = _usedTxSigs.values(); for (let i = 0; i < 5000; i++) { const v = it.next().value; if (v === undefined) break; _usedTxSigs.delete(v); } }
+  // the buyer's ONE signed transaction must pay the correct 3-way split of real $CHIKI:
+  // 75% to the seller, 20% to the reward pool, 5% burned (full price left the buyer)
+  const split = await txMarketSplit(sig, buyer, row.sid, Number(row.price) || 0);
+  if (!split.ok) { _usedTxSigs.delete(sig); return res.status(409).json({ error: `on-chain split for that signature failed: ${split.reason}` }); }
+  saveUsedSigs();
   marketListings = marketListings.filter(x => x.id !== id);
   // record the sale so the SELLER'S client shows the on-chain proceeds landed
   const arr = marketSales[row.sid] || (marketSales[row.sid] = []);
-  if (!arr.some(s => s.id === row.id)) arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, buyer: buyer.slice(0, 8), onchain: true, txSig: sig, ts: Date.now() });
+  if (!arr.some(s => s.id === row.id)) arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, buyer: buyer.slice(0, 8), onchain: true, txSig: sig, sellerNet: split.seller, poolTax: split.pool, ts: Date.now() });
   saveMarket();
   res.json({ ok: true, released: { id: row.id, kind: row.kind, item: row.item, qty: row.qty, lvl: row.lvl, xp: row.xp }, txSig: sig });
 });
@@ -2872,6 +2917,7 @@ app.post("/market/op", (req, res) => {
   const op = String(b.op || "");
   const l = b.listing || {};
   if (!sid) return res.status(400).json({ error: "sid required" });
+  let cancelled;                                 // set by the cancel op → tells the seller's client whether to reclaim
   pruneMarket();
   if (op === "list") {
     if (marketListings.filter(x => x.sid === sid).length >= 12) return res.status(429).json({ error: "too many listings" });
@@ -2897,7 +2943,9 @@ app.post("/market/op", (req, res) => {
     marketListings = marketListings.filter(x => x.id !== id);
   } else if (op === "cancel" || op === "sold") {
     const id = stripTags(String(l.id || "")).slice(0, 40);
+    const before = marketListings.length;
     marketListings = marketListings.filter(x => !(x.id === id && x.sid === sid));
+    cancelled = marketListings.length < before;   // true ONLY if a still-live listing was removed (else it already sold)
   } else if (op === "sales_ack") {
     const rawIds = Array.isArray(b.ids) ? b.ids : (b.listing && Array.isArray(b.listing.ids) ? b.listing.ids : []);
     const ids = rawIds.map(x => String(x).slice(0, 40));
@@ -2907,7 +2955,7 @@ app.post("/market/op", (req, res) => {
     }
   }
   saveMarket();
-  res.json({ ok: true, listings: marketListings.slice(-300) });
+  res.json({ ok: true, cancelled, listings: marketListings.slice(-300) });
 });
 
 // Open the port FIRST so Render detects it immediately (no "No open ports" timeout on a cold DB),
