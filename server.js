@@ -815,7 +815,7 @@ async function verifyEggPayment(sig, wallet) {
   const spent = bal(pre, wallet) - bal(post, wallet);
   const treasuryGain = bal(post, treasStr) - bal(pre, treasStr);
   if (spent < MEME_EGG_PRICE * 0.999) return { ok: false, error: `payment too small — ${MEME_EGG_PRICE.toLocaleString()} $CHIKI required` };
-  if (treasuryGain <= 0) return { ok: false, error: "payment did not reach the treasury" };
+  if (treasuryGain < MEME_EGG_PRICE * 0.999) return { ok: false, error: "payment did not reach the treasury — the full price must land in the treasury" };
   return { ok: true, spent, treasuryGain };
 }
 // how many eggs are claimed (bought) — incubating(mystery) + pending + minted all hold a slot against the 105 total.
@@ -921,7 +921,8 @@ const cupAdminOk = (req) => {
   const key = req.body?.key || req.query?.key;
   if (process.env.ADMIN_KEY && key === process.env.ADMIN_KEY) return true;
   const w = req.body?.wallet || req.query?.wallet;
-  return !!(w && isAdminWallet(w));
+  const msg = req.body?.authMsg || req.query?.authMsg, sig = req.body?.authSig || req.query?.authSig;
+  return !!(w && isPubkey(w) && isAdminWallet(w) && verifyWalletSig(w, msg, sig));   // wallet branch now REQUIRES a fresh signature — bare wallet match is not enough
 };
 function cupSnapshot(forWallet) {
   const s = liveCup ? liveCup.state : null;
@@ -1232,7 +1233,10 @@ app.post("/profile", async (req, res) => {
   const hasMmo = profile.mmo && typeof profile.mmo === "object";
   const cap = hasMmo ? 65000 : 8000;
   if (JSON.stringify(profile).length > cap) return res.status(413).json({ error: "profile too large" });
-  if (hasMmo && !verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig)) {
+  // require a signature for MMO saves AND any write touching identity/score (glory/handle) — else a
+  // legacy-shape body could overwrite another wallet's name or leaderboard score with no auth
+  const touchesIdentity = ("glory" in profile) || ("handle" in profile);
+  if ((hasMmo || touchesIdentity) && !verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig)) {
     return res.status(401).json({ error: "sign-in required to save progress" });
   }
   const now = Date.now();
@@ -2337,9 +2341,9 @@ app.post("/meme/hatch", async (req, res) => {
   if (MEME_VERIFY_PAY) {
     if (!paySig || typeof paySig !== "string") return res.status(402).json({ error: "payment required — include your $CHIKI payment signature" });
     if (memeUsedSigs[paySig]) return res.status(409).json({ error: "that payment was already used to hatch an egg" });
+    memeUsedSigs[paySig] = { wallet, ts: now };   // CLAIM the sig BEFORE the await — one payment hatches exactly one egg even under concurrent requests (TOCTOU)
     const v = await verifyEggPayment(paySig, wallet);
-    if (!v.ok) return res.status(402).json({ error: v.error });
-    memeUsedSigs[paySig] = { wallet, ts: now };   // burn the signature so it can't hatch a second egg
+    if (!v.ok) { delete memeUsedSigs[paySig]; return res.status(402).json({ error: v.error }); }
   }
   // 🎲 The species is NOT chosen here — it stays a MYSTERY and is rolled at hatch time (POST /meme/hatched).
   // We only RESERVE a slot against the 105 total here.
@@ -2463,6 +2467,14 @@ app.post("/meme/buy", async (req, res) => {
   if (h.wallet === wallet) return res.status(400).json({ error: "you can't buy your own listing" });
   if (memeOwnedActive(wallet) >= 1) return res.status(409).json({ error: "You already own a Meme Legendary — list yours for sale before buying another." });
   const price = h.listed.price, seller = h.wallet;
+  // SECURITY: never reassign ownership on the buyer's say-so — require a real on-chain payment of the
+  // full price from buyer -> seller, replay-guarded (mirrors the resource market / egg payment).
+  const paySig = req.body && req.body.paySig;
+  if (!paySig || typeof paySig !== "string") return res.status(402).json({ error: "on-chain payment required — pay the seller first" });
+  if (memeUsedSigs[paySig]) return res.status(409).json({ error: "that payment was already used" });
+  memeUsedSigs[paySig] = { wallet, ts: Date.now() };
+  const paid = await txTransfer(paySig, wallet, seller, price);
+  if (!paid) { delete memeUsedSigs[paySig]; return res.status(402).json({ error: "payment to the seller could not be verified on-chain" }); }
   h.wallet = wallet; h.listed = null; h.lastSale = { price, from: seller, to: wallet, ts: Date.now() };
   await saveMeme();
   res.json({ ok: true, price, seller, char: h.char, name: h.name, edition: h.edition });
@@ -2826,7 +2838,8 @@ async function txMarketSplit(sig, buyer, seller, price) {
     scanBurn(tx.transaction && tx.transaction.message && tx.transaction.message.instructions);
     for (const inner of ((tx.meta && tx.meta.innerInstructions) || [])) scanBurn(inner.instructions);
     // tolerance = a couple whole $CHIKI (each leg is rounded to whole tokens client-side); NOT a % of price
-    const tol = 2.0;
+    const tol = Math.max(0.001, price * 0.005);   // proportional slack — a flat 2.0 let a ZERO-value tx clear tiny-price listings
+    if (dBuyer <= 0 || dSeller <= 0 || dTeam <= 0 || burned <= 0) return { ok: false, reason: "no $CHIKI actually moved on one of the legs" };
     if (dBuyer  < price * 1.0                 - tol) return { ok: false, reason: `buyer paid ${dBuyer}, need ${price}` };
     if (dSeller < price * MARKET_SELLER_SHARE - tol) return { ok: false, reason: `seller got ${dSeller}, need ${price * MARKET_SELLER_SHARE}` };
     if (dTeam   < price * MARKET_TEAM_TAX     - tol) return { ok: false, reason: `team wallet got ${dTeam}, need ${price * MARKET_TEAM_TAX}` };
