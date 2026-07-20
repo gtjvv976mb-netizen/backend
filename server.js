@@ -2851,6 +2851,7 @@ app.post("/market/buy-onchain", async (req, res) => {
   if (!MARKET_ONCHAIN) return res.status(503).json({ error: "on-chain trading is not enabled yet — buys settle in in-game $CHIKI for now", onchain: false });
   const b = req.body || {};
   const buyer = String(b.buyer || "");
+  const buyerName = stripTags(String(b.buyerName || "")).slice(0, 20);
   const sig = stripTags(String(b.txSig || "")).slice(0, 120);
   const id = stripTags(String(b.listingId || "")).slice(0, 40);
   if (!isPubkey(buyer)) return res.status(400).json({ error: "valid buyer wallet required" });
@@ -2874,7 +2875,7 @@ app.post("/market/buy-onchain", async (req, res) => {
   marketListings = marketListings.filter(x => x.id !== id);
   // record the sale so the SELLER'S client shows the on-chain proceeds landed
   const arr = marketSales[row.sid] || (marketSales[row.sid] = []);
-  if (!arr.some(s => s.id === row.id)) arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, buyer: buyer.slice(0, 8), onchain: true, txSig: sig, sellerNet: split.seller, teamTax: split.team, ts: Date.now() });
+  if (!arr.some(s => s.id === row.id)) arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, buyer: buyer.slice(0, 8), buyerName, onchain: true, txSig: sig, sellerNet: split.seller, teamTax: split.team, ts: Date.now() });
   saveMarket();
   res.json({ ok: true, released: { id: row.id, kind: row.kind, item: row.item, qty: row.qty, lvl: row.lvl, xp: row.xp }, txSig: sig });
 });
@@ -2944,8 +2945,9 @@ app.post("/market/op", (req, res) => {
     // player-to-player settlement: without it the seller's goods vanish for nothing
     if (row && row.sid && row.sid !== sid) {
       const arr = marketSales[row.sid] || (marketSales[row.sid] = []);
+      const buyerName = stripTags(String(b.buyerName || "")).slice(0, 20);
       if (!arr.some(s => s.id === row.id) && arr.length < 50)
-        arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, buyer: sid.slice(0, 8), ts: Date.now() });
+        arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, buyer: sid.slice(0, 8), buyerName, ts: Date.now() });
     }
     marketListings = marketListings.filter(x => x.id !== id);
   } else if (op === "cancel" || op === "sold") {
