@@ -28,25 +28,40 @@ Notes:
 - The deployed backend previously had **no** `/market/*` routes at all (the shared book
   silently fell back to per-client NPC mode). This commit adds them.
 
-## Rail B — real on-chain $CHIKI (designed, not yet enabled)
+## Rail B — real on-chain $CHIKI (server half BUILT + flagged off)
 
-Exactly as intuited: a real-token trade **requires the buyer to sign an SPL transfer**
-for the exact amount to the seller's wallet. The game never touches keys; the server
-never holds funds — it only verifies and releases the item.
+Buyer signs a real $CHIKI SPL transfer straight to the seller's wallet; the server only
+VERIFIES it on-chain and releases the item. Funds flow buyer→seller directly — the game
+never custodies money.
 
-1. Listing records the **seller's wallet address** (signed-in sellers only).
-2. Buyer presses Buy → client asks Phantom to sign+send one SPL token transfer:
-   `buyer ATA → seller ATA, amount = price, mint = $CHIKI`. (Needs `@solana/web3.js`
-   served locally with the realm bundle to build the transaction.)
-3. Client posts the tx signature to `POST /market/settle {listingId, txSig}`.
-4. Server marks the listing **pending**, fetches the tx via RPC, and verifies:
-   confirmed ∧ token = $CHIKI mint ∧ destination = seller's ATA ∧ amount ≥ price
-   ∧ source owner = the buyer's signed-in wallet ∧ txSig never used before (replay guard).
-5. On success the server releases the item to the buyer and records the sale for the
-   seller (goods state must be server-authoritative first — see CHEATPROOF_BACKEND_SPEC).
-6. Timeouts/failed verification → listing returns to the book, nothing moves.
+### DONE (this commit) — the safe, verified server half
+- `POST /market/buy-onchain {buyer, txSig, listingId}` — gated by `MARKET_ONCHAIN=1` (else 503).
+  Verifies with `txTransfer(sig, buyer, sellerWallet, price)` (pre/post token-balance deltas of
+  the $CHIKI mint, same proven method as the quest-reward `txPaid`): confirmed ∧ seller received
+  ≥ price ∧ buyer paid ≥ price. Replay guard (`_usedTxSigs`, a sig settles ≤ 1 listing), self-buy
+  block, unknown-listing 404. On success: removes the listing, records the sale for the seller,
+  returns the released item. It NEVER sends money.
+- `getStats().marketOnchain` exposes the flag so the client knows whether to offer on-chain buys.
+- Tested: flag-off → 503; bad buyer → 400; unknown listing → 404; replay → 409. (A real
+  mainnet tx is required to exercise the positive path.)
 
-Prerequisites before enabling Rail B: server-authoritative inventories (otherwise a
-hacked client can dupe the escrowed goods), a Postgres-backed listing store, and rate
-limits on `/market/settle` RPC lookups. Until then Rail A is the correct, honest rail:
-soft-currency trades, real burns, zero custody risk.
+### TODO before enabling (the client half — needs a real Phantom + mainnet test)
+1. **Bundle Solana libs in the realm shell** (`web_shell.html`): a self-contained
+   `@solana/web3.js` + `@solana/spl-token` UMD (CSP blocks CDNs — vendor the file into
+   `realm/`). ~150 KB; affects bundle size.
+2. **JS bridge** `window.__chikiPay(sellerPubkey, amount)`:
+   - `getAssociatedTokenAddress(MINT, buyer)` and `(MINT, seller)`;
+   - if the seller's ATA doesn't exist, prepend `createAssociatedTokenAccountInstruction`
+     (payer = buyer, ~0.002 SOL rent);
+   - `createTransferCheckedInstruction(buyerATA, MINT, sellerATA, buyer, amount*10**decimals, decimals)`;
+   - `phantom.signAndSendTransaction(tx)` → return the signature (or an error string).
+3. **Market.gd** on-chain buy path: only when `Chain` reports `marketOnchain` true → call the
+   bridge, poll for the sig, `POST /market/buy-onchain`; on 200 grant the released goods; on any
+   failure fall back to a clear error (never grant without a verified transfer).
+4. **Mainnet test checklist**: two real wallets; list → buy with a real signed transfer →
+   confirm the seller's on-chain balance rose by the price, the listing cleared, the item
+   released once, and a replayed sig is rejected. Test the seller-has-no-ATA path (rent paid by
+   buyer). Only then set `MARKET_ONCHAIN=1` on the server.
+
+Until step 4 passes, the game keeps using **Rail A** (in-game $CHIKI, 5% burn, no signature) —
+the safe default. `MARKET_ONCHAIN` stays unset.

@@ -1109,7 +1109,7 @@ async function chikiHolderCount() {
 let _statsCache = { t: 0, data: null };
 async function getStats() {
   if (_statsCache.data && Date.now() - _statsCache.t < 15000) return _statsCache.data;
-  const out = { network: NETWORK, minHold: MIN, whaleMin: WHALE_MIN, poolReserveSol: RESERVE };
+  const out = { network: NETWORK, minHold: MIN, whaleMin: WHALE_MIN, poolReserveSol: RESERVE, marketOnchain: MARKET_ONCHAIN };
   try { out.poolSol = await poolSol(); } catch (e) {}
   try { out.players = await store.count(); } catch (e) {}
   try { out.dailyPaidSol = await store.dailyTotal(); } catch (e) {}
@@ -2778,6 +2778,54 @@ app.get("/world/dm", (req, res) => {
   if (!isPresenceId(sid)) return res.status(400).json({ error: "valid wallet required" });
   const since = Number(req.query?.since) || 0;
   res.json({ messages: (worldDM.get(sid) || []).filter(m => m.ts > since).slice(-40) });
+});
+
+// ---- ON-CHAIN Trading Post settlement (OPT-IN, off by default) ------------------------------
+// When MARKET_ONCHAIN=1 the buyer signs a REAL $CHIKI SPL transfer straight to the seller's
+// wallet (via Phantom, client-side). This endpoint only VERIFIES that transfer on-chain and then
+// releases the item — it NEVER moves money itself. Real funds flow buyer -> seller directly.
+// PREREQ before enabling: the client must bundle @solana/web3.js to build+sign the transfer, and
+// the whole path needs a live mainnet Phantom test. Until then this returns 503 and the game uses
+// the safe in-game-$CHIKI rail (op:buy above).
+const MARKET_ONCHAIN = String(process.env.MARKET_ONCHAIN || "") === "1" && !!MINT;
+const _usedTxSigs = new Set();   // replay guard: a tx signature settles at most one listing
+// verify sig is a confirmed SPL transfer of >= amount of the $CHIKI mint from `from` to `to`
+async function txTransfer(sig, from, to, amount) {
+  try {
+    const tx = await conn.getParsedTransaction(sig, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
+    if (!tx || (tx.meta && tx.meta.err)) return false;
+    const mint = MINT.toBase58();
+    const pre = (tx.meta && tx.meta.preTokenBalances) || [], post = (tx.meta && tx.meta.postTokenBalances) || [];
+    const amt = (arr, owner) => { const e = arr.find(b => b.owner === owner && b.mint === mint); return e ? Number((e.uiTokenAmount && e.uiTokenAmount.uiAmount) || 0) : 0; };
+    const dTo = amt(post, to) - amt(pre, to);
+    const dFrom = amt(post, from) - amt(pre, from);
+    return dTo >= amount - 0.5 && dFrom <= -(amount - 0.5);
+  } catch (e) { return false; }
+}
+app.post("/market/buy-onchain", async (req, res) => {
+  if (!MARKET_ONCHAIN) return res.status(503).json({ error: "on-chain trading is not enabled yet — buys settle in in-game $CHIKI for now", onchain: false });
+  const b = req.body || {};
+  const buyer = String(b.buyer || "");
+  const sig = stripTags(String(b.txSig || "")).slice(0, 120);
+  const id = stripTags(String(b.listingId || "")).slice(0, 40);
+  if (!isPubkey(buyer)) return res.status(400).json({ error: "valid buyer wallet required" });
+  if (!sig || !id) return res.status(400).json({ error: "txSig and listingId required" });
+  if (_usedTxSigs.has(sig)) return res.status(409).json({ error: "that transaction was already used" });
+  pruneMarket();
+  const row = marketListings.find(x => x.id === id);
+  if (!row) return res.status(404).json({ error: "listing is gone" });
+  if (!isPubkey(row.sid)) return res.status(409).json({ error: "seller is not on-chain payable" });
+  if (row.sid === buyer) return res.status(400).json({ error: "that is your own listing" });
+  // the buyer's signed transfer must pay the seller AT LEAST the listing price of real $CHIKI
+  const ok = await txTransfer(sig, buyer, row.sid, Number(row.price) || 0);
+  if (!ok) return res.status(409).json({ error: `no confirmed transfer of ${row.price} $CHIKI from you to the seller was found for that signature` });
+  _usedTxSigs.add(sig); if (_usedTxSigs.size > 20000) _usedTxSigs.clear();
+  marketListings = marketListings.filter(x => x.id !== id);
+  // record the sale so the SELLER'S client shows the on-chain proceeds landed
+  const arr = marketSales[row.sid] || (marketSales[row.sid] = []);
+  if (!arr.some(s => s.id === row.id)) arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, buyer: buyer.slice(0, 8), onchain: true, txSig: sig, ts: Date.now() });
+  saveMarket();
+  res.json({ ok: true, released: { id: row.id, kind: row.kind, item: row.item, qty: row.qty, lvl: row.lvl, xp: row.xp }, txSig: sig });
 });
 
 // ---- Trading Post: a shared player-to-player market of in-game items for in-game $CHIKI.
