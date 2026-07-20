@@ -1661,8 +1661,11 @@ app.post("/claim", async (req, res) => {
    ============================================================================ */
 const CHIKI_DECIMALS = Math.max(0, Number(process.env.CHIKI_DECIMALS || 6));   // pump.fun = 6
 // MUST stay in sync with the client's Econ story chain (ids + order).
-// CHIKORIA · THE BROKEN WHEEL — ACT I (21 chapters, 3 parts). MUST match the client's Econ.STORY
-// ids + order exactly (the server enforces in-order completion). Amounts sum to 100,000/player.
+// CHIKORIA · THE BROKEN WHEEL — ACT I is 63 chapters client-side (9 parts of 7); THESE 21 are
+// the on-chain reward ladder — the client tags them "real": true and reports ONLY these ids.
+// Their ids + RELATIVE order here must match the client's real-tagged chapters exactly (the
+// server enforces in-order completion); the other 42 chapters pay soft in-game $CHIKI and are
+// never reported. Amounts sum to 100,000/player — unchanged by the Act I expansion.
 const MAIN_QUESTS = [
   { id: "s_meet",    chiki: 1000 },
   { id: "s_kill",    chiki: 1500 },
