@@ -2753,6 +2753,33 @@ app.post("/world/chat", (req, res) => {
 });
 app.get("/world/chat", (_q, res) => res.json({ messages: worldChat.slice(-40) }));
 
+// ---- Whispers (direct messages). In-memory inbox per recipient presence-id. Cosmetic social
+// layer — presence-id gated (same as world chat), sanitised, capped. No history persistence.
+const worldDM = new Map();   // recipient sid -> [ {from, fromHandle, text, ts} ]
+function dmInbox(sid) { let a = worldDM.get(sid); if (!a) { a = []; worldDM.set(sid, a); } return a; }
+app.post("/world/dm", (req, res) => {
+  const b = req.body || {};
+  if (!isPresenceId(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
+  const to = String(b.to || "");
+  if (!isPresenceId(to)) return res.status(400).json({ error: "valid recipient required" });
+  const text = stripTags(String(b.text || "")).slice(0, 200).trim();
+  if (!text) return res.json({ ok: true });
+  const from = String(b.wallet), fromHandle = stripTags(String(b.handle || "Trainer")).slice(0, 20);
+  const msg = { from, fromHandle, to, text, ts: Date.now() };
+  const inbox = dmInbox(to); inbox.push(msg); if (inbox.length > 60) inbox.shift();
+  // echo into the sender's own inbox so their client shows the sent line in-thread
+  const sent = dmInbox(from); sent.push({ ...msg, self: true }); if (sent.length > 60) sent.shift();
+  // hard cap on distinct inboxes (DoS guard)
+  if (worldDM.size > 5000) { const oldest = [...worldDM.keys()].slice(0, worldDM.size - 5000); oldest.forEach(k => worldDM.delete(k)); }
+  res.json({ ok: true });
+});
+app.get("/world/dm", (req, res) => {
+  const sid = String(req.query?.wallet || "");
+  if (!isPresenceId(sid)) return res.status(400).json({ error: "valid wallet required" });
+  const since = Number(req.query?.since) || 0;
+  res.json({ messages: (worldDM.get(sid) || []).filter(m => m.ts > since).slice(-40) });
+});
+
 // ---- Trading Post: a shared player-to-player market of in-game items for in-game $CHIKI.
 // In-memory ring (persisted best-effort to kv). Items + soft-currency only — no on-chain funds.
 // SETTLEMENT: when a listing is bought, the sale is RECORDED for the seller; the seller's
