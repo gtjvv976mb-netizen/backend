@@ -2920,16 +2920,20 @@ app.post("/market/op", (req, res) => {
   let cancelled;                                 // set by the cancel op → tells the seller's client whether to reclaim
   pruneMarket();
   if (op === "list") {
-    if (marketListings.filter(x => x.sid === sid).length >= 12) return res.status(429).json({ error: "too many listings" });
-    marketListings.push({
-      id: stripTags(String(l.id || ("S" + Date.now() + Math.floor(Math.random() * 1e4)))).slice(0, 40),
-      seller: stripTags(String(l.seller || "Trainer")).slice(0, 20), sid,
-      kind: (["chikimon", "ffish", "pot"].includes(String(l.kind)) ? String(l.kind) : "mat"),
-      item: stripTags(String(l.item || "wood")).slice(0, 24),
-      qty: clampF(l.qty, 1, 999999, 1) | 0, price: clampF(l.price, 1, 9999999, 1) | 0,
-      lvl: clampF(l.lvl, 1, 50, 1) | 0, xp: clampF(l.xp, 0, 1e9, 0) | 0, ts: Date.now(),
-    });
-    if (marketListings.length > 400) marketListings.shift();
+    const lid = stripTags(String(l.id || ("S" + Date.now() + Math.floor(Math.random() * 1e4)))).slice(0, 40);
+    // IDEMPOTENT: a client may re-push a listing it made offline (reconcile). Don't duplicate an id.
+    if (!marketListings.some(x => x.id === lid)) {
+      if (marketListings.filter(x => x.sid === sid).length >= 12) return res.status(429).json({ error: "too many listings" });
+      marketListings.push({
+        id: lid,
+        seller: stripTags(String(l.seller || "Trainer")).slice(0, 20), sid,
+        kind: (["chikimon", "ffish", "pot"].includes(String(l.kind)) ? String(l.kind) : "mat"),
+        item: stripTags(String(l.item || "wood")).slice(0, 24),
+        qty: clampF(l.qty, 1, 999999, 1) | 0, price: clampF(l.price, 1, 9999999, 1) | 0,
+        lvl: clampF(l.lvl, 1, 50, 1) | 0, xp: clampF(l.xp, 0, 1e9, 0) | 0, ts: Date.now(),
+      });
+      if (marketListings.length > 400) marketListings.shift();
+    }
   } else if (op === "buy") {
     const id = stripTags(String(l.id || "")).slice(0, 40);
     const row = marketListings.find(x => x.id === id);
