@@ -2954,6 +2954,12 @@ app.post("/market/op", (req, res) => {
   } else if (op === "buy") {
     const id = stripTags(String(l.id || "")).slice(0, 40);
     const row = marketListings.find(x => x.id === id);
+    // SECURITY: when on-chain trading is live, a wallet-backed listing MUST settle through the
+    // verified /market/buy-onchain path — never through this unauthenticated soft op:buy, or a
+    // seller could POST a fake buy against their own listing to mint soft $CHIKI for nothing.
+    if (row && MARKET_ONCHAIN && isPubkey(String(row.wallet || ""))) {
+      return res.status(409).json({ error: "this listing settles on-chain — buy it through the on-chain flow" });
+    }
     // record the sale for the seller BEFORE the listing disappears — this is the
     // player-to-player settlement: without it the seller's goods vanish for nothing
     if (row && row.sid && row.sid !== sid) {
