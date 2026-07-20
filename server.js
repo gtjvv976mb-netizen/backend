@@ -2719,7 +2719,7 @@ function worldSnapshot(wallet, x, z) {
     if (now - p.ts > WORLD_TTL_MS) { worldPlayers.delete(w); continue; }
     if (w === wallet) continue;
     if (Math.hypot((p.x || 0) - x, (p.z || 0) - z) > WORLD_RADIUS) continue;
-    out.push({ wallet: w, x: p.x, z: p.z, dir: p.dir, handle: p.handle, leg: p.leg, el: p.el, br: p.br });
+    out.push({ wallet: w, x: p.x, z: p.z, dir: p.dir, handle: p.handle, leg: p.leg, el: p.el, br: p.br, avatar: p.avatar });
   }
   return out.slice(0, 60);   // cap payload
 }
@@ -2733,6 +2733,7 @@ app.post("/world/move", (req, res) => {
     handle: stripTags(String(b.handle || "Trainer")).slice(0, 20),
     leg: clampF(b.leg, 0, 20, 14) | 0,                 // companion species index
     el: stripTags(String(b.el || "Fire")).slice(0, 10),
+    avatar: stripTags(String(b.avatar || "classic")).slice(0, 20),   // player's chosen look → remote renders the real rig
     br: clampF(b.br, 1, 30, 1) | 0,
     ts: Date.now(),
   });
