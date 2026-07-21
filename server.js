@@ -3013,6 +3013,7 @@ app.post("/market/op", (req, res) => {
   } else if (op === "order_fill") {
     const oid = stripTags(String(l.id || "")).slice(0, 40);
     const row = marketOrders.find(x => x.id === oid);
+    var filled = false;
     // can't fill your own order (that would launder the 25% market fee back to yourself)
     if (row && row.sid && row.sid !== sid) {
       const arr = marketFills[row.sid] || (marketFills[row.sid] = []);
@@ -3020,9 +3021,14 @@ app.post("/market/op", (req, res) => {
       if (!arr.some(f => f.id === row.id) && arr.length < 50)
         arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, fillerName, ts: Date.now() });
       marketOrders = marketOrders.filter(x => x.id !== oid);
+      filled = true;
     } else if (row) {
       return res.status(409).json({ error: "you can't fill your own order" });
     }
+    saveMarket();
+    // the FILLED flag is authoritative: two racing fillers -> only the first gets true, and only
+    // that client deducts goods + credits the 75% — the loser keeps everything and gets told
+    return res.json({ ok: true, filled, listings: marketListings.slice(-300) });
   } else if (op === "order_cancel") {
     const oid = stripTags(String(l.id || "")).slice(0, 40);
     const before = marketOrders.length;
