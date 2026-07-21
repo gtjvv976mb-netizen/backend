@@ -2901,10 +2901,14 @@ app.post("/market/buy-onchain", async (req, res) => {
 // purse, then acks. Nothing is credited twice and nothing vanishes on a lost response.
 let marketListings = [];
 let marketSales = {};                        // seller sid -> [ {id,item,kind,qty,price,buyer,ts} ]
+let marketOrders = [];                       // WTB craft orders: {id, buyer, sid, kind, item, qty, price(total), ts}
+let marketFills = {};                        // buyer sid -> [ {id,item,kind,qty,price,fillerName,ts} ] — goods owed to the buyer
 const MARKET_TTL_MS = 24 * 60 * 60 * 1000;   // listings expire after a day
 store.kvGet("market_listings").then(v => { if (Array.isArray(v)) marketListings = v.filter(l => l && Date.now() - (l.ts || 0) < MARKET_TTL_MS); }).catch(() => {});
 store.kvGet("market_sales").then(v => { if (v && typeof v === "object") marketSales = v; }).catch(() => {});
-function saveMarket() { store.kvSet("market_listings", marketListings.slice(-400)).catch(() => {}); store.kvSet("market_sales", marketSales).catch(() => {}); }
+store.kvGet("market_orders").then(v => { if (Array.isArray(v)) marketOrders = v.filter(o => o && Date.now() - (o.ts || 0) < MARKET_TTL_MS); }).catch(() => {});
+store.kvGet("market_fills").then(v => { if (v && typeof v === "object") marketFills = v; }).catch(() => {});
+function saveMarket() { store.kvSet("market_listings", marketListings.slice(-400)).catch(() => {}); store.kvSet("market_sales", marketSales).catch(() => {}); store.kvSet("market_orders", marketOrders.slice(-200)).catch(() => {}); store.kvSet("market_fills", marketFills).catch(() => {}); }
 function pruneMarket() {
   const now = Date.now();
   marketListings = marketListings.filter(l => now - (l.ts || 0) < MARKET_TTL_MS);
@@ -2912,6 +2916,17 @@ function pruneMarket() {
   for (const sid of sids) {
     marketSales[sid] = (marketSales[sid] || []).filter(s => now - (s.ts || 0) < 7 * 24 * 3600 * 1000);
     if (!marketSales[sid].length) delete marketSales[sid];
+  }
+  marketOrders = marketOrders.filter(o => now - (o.ts || 0) < MARKET_TTL_MS);
+  for (const sid of Object.keys(marketFills)) {
+    marketFills[sid] = (marketFills[sid] || []).filter(f => now - (f.ts || 0) < 7 * 24 * 3600 * 1000);
+    if (!marketFills[sid].length) delete marketFills[sid];
+  }
+  const fkeys = Object.keys(marketFills);
+  if (fkeys.length > 5000) {
+    fkeys.map(k => [k, Math.max(...(marketFills[k] || [{ts:0}]).map(f => f.ts || 0))])
+         .sort((a, b) => a[1] - b[1]).slice(0, fkeys.length - 5000)
+         .forEach(([k]) => delete marketFills[k]);
   }
   // SECURITY: hard cap on distinct seller buckets — drop the oldest so a flood of fake sids can't grow memory unbounded
   const keys = Object.keys(marketSales);
@@ -2921,7 +2936,13 @@ function pruneMarket() {
         .forEach(([k]) => delete marketSales[k]);
   }
 }
-app.get("/market/list", (_q, res) => { pruneMarket(); res.json({ listings: marketListings.slice(-300) }); });
+app.get("/market/list", (_q, res) => { pruneMarket(); res.json({ listings: marketListings.slice(-300), orders: marketOrders.slice(-100) }); });
+// pending order FILLS for one buyer — client receives the goods then acks with the ids
+app.get("/market/fills", (req, res) => {
+  const sid = stripTags(String(req.query?.sid || "")).slice(0, 40);
+  if (!sid) return res.status(400).json({ error: "sid required" });
+  res.json({ fills: (marketFills[sid] || []).slice(0, 40) });
+});
 // pending sale proceeds for one seller — client credits then acks with the ids
 app.get("/market/sales", (req, res) => {
   const sid = stripTags(String(req.query?.sid || "")).slice(0, 40);
@@ -2975,6 +2996,45 @@ app.post("/market/op", (req, res) => {
     const before = marketListings.length;
     marketListings = marketListings.filter(x => !(x.id === id && x.sid === sid));
     cancelled = marketListings.length < before;   // true ONLY if a still-live listing was removed (else it already sold)
+  } else if (op === "order_post") {
+    // WTB craft order: buyer escrows the offer client-side (signed save) and posts the want.
+    const oid = stripTags(String(l.id || ("O" + Date.now() + Math.floor(Math.random() * 1e4)))).slice(0, 40);
+    if (!marketOrders.some(x => x.id === oid)) {
+      if (marketOrders.filter(x => x.sid === sid).length >= 3) return res.status(429).json({ error: "3 open orders max" });
+      marketOrders.push({
+        id: oid,
+        buyer: stripTags(String(l.seller || "Trainer")).slice(0, 20), sid,
+        kind: (["ffish", "pot"].includes(String(l.kind)) ? String(l.kind) : "mat"),
+        item: stripTags(String(l.item || "wood")).slice(0, 24),
+        qty: clampF(l.qty, 1, 99, 1) | 0, price: clampF(l.price, 1, 50000, 1) | 0, ts: Date.now(),
+      });
+      if (marketOrders.length > 200) marketOrders.shift();
+    }
+  } else if (op === "order_fill") {
+    const oid = stripTags(String(l.id || "")).slice(0, 40);
+    const row = marketOrders.find(x => x.id === oid);
+    // can't fill your own order (that would launder the 25% market fee back to yourself)
+    if (row && row.sid && row.sid !== sid) {
+      const arr = marketFills[row.sid] || (marketFills[row.sid] = []);
+      const fillerName = stripTags(String(b.buyerName || "")).slice(0, 20);
+      if (!arr.some(f => f.id === row.id) && arr.length < 50)
+        arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, fillerName, ts: Date.now() });
+      marketOrders = marketOrders.filter(x => x.id !== oid);
+    } else if (row) {
+      return res.status(409).json({ error: "you can't fill your own order" });
+    }
+  } else if (op === "order_cancel") {
+    const oid = stripTags(String(l.id || "")).slice(0, 40);
+    const before = marketOrders.length;
+    marketOrders = marketOrders.filter(x => !(x.id === oid && x.sid === sid));
+    cancelled = marketOrders.length < before;   // true ONLY if still open — the buyer's client refunds the escrow
+  } else if (op === "fills_ack") {
+    const rawIds = Array.isArray(b.ids) ? b.ids : (b.listing && Array.isArray(b.listing.ids) ? b.listing.ids : []);
+    const ids = rawIds.map(x => String(x).slice(0, 40));
+    if (marketFills[sid]) {
+      marketFills[sid] = marketFills[sid].filter(f => !ids.includes(f.id));
+      if (!marketFills[sid].length) delete marketFills[sid];
+    }
   } else if (op === "sales_ack") {
     const rawIds = Array.isArray(b.ids) ? b.ids : (b.listing && Array.isArray(b.listing.ids) ? b.listing.ids : []);
     const ids = rawIds.map(x => String(x).slice(0, 40));
