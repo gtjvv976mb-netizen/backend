@@ -2748,7 +2748,7 @@ app.post("/world/move", (req, res) => {
     avatar: stripTags(String(b.avatar || "classic")).slice(0, 20),   // player's chosen look → remote renders the real rig
     comp: stripTags(String(b.comp || "")).slice(0, 24),              // player's lead chikimon → remote renders it beside them
     party: String(b.party || "").split(",").filter(Boolean).slice(0, 3).map(s => stripTags(String(s)).slice(0, 24)).join(","),   // full 3-slot party → remote renders the whole team
-    br: clampF(b.br, 1, 30, 1) | 0,
+    br: clampF(b.br, 1, 50, 1) | 0,   // companion LEVEL (cap 50) — not the Cup 1..30 BR
     ts: Date.now(),
   });
   res.json({ ok: true, players: worldSnapshot(wallet, x, z), online: worldPlayers.size });
