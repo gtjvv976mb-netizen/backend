@@ -1858,9 +1858,10 @@ async function _payoutQuestReward(wallet) {
   }
   const owed = Math.floor(Math.min(QUEST_REWARD_TOTAL, questEarned(begin.doneMask)) - (begin.paidAmount || 0));
   if (owed < 1) { await store.qrPayoutClear(wallet).catch(() => {}); return { skipped: "nothing owed", earned: questEarned(begin.doneMask), paid: begin.paidAmount }; }
-  let bal = 0;
-  try { bal = await chikiBalance(wallet); } catch (e) { await store.qrPayoutClear(wallet).catch(() => {}); return { error: "balance check failed — retry" }; }
-  if (bal < QUEST_MIN_HOLD) { await store.qrPayoutClear(wallet).catch(() => {}); return { skipped: `ineligible at payout — wallet no longer holds ${QUEST_MIN_HOLD} $CHIKI`, balance: bal }; }
+  // OWNER POLICY (2026-07-22): eligibility is checked when the reward is EARNED (hold + age
+  // gates on the final quest). Selling afterwards no longer forfeits the payout — no
+  // at-payout balance re-check. Burn/system addresses are unpayable black holes: skip them.
+  if (wallet === "11111111111111111111111111111111") { await store.qrPayoutClear(wallet).catch(() => {}); return { skipped: "system/burn address — unpayable" }; }
   const now = Date.now();
   let out;
   try { out = await sendChikiRaw(wallet, owed); }
@@ -2048,9 +2049,8 @@ async function _payoutOne(wallet) {
     return { pending: true, needsReconcile: true, note: "a prior payout attempt was not durably recorded — verify on-chain and resolve via /quest/reconcile before releasing (NOT auto-resending, to avoid a double-pay)" };
   }
   // Anti-sybil: the winner must STILL hold the stake at payout time (defeats flash/cycled-stake capture of all slots).
-  let bal = 0;
-  try { bal = await chikiBalance(wallet); } catch (e) { await store.payoutClear(wallet).catch(() => {}); return { error: "balance check failed — retry" }; }
-  if (bal < QUEST_MIN_HOLD) { await store.payoutClear(wallet).catch(() => {}); return { skipped: `ineligible at payout — wallet no longer holds ${QUEST_MIN_HOLD} $CHIKI`, balance: bal }; }
+  if (wallet === "11111111111111111111111111111111") { await store.payoutClear(wallet).catch(() => {}); return { skipped: "system/burn address — unpayable" }; }
+
   const now = Date.now();
   let out;
   try { out = await sendChikiRaw(wallet, WINNER_REWARD); }
