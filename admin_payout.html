@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Chikoria — Reward Release Console (LOCAL ADMIN TOOL)</title>
+<style>
+	body { font-family: -apple-system, "Segoe UI", sans-serif; background: #1c1106; color: #f4e9c8; margin: 0; padding: 24px; }
+	h1 { color: #ffd34d; font-size: 22px; } h2 { color: #ffd34d; font-size: 16px; margin-top: 28px; }
+	.card { background: #2a1a09; border: 2px solid #d9a636; border-radius: 12px; padding: 16px; margin: 12px 0; max-width: 980px; }
+	button { background: #d9a636; color: #241505; border: 0; border-radius: 9px; padding: 10px 18px; font-weight: 700; font-size: 14px; cursor: pointer; margin: 4px 6px 4px 0; }
+	button:disabled { opacity: .45; cursor: default; }
+	button.green { background: #4caf50; color: #fff; }
+	input { background: #171007; color: #f4e9c8; border: 1px solid #d9a636; border-radius: 7px; padding: 8px; width: 90px; }
+	pre { background: #171007; border-radius: 8px; padding: 12px; overflow: auto; max-height: 380px; font-size: 12px; white-space: pre-wrap; }
+	table { border-collapse: collapse; width: 100%; font-size: 13px; }
+	td, th { border-bottom: 1px solid #4a3417; padding: 6px 8px; text-align: left; }
+	.ok { color: #7fe08a; } .warn { color: #ffb09a; } .dim { color: #b89b6a; }
+</style>
+</head>
+<body>
+<h1>🏦 Chikoria Reward Release Console</h1>
+<p class="dim">LOCAL admin tool — never deploy this file. It holds no secrets: every action is signed live by YOUR Phantom
+wallet (which must be listed in the backend's <b>ADMIN_WALLETS</b>). Serve it with <code>python3 -m http.server 8907</code>
+and open <code>http://localhost:8907/admin_payout.html</code> — Phantom does not inject into file:// pages.</p>
+
+<div class="card">
+	<button id="connect">🦊 Connect Phantom (admin wallet)</button>
+	<span id="who" class="dim">not connected</span>
+</div>
+
+<div class="card">
+	<h2>1 · Review what's owed (read-only)</h2>
+	<button id="listPouches" disabled>📜 List quest pouches</button>
+	<button id="listWinners" disabled>🏆 List winners</button>
+	<div id="review"></div>
+</div>
+
+<div class="card">
+	<h2>2 · Release (moves REAL $CHIKI — the hot wallet must be funded first)</h2>
+	<p class="dim">Optional cap per run: <input id="maxN" type="number" placeholder="max" value="10"> wallets — release in
+	small batches while you watch Solscan. Both endpoints are idempotent: a re-run can never double-pay.</p>
+	<button id="reconcile" disabled>🧹 Reconcile stuck attempts (run after any errors)</button><br>
+	<button id="payPouches" class="green" disabled>💸 Release quest pouches</button>
+	<button id="payWinners" class="green" disabled>💸 Release winner pool</button>
+	<div id="result"></div>
+</div>
+
+<script>
+const BACKEND = "https://backend-wffd.onrender.com";
+let WALLET = "";
+
+function nonce() {
+	const a = new Uint8Array(12); crypto.getRandomValues(a);
+	return Array.from(a, b => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[b % 62]).join("");
+}
+function b64(bytes) { let s = ""; bytes.forEach(b => s += String.fromCharCode(b)); return btoa(s); }
+
+async function signed(action) {
+	// message format the server verifies: wallet: + action: + fresh ts: (<=5 min) + single-use nonce:
+	const msg = `chikoria-admin wallet:${WALLET} action:${action} ts:${Date.now()} nonce:${nonce()}`;
+	const enc = new TextEncoder().encode(msg);
+	const out = await window.solana.signMessage(enc, "utf8");
+	return { adminWallet: WALLET, authMsg: msg, authSig: b64(out.signature) };
+}
+
+async function call(path, action, extra = {}) {
+	const body = Object.assign(await signed(action), extra);
+	const r = await fetch(BACKEND + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+	return { code: r.status, json: await r.json().catch(() => ({})) };
+}
+
+function show(el, res) {
+	const box = document.getElementById(el);
+	let html = `<p class="${res.code === 200 ? "ok" : "warn"}">HTTP ${res.code}</p>`;
+	const j = res.json;
+	if (j.players) {
+		html += `<p>owed total: <b>${j.owedTotalChiki ?? "?"} $CHIKI</b> across ${j.count} wallets</p><table><tr><th>wallet</th><th>earned</th><th>paid</th><th>owed</th></tr>` +
+			j.players.slice(0, 40).map(p => `<tr><td>${p.wallet.slice(0,4)}…${p.wallet.slice(-4)}</td><td>${p.earned}</td><td>${p.paid}</td><td><b>${p.owed}</b></td></tr>`).join("") + "</table>";
+	} else if (j.winners) {
+		html += `<p>${j.paid}/${j.total} paid · pool still needed: <b>${j.poolNeededChiki} $CHIKI</b> (prize ${j.prize} × cap ${j.cap})</p><table><tr><th>#</th><th>wallet</th><th>paid</th><th>sig</th></tr>` +
+			j.winners.slice(0, 40).map(w => `<tr><td>${w.rank}</td><td>${w.wallet.slice(0,4)}…${w.wallet.slice(-4)}</td><td>${w.paid ? "✅" : "⏳"}</td><td>${w.payout_sig ? `<a style="color:#7fb3ff" href="https://solscan.io/tx/${w.payout_sig}" target="_blank">tx</a>` : ""}</td></tr>`).join("") + "</table>";
+	} else {
+		html += "<pre>" + JSON.stringify(j, null, 2) + "</pre>";
+	}
+	box.innerHTML = html;
+}
+
+document.getElementById("connect").onclick = async () => {
+	if (!window.solana || !window.solana.isPhantom) { alert("Phantom not found — open via http://localhost, not file://"); return; }
+	const r = await window.solana.connect();
+	WALLET = r.publicKey.toString();
+	document.getElementById("who").textContent = "admin: " + WALLET;
+	for (const id of ["listPouches", "listWinners", "payPouches", "payWinners", "reconcile"])
+		document.getElementById(id).disabled = false;
+};
+document.getElementById("reconcile").onclick = async () => show("result", await call("/quest/rewards/reconcile", "quest_rewards_reconcile"));
+document.getElementById("listPouches").onclick = async () => show("review", await call("/quest/rewards", "quest_rewards"));
+document.getElementById("listWinners").onclick = async () => show("review", await call("/quest/winners", "quest_winners"));
+document.getElementById("payPouches").onclick = async () => {
+	if (!confirm("Release quest-pouch $CHIKI from the hot wallet now?")) return;
+	show("result", await call("/quest/rewards/payout", "quest_rewards_payout", { max: Number(document.getElementById("maxN").value) || 10 }));
+};
+document.getElementById("payWinners").onclick = async () => {
+	if (!confirm("Release winner-pool $CHIKI from the hot wallet now?")) return;
+	show("result", await call("/quest/payout", "quest_payout", { max: Number(document.getElementById("maxN").value) || 10 }));
+};
+</script>
+</body>
+</html>

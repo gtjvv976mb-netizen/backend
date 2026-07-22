@@ -11,7 +11,7 @@ import {
 } from "@solana/web3.js";
 import { createCup } from "./cup-live.js";   // Chikoria Cup live orchestrator (double-elim, deterministic resolver)
 import { createMatch as pvpCreate, submit as pvpSubmit, tick as pvpTick, viewFor as pvpView, forfeit as pvpForfeit, spectatorView as pvpSpectate } from "./pvp-engine.js";   // live PvP battles
-import { getAssociatedTokenAddress, createTransferCheckedInstruction } from "@solana/spl-token";   // $CHIKI quest-reward payouts
+import { getAssociatedTokenAddressSync, createTransferCheckedInstruction, createAssociatedTokenAccountIdempotentInstruction, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";   // $CHIKI quest-reward payouts ($CHIKI is TOKEN-2022 — the legacy program rejects its accounts with InvalidAccountData)
 
 dotenv.config();
 const {
@@ -1723,11 +1723,17 @@ async function _questSave(wallet, led) { try { await store.kvSet(QKEY(wallet), l
 // Send `amt` whole $CHIKI, returning the signature WITHOUT awaiting confirmation, so the caller can durably
 // record the sig BEFORE confirming — the crux of an idempotent, non-double-paying payout.
 async function sendChikiRaw(destWallet, amt) {
-  const src = await getAssociatedTokenAddress(MINT, treasury.publicKey);
-  const dst = await getAssociatedTokenAddress(MINT, new PublicKey(destWallet));
+  // TOKEN-2022 mint: derive both ATAs against the Token-2022 program AND pass it to the
+  // transfer ix — the defaults target legacy Tokenkeg and fail with InvalidAccountData.
+  const destPk = new PublicKey(destWallet);
+  const src = getAssociatedTokenAddressSync(MINT, treasury.publicKey, false, TOKEN_2022_PROGRAM_ID);
+  const dst = getAssociatedTokenAddressSync(MINT, destPk, false, TOKEN_2022_PROGRAM_ID);
   const raw = BigInt(Math.round(amt * 10 ** CHIKI_DECIMALS));
   const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("finalized");
-  const tx  = new Transaction().add(createTransferCheckedInstruction(src, MINT, dst, treasury.publicKey, raw, CHIKI_DECIMALS));
+  const tx = new Transaction()
+    // winner may have emptied/closed their token account — recreate it idempotently (treasury pays ~0.002 SOL rent)
+    .add(createAssociatedTokenAccountIdempotentInstruction(treasury.publicKey, dst, destPk, MINT, TOKEN_2022_PROGRAM_ID))
+    .add(createTransferCheckedInstruction(src, MINT, dst, treasury.publicKey, raw, CHIKI_DECIMALS, [], TOKEN_2022_PROGRAM_ID));
   tx.recentBlockhash = blockhash; tx.feePayer = treasury.publicKey;
   const sig = await conn.sendTransaction(tx, [treasury]);
   return { sig, lastValidBlockHeight };
@@ -1757,7 +1763,7 @@ async function txPaid(sig, wallet, amount, exact) {
 // Lets reconcile POSITIVELY confirm a sent-but-unrecorded payout so `clear` can never wipe an already-paid winner.
 async function findTreasuryPayment(wallet, amount, exact) {
   try {
-    const dst = await getAssociatedTokenAddress(MINT, new PublicKey(wallet));
+    const dst = getAssociatedTokenAddressSync(MINT, new PublicKey(wallet), false, TOKEN_2022_PROGRAM_ID);
     const sigs = await conn.getSignaturesForAddress(dst, { limit: 40 });
     for (const s of sigs) { if (s.err) continue; if (await txPaid(s.signature, wallet, amount, exact)) return s.signature; }
   } catch (e) {}
