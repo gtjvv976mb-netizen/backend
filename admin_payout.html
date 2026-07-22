@@ -70,6 +70,9 @@ async function call(path, action, extra = {}) {
 }
 
 function show(el, res) {
+	// remember wallets a release marked as stuck — the Reconcile button clears exactly those
+	if (res.json && Array.isArray(res.json.results))
+		window._stuck = res.json.results.filter(r => r.needsReconcile).map(r => r.wallet);
 	const box = document.getElementById(el);
 	let html = `<p class="${res.code === 200 ? "ok" : "warn"}">HTTP ${res.code}</p>`;
 	const j = res.json;
@@ -93,7 +96,22 @@ document.getElementById("connect").onclick = async () => {
 	for (const id of ["listPouches", "listWinners", "payPouches", "payWinners", "reconcile"])
 		document.getElementById(id).disabled = false;
 };
-document.getElementById("reconcile").onclick = async () => show("result", await call("/quest/rewards/reconcile", "quest_rewards_reconcile"));
+document.getElementById("reconcile").onclick = async () => {
+	let wallets = window._stuck || [];
+	if (!wallets.length) {
+		const w = prompt("No stuck wallets collected yet — run a Release first to gather them, or paste one wallet to reconcile:");
+		if (!w) return;
+		wallets = [w.trim()];
+	}
+	if (!confirm(`Reconcile ${wallets.length} stuck wallet(s)? Each needs one Phantom signature. The server checks the chain first and marks PAID if a real transfer is found — clearing only happens when none exists (double-pay impossible).`)) return;
+	const out = [];
+	for (const w of wallets) {
+		const r = await call("/quest/rewards/reconcile", "quest_rewards_reconcile", { wallet: w, clear: true });
+		out.push({ wallet: w.slice(0, 4) + "…" + w.slice(-4), http: r.code, ...r.json });
+	}
+	window._stuck = [];
+	show("result", { code: 200, json: { reconciled: out } });
+};
 document.getElementById("listPouches").onclick = async () => show("review", await call("/quest/rewards", "quest_rewards"));
 document.getElementById("listWinners").onclick = async () => show("review", await call("/quest/winners", "quest_winners"));
 document.getElementById("payPouches").onclick = async () => {
