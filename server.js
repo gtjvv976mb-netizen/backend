@@ -1570,6 +1570,14 @@ app.get("/stats", async (_q, res) => {
 app.get("/leaderboard", async (_q, res) => {
   try { res.json(await getLeaderboard()); } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
+// GET /rewards/history?wallet= — this wallet's confirmed reward payouts, newest first
+app.get("/rewards/history", async (req, res) => {
+  const w = String(req.query.wallet || "");
+  if (!isPubkey(w)) return res.status(400).json({ error: "valid 'wallet' required" });
+  try { res.json({ ok: true, history: (await store.kvGet("payhist:" + w)) || [] }); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 app.get("/feed", async (req, res) => {
   const since = Number(req.query?.since) || 0;
   res.json({ events: feedEvents.filter(e => e.id > since) });
@@ -1738,6 +1746,18 @@ async function sendChikiRaw(destWallet, amt) {
   const sig = await conn.sendTransaction(tx, [treasury]);
   return { sig, lastValidBlockHeight };
 }
+// durable per-wallet payout history — the in-game "reward received" toast + Ledger history
+// read this. Appended ONLY on a confirmed on-chain landing; capped at the 50 newest.
+async function recordPayout(wallet, kind, amount, sig) {
+  try {
+    const key = "payhist:" + wallet;
+    const cur = (await store.kvGet(key)) || [];
+    const list = Array.isArray(cur) ? cur : [];
+    list.unshift({ kind, amount, sig, ts: Date.now() });
+    await store.kvSet(key, list.slice(0, 50));
+  } catch (e) { /* history is best-effort — never block a payout on it */ }
+}
+
 async function sigLanded(sig) {   // true = confirmed on-chain with no error; false = not found / failed
   if (!sig) return false;
   try { const st = await conn.getSignatureStatuses([sig], { searchTransactionHistory: true }); const s = st.value[0];
@@ -1852,6 +1872,7 @@ async function _payoutQuestReward(wallet) {
   if (landed) {
     for (let i = 0; i < 3; i++) { try { await store.qrPayoutConfirm(wallet, owed); recorded = true; break; } catch (e) { await new Promise(r => setTimeout(r, 400 * (i + 1))); } }
     pushFeed("questreward", { wallet, short: wallet.slice(0, 4) + "…" + wallet.slice(-4), chikiPaid: owed, signature: out.sig });
+    await recordPayout(wallet, "quest", owed, out.sig);
     return { paid: true, signature: out.sig, amount: owed, recorded };
   }
   if (!recorded) return { sent: true, unrecorded: true, signature: out.sig, amount: owed, note: "SENT but the sig could not be recorded — reconcile via /quest/rewards/reconcile before re-running" };
@@ -2046,6 +2067,7 @@ async function _payoutOne(wallet) {
   if (landed) {
     for (let i = 0; i < 3; i++) { try { await store.payoutConfirm(wallet, out.sig); recorded = true; break; } catch (e) { await new Promise(r => setTimeout(r, 400 * (i + 1))); } }
     pushFeed("questwin", { wallet, short: wallet.slice(0, 4) + "…" + wallet.slice(-4), chikiPaid: WINNER_REWARD, signature: out.sig });
+    await recordPayout(wallet, "winner", WINNER_REWARD, out.sig);
     return { paid: true, signature: out.sig, recorded };
   }
   if (!recorded) return { sent: true, unrecorded: true, signature: out.sig, note: "SENT but the sig could not be recorded — reconcile via /quest/reconcile with THIS signature before re-running payout (do NOT blind-retry)" };
