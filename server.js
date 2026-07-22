@@ -2922,6 +2922,56 @@ app.post("/market/buy-onchain", async (req, res) => {
   res.json({ ok: true, released: { id: row.id, kind: row.kind, item: row.item, qty: row.qty, lvl: row.lvl, xp: row.xp }, txSig: sig });
 });
 
+// ---- ORDER settlement (real $CHIKI): the POSTER pays a pending delivery. Their ONE signed
+// transaction must carry the same verified 75/20/5 split as a listing buy, with the FILLER in
+// the seller seat. On verification: order closes, goods queue to the poster (fills poll), and
+// the filler gets an on-chain sale receipt (sales poll — no soft credit, the money is real).
+app.post("/market/order-pay", async (req, res) => {
+  if (!MARKET_ONCHAIN) return res.status(503).json({ error: "on-chain trading is not enabled" });
+  const b = req.body || {};
+  const payer = String(b.payer || "");
+  const sig = stripTags(String(b.txSig || "")).slice(0, 120);
+  const id = stripTags(String(b.orderId || "")).slice(0, 40);
+  if (!isPubkey(payer)) return res.status(400).json({ error: "valid payer wallet required" });
+  if (!sig || !id) return res.status(400).json({ error: "txSig and orderId required" });
+  if (_usedTxSigs.has(sig)) return res.status(409).json({ error: "that transaction was already used" });
+  pruneMarket();
+  const row = marketOrders.find(x => x.id === id);
+  if (!row) return res.status(404).json({ error: "order is gone" });
+  if (row.state !== "delivered" || !isPubkey(String(row.fillerWallet || ""))) return res.status(409).json({ error: "no delivery is awaiting payment on that order" });
+  if (payer !== String(row.wallet || "")) return res.status(403).json({ error: "only the order's poster wallet can pay it" });
+  // RESERVE the row: while `paying` is fresh, decline / undeliver / expiry are all refused, so
+  // the order can't be torn down between tx broadcast and verification (money-goods atomicity)
+  row.paying = Date.now();
+  // CLAIM the sig BEFORE the async verify (TOCTOU) — one payment can never settle twice
+  _usedTxSigs.add(sig);
+  if (_usedTxSigs.size > 20000) { const it = _usedTxSigs.values(); for (let i = 0; i < 5000; i++) { const v = it.next().value; if (v === undefined) break; _usedTxSigs.delete(v); } }
+  // the client submits the sig the moment Phantom broadcasts, usually BEFORE the cluster reaches
+  // 'confirmed' — a single lookup would routinely miss a perfectly good payment and strand real
+  // $CHIKI. Poll for up to ~20s before giving up.
+  let split = { ok: false, reason: "transaction not confirmed" };
+  for (let tries = 0; tries < 8; tries++) {
+    split = await txMarketSplit(sig, payer, String(row.fillerWallet), Number(row.price) || 0);
+    if (split.ok || !/not confirmed|rpc error/i.test(String(split.reason || ""))) break;
+    await new Promise(r => setTimeout(r, 2500));
+  }
+  if (!split.ok) { _usedTxSigs.delete(sig); delete row.paying; return res.status(409).json({ error: `on-chain split for that signature failed: ${split.reason} — if you approved it in Phantom, wait a few seconds and press Pay again (the same payment is retried, never re-charged)` }); }
+  saveUsedSigs();
+  // re-fetch: the reservation blocks decline/expiry, but never trust a 20s-old reference
+  const fresh = marketOrders.find(x => x.id === id) || row;
+  marketOrders = marketOrders.filter(x => x.id !== id);
+  // goods to the POSTER (their client grants via the fills poll). Value-bearing: never cap-drop.
+  const farr = marketFills[fresh.sid] || (marketFills[fresh.sid] = []);
+  if (!farr.some(f => f.id === fresh.id))
+    farr.push({ id: fresh.id, item: fresh.item, kind: fresh.kind, qty: fresh.qty, price: fresh.price, fillerName: fresh.fillerName || "a trainer", ts: Date.now() });
+  // on-chain receipt to the FILLER (their client records it via the sales poll, no soft credit)
+  const sarr = marketSales[fresh.fillerSid] || (marketSales[fresh.fillerSid] = []);
+  if (!sarr.some(s => s.id === fresh.id))
+    sarr.push({ id: fresh.id, item: fresh.item, kind: fresh.kind, qty: fresh.qty, price: fresh.price, buyer: payer.slice(0, 8), buyerName: fresh.buyer, onchain: true, txSig: sig, sellerNet: split.seller, teamTax: split.team, ts: Date.now() });
+  saveMarket();
+  res.json({ ok: true, txSig: sig });
+});
+
 // ---- Trading Post: a shared player-to-player market of in-game items for in-game $CHIKI.
 // In-memory ring (persisted best-effort to kv). Items + soft-currency only — no on-chain funds.
 // SETTLEMENT: when a listing is bought, the sale is RECORDED for the seller; the seller's
@@ -2934,9 +2984,20 @@ let marketFills = {};                        // buyer sid -> [ {id,item,kind,qty
 const MARKET_TTL_MS = 24 * 60 * 60 * 1000;   // listings expire after a day
 store.kvGet("market_listings").then(v => { if (Array.isArray(v)) marketListings = v.filter(l => l && Date.now() - (l.ts || 0) < MARKET_TTL_MS); }).catch(() => {});
 store.kvGet("market_sales").then(v => { if (v && typeof v === "object") marketSales = v; }).catch(() => {});
-store.kvGet("market_orders").then(v => { if (Array.isArray(v)) marketOrders = v.filter(o => o && Date.now() - (o.ts || 0) < MARKET_TTL_MS); }).catch(() => {});
+store.kvGet("market_orders").then(v => { if (Array.isArray(v)) marketOrders = v.filter(o => o && (o.state === "delivered" ? Date.now() - (o.deliveredTs || 0) < ORDER_PAY_WINDOW_MS + 3600000 : Date.now() - (o.ts || 0) < MARKET_TTL_MS)); }).catch(() => {});
 store.kvGet("market_fills").then(v => { if (v && typeof v === "object") marketFills = v; }).catch(() => {});
 function saveMarket() { store.kvSet("market_listings", marketListings.slice(-400)).catch(() => {}); store.kvSet("market_sales", marketSales).catch(() => {}); store.kvSet("market_orders", marketOrders.slice(-200)).catch(() => {}); store.kvSet("market_fills", marketFills).catch(() => {}); }
+const ORDER_PAY_WINDOW_MS = 48 * 3600 * 1000; // poster has 48h to pay a delivery, then goods auto-return
+// hand a pending delivery's goods back to the filler (decline / payment window expired) via the
+// fills queue their client already polls; `returned` switches the client to the goods-back toast
+function returnOrderGoods(row, why) {
+  if (!row.fillerSid) return;
+  const arr = marketFills[row.fillerSid] || (marketFills[row.fillerSid] = []);
+  // value-bearing: the filler's staked goods ride on this record — never cap-drop it (memory is
+  // bounded by the 200-order book + the 7-day fills TTL)
+  if (!arr.some(f => f.id === row.id))
+    arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, fillerName: row.buyer, returned: true, why, ts: Date.now() });
+}
 function pruneMarket() {
   const now = Date.now();
   marketListings = marketListings.filter(l => now - (l.ts || 0) < MARKET_TTL_MS);
@@ -2945,7 +3006,18 @@ function pruneMarket() {
     marketSales[sid] = (marketSales[sid] || []).filter(s => now - (s.ts || 0) < 7 * 24 * 3600 * 1000);
     if (!marketSales[sid].length) delete marketSales[sid];
   }
-  marketOrders = marketOrders.filter(o => now - (o.ts || 0) < MARKET_TTL_MS);
+  // orders: drop LEGACY soft-escrow rows (no wallet — pre-real-rail, unpayable); a DELIVERED
+  // order is exempt from the open-order TTL but auto-returns its goods when the pay window ends
+  marketOrders = marketOrders.filter(o => {
+    if (!isPubkey(String(o.wallet || ""))) return false;
+    if (o.state === "delivered") {
+      if (o.paying && now - o.paying < 90000) return true;   // a payment is being verified — hold
+      if (now - (o.deliveredTs || 0) < ORDER_PAY_WINDOW_MS) return true;
+      returnOrderGoods(o, "expired");
+      return false;
+    }
+    return now - (o.ts || 0) < MARKET_TTL_MS;
+  });
   for (const sid of Object.keys(marketFills)) {
     marketFills[sid] = (marketFills[sid] || []).filter(f => now - (f.ts || 0) < 7 * 24 * 3600 * 1000);
     if (!marketFills[sid].length) delete marketFills[sid];
@@ -2964,7 +3036,7 @@ function pruneMarket() {
         .forEach(([k]) => delete marketSales[k]);
   }
 }
-app.get("/market/list", (_q, res) => { pruneMarket(); res.json({ listings: marketListings.slice(-300), orders: marketOrders.slice(-100) }); });
+app.get("/market/list", (_q, res) => { pruneMarket(); res.json({ listings: marketListings.slice(-300), orders: marketOrders.slice(-200) }); });
 // pending order FILLS for one buyer — client receives the goods then acks with the ids
 app.get("/market/fills", (req, res) => {
   const sid = stripTags(String(req.query?.sid || "")).slice(0, 40);
@@ -2977,7 +3049,7 @@ app.get("/market/sales", (req, res) => {
   if (!sid) return res.status(400).json({ error: "sid required" });
   res.json({ sales: (marketSales[sid] || []).slice(0, 40) });
 });
-app.post("/market/op", (req, res) => {
+app.post("/market/op", async (req, res) => {
   const b = req.body || {};
   const sid = stripTags(String(b.sid || "")).slice(0, 40);
   const op = String(b.op || "");
@@ -3025,43 +3097,85 @@ app.post("/market/op", (req, res) => {
     marketListings = marketListings.filter(x => !(x.id === id && x.sid === sid));
     cancelled = marketListings.length < before;   // true ONLY if a still-live listing was removed (else it already sold)
   } else if (op === "order_post") {
-    // WTB craft order: buyer escrows the offer client-side (signed save) and posts the want.
+    // WTB craft order — REAL-$CHIKI ONLY. No escrow moves at post time: the poster's wallet
+    // rides on the order and they sign the real 75/20/5 payment (via /market/order-pay) when a
+    // trainer delivers. Requires a wallet and (fail-open on RPC trouble) a live balance that can
+    // cover the offer, so fillers don't lock goods against a wallet that can't pay.
+    if (!MARKET_ONCHAIN) return res.status(503).json({ error: "orders are paused while on-chain trading is offline" });
+    const ow = stripTags(String(l.wallet || "")).slice(0, 44);
+    if (!isPubkey(ow)) return res.status(400).json({ error: "orders pay real $CHIKI — connect your Phantom wallet to post one" });
     const oid = stripTags(String(l.id || ("O" + Date.now() + Math.floor(Math.random() * 1e4)))).slice(0, 40);
-    if (!marketOrders.some(x => x.id === oid)) {
+    const price = clampF(l.price, 1, 50000, 1) | 0;
+    try {
+      const bal = await chikiBalance(ow, true);
+      if (bal < price) return res.status(403).json({ error: `your wallet holds ${Math.floor(bal).toLocaleString()} $CHIKI — not enough to back a ${price.toLocaleString()} offer` });
+    } catch (e) { /* RPC down: allow the post — decline + the 48h auto-return bound the risk */ }
+    const clash = marketOrders.find(x => x.id === oid);
+    if (clash && clash.sid !== sid) return res.status(409).json({ error: "order id collision — repost" });
+    if (!clash) {
       if (marketOrders.filter(x => x.sid === sid).length >= 3) return res.status(429).json({ error: "3 open orders max" });
       marketOrders.push({
         id: oid,
-        buyer: stripTags(String(l.seller || "Trainer")).slice(0, 20), sid,
+        buyer: stripTags(String(l.seller || "Trainer")).slice(0, 20), sid, wallet: ow,
         kind: (["ffish", "pot"].includes(String(l.kind)) ? String(l.kind) : "mat"),
         item: stripTags(String(l.item || "wood")).slice(0, 24),
-        qty: clampF(l.qty, 1, 99, 1) | 0, price: clampF(l.price, 1, 50000, 1) | 0, ts: Date.now(),
+        qty: clampF(l.qty, 1, 99, 1) | 0, price, ts: Date.now(),
       });
-      if (marketOrders.length > 200) marketOrders.shift();
+      // cap eviction must NEVER destroy a delivered row (a filler's staked goods live on it)
+      while (marketOrders.length > 200) {
+        const oi = marketOrders.findIndex(x => x.state !== "delivered");
+        if (oi < 0) break;
+        marketOrders.splice(oi, 1);
+      }
     }
   } else if (op === "order_fill") {
+    // LEGACY soft-settlement fill from a stale cached client — never allow it against the
+    // real-$CHIKI book. filled:false makes the old client keep its goods and show "too late".
+    return res.json({ ok: true, filled: false, listings: marketListings.slice(-300) });
+  } else if (op === "order_deliver") {
+    // a filler stakes goods against an open order: the order LOCKS (one delivery at a time),
+    // the goods leave the filler's bag client-side, and the poster is asked to pay real $CHIKI.
     const oid = stripTags(String(l.id || "")).slice(0, 40);
+    const fw = stripTags(String(l.fillerWallet || "")).slice(0, 44);
     const row = marketOrders.find(x => x.id === oid);
-    var filled = false;
-    // can't fill your own order (that would launder the 25% market fee back to yourself)
-    if (row && row.sid && row.sid !== sid) {
-      const arr = marketFills[row.sid] || (marketFills[row.sid] = []);
-      const fillerName = stripTags(String(b.buyerName || "")).slice(0, 20);
-      if (!arr.some(f => f.id === row.id) && arr.length < 50)
-        arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, fillerName, ts: Date.now() });
-      marketOrders = marketOrders.filter(x => x.id !== oid);
-      filled = true;
-    } else if (row) {
-      return res.status(409).json({ error: "you can't fill your own order" });
-    }
+    if (!row || row.state === "delivered") return res.json({ ok: true, delivered: false });
+    if (row.sid === sid) return res.status(409).json({ error: "you can't deliver your own order" });
+    if (!isPubkey(fw)) return res.status(400).json({ error: "connect your Phantom wallet — deliveries pay you real $CHIKI" });
+    if (fw === row.wallet) return res.status(409).json({ error: "you can't deliver to your own wallet" });
+    row.state = "delivered";
+    row.fillerSid = sid;
+    row.fillerWallet = fw;
+    row.fillerName = stripTags(String(b.buyerName || "")).slice(0, 20);
+    row.deliveredTs = Date.now();
     saveMarket();
-    // the FILLED flag is authoritative: two racing fillers -> only the first gets true, and only
-    // that client deducts goods + credits the 75% — the loser keeps everything and gets told
-    return res.json({ ok: true, filled, listings: marketListings.slice(-300) });
+    // the DELIVERED flag is authoritative: two racing deliverers -> only the first gets true,
+    // and only that client hands over goods — the loser keeps everything and gets told
+    return res.json({ ok: true, delivered: true });
+  } else if (op === "order_undeliver") {
+    // the FILLER backs out of their own pending delivery (couldn't actually stake the goods,
+    // or an ambiguous network failure) — reopen the order. Refused mid-payment.
+    const oid = stripTags(String(l.id || "")).slice(0, 40);
+    const row = marketOrders.find(x => x.id === oid && x.state === "delivered" && x.fillerSid === sid);
+    if (row && row.paying && Date.now() - row.paying < 90000) return res.status(409).json({ error: "the poster is paying right now" });
+    if (row) {
+      delete row.state; delete row.fillerSid; delete row.fillerWallet; delete row.fillerName; delete row.deliveredTs; delete row.paying;
+    }
+    cancelled = !!row;
+  } else if (op === "order_decline") {
+    // the poster refuses to pay a pending delivery: goods go BACK to the filler (fills queue,
+    // flagged returned) and the order closes. Refused while a payment is being verified.
+    const oid = stripTags(String(l.id || "")).slice(0, 40);
+    const row = marketOrders.find(x => x.id === oid && x.sid === sid);
+    if (row && row.paying && Date.now() - row.paying < 90000) return res.status(409).json({ error: "your payment for this delivery is being verified — it can't be declined now" });
+    if (row && row.state === "delivered") returnOrderGoods(row, "declined");
+    if (row) marketOrders = marketOrders.filter(x => x.id !== oid);
+    cancelled = !!row;
   } else if (op === "order_cancel") {
     const oid = stripTags(String(l.id || "")).slice(0, 40);
-    const before = marketOrders.length;
+    const row = marketOrders.find(x => x.id === oid && x.sid === sid);
+    if (row && row.state === "delivered") return res.status(409).json({ error: "a delivery is awaiting your payment — pay it or decline it first" });
     marketOrders = marketOrders.filter(x => !(x.id === oid && x.sid === sid));
-    cancelled = marketOrders.length < before;   // true ONLY if still open — the buyer's client refunds the escrow
+    cancelled = !!row;                          // nothing to refund — real orders hold no escrow
   } else if (op === "fills_ack") {
     const rawIds = Array.isArray(b.ids) ? b.ids : (b.listing && Array.isArray(b.listing.ids) ? b.listing.ids : []);
     const ids = rawIds.map(x => String(x).slice(0, 40));
