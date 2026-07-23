@@ -2897,6 +2897,17 @@ app.get("/world/players", (req, res) => {
   const wallet = req.query?.wallet || "", x = clampF(req.query?.x, -100000, 100000, 0), z = clampF(req.query?.z, -100000, 100000, 0);
   res.json({ players: worldSnapshot(wallet, x, z), online: worldPlayers.size });
 });
+// The "who's online" roster behind the presence pill. Sourced from the SAME worldPlayers map that
+// backs the pill's count (NOT chat presence) — so the list can never say "no one" while the count
+// says N. Returns EVERY live trainer (handle + short wallet), not distance-filtered, incl. the caller.
+app.get("/world/roster", (_q, res) => {
+  const now = Date.now(); const users = [];
+  for (const [w, p] of worldPlayers) {
+    if (now - p.ts > WORLD_TTL_MS) { worldPlayers.delete(w); continue; }
+    users.push({ wallet: w, handle: p.handle || null, short: w.length >= 8 ? (w.slice(0, 4) + "…" + w.slice(-4)) : w, admin: isAdminWallet(w) });
+  }
+  res.json({ users, count: users.length });
+});
 setInterval(() => { const now = Date.now(); for (const [w, p] of worldPlayers) if (now - p.ts > WORLD_TTL_MS) worldPlayers.delete(w); }, 10000);
 
 // Shared-world chat — a PERSISTED rolling log (kv), served in full so every player can scroll
