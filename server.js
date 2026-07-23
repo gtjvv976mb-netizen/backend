@@ -2807,16 +2807,34 @@ app.get("/world/players", (req, res) => {
 });
 setInterval(() => { const now = Date.now(); for (const [w, p] of worldPlayers) if (now - p.ts > WORLD_TTL_MS) worldPlayers.delete(w); }, 10000);
 
-// Shared-world chat (in-memory ring buffer). Lightweight — the open-world social channel.
+// Shared-world chat — a PERSISTED rolling log (kv), served in full so every player can scroll
+// back through everyone's messages, including from before they logged in. History survives
+// server restarts; the 1000-message window is the only trim.
 const worldChat = [];
+store.kvGet("world_chat").then(v => { if (Array.isArray(v) && !worldChat.length) worldChat.push(...v.slice(-1000)); }).catch(() => {});
+let _chatSavedAt = 0;
+function saveWorldChat() {
+  const now = Date.now();
+  if (now - _chatSavedAt < 5000) return;   // batch writes — chat can be bursty
+  _chatSavedAt = now;
+  store.kvSet("world_chat", worldChat.slice(-1000)).catch(() => {});
+}
 app.post("/world/chat", (req, res) => {
   const b = req.body || {};
   if (!isPresenceId(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
   const text = stripTags(String(b.text || "")).slice(0, 200).trim();
-  if (text) { worldChat.push({ handle: stripTags(String(b.handle || "Trainer")).slice(0, 20), short: b.wallet.slice(0, 4) + "…" + b.wallet.slice(-4), text, ts: Date.now() }); if (worldChat.length > 200) worldChat.shift(); }
+  if (text) {
+    worldChat.push({ handle: stripTags(String(b.handle || "Trainer")).slice(0, 20), short: b.wallet.slice(0, 4) + "…" + b.wallet.slice(-4), text, ts: Date.now() });
+    if (worldChat.length > 1000) worldChat.shift();
+    saveWorldChat();
+  }
   res.json({ ok: true, messages: worldChat.slice(-40) });
 });
-app.get("/world/chat", (_q, res) => res.json({ messages: worldChat.slice(-40) }));
+// full history on request (first load); incremental polls pass ?since=<last ts>
+app.get("/world/chat", (req, res) => {
+  const since = Number(req.query?.since) || 0;
+  res.json({ messages: since > 0 ? worldChat.filter(m => m.ts > since).slice(-200) : worldChat.slice(-1000) });
+});
 
 // ---- Whispers (direct messages). In-memory inbox per recipient presence-id. Cosmetic social
 // layer — presence-id gated (same as world chat), sanitised, capped. No history persistence.
