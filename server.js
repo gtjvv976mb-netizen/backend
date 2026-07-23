@@ -359,10 +359,16 @@ function pgStore() {
       await pool.query(`ALTER TABLE quest_winners ADD COLUMN IF NOT EXISTS payout_lvbh BIGINT`);
       await pool.query(`CREATE TABLE IF NOT EXISTS quest_rewards(
         wallet TEXT PRIMARY KEY,
-        done_mask INT NOT NULL DEFAULT 0,
+        done_mask BIGINT NOT NULL DEFAULT 0,
         paid_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
         payout_sig TEXT, payout_at BIGINT, payout_lvbh BIGINT, payout_amount DOUBLE PRECISION
       )`);
+      // 63-chapter masks use bits up to 62 — widen a legacy INT column in place (values keep
+      // their bit positions). Guarded so the rewrite only ever runs once.
+      const dmType = await pool.query(`SELECT data_type FROM information_schema.columns
+        WHERE table_name='quest_rewards' AND column_name='done_mask'`);
+      if (dmType.rows[0] && dmType.rows[0].data_type === "integer")
+        await pool.query(`ALTER TABLE quest_rewards ALTER COLUMN done_mask TYPE BIGINT`);
     },
     async kvGet(k) { const r = await pool.query(`SELECT v FROM kv WHERE k=$1`, [k]); return r.rows[0]?.v ?? null; },
     async kvSet(k, v) { await pool.query(`INSERT INTO kv(k,v) VALUES($1,$2::jsonb) ON CONFLICT(k) DO UPDATE SET v=$2::jsonb`, [k, JSON.stringify(v)]); },
@@ -411,7 +417,7 @@ function pgStore() {
     async payoutConfirm(wallet, sig) { await pool.query(`UPDATE quest_winners SET paid=true, payout_sig=$2 WHERE wallet=$1`, [wallet, sig]); },
     async payoutClear(wallet) { await pool.query(`UPDATE quest_winners SET payout_at=0, payout_sig=NULL, payout_lvbh=0 WHERE wallet=$1 AND paid=false`, [wallet]); },
     // ---- per-quest reward pouch: idempotent accrual (done_mask bit-OR) + variable-amount admin payout ----
-    async qrAccrue(wallet, bit) { await pool.query(`INSERT INTO quest_rewards(wallet,done_mask) VALUES($1,$2) ON CONFLICT(wallet) DO UPDATE SET done_mask = quest_rewards.done_mask | $2`, [wallet, bit|0]); },
+    async qrAccrue(wallet, bit) { await pool.query(`INSERT INTO quest_rewards(wallet,done_mask) VALUES($1,$2::bigint) ON CONFLICT(wallet) DO UPDATE SET done_mask = quest_rewards.done_mask | $2::bigint`, [wallet, questMask(bit).toString()]); },
     async qrGet(wallet) { const r = await pool.query(`SELECT wallet,done_mask,paid_amount,payout_sig,payout_at,payout_lvbh,payout_amount FROM quest_rewards WHERE wallet=$1`, [wallet]); return r.rows[0] || null; },
     async qrList(limit) { const r = await pool.query(`SELECT wallet,done_mask,paid_amount FROM quest_rewards WHERE done_mask > 0 ORDER BY wallet LIMIT $1`, [Math.max(1, limit|0)]); return r.rows; },
     async qrPayoutBegin(wallet) {
@@ -426,7 +432,7 @@ function pgStore() {
         if (pat && now - pat < 120000 && row.payout_sig) { await c.query("COMMIT"); return { state: "inflight", sig: row.payout_sig }; }
         await c.query("UPDATE quest_rewards SET payout_at=$2::bigint WHERE wallet=$1", [wallet, now]);
         await c.query("COMMIT");
-        return { state: "proceed", doneMask: Number(row.done_mask)||0, paidAmount: Number(row.paid_amount)||0,
+        return { state: "proceed", doneMask: String(row.done_mask || 0), paidAmount: Number(row.paid_amount)||0,
                  priorSig: row.payout_sig||null, priorAt: pat, priorLvbh: row.payout_lvbh?Number(row.payout_lvbh):0, priorAmount: Number(row.payout_amount)||0 };
       } catch (e) { try { await c.query("ROLLBACK"); } catch(_){} throw e; } finally { c.release(); }
     },
@@ -602,13 +608,13 @@ function memStore() {
     async payoutRecordSig(wallet, sig, lvbh, now) { const r=_memWinners.get(wallet); if(r&&!r.paid){ r.payout_sig=sig; r.payout_lvbh=lvbh||0; r.payout_at=now; } },
     async payoutConfirm(wallet, sig) { const r=_memWinners.get(wallet); if(r){ r.paid=true; r.payout_sig=sig; } },
     async payoutClear(wallet) { const r=_memWinners.get(wallet); if(r&&!r.paid){ r.payout_at=0; r.payout_sig=null; r.payout_lvbh=0; } },
-    async qrAccrue(wallet, bit) { const r=_memQR.get(wallet)||{wallet,done_mask:0,paid_amount:0,payout_sig:null,payout_at:0,payout_lvbh:0,payout_amount:0}; r.done_mask=(r.done_mask|0)|(bit|0); _memQR.set(wallet,r); },
+    async qrAccrue(wallet, bit) { const r=_memQR.get(wallet)||{wallet,done_mask:0n,paid_amount:0,payout_sig:null,payout_at:0,payout_lvbh:0,payout_amount:0}; r.done_mask=questMask(r.done_mask)|questMask(bit); _memQR.set(wallet,r); },
     async qrGet(wallet) { return _memQR.get(wallet)||null; },
     async qrList(limit) { return [..._memQR.values()].filter(r=>r.done_mask>0).slice(0,Math.max(1,limit|0)); },
     async qrPayoutBegin(wallet) { return _memWith(async()=>{ const r=_memQR.get(wallet); if(!r) return {state:"none"};
       const now=Date.now(), pat=r.payout_at||0; if(pat && now-pat<120000 && r.payout_sig) return {state:"inflight",sig:r.payout_sig};
       const prior={priorSig:r.payout_sig||null,priorAt:pat,priorLvbh:r.payout_lvbh||0,priorAmount:r.payout_amount||0}; r.payout_at=now;
-      return {state:"proceed",doneMask:r.done_mask|0,paidAmount:r.paid_amount||0,...prior}; }); },
+      return {state:"proceed",doneMask:String(r.done_mask||0),paidAmount:r.paid_amount||0,...prior}; }); },
     async qrPayoutRecordSig(wallet, sig, lvbh, amount, now) { const r=_memQR.get(wallet); if(r){ r.payout_sig=sig; r.payout_lvbh=lvbh||0; r.payout_amount=amount; r.payout_at=now; } },
     async qrPayoutConfirm(wallet, amount) { const r=_memQR.get(wallet); if(r && (r.payout_sig || r.payout_at)){ r.paid_amount=(r.paid_amount||0)+((r.payout_amount||0)>=1?r.payout_amount:amount); r.payout_sig=null; r.payout_lvbh=0; r.payout_amount=0; r.payout_at=0; } },
     async qrPayoutClear(wallet) { const r=_memQR.get(wallet); if(r){ r.payout_sig=null; r.payout_lvbh=0; r.payout_amount=0; r.payout_at=0; } },
@@ -1697,34 +1703,84 @@ const CHIKI_DECIMALS = Math.max(0, Number(process.env.CHIKI_DECIMALS || 6));   /
 // Their ids + RELATIVE order here must match the client's real-tagged chapters exactly (the
 // server enforces in-order completion); the other 42 chapters pay soft in-game $CHIKI and are
 // never reported. Amounts sum to 100,000/player — unchanged by the Act I expansion.
+// ALL 63 story chapters pay REAL $CHIKI (2026-07-23: the 42 former soft chapters were
+// promoted). ORDER = campaign chapter order — the in-order gate walks this list.
+// "bit" = the chapter's PERMANENT position in quest_rewards.done_mask (BIGINT).
+// Legacy bits 0-20 belong to the original 21 chapters in their OLD list order and
+// must NEVER move (live wallets hold masks minted at those positions); promoted
+// chapters take bits 21-62 in chapter order. 63 bits > 32 → ALL mask math is BigInt.
 const MAIN_QUESTS = [
-  { id: "s_meet",    chiki: 1000 },
-  { id: "s_kill",    chiki: 1500 },
-  { id: "s_gather",  chiki: 2000 },
-  { id: "s_stone",   chiki: 2500 },
-  { id: "s_craft",   chiki: 2500 },
-  { id: "s_forage",  chiki: 3500 },
-  { id: "s_fish",    chiki: 4000 },
-  { id: "s_hunt",    chiki: 5000 },
-  { id: "s_shell",   chiki: 3500 },
-  { id: "s_gear",    chiki: 4000 },
-  { id: "s_meat",    chiki: 4500 },
-  { id: "s_stock",   chiki: 5000 },
-  { id: "s_chiki",   chiki: 5500 },
-  { id: "s_honey",   chiki: 5500 },
-  { id: "s_ore",     chiki: 5500 },
-  { id: "s_angler",  chiki: 6000 },
-  { id: "s_slayer",  chiki: 7500 },
-  { id: "s_forge2",  chiki: 7000 },
-  { id: "s_crystal", chiki: 7500 },
-  { id: "s_train",   chiki: 7500 },
-  { id: "s_ascend",  chiki: 9000 },
+  { id: "s_meet",      chiki: 1000, bit: 0 },   // Ch.1
+  { id: "s_kill",      chiki: 1500, bit: 1 },   // Ch.2
+  { id: "s_gather",    chiki: 2000, bit: 2 },   // Ch.3
+  { id: "s_stone",     chiki: 2500, bit: 3 },   // Ch.4
+  { id: "s_craft",     chiki: 2500, bit: 4 },   // Ch.5
+  { id: "s_forage",    chiki: 3500, bit: 5 },   // Ch.6
+  { id: "s_fish",      chiki: 4000, bit: 6 },   // Ch.7
+  { id: "s2_flower",   chiki: 60,   bit: 21 },   // Ch.8
+  { id: "s2_pork",     chiki: 70,   bit: 22 },   // Ch.9
+  { id: "s2_potion",   chiki: 80,   bit: 23 },   // Ch.10
+  { id: "s2_cook",     chiki: 80,   bit: 24 },   // Ch.11
+  { id: "s2_train5",   chiki: 90,   bit: 25 },   // Ch.12
+  { id: "s2_kill2",    chiki: 100,  bit: 26 },   // Ch.13
+  { id: "s2_honey1",   chiki: 100,  bit: 27 },   // Ch.14
+  { id: "s_hunt",      chiki: 5000, bit: 7 },   // Ch.15
+  { id: "s_shell",     chiki: 3500, bit: 8 },   // Ch.16
+  { id: "s_gear",      chiki: 4000, bit: 9 },   // Ch.17
+  { id: "s_meat",      chiki: 4500, bit: 10 },   // Ch.18
+  { id: "s2_comp4",    chiki: 110,  bit: 28 },   // Ch.19
+  { id: "s_stock",     chiki: 5000, bit: 11 },   // Ch.20
+  { id: "s2_fish2",    chiki: 120,  bit: 29 },   // Ch.21
+  { id: "s2_berry2",   chiki: 130,  bit: 30 },   // Ch.22
+  { id: "s2_ffish",    chiki: 150,  bit: 31 },   // Ch.23
+  { id: "s2_ffgold",   chiki: 160,  bit: 32 },   // Ch.24
+  { id: "s2_eggmake",  chiki: 160,  bit: 33 },   // Ch.25
+  { id: "s2_tend",     chiki: 150,  bit: 34 },   // Ch.26
+  { id: "s_chiki",     chiki: 5500, bit: 12 },   // Ch.27
+  { id: "s2_hatch1",   chiki: 200,  bit: 35 },   // Ch.28
+  { id: "s_honey",     chiki: 5500, bit: 13 },   // Ch.29
+  { id: "s2_train10",  chiki: 180,  bit: 36 },   // Ch.30
+  { id: "s2_ffkoi",    chiki: 220,  bit: 37 },   // Ch.31
+  { id: "s2_hide",     chiki: 200,  bit: 38 },   // Ch.32
+  { id: "s2_eggmount", chiki: 220,  bit: 39 },   // Ch.33
+  { id: "s2_kill3",    chiki: 240,  bit: 40 },   // Ch.34
+  { id: "s2_hatchmount",chiki: 280,  bit: 41 },   // Ch.35
+  { id: "s2_ride",     chiki: 240,  bit: 42 },   // Ch.36
+  { id: "s_ore",       chiki: 5500, bit: 14 },   // Ch.37
+  { id: "s2_list",     chiki: 260,  bit: 43 },   // Ch.38
+  { id: "s2_sold",     chiki: 280,  bit: 44 },   // Ch.39
+  { id: "s2_buy",      chiki: 260,  bit: 45 },   // Ch.40
+  { id: "s2_merchant", chiki: 300,  bit: 46 },   // Ch.41
+  { id: "s_angler",    chiki: 6000, bit: 15 },   // Ch.42
+  { id: "s2_train15",  chiki: 320,  bit: 47 },   // Ch.43
+  { id: "s2_ffeel",    chiki: 360,  bit: 48 },   // Ch.44
+  { id: "s2_ore2",     chiki: 340,  bit: 49 },   // Ch.45
+  { id: "s2_eggleg",   chiki: 380,  bit: 50 },   // Ch.46
+  { id: "s_slayer",    chiki: 7500, bit: 16 },   // Ch.47
+  { id: "s_forge2",    chiki: 7000, bit: 17 },   // Ch.48
+  { id: "s2_hatchleg", chiki: 450,  bit: 51 },   // Ch.49
+  { id: "s_crystal",   chiki: 7500, bit: 18 },   // Ch.50
+  { id: "s_train",     chiki: 7500, bit: 19 },   // Ch.51
+  { id: "s2_train20",  chiki: 420,  bit: 52 },   // Ch.52
+  { id: "s2_ffrain1",  chiki: 500,  bit: 53 },   // Ch.53
+  { id: "s2_scroll",   chiki: 500,  bit: 54 },   // Ch.54
+  { id: "s2_kill4",    chiki: 420,  bit: 55 },   // Ch.55
+  { id: "s2_comp14",   chiki: 450,  bit: 56 },   // Ch.56
+  { id: "s2_ffrain10", chiki: 600,  bit: 57 },   // Ch.57
+  { id: "s2_eggmeme",  chiki: 550,  bit: 58 },   // Ch.58
+  { id: "s2_hatchmeme",chiki: 600,  bit: 59 },   // Ch.59
+  { id: "s2_kill5",    chiki: 550,  bit: 60 },   // Ch.60
+  { id: "s2_crystal2", chiki: 550,  bit: 61 },   // Ch.61
+  { id: "s2_feast",    chiki: 600,  bit: 62 },   // Ch.62
+  { id: "s_ascend",    chiki: 9000, bit: 20 },   // Ch.63
 ];
 // Per-quest $CHIKI rewards accrue to a per-player pouch (admin-released, SEPARATE from the grand prize).
 const QUEST_REWARD_AMT   = new Map(MAIN_QUESTS.map(q => [q.id, q.chiki || 0]));
-const QUEST_BIT          = new Map(MAIN_QUESTS.map((q, i) => [q.id, 1 << i]));
-const QUEST_REWARD_TOTAL = MAIN_QUESTS.reduce((a, q) => a + (q.chiki || 0), 0);   // 100000 per player when all done
-function questEarned(mask) { let s = 0; MAIN_QUESTS.forEach((q, i) => { if (((mask | 0) & (1 << i))) s += (q.chiki || 0); }); return s; }
+const QUEST_BIT          = new Map(MAIN_QUESTS.map(q => [q.id, 1n << BigInt(q.bit)]));   // BigInt — bits reach 62
+const QUEST_REWARD_TOTAL = MAIN_QUESTS.reduce((a, q) => a + (q.chiki || 0), 0);   // 112030 per player when all done
+// mask may arrive as Number, numeric string (pg BIGINT), or BigInt — normalize to BigInt
+function questMask(mask) { try { return BigInt(mask || 0); } catch (e) { return 0n; } }
+function questEarned(mask) { const m = questMask(mask); let s = 0; for (const q of MAIN_QUESTS) if (m & QUEST_BIT.get(q.id)) s += (q.chiki || 0); return s; }
 // REWARD MODEL — race to finish, ADMIN-GATED payout. The first WINNER_CAP wallets to COMPLETE THE WHOLE
 // questline are recorded as winners atomically (cross-instance safe, once each). NO $CHIKI is sent on
 // completion. An admin reviews the list and releases the pool in one idempotent, on-chain-reconciled batch
@@ -1908,7 +1964,7 @@ app.post("/quest/rewards", async (req, res) => {
   try {
     const rows = await store.qrList(9999);
     let owedTotal = 0;
-    const players = rows.map(r => { const earned = Math.min(QUEST_REWARD_TOTAL, questEarned(Number(r.done_mask) || 0)); const paid = Number(r.paid_amount) || 0; const owed = Math.max(0, Math.floor(earned - paid)); owedTotal += owed; return { wallet: r.wallet, earned, paid, owed }; });
+    const players = rows.map(r => { const earned = Math.min(QUEST_REWARD_TOTAL, questEarned(r.done_mask)); const paid = Number(r.paid_amount) || 0; const owed = Math.max(0, Math.floor(earned - paid)); owedTotal += owed; return { wallet: r.wallet, earned, paid, owed }; });
     res.json({ ok: true, count: players.length, owedTotalChiki: owedTotal, perPlayerMax: QUEST_REWARD_TOTAL, players });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
@@ -1938,7 +1994,7 @@ app.post("/quest/rewards/reconcile", async (req, res) => {
     const r = await store.qrGet(wallet);
     if (!r) return res.status(404).json({ error: "no quest rewards for this wallet" });
     // expected in-flight amount = recorded payout_amount, or (if the record write failed) the recomputed owed.
-    const owedNow = Math.floor(Math.min(QUEST_REWARD_TOTAL, questEarned(Number(r.done_mask) || 0)) - (Number(r.paid_amount) || 0));
+    const owedNow = Math.floor(Math.min(QUEST_REWARD_TOTAL, questEarned(r.done_mask)) - (Number(r.paid_amount) || 0));
     const expectAmt = (Number(r.payout_amount) || 0) >= 1 ? Number(r.payout_amount) : owedNow;
     const sig = req.body?.sig ? String(req.body.sig) : null;
     if (sig) {
@@ -1964,10 +2020,10 @@ app.get("/quest/state", async (req, res) => {
     // SELF-HEAL: the pouch mask must cover every chapter the ledger says is done. Chapters
     // reported before the pouch feature shipped (or whose accrual write failed) are missing
     // their bit — back-fill on this read path so every player heals on their next login.
-    let qrMask = Number(qr.done_mask) || 0;
-    let ledMask = 0;
-    for (const qid of Object.keys(led.done)) ledMask |= (QUEST_BIT.get(qid) || 0);
-    if ((ledMask & ~qrMask) !== 0) {
+    let qrMask = questMask(qr.done_mask);
+    let ledMask = 0n;
+    for (const qid of Object.keys(led.done)) ledMask |= (QUEST_BIT.get(qid) || 0n);
+    if ((ledMask & ~qrMask) !== 0n) {
       try { await store.qrAccrue(wallet, ledMask); qrMask |= ledMask; }
       catch (e) { console.error("qrAccrue(state-heal) failed", wallet, String(e.message || e)); }
     }
