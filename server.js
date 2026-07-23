@@ -3000,12 +3000,47 @@ let marketListings = [];
 let marketSales = {};                        // seller sid -> [ {id,item,kind,qty,price,buyer,ts} ]
 let marketOrders = [];                       // WTB craft orders: {id, buyer, sid, kind, item, qty, price(total), ts}
 let marketFills = {};                        // buyer sid -> [ {id,item,kind,qty,price,fillerName,ts} ] — goods owed to the buyer
+let marketAuctions = [];                     // 🔨 chikimon auctions: {id, seller, sid, species, lvl, xp, minBid, curBid, curSid, curName, ts, endsAt}
+let auctionRefunds = {};                     // sid -> [ {rid,id,amt,ts} ] — outbid escrow going home
 const MARKET_TTL_MS = 24 * 60 * 60 * 1000;   // listings expire after a day
 store.kvGet("market_listings").then(v => { if (Array.isArray(v)) marketListings = v.filter(l => l && Date.now() - (l.ts || 0) < MARKET_TTL_MS); }).catch(() => {});
 store.kvGet("market_sales").then(v => { if (v && typeof v === "object") marketSales = v; }).catch(() => {});
 store.kvGet("market_orders").then(v => { if (Array.isArray(v)) marketOrders = v.filter(o => o && (o.state === "delivered" ? Date.now() - (o.deliveredTs || 0) < ORDER_PAY_WINDOW_MS + 3600000 : Date.now() - (o.ts || 0) < MARKET_TTL_MS)); }).catch(() => {});
 store.kvGet("market_fills").then(v => { if (v && typeof v === "object") marketFills = v; }).catch(() => {});
-function saveMarket() { store.kvSet("market_listings", marketListings.slice(-400)).catch(() => {}); store.kvSet("market_sales", marketSales).catch(() => {}); store.kvSet("market_orders", marketOrders.slice(-200)).catch(() => {}); store.kvSet("market_fills", marketFills).catch(() => {}); }
+store.kvGet("market_auctions").then(v => { if (Array.isArray(v)) marketAuctions = v; }).catch(() => {});
+store.kvGet("auction_refunds").then(v => { if (v && typeof v === "object") auctionRefunds = v; }).catch(() => {});
+function saveMarket() { store.kvSet("market_listings", marketListings.slice(-400)).catch(() => {}); store.kvSet("market_sales", marketSales).catch(() => {}); store.kvSet("market_orders", marketOrders.slice(-200)).catch(() => {}); store.kvSet("market_fills", marketFills).catch(() => {}); store.kvSet("market_auctions", marketAuctions.slice(-100)).catch(() => {}); store.kvSet("auction_refunds", auctionRefunds).catch(() => {}); }
+const AUCTION_MS = 12 * 3600 * 1000;         // every auction runs 12h — snappy, two cycles a day
+// the outbid bidder's escrow goes home through this queue (their client re-credits + acks)
+function queueAuctionRefund(sid, id, amt) {
+  if (!sid || !(amt > 0)) return;
+  const arr = auctionRefunds[sid] || (auctionRefunds[sid] = []);
+  arr.push({ rid: id + "#" + Date.now() + "#" + Math.floor(Math.random() * 1e4), id, amt, ts: Date.now() });
+}
+// settle every ENDED auction: winner gets the chikimon (fills queue), the seller gets a sale
+// record (their client credits the 75/20/5 split), a no-bid chikimon walks home to its seller
+function sweepAuctions(now) {
+  marketAuctions = marketAuctions.filter(a => {
+    if (now < (a.endsAt || 0)) return true;
+    if (a.curSid && a.curBid > 0) {
+      const farr = marketFills[a.curSid] || (marketFills[a.curSid] = []);
+      if (!farr.some(f => f.id === a.id))
+        farr.push({ id: a.id, item: a.species, kind: "chikimon", qty: 1, lvl: a.lvl, xp: a.xp, price: a.curBid, fillerName: a.seller, ts: now });
+      const sarr = marketSales[a.sid] || (marketSales[a.sid] = []);
+      if (!sarr.some(s => s.id === a.id))
+        sarr.push({ id: a.id, item: a.species, kind: "chikimon", qty: 1, price: a.curBid, buyer: String(a.curSid).slice(0, 8), buyerName: a.curName || "a trainer", ts: now });
+    } else {
+      const rarr = marketFills[a.sid] || (marketFills[a.sid] = []);
+      if (!rarr.some(f => f.id === a.id))
+        rarr.push({ id: a.id, item: a.species, kind: "chikimon", qty: 1, lvl: a.lvl, xp: a.xp, price: 0, fillerName: a.seller, returned: true, why: "noBids", ts: now });
+    }
+    return false;
+  });
+  for (const sid of Object.keys(auctionRefunds)) {
+    auctionRefunds[sid] = (auctionRefunds[sid] || []).filter(r => now - (r.ts || 0) < 7 * 24 * 3600 * 1000);
+    if (!auctionRefunds[sid].length) delete auctionRefunds[sid];
+  }
+}
 const ORDER_PAY_WINDOW_MS = 48 * 3600 * 1000; // poster has 48h to pay a delivery, then goods auto-return
 // hand a pending delivery's goods back to the filler (decline / payment window expired) via the
 // fills queue their client already polls; `returned` switches the client to the goods-back toast
@@ -3019,6 +3054,7 @@ function returnOrderGoods(row, why) {
 }
 function pruneMarket() {
   const now = Date.now();
+  sweepAuctions(now);
   marketListings = marketListings.filter(l => now - (l.ts || 0) < MARKET_TTL_MS);
   const sids = Object.keys(marketSales);
   for (const sid of sids) {
@@ -3055,12 +3091,12 @@ function pruneMarket() {
         .forEach(([k]) => delete marketSales[k]);
   }
 }
-app.get("/market/list", (_q, res) => { pruneMarket(); res.json({ listings: marketListings.slice(-300), orders: marketOrders.slice(-200) }); });
+app.get("/market/list", (_q, res) => { pruneMarket(); res.json({ listings: marketListings.slice(-300), orders: marketOrders.slice(-200), auctions: marketAuctions.slice(-100) }); });
 // pending order FILLS for one buyer — client receives the goods then acks with the ids
 app.get("/market/fills", (req, res) => {
   const sid = stripTags(String(req.query?.sid || "")).slice(0, 40);
   if (!sid) return res.status(400).json({ error: "sid required" });
-  res.json({ fills: (marketFills[sid] || []).slice(0, 40) });
+  res.json({ fills: (marketFills[sid] || []).slice(0, 40), refunds: (auctionRefunds[sid] || []).slice(0, 40) });
 });
 // pending sale proceeds for one seller — client credits then acks with the ids
 app.get("/market/sales", (req, res) => {
@@ -3195,6 +3231,51 @@ app.post("/market/op", async (req, res) => {
     if (row && row.state === "delivered") return res.status(409).json({ error: "a delivery is awaiting your payment — pay it or decline it first" });
     marketOrders = marketOrders.filter(x => !(x.id === oid && x.sid === sid));
     cancelled = !!row;                          // nothing to refund — real orders hold no escrow
+  } else if (op === "auction_post") {
+    // 🔨 a chikimon goes under the hammer: 12h, highest bid wins. The seller's client already
+    // took custody of the unit (it restores intact on cancel / no-bid return).
+    const aid = stripTags(String(l.id || "")).slice(0, 40);
+    if (!aid) return res.status(400).json({ error: "auction id required" });
+    if (!marketAuctions.some(x => x.id === aid)) {
+      if (marketAuctions.filter(x => x.sid === sid).length >= 2) return res.status(429).json({ error: "2 live auctions max" });
+      marketAuctions.push({
+        id: aid, seller: stripTags(String(l.seller || "Trainer")).slice(0, 20), sid,
+        species: stripTags(String(l.species || "")).slice(0, 24),
+        lvl: clampF(l.lvl, 1, 50, 1) | 0, xp: clampF(l.xp, 0, 1e9, 0) | 0,
+        minBid: clampF(l.minBid, 1, 50000, 1) | 0, curBid: 0, curSid: "", curName: "",
+        ts: Date.now(), endsAt: Date.now() + AUCTION_MS,
+      });
+    }
+  } else if (op === "auction_bid") {
+    // AUTHORITATIVE: exactly one bidder can hold the top spot; the displaced bidder's escrow
+    // goes home through the refunds queue. accepted:false = the bidder's client deducts NOTHING.
+    const aid = stripTags(String(l.id || "")).slice(0, 40);
+    const amt = clampF(l.amount, 1, 50000, 1) | 0;
+    const row = marketAuctions.find(x => x.id === aid);
+    if (!row || Date.now() >= row.endsAt) return res.json({ ok: true, accepted: false, reason: "auction ended" });
+    if (row.sid === sid) return res.status(409).json({ error: "you can't bid on your own auction" });
+    const need = Math.max(row.minBid, row.curBid + Math.max(1, Math.ceil(row.curBid * 0.05)));
+    if (amt < need) return res.json({ ok: true, accepted: false, need });
+    if (row.curSid) queueAuctionRefund(row.curSid, row.id, row.curBid);
+    row.curBid = amt;
+    row.curSid = sid;
+    row.curName = stripTags(String(b.buyerName || "Trainer")).slice(0, 20);
+    saveMarket();
+    return res.json({ ok: true, accepted: true, cur: amt, endsAt: row.endsAt });
+  } else if (op === "auction_cancel") {
+    // only a bid-less auction can be pulled — once money is on the table, the hammer falls
+    const aid = stripTags(String(l.id || "")).slice(0, 40);
+    const row = marketAuctions.find(x => x.id === aid && x.sid === sid);
+    if (row && row.curSid) return res.status(409).json({ error: "there's already a bid — the auction must run its course" });
+    marketAuctions = marketAuctions.filter(x => !(x.id === aid && x.sid === sid));
+    cancelled = !!row;                        // the seller's client restores the stashed unit
+  } else if (op === "refunds_ack") {
+    const rawIds = Array.isArray(b.ids) ? b.ids : [];
+    const ids = rawIds.map(x => String(x).slice(0, 64));
+    if (auctionRefunds[sid]) {
+      auctionRefunds[sid] = auctionRefunds[sid].filter(r => !ids.includes(r.rid));
+      if (!auctionRefunds[sid].length) delete auctionRefunds[sid];
+    }
   } else if (op === "fills_ack") {
     const rawIds = Array.isArray(b.ids) ? b.ids : (b.listing && Array.isArray(b.listing.ids) ? b.listing.ids : []);
     const ids = rawIds.map(x => String(x).slice(0, 40));
