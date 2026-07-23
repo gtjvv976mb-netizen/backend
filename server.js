@@ -1379,6 +1379,25 @@ function banAuthOk(req) {
   const { adminWallet, authMsg, authSig } = req.body || {};
   return isPubkey(adminWallet) && verifyWalletSig(adminWallet, authMsg, authSig) && isAdminWallet(adminWallet);
 }
+// ADMIN: wipe a wallet's CLOUD save (profile.mmo only). One-time repair for saves contaminated
+// by the pre-slot wallet-inheritance bug: the wrong trainer's whole profile could have been
+// pushed under a newcomer's wallet. Deletes ONLY the MMO cloud copy — the legacy web-game
+// fields and every local save are untouched; the wallet's next login starts clean (or from
+// its own local slot).
+app.post("/profile/admin-wipe", async (req, res) => {
+  if (!banAuthOk(req)) return res.status(403).json({ error: "admin sign-in or key required" });
+  const w = req.body?.target;
+  if (!isPubkey(w)) return res.status(400).json({ error: "valid target wallet required" });
+  try {
+    const prev = await store.getProfile(w);
+    if (!prev || !prev.mmo) return res.json({ ok: true, wiped: false, note: "that wallet has no MMO cloud-save" });
+    delete prev.mmo;
+    prev._mmoWipedAt = Date.now();
+    await store.setProfile(w, prev);
+    res.json({ ok: true, wiped: true, wallet: w });
+  } catch (e) { res.status(500).json({ error: "wipe failed: " + String(e.message || e) }); }
+});
+
 // `target` = wallet to (un)ban — separate from the admin's own `wallet`/`adminWallet`.
 async function adminBan(req, res) {
   if (!banAuthOk(req)) return res.status(403).json({ error: "admin sign-in or key required" });

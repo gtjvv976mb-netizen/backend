@@ -39,7 +39,8 @@ and open <code>http://localhost:8907/admin_payout.html</code> — Phantom does n
 	<h2>2 · Release (moves REAL $CHIKI — the hot wallet must be funded first)</h2>
 	<p class="dim">Optional cap per run: <input id="maxN" type="number" placeholder="max" value="10"> wallets — release in
 	small batches while you watch Solscan. Both endpoints are idempotent: a re-run can never double-pay.</p>
-	<button id="reconcile" disabled>🧹 Reconcile stuck attempts (run after any errors)</button><br>
+	<button id="reconcile" disabled>🧹 Reconcile stuck attempts (run after any errors)</button>
+	<button id="wipeCloud" disabled>☁️🗑 Wipe a wallet's MMO cloud-save (contamination repair)</button><br>
 	<button id="payPouches" class="green" disabled>💸 Release quest pouches</button>
 	<button id="payWinners" class="green" disabled>💸 Release winner pool</button>
 	<div id="result"></div>
@@ -93,8 +94,14 @@ document.getElementById("connect").onclick = async () => {
 	const r = await window.solana.connect();
 	WALLET = r.publicKey.toString();
 	document.getElementById("who").textContent = "admin: " + WALLET;
-	for (const id of ["listPouches", "listWinners", "payPouches", "payWinners", "reconcile"])
+	for (const id of ["listPouches", "listWinners", "payPouches", "payWinners", "reconcile", "wipeCloud"])
 		document.getElementById(id).disabled = false;
+};
+document.getElementById("wipeCloud").onclick = async () => {
+	const w = prompt("Wallet whose MMO CLOUD-save to wipe (local saves untouched — use for saves contaminated by the old wallet-inheritance bug):");
+	if (!w) return;
+	if (!confirm(`Delete the MMO cloud-save for ${w.trim()}? Its next login starts from its local slot, or completely fresh.`)) return;
+	show("result", await call("/profile/admin-wipe", "profile_admin_wipe", { target: w.trim() }));
 };
 document.getElementById("reconcile").onclick = async () => {
 	let wallets = window._stuck || [];
