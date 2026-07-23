@@ -1245,19 +1245,31 @@ app.post("/profile", async (req, res) => {
   const hasMmo = profile.mmo && typeof profile.mmo === "object";
   const cap = hasMmo ? 65000 : 8000;
   if (JSON.stringify(profile).length > cap) return res.status(413).json({ error: "profile too large" });
-  // require a signature for MMO saves AND any write touching identity/score (glory/handle) — else a
-  // legacy-shape body could overwrite another wallet's name or leaderboard score with no auth
+  let prev = null;
+  try { prev = await store.getProfile(wallet); } catch (e) {}
+  // AUTH GATE. A signature is required for: MMO saves, any write touching identity/score
+  // (glory/handle), OR any write against an ESTABLISHED account (one that already has an mmo save).
+  // The last clause closes the hole where an unsigned {profile:{}} for a victim wallet slipped past
+  // the shape check and let sanitize zero their glory + drop their handle (a real griefing wipe).
   const touchesIdentity = ("glory" in profile) || ("handle" in profile);
-  if ((hasMmo || touchesIdentity) && !verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig)) {
+  const isEstablished = !!(prev && prev.mmo);
+  if ((hasMmo || touchesIdentity || isEstablished) && !verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig)) {
     return res.status(401).json({ error: "sign-in required to save progress" });
   }
   const now = Date.now();
   if (now - (_lastSave.get(wallet) || 0) < 600) return res.json({ ok: true, throttled: true });   // ignore rapid-fire writes (anti-spam)
   _lastSave.set(wallet, now);
   try {
-    const prev = await store.getProfile(wallet);
     // admins are trusted (creator testing); everyone else is clamped to legal values
     const safe = isAdminWallet(wallet) ? profile : sanitizeProfile(prev, profile, wallet);
+    // SECURITY: an unsigned legacy write must NOT drop protected identity/score fields it didn't
+    // supply — carry them forward from the stored profile so a `{profile:{}}` can't zero a wallet's
+    // Glory (Cup entry currency, real prize pool) or erase its handle/leaderboard score.
+    if (!isAdminWallet(wallet) && prev) {
+      if (!("glory"  in profile) && prev.glory  != null) safe.glory  = prev.glory;
+      if (!("handle" in profile) && prev.handle != null) safe.handle = prev.handle;
+      if (!("bal"    in profile) && prev.bal    != null) safe.bal    = prev.bal;
+    }
     if (hasMmo) safe.mmo = profile.mmo;   // the signed MMO cloud-save rides through verbatim
     else if (prev && prev.mmo) safe.mmo = prev.mmo;   // SECURITY: legacy (unsigned) writes must NOT wipe the owner's cloud-save — carry it forward
     safe._serverSavedAt = now;   // authoritative "last seen" for offline progression
@@ -1795,6 +1807,11 @@ const WINNER_CAP    = Math.max(0, Number(process.env.WINNER_CAP    || 10));
 const WINNER_REWARD = Math.max(0, Number(process.env.WINNER_REWARD || 1000000));
 const FINAL_QUEST   = MAIN_QUESTS[MAIN_QUESTS.length - 1].id;
 const QUEST_IDX     = new Map(MAIN_QUESTS.map((q, i) => [q.id, i]));
+// OPTIONAL chapters (the market counterparty ones): the client lets a solo player skip these
+// because they can't sell-to / buy-from another trainer. The in-order gate below MUST NOT require
+// them as predecessors, or a skipped optional chapter permanently 409-stalls every later real
+// reward (Ch.42..63) and the 1,000,000 winner slot. Keep in sync with Econ.gd "optional": true.
+const QUEST_OPTIONAL = new Set(["s2_sold", "s2_buy", "s2_merchant"]);
 const QUEST_MIN_GAP_MS = Math.max(0, Number(process.env.QUEST_MIN_GAP_SEC ?? 20)) * 1000;
 // Winner eligibility — FAIL-CLOSED (enforced on the reward path regardless of VERIFY_HOLDERS):
 const QUEST_MIN_HOLD = Math.max(0, Number(process.env.QUEST_MIN_HOLD || MIN));                       // must hold >= this $CHIKI
@@ -1895,7 +1912,7 @@ app.post("/quest/complete", async (req, res) => {
       const wrow = isFinal ? await store.winnerGet(wallet) : null;
       return res.json({ ok: true, already: true, questId, finished: isFinal, won: !!wrow, rank: wrow ? wrow.rank : 0, done: Object.keys(led.done) });
     }
-    for (let i = 0; i < idx; i++) if (!led.done[MAIN_QUESTS[i].id]) return res.status(409).json({ error: "complete earlier chapters first", need: MAIN_QUESTS[i].id });
+    for (let i = 0; i < idx; i++) { const pid = MAIN_QUESTS[i].id; if (QUEST_OPTIONAL.has(pid)) continue; if (!led.done[pid]) return res.status(409).json({ error: "complete earlier chapters first", need: pid }); }
     const now = Date.now();
     if (now - led.lastAt < QUEST_MIN_GAP_MS) return res.status(429).json({ error: "too fast — pace yourself", retryInMs: QUEST_MIN_GAP_MS - (now - led.lastAt) });
 
