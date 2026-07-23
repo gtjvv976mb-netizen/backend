@@ -1827,6 +1827,9 @@ app.post("/quest/complete", async (req, res) => {
     const led = await _questLoad(wallet);
     const idx = QUEST_IDX.get(questId);
     if (led.done[questId]) {
+      // SELF-HEAL: completions recorded before the per-quest pouch shipped (or whose accrual
+      // write failed) have a done entry but no pouch bit — back-fill it here, idempotently.
+      try { await store.qrAccrue(wallet, QUEST_BIT.get(questId) || 0); } catch (e) { console.error("qrAccrue(already) failed", wallet, questId, String(e.message || e)); }
       const wrow = isFinal ? await store.winnerGet(wallet) : null;
       return res.json({ ok: true, already: true, questId, finished: isFinal, won: !!wrow, rank: wrow ? wrow.rank : 0, done: Object.keys(led.done) });
     }
@@ -1849,7 +1852,7 @@ app.post("/quest/complete", async (req, res) => {
     led.done[questId] = now;
     led.lastAt = now;
     // Accrue this quest's per-quest reward to the admin-released pouch (idempotent via the done_mask bit).
-    try { await store.qrAccrue(wallet, QUEST_BIT.get(questId) || 0); } catch (e) {}
+    try { await store.qrAccrue(wallet, QUEST_BIT.get(questId) || 0); } catch (e) { console.error("qrAccrue failed", wallet, questId, String(e.message || e)); }
     await _questSave(wallet, led);
     res.json({ ok: true, questId, finished: isFinal,
       won: !!(award && award.won), rank: award ? (award.rank || 0) : 0,
@@ -1958,7 +1961,17 @@ app.get("/quest/state", async (req, res) => {
     const led = await _questLoad(wallet);
     const wrow = await store.winnerGet(wallet);
     const qr = (await store.qrGet(wallet)) || {};
-    const qrEarned = questEarned(Number(qr.done_mask) || 0), qrPaid = Number(qr.paid_amount) || 0;
+    // SELF-HEAL: the pouch mask must cover every chapter the ledger says is done. Chapters
+    // reported before the pouch feature shipped (or whose accrual write failed) are missing
+    // their bit — back-fill on this read path so every player heals on their next login.
+    let qrMask = Number(qr.done_mask) || 0;
+    let ledMask = 0;
+    for (const qid of Object.keys(led.done)) ledMask |= (QUEST_BIT.get(qid) || 0);
+    if ((ledMask & ~qrMask) !== 0) {
+      try { await store.qrAccrue(wallet, ledMask); qrMask |= ledMask; }
+      catch (e) { console.error("qrAccrue(state-heal) failed", wallet, String(e.message || e)); }
+    }
+    const qrEarned = questEarned(qrMask), qrPaid = Number(qr.paid_amount) || 0;
     res.json({ wallet, done: Object.keys(led.done), finished: !!led.done[FINAL_QUEST],
       won: !!wrow, rank: wrow ? wrow.rank : 0, paid: !!(wrow && wrow.paid),
       payoutSig: (wrow && wrow.paid) ? wrow.payout_sig : null,
