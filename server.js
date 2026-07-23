@@ -2836,9 +2836,26 @@ app.get("/world/chat", (req, res) => {
   res.json({ messages: since > 0 ? worldChat.filter(m => m.ts > since).slice(-200) : worldChat.slice(-1000) });
 });
 
-// ---- Whispers (direct messages). In-memory inbox per recipient presence-id. Cosmetic social
-// layer — presence-id gated (same as world chat), sanitised, capped. No history persistence.
+// ---- Whispers (direct messages). PERSISTED inbox per recipient presence-id (kv) — history
+// survives restarts, so a whisper always reaches its trainer. Sanitised, capped, 30d retention.
 const worldDM = new Map();   // recipient sid -> [ {from, fromHandle, text, ts} ]
+store.kvGet("world_dm").then(v => {
+  if (v && typeof v === "object" && !worldDM.size)
+    for (const k of Object.keys(v)) if (Array.isArray(v[k])) worldDM.set(k, v[k].slice(-200));
+}).catch(() => {});
+let _dmSavedAt = 0;
+function saveWorldDM() {
+  const now = Date.now();
+  if (now - _dmSavedAt < 5000) return;
+  _dmSavedAt = now;
+  const cutoff = now - 30 * 24 * 3600 * 1000;
+  const obj = {};
+  for (const [k, a] of worldDM) {
+    const kept = a.filter(m => (m.ts || 0) > cutoff).slice(-200);
+    if (kept.length) obj[k] = kept;
+  }
+  store.kvSet("world_dm", obj).catch(() => {});
+}
 function dmInbox(sid) { let a = worldDM.get(sid); if (!a) { a = []; worldDM.set(sid, a); } return a; }
 app.post("/world/dm", (req, res) => {
   const b = req.body || {};
@@ -2849,11 +2866,12 @@ app.post("/world/dm", (req, res) => {
   if (!text) return res.json({ ok: true });
   const from = String(b.wallet), fromHandle = stripTags(String(b.handle || "Trainer")).slice(0, 20);
   const msg = { from, fromHandle, to, text, ts: Date.now() };
-  const inbox = dmInbox(to); inbox.push(msg); if (inbox.length > 60) inbox.shift();
+  const inbox = dmInbox(to); inbox.push(msg); if (inbox.length > 200) inbox.shift();
   // echo into the sender's own inbox so their client shows the sent line in-thread
-  const sent = dmInbox(from); sent.push({ ...msg, self: true }); if (sent.length > 60) sent.shift();
+  const sent = dmInbox(from); sent.push({ ...msg, self: true }); if (sent.length > 200) sent.shift();
   // hard cap on distinct inboxes (DoS guard)
   if (worldDM.size > 5000) { const oldest = [...worldDM.keys()].slice(0, worldDM.size - 5000); oldest.forEach(k => worldDM.delete(k)); }
+  saveWorldDM();
   res.json({ ok: true });
 });
 app.get("/world/dm", (req, res) => {
