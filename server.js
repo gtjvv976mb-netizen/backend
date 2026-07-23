@@ -1223,7 +1223,13 @@ app.post("/verify", async (req, res) => {
     const chikis = eligible ? (chikiCount(balance, whaleSince) || 1) : 0;
     const whalePending = eligible && balance >= WHALE_MIN && chikis < 2;
     const whaleReadyInMs = whalePending && whaleSince ? Math.max(0, WHALE_HOLD_MS - (Date.now() - Number(whaleSince))) : 0;
-    res.json({ wallet, eligible, balance, chikis, whalePending, whaleReadyInMs, minHold: MIN, verified: verifyOn, firstSeen, profile: profile || null, dbOk, signedIn });
+    // CREATOR/ADMIN unlock: the client (Chain.gd) reads `isAdmin` here to unlock the in-game
+    // F8/F9 Creator Toolbox. It was never sent → admin could never sign in and access it.
+    // Require PROVEN ownership (signedIn) so pasting an admin's public address can't unlock it;
+    // this flag only gates IN-GAME dev tools — every real-$CHIKI payout stays separately
+    // signature-gated (_questAdminOk / admin_payout).
+    const isAdmin = signedIn && isAdminWallet(wallet);
+    res.json({ wallet, eligible, balance, chikis, whalePending, whaleReadyInMs, minHold: MIN, verified: verifyOn, firstSeen, profile: profile || null, dbOk, signedIn, isAdmin });
   } catch (e) { res.status(500).json({ error: "verify failed: " + String(e.message || e) }); }
 });
 
