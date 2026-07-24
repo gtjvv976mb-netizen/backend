@@ -1317,6 +1317,31 @@ app.get("/admin/grant-chiki", async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// ADMIN RESTITUTION: re-issue a sale receipt whose credit was lost to the settlement race (e.g. an
+// auction that sold but never paid the seller). Protected by ADMIN_KEY. The receipt lands in the
+// seller's /market/sales queue and their client credits the standard 75% share on the next poll —
+// so this uses the SAME crediting path a normal sale would (anti-cheat/ceiling apply identically),
+// it does NOT mint or bypass the clamps. GET /admin/regrant-sale?key=SECRET&wallet=PUBKEY&species=NAME&price=N
+app.get("/admin/regrant-sale", (req, res) => {
+  const KEY = process.env.ADMIN_KEY || "";
+  if (!KEY || req.query?.key !== KEY) return res.status(403).json({ error: "forbidden" });
+  const wallet = req.query?.wallet;
+  if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  const species = String(req.query?.species || "chikimon").slice(0, 24);
+  const price = Math.max(1, Math.min(1e7, Math.floor(Number(req.query?.price) || 0)));
+  if (price < 1) return res.status(400).json({ error: "price (the original hammer/sale amount) required" });
+  try {
+    const arr = marketSales[wallet] || (marketSales[wallet] = []);
+    const id = "REGRANT-" + species + "-" + Date.now();
+    arr.push({ id, item: species, kind: "chikimon", qty: 1, price, buyer: "restitution",
+               buyerName: "Sale restitution", ts: Date.now() });
+    saveMarket();
+    console.log("Admin restitution: re-issued", species, price, "sale for", wallet);
+    res.json({ ok: true, wallet, species, price, sellerWillNet: Math.round(price * 0.75),
+      note: "Have the seller open the game — their client credits 75% on the next market sync (~30s)." });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // ADMIN RECOVERY: rebuild a wallet's roster for a user whose Chikis were lost to the old overwrite bug.
 // GET /admin/restore-chikis?key=SECRET&wallet=PUBKEY&roster=sp:level[:L][:Nick],sp:level,...
 //   sp = species index (0-9 normal, 10-14 legendary), add ":L" to mark a legendary, optional ":Nick" name.
