@@ -3130,6 +3130,7 @@ app.post("/market/buy-onchain", async (req, res) => {
   const split = await txMarketSplit(sig, buyer, sellerWallet, Number(row.price) || 0);
   if (!split.ok) { _usedTxSigs.delete(sig); return res.status(409).json({ error: `on-chain split for that signature failed: ${split.reason}` }); }
   marketListings = marketListings.filter(x => x.id !== id);
+  _consumeListing(id);   // SOLD -> a re-push can never resurrect it
   const released = { id: row.id, kind: row.kind, item: row.item, qty: row.qty, lvl: row.lvl, xp: row.xp };
   _usedTxSigs.set(sig, { listingId: id, buyer, released, ts: Date.now() });   // cache release for idempotent retry
   saveUsedSigs();
@@ -3232,6 +3233,17 @@ store.kvGet("market_sales").then(v => { if (v && typeof v === "object") marketSa
 store.kvGet("market_orders").then(v => { if (Array.isArray(v)) marketOrders = v.filter(o => o && (o.state === "delivered" ? Date.now() - (o.deliveredTs || 0) < ORDER_PAY_WINDOW_MS + 3600000 : Date.now() - (o.ts || 0) < MARKET_TTL_MS)); }).catch(() => {});
 store.kvGet("market_fills").then(v => { if (v && typeof v === "object") marketFills = v; }).catch(() => {});
 store.kvGet("market_auctions").then(v => { if (Array.isArray(v)) marketAuctions = v; }).catch(() => {});
+// RESURRECTION GUARD: once a listing id leaves the board (bought / cancelled / on-chain settled) it is
+// remembered here, so a stale client re-push (offline reconcile) can NEVER re-add it — that was the
+// double-sale bug where a SOLD item re-listed itself and could be bought again. Legit re-lists use a
+// fresh id, so they're unaffected. Kept for MARKET_TTL_MS (matches the listing + client-save lifetime).
+const _soldListings = new Map();   // listing id -> ts consumed
+store.kvGet("market_sold_ids").then(v => { if (Array.isArray(v)) for (const e of v) { if (e && e.id) _soldListings.set(String(e.id), Number(e.ts) || Date.now()); } }).catch(() => {});
+function _consumeListing(id) {
+  if (!id) return;
+  _soldListings.set(String(id), Date.now());
+  if (_soldListings.size > 8000) { const cut = Date.now() - MARKET_TTL_MS; for (const [k, t] of _soldListings) if (t < cut) _soldListings.delete(k); }
+}
 store.kvGet("auction_refunds").then(v => { if (v && typeof v === "object") auctionRefunds = v; }).catch(() => {});
 async function saveMarket() {
   try {
@@ -3242,6 +3254,7 @@ async function saveMarket() {
       store.kvSet("market_fills", marketFills),
       store.kvSet("market_auctions", marketAuctions.slice(-100)),
       store.kvSet("auction_refunds", auctionRefunds),
+      store.kvSet("market_sold_ids", [..._soldListings].slice(-4000).map(([id, ts]) => ({ id, ts }))),
     ]);
   } catch (e) { console.warn("saveMarket persist failed:", String(e?.message || e)); }
 }
@@ -3355,6 +3368,7 @@ function pruneMarket() {
   if (!_sidSeeded) { _sidSeeded = true; seedSidOwnerFromBoard(); }   // one-time: protect pre-deploy rows from seizure
   sweepAuctions(now);
   marketListings = marketListings.filter(l => now - (l.ts || 0) < MARKET_TTL_MS);
+  { const cut = now - MARKET_TTL_MS; for (const [k, t] of _soldListings) if (t < cut) _soldListings.delete(k); }   // forget consumed ids after the listing TTL
   _pruneValueMap(marketSales, "credited", now);   // uncredited proceeds survive 60d, not 7
   // orders: drop LEGACY soft-escrow rows (no wallet — pre-real-rail, unpayable); a DELIVERED
   // order is exempt from the open-order TTL but auto-returns its goods when the pay window ends
@@ -3408,7 +3422,9 @@ app.post("/market/op", async (req, res) => {
   if (op === "list") {
     const lid = stripTags(String(l.id || ("S" + Date.now() + Math.floor(Math.random() * 1e4)))).slice(0, 40);
     // IDEMPOTENT: a client may re-push a listing it made offline (reconcile). Don't duplicate an id.
-    if (!marketListings.some(x => x.id === lid)) {
+    if (_soldListings.has(lid)) {
+      // a stale reconcile re-pushing an already-SOLD listing — never resurrect it (double-sale exploit)
+    } else if (!marketListings.some(x => x.id === lid)) {
       if (marketListings.filter(x => x.sid === sid).length >= 12) return res.status(429).json({ error: "too many listings" });
       marketListings.push({
         id: lid,
@@ -3439,10 +3455,12 @@ app.post("/market/op", async (req, res) => {
         arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, buyer: sid.slice(0, 8), buyerName, ts: Date.now() });
     }
     marketListings = marketListings.filter(x => x.id !== id);
+    _consumeListing(id);   // SOLD -> a re-push can never resurrect it
   } else if (op === "cancel" || op === "sold") {
     const id = stripTags(String(l.id || "")).slice(0, 40);
     const before = marketListings.length;
     marketListings = marketListings.filter(x => !(x.id === id && x.sid === sid));
+    _consumeListing(id);
     cancelled = marketListings.length < before;   // true ONLY if a still-live listing was removed (else it already sold)
   } else if (op === "order_post") {
     // WTB craft order — REAL-$CHIKI ONLY. No escrow moves at post time: the poster's wallet
