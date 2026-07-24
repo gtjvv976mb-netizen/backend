@@ -1229,7 +1229,13 @@ app.post("/verify", async (req, res) => {
     // this flag only gates IN-GAME dev tools — every real-$CHIKI payout stays separately
     // signature-gated (_questAdminOk / admin_payout).
     const isAdmin = signedIn && isAdminWallet(wallet);
-    res.json({ wallet, eligible, balance, chikis, whalePending, whaleReadyInMs, minHold: MIN, verified: verifyOn, firstSeen, profile: profile || null, dbOk, signedIn, isAdmin });
+    // MARKET TOKEN: a proven owner gets a bearer token their client attaches to mutating market ops
+    // (ack/cancel/bid). Non-signed-in (address-only / demo) callers get none. We ALSO bind this
+    // wallet to the client's OWN net_id here — the only place a sid can be tied to a wallet safely,
+    // since the net_id is private (in the owner's save) and arrives with a proven signature.
+    const mktToken = signedIn ? mintMarketToken(wallet) : "";
+    if (signedIn) bindSid(stripTags(String(req.body?.netId || "")).slice(0, 40), wallet);
+    res.json({ wallet, eligible, balance, chikis, whalePending, whaleReadyInMs, minHold: MIN, verified: verifyOn, firstSeen, profile: profile || null, dbOk, signedIn, isAdmin, mktToken });
   } catch (e) { res.status(500).json({ error: "verify failed: " + String(e.message || e) }); }
 });
 
@@ -1331,13 +1337,17 @@ app.get("/admin/regrant-sale", (req, res) => {
   const price = Math.max(1, Math.min(1e7, Math.floor(Number(req.query?.price) || 0)));
   if (price < 1) return res.status(400).json({ error: "price (the original hammer/sale amount) required" });
   try {
-    const arr = marketSales[wallet] || (marketSales[wallet] = []);
+    // file under the SID the seller's client actually polls (their net_id) — falling back to the
+    // wallet only if we've never seen them sign in. (The client polls /market/sales?sid=net_id, so
+    // filing under the raw wallet would land in a bucket no client reads — the audit's finding #3.)
+    const key = walletSid[wallet] || wallet;
+    const arr = marketSales[key] || (marketSales[key] = []);
     const id = "REGRANT-" + species + "-" + Date.now();
     arr.push({ id, item: species, kind: "chikimon", qty: 1, price, buyer: "restitution",
                buyerName: "Sale restitution", ts: Date.now() });
     saveMarket();
-    console.log("Admin restitution: re-issued", species, price, "sale for", wallet);
-    res.json({ ok: true, wallet, species, price, sellerWillNet: Math.round(price * 0.75),
+    console.log("Admin restitution: re-issued", species, price, "sale for", wallet, "under sid", key);
+    res.json({ ok: true, wallet, sid: key, species, price, sellerWillNet: Math.round(price * 0.75),
       note: "Have the seller open the game — their client credits 75% on the next market sync (~30s)." });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
@@ -3017,9 +3027,23 @@ app.get("/world/dm", (req, res) => {
 // the whole path needs a live mainnet Phantom test. Until then this returns 503 and the game uses
 // the safe in-game-$CHIKI rail (op:buy above).
 const MARKET_ONCHAIN = String(process.env.MARKET_ONCHAIN || "") === "1" && !!MINT && !!TEAM_WALLET;
-const _usedTxSigs = new Set();   // replay guard: a tx signature settles at most one listing
-(async () => { try { const v = await store.kvGet("market_used_sigs"); if (Array.isArray(v)) v.forEach(s => _usedTxSigs.add(String(s))); } catch (e) {} })();
-function saveUsedSigs() { try { store.kvSet("market_used_sigs", [..._usedTxSigs].slice(-20000)); } catch (e) {} }
+// replay guard + idempotent recovery: each tx sig settles at most ONE listing/order (BOUND to its
+// id), and re-POSTing the same sig for the SAME listing returns the cached release — so a dropped
+// 200 response can't lose the buyer's paid-for goods. Pruned by AGE, not by count: a count cap could
+// evict an old sig and let it be replayed against a different, cheaper listing (audit finding).
+const _usedTxSigs = new Map();   // sig -> { listingId?/orderId?, buyer, released?, ts }
+(async () => { try { const v = await store.kvGet("market_used_sigs"); if (Array.isArray(v)) { for (const e of v) { if (typeof e === "string") _usedTxSigs.set(e, { ts: 0 }); else if (e && e.sig) _usedTxSigs.set(String(e.sig), { listingId: e.listingId, orderId: e.orderId, buyer: e.buyer, released: e.released, ts: e.ts || 0 }); } } } catch (e) {} })();
+const USED_SIG_KEEP_MS = 365 * 24 * 3600 * 1000;   // keep a year — sig volume is one per real trade
+function saveUsedSigs() {
+  try {
+    const now = Date.now(), arr = [];
+    for (const [sig, e] of _usedTxSigs) { if (e.ts && now - e.ts > USED_SIG_KEEP_MS) { _usedTxSigs.delete(sig); continue; } arr.push({ sig, listingId: e.listingId, orderId: e.orderId, buyer: e.buyer, released: e.released, ts: e.ts }); }
+    // persist ALL age-pruned sigs — NO count cap: a count cap would drop the oldest active sig and
+    // let it be replayed against a different cheaper listing (the age-only invariant above exists to
+    // prevent exactly that). Volume is one sig per real trade, so age (1yr) is the sole bound.
+    store.kvSet("market_used_sigs", arr);
+  } catch (e) {}
+}
 // Market fee split on every on-chain BUY (must sum to 1.0): 75% seller, 20% TEAM wallet, 5% burn.
 const MARKET_SELLER_SHARE = 0.75, MARKET_TEAM_TAX = 0.20, MARKET_BURN = 0.05;
 // Verify the buyer's SINGLE signed transaction pays the correct 3-way split of REAL $CHIKI:
@@ -3050,7 +3074,9 @@ async function txMarketSplit(sig, buyer, seller, price) {
     scanBurn(tx.transaction && tx.transaction.message && tx.transaction.message.instructions);
     for (const inner of ((tx.meta && tx.meta.innerInstructions) || [])) scanBurn(inner.instructions);
     // tolerance = a couple whole $CHIKI (each leg is rounded to whole tokens client-side); NOT a % of price
-    const tol = Math.max(0.001, price * 0.005);   // proportional slack — a flat 2.0 let a ZERO-value tx clear tiny-price listings
+    // slack ONLY for whole-token client rounding — tight (≤25 tokens, 0.1%) and capped so a large
+    // sale can't be proportionally underpaid. The zero-value legs are rejected explicitly below.
+    const tol = Math.min(25, Math.max(2, price * 0.001));
     if (dBuyer <= 0 || dSeller <= 0 || dTeam <= 0 || burned <= 0) return { ok: false, reason: "no $CHIKI actually moved on one of the legs" };
     if (dBuyer  < price * 1.0                 - tol) return { ok: false, reason: `buyer paid ${dBuyer}, need ${price}` };
     if (dSeller < price * MARKET_SELLER_SHARE - tol) return { ok: false, reason: `seller got ${dSeller}, need ${price * MARKET_SELLER_SHARE}` };
@@ -3081,7 +3107,14 @@ app.post("/market/buy-onchain", async (req, res) => {
   const id = stripTags(String(b.listingId || "")).slice(0, 40);
   if (!isPubkey(buyer)) return res.status(400).json({ error: "valid buyer wallet required" });
   if (!sig || !id) return res.status(400).json({ error: "txSig and listingId required" });
-  if (_usedTxSigs.has(sig)) return res.status(409).json({ error: "that transaction was already used" });
+  // IDEMPOTENT RECOVERY: a re-POST of a sig already settled for THIS listing+buyer returns the same
+  // release, so a buyer whose 200 was dropped can safely retry and still receive the goods. A sig
+  // replayed against a DIFFERENT listing is refused — one payment settles exactly one item.
+  const prior = _usedTxSigs.get(sig);
+  if (prior) {
+    if (prior.listingId === id && prior.buyer === buyer && prior.released) return res.json({ ok: true, released: prior.released, txSig: sig, replayed: true });
+    return res.status(409).json({ error: "that transaction was already used" });
+  }
   pruneMarket();
   const row = marketListings.find(x => x.id === id);
   if (!row) return res.status(404).json({ error: "listing is gone" });
@@ -3089,20 +3122,21 @@ app.post("/market/buy-onchain", async (req, res) => {
   if (!isPubkey(sellerWallet)) return res.status(409).json({ error: "seller has no on-chain wallet on this listing" });
   if (sellerWallet === buyer) return res.status(400).json({ error: "that is your own listing" });
   // CLAIM the sig BEFORE the async verify so two concurrent requests can't both settle it (TOCTOU),
-  // and so ONE payment can never settle a second listing. Released again only if verify fails.
-  _usedTxSigs.add(sig);
-  if (_usedTxSigs.size > 20000) { const it = _usedTxSigs.values(); for (let i = 0; i < 5000; i++) { const v = it.next().value; if (v === undefined) break; _usedTxSigs.delete(v); } }
+  // BOUND to this listing so ONE payment can never settle a second listing. Released again if verify fails.
+  _usedTxSigs.set(sig, { listingId: id, buyer, ts: Date.now() });
   // the buyer's ONE signed transaction must pay the correct 3-way split of real $CHIKI:
   // 75% to the seller, 20% to the reward pool, 5% burned (full price left the buyer)
   const split = await txMarketSplit(sig, buyer, sellerWallet, Number(row.price) || 0);
   if (!split.ok) { _usedTxSigs.delete(sig); return res.status(409).json({ error: `on-chain split for that signature failed: ${split.reason}` }); }
-  saveUsedSigs();
   marketListings = marketListings.filter(x => x.id !== id);
+  const released = { id: row.id, kind: row.kind, item: row.item, qty: row.qty, lvl: row.lvl, xp: row.xp };
+  _usedTxSigs.set(sig, { listingId: id, buyer, released, ts: Date.now() });   // cache release for idempotent retry
+  saveUsedSigs();
   // record the sale so the SELLER'S client shows the on-chain proceeds landed
   const arr = marketSales[row.sid] || (marketSales[row.sid] = []);
   if (!arr.some(s => s.id === row.id)) arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, buyer: buyer.slice(0, 8), buyerName, onchain: true, txSig: sig, sellerNet: split.seller, teamTax: split.team, ts: Date.now() });
-  saveMarket();
-  res.json({ ok: true, released: { id: row.id, kind: row.kind, item: row.item, qty: row.qty, lvl: row.lvl, xp: row.xp }, txSig: sig });
+  await saveMarket();
+  res.json({ ok: true, released, txSig: sig });
 });
 
 // ---- ORDER settlement (real $CHIKI): the POSTER pays a pending delivery. Their ONE signed
@@ -3126,9 +3160,9 @@ app.post("/market/order-pay", async (req, res) => {
   // RESERVE the row: while `paying` is fresh, decline / undeliver / expiry are all refused, so
   // the order can't be torn down between tx broadcast and verification (money-goods atomicity)
   row.paying = Date.now();
-  // CLAIM the sig BEFORE the async verify (TOCTOU) — one payment can never settle twice
-  _usedTxSigs.add(sig);
-  if (_usedTxSigs.size > 20000) { const it = _usedTxSigs.values(); for (let i = 0; i < 5000; i++) { const v = it.next().value; if (v === undefined) break; _usedTxSigs.delete(v); } }
+  // CLAIM the sig BEFORE the async verify (TOCTOU) — one payment can never settle twice, BOUND to
+  // this order so it can't be replayed against another. Pruned by age in saveUsedSigs, not by count.
+  _usedTxSigs.set(sig, { orderId: id, buyer: payer, ts: Date.now() });
   // the client submits the sig the moment Phantom broadcasts, usually BEFORE the cluster reaches
   // 'confirmed' — a single lookup would routinely miss a perfectly good payment and strand real
   // $CHIKI. Poll for up to ~20s before giving up.
@@ -3151,7 +3185,7 @@ app.post("/market/order-pay", async (req, res) => {
   const sarr = marketSales[fresh.fillerSid] || (marketSales[fresh.fillerSid] = []);
   if (!sarr.some(s => s.id === fresh.id))
     sarr.push({ id: fresh.id, item: fresh.item, kind: fresh.kind, qty: fresh.qty, price: fresh.price, buyer: payer.slice(0, 8), buyerName: fresh.buyer, onchain: true, txSig: sig, sellerNet: split.seller, teamTax: split.team, ts: Date.now() });
-  saveMarket();
+  await saveMarket();   // durability: the goods+receipt must be persisted before we confirm the pay
   res.json({ ok: true, txSig: sig });
 });
 
@@ -3167,13 +3201,114 @@ let marketFills = {};                        // buyer sid -> [ {id,item,kind,qty
 let marketAuctions = [];                     // 🔨 chikimon auctions: {id, seller, sid, species, lvl, xp, minBid, curBid, curSid, curName, ts, endsAt}
 let auctionRefunds = {};                     // sid -> [ {rid,id,amt,ts} ] — outbid escrow going home
 const MARKET_TTL_MS = 24 * 60 * 60 * 1000;   // listings expire after a day
+// DURABILITY: a settled receipt lingers briefly for recovery, then drops; UNCREDITED value (owed
+// proceeds/goods/escrow) survives far longer so a player offline for weeks still recovers it on
+// return. Never blindly time-drop money that was never actually credited.
+const KEEP_CREDITED_MS = 2 * 24 * 3600 * 1000;    // 2 days after credit/grant/refund
+const KEEP_PENDING_MS = 60 * 24 * 3600 * 1000;    // 60 days for uncredited value (was a lossy 7)
+// keep uncredited value-bearing rows for KEEP_PENDING_MS; settled receipts drop after KEEP_CREDITED_MS
+function _pruneValueMap(map, doneKey, now) {
+  for (const k of Object.keys(map)) {
+    map[k] = (map[k] || []).filter(r => { const age = now - (r.ts || 0); return r[doneKey] ? age < KEEP_CREDITED_MS : age < KEEP_PENDING_MS; });
+    if (!map[k].length) delete map[k];
+  }
+}
+// bucket-count backstop against a flood of fake sids. Buckets are keyed by the client sid (net_id),
+// NOT a wallet, so key-shape tells us nothing — protect by OWNERSHIP instead: a sid BOUND to a real
+// signed-in wallet (sidOwner[k]) with any uncredited value is NEVER evicted, even if it's the oldest.
+// Only fully-settled buckets, or UNBOUND ones (demo / a flood of never-signed-in fake sids), can go.
+function _capValueMap(map, doneKey, cap) {
+  const keys = Object.keys(map);
+  if (keys.length <= cap) return;
+  const evictable = keys.filter(k => !sidOwner[k] || (map[k] || []).every(r => r[doneKey]));
+  if (!evictable.length) { console.warn(`_capValueMap: ${keys.length} buckets all hold owed value — not dropping any`); return; }
+  evictable.map(k => [k, Math.max(0, ...(map[k] || []).map(r => r.ts || 0))])
+    .sort((a, b) => a[1] - b[1]).slice(0, Math.min(evictable.length, keys.length - cap))
+    .forEach(([k]) => delete map[k]);
+}
 store.kvGet("market_listings").then(v => { if (Array.isArray(v)) marketListings = v.filter(l => l && Date.now() - (l.ts || 0) < MARKET_TTL_MS); }).catch(() => {});
 store.kvGet("market_sales").then(v => { if (v && typeof v === "object") marketSales = v; }).catch(() => {});
 store.kvGet("market_orders").then(v => { if (Array.isArray(v)) marketOrders = v.filter(o => o && (o.state === "delivered" ? Date.now() - (o.deliveredTs || 0) < ORDER_PAY_WINDOW_MS + 3600000 : Date.now() - (o.ts || 0) < MARKET_TTL_MS)); }).catch(() => {});
 store.kvGet("market_fills").then(v => { if (v && typeof v === "object") marketFills = v; }).catch(() => {});
 store.kvGet("market_auctions").then(v => { if (Array.isArray(v)) marketAuctions = v; }).catch(() => {});
 store.kvGet("auction_refunds").then(v => { if (v && typeof v === "object") auctionRefunds = v; }).catch(() => {});
-function saveMarket() { store.kvSet("market_listings", marketListings.slice(-400)).catch(() => {}); store.kvSet("market_sales", marketSales).catch(() => {}); store.kvSet("market_orders", marketOrders.slice(-200)).catch(() => {}); store.kvSet("market_fills", marketFills).catch(() => {}); store.kvSet("market_auctions", marketAuctions.slice(-100)).catch(() => {}); store.kvSet("auction_refunds", auctionRefunds).catch(() => {}); }
+async function saveMarket() {
+  try {
+    await Promise.all([
+      store.kvSet("market_listings", marketListings.slice(-400)),
+      store.kvSet("market_sales", marketSales),
+      store.kvSet("market_orders", marketOrders.slice(-200)),
+      store.kvSet("market_fills", marketFills),
+      store.kvSet("market_auctions", marketAuctions.slice(-100)),
+      store.kvSet("auction_refunds", auctionRefunds),
+    ]);
+  } catch (e) { console.warn("saveMarket persist failed:", String(e?.message || e)); }
+}
+// ---- MARKET SESSION AUTH ----
+// The marketplace keys settlement on the client's `sid` (a per-install net_id). That sid is PUBLIC
+// (it rides on every /market/list row), so the audit found anyone could forge it to wipe/hide/strand
+// another player's proceeds via the ack & cancel ops. Fix WITHOUT re-keying settlement (which would
+// break the client's sid-based mine-detection): tie each net_id to the WALLET that owns it, and
+// require a matching bearer token on every mutating op.
+//   • marketTokens: wallet -> token, minted to a PROVEN owner at /verify (valid Phantom signature).
+//   • sidOwner:     net_id -> wallet. Bound ONLY from the owner's OWN proven identity — at /verify
+//                   (the client sends its own net_id alongside its signature) and, at boot, seeded
+//                   from the persisted board (each listing/order already carries its owner wallet).
+//                   NEVER bound from an attacker-supplied sid on /market/op (that let a stranger seize
+//                   a victim's sid), and never re-bound once set (first-writer-wins).
+//   • walletSid:    wallet -> net_id, the reverse, so admin restitution files under the sid the
+//                   seller's client actually polls.
+let marketTokens = {}, sidOwner = {}, walletSid = {};
+store.kvGet("market_tokens").then(v => { if (v && typeof v === "object") marketTokens = v; }).catch(() => {});
+store.kvGet("market_sid_owner").then(v => { if (v && typeof v === "object") sidOwner = v; }).catch(() => {});
+store.kvGet("market_wallet_sid").then(v => { if (v && typeof v === "object") walletSid = v; }).catch(() => {});
+function mintMarketToken(wallet) {
+  if (!isPubkey(wallet)) return "";
+  if (!marketTokens[wallet]) { marketTokens[wallet] = crypto.randomBytes(24).toString("hex"); store.kvSet("market_tokens", marketTokens).catch(() => {}); }
+  return marketTokens[wallet];
+}
+// the wallet a request has PROVEN it controls via its market token (or "" if unproven)
+function mktWallet(b) {
+  const w = String(b?.wallet || ""), t = String(b?.mktToken || "");
+  return (isPubkey(w) && t.length >= 16 && marketTokens[w] === t) ? w : "";
+}
+// the wallet the persisted board already attributes this sid to (or "" if none) — used to reject a
+// hijack where an attacker asserts a victim's (public, still-unbound) net_id at /verify.
+function _sidBoardWallet(sid) {
+  for (const l of marketListings) if (l.sid === sid && isPubkey(String(l.wallet || ""))) return l.wallet;
+  for (const o of marketOrders) if (o.sid === sid && isPubkey(String(o.wallet || ""))) return o.wallet;
+  for (const a of marketAuctions) {
+    if (a.sid === sid && isPubkey(String(a.wallet || ""))) return a.wallet;          // seller
+    if (a.curSid === sid && isPubkey(String(a.curWallet || ""))) return a.curWallet; // top bidder
+  }
+  return "";
+}
+// bind sid -> owner wallet, first-writer-wins. `sid` MUST be the caller's own (proven at /verify) or a
+// persisted board row's own (seeded at boot) — never an arbitrary sid pulled from a /market/op body.
+// ANTI-HIJACK: refuse to bind a sid the board already attributes to a DIFFERENT wallet, so a stranger
+// can't sign in asserting a victim's net_id and seize it.
+function bindSid(sid, wallet) {
+  if (!sid || !isPubkey(wallet) || sidOwner[sid]) return;
+  const boardW = _sidBoardWallet(sid);
+  if (boardW && boardW !== wallet) return;
+  sidOwner[sid] = wallet; walletSid[wallet] = sid;
+  store.kvSet("market_sid_owner", sidOwner).catch(() => {});
+  store.kvSet("market_wallet_sid", walletSid).catch(() => {});
+}
+// seed sid->wallet from the persisted board so pre-deploy listings can't be seized before their owner
+// next signs in (each row carries its owner wallet; first-writer-wins, so a live /verify never loses).
+function seedSidOwnerFromBoard() {
+  let dirty = false;
+  const take = (sid, w) => { if (sid && isPubkey(w) && !sidOwner[sid]) { sidOwner[sid] = w; walletSid[w] = sid; dirty = true; } };
+  for (const l of marketListings) take(l.sid, l.wallet);
+  for (const o of marketOrders) take(o.sid, o.wallet);
+  for (const a of marketAuctions) { take(a.sid, a.wallet); take(a.curSid, a.curWallet); }
+  if (dirty) { store.kvSet("market_sid_owner", sidOwner).catch(() => {}); store.kvSet("market_wallet_sid", walletSid).catch(() => {}); }
+}
+// gate a mutating op: the caller must PROVE the wallet that owns this sid. An unbound sid has no
+// provable owner, so value-destroying ops on it are refused outright (a stranger can't strand an
+// as-yet-unbound seller's proceeds, and a legit owner is always bound at /verify before they trade).
+function opAuthOk(sid, b) { const owner = sidOwner[sid]; return !!owner && mktWallet(b) === owner; }
 const AUCTION_MS = 12 * 3600 * 1000;         // every auction runs 12h — snappy, two cycles a day
 // the outbid bidder's escrow goes home through this queue (their client re-credits + acks)
 function queueAuctionRefund(sid, id, amt) {
@@ -3200,10 +3335,7 @@ function sweepAuctions(now) {
     }
     return false;
   });
-  for (const sid of Object.keys(auctionRefunds)) {
-    auctionRefunds[sid] = (auctionRefunds[sid] || []).filter(r => now - (r.ts || 0) < 7 * 24 * 3600 * 1000);
-    if (!auctionRefunds[sid].length) delete auctionRefunds[sid];
-  }
+  _pruneValueMap(auctionRefunds, "refunded", now);   // un-returned escrow survives 60d, not 7
 }
 const ORDER_PAY_WINDOW_MS = 48 * 3600 * 1000; // poster has 48h to pay a delivery, then goods auto-return
 // hand a pending delivery's goods back to the filler (decline / payment window expired) via the
@@ -3216,15 +3348,13 @@ function returnOrderGoods(row, why) {
   if (!arr.some(f => f.id === row.id))
     arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, fillerName: row.buyer, returned: true, why, ts: Date.now() });
 }
+let _sidSeeded = false;
 function pruneMarket() {
   const now = Date.now();
+  if (!_sidSeeded) { _sidSeeded = true; seedSidOwnerFromBoard(); }   // one-time: protect pre-deploy rows from seizure
   sweepAuctions(now);
   marketListings = marketListings.filter(l => now - (l.ts || 0) < MARKET_TTL_MS);
-  const sids = Object.keys(marketSales);
-  for (const sid of sids) {
-    marketSales[sid] = (marketSales[sid] || []).filter(s => now - (s.ts || 0) < 7 * 24 * 3600 * 1000);
-    if (!marketSales[sid].length) delete marketSales[sid];
-  }
+  _pruneValueMap(marketSales, "credited", now);   // uncredited proceeds survive 60d, not 7
   // orders: drop LEGACY soft-escrow rows (no wallet — pre-real-rail, unpayable); a DELIVERED
   // order is exempt from the open-order TTL but auto-returns its goods when the pay window ends
   marketOrders = marketOrders.filter(o => {
@@ -3237,36 +3367,26 @@ function pruneMarket() {
     }
     return now - (o.ts || 0) < MARKET_TTL_MS;
   });
-  for (const sid of Object.keys(marketFills)) {
-    marketFills[sid] = (marketFills[sid] || []).filter(f => now - (f.ts || 0) < 7 * 24 * 3600 * 1000);
-    if (!marketFills[sid].length) delete marketFills[sid];
-  }
-  const fkeys = Object.keys(marketFills);
-  if (fkeys.length > 5000) {
-    fkeys.map(k => [k, Math.max(...(marketFills[k] || [{ts:0}]).map(f => f.ts || 0))])
-         .sort((a, b) => a[1] - b[1]).slice(0, fkeys.length - 5000)
-         .forEach(([k]) => delete marketFills[k]);
-  }
-  // SECURITY: hard cap on distinct seller buckets — drop the oldest so a flood of fake sids can't grow memory unbounded
-  const keys = Object.keys(marketSales);
-  if (keys.length > 5000) {
-    keys.map(k => [k, Math.max(...(marketSales[k] || [{ts:0}]).map(s => s.ts || 0))])
-        .sort((a, b) => a[1] - b[1]).slice(0, keys.length - 5000)
-        .forEach(([k]) => delete marketSales[k]);
-  }
+  _pruneValueMap(marketFills, "granted", now);    // owed goods survive 60d, not 7
+  // SECURITY backstop: cap distinct buckets so a flood of fake sids can't grow memory unbounded —
+  // but only ever drop buckets with NO money owed (never a wallet bucket holding uncredited value)
+  _capValueMap(marketFills, "granted", 5000);
+  _capValueMap(marketSales, "credited", 5000);
+  _capValueMap(auctionRefunds, "refunded", 5000);   // same content-based backstop as its siblings
 }
 app.get("/market/list", (_q, res) => { pruneMarket(); res.json({ listings: marketListings.slice(-300), orders: marketOrders.slice(-200), auctions: marketAuctions.slice(-100) }); });
 // pending order FILLS for one buyer — client receives the goods then acks with the ids
 app.get("/market/fills", (req, res) => {
   const sid = stripTags(String(req.query?.sid || "")).slice(0, 40);
   if (!sid) return res.status(400).json({ error: "sid required" });
-  res.json({ fills: (marketFills[sid] || []).slice(0, 40), refunds: (auctionRefunds[sid] || []).slice(0, 40) });
+  // return only rows NOT yet settled — a settled row lingers as a durable receipt but is never re-served
+  res.json({ fills: (marketFills[sid] || []).filter(f => !f.granted).slice(0, 40), refunds: (auctionRefunds[sid] || []).filter(r => !r.refunded).slice(0, 40) });
 });
 // pending sale proceeds for one seller — client credits then acks with the ids
 app.get("/market/sales", (req, res) => {
   const sid = stripTags(String(req.query?.sid || "")).slice(0, 40);
   if (!sid) return res.status(400).json({ error: "sid required" });
-  res.json({ sales: (marketSales[sid] || []).slice(0, 40) });
+  res.json({ sales: (marketSales[sid] || []).filter(s => !s.credited).slice(0, 40) });
 });
 app.post("/market/op", async (req, res) => {
   const b = req.body || {};
@@ -3276,6 +3396,14 @@ app.post("/market/op", async (req, res) => {
   if (!sid) return res.status(400).json({ error: "sid required" });
   let cancelled;                                 // set by the cancel op → tells the seller's client whether to reclaim
   pruneMarket();
+  // AUTH GATE: every op that clears a player's own value queue, tears down their own listings/orders,
+  // OR *creates* value under a sid must prove wallet ownership (market token) of that sid. Gating the
+  // CREATE ops (list/order_post/auction_post) too means a row can only ever exist under the caller's
+  // OWN bound sid — so the public `sid`/`wallet` fields on the board can't be poisoned to hijack the
+  // sid->wallet binding, and proceeds can never accrue under an unbound (seizable) sid. The binding is
+  // established ONLY from the owner's own proven identity (at /verify, seeded from the board at boot).
+  const _AUTH_OPS = new Set(["list", "order_post", "auction_post", "sales_ack", "fills_ack", "refunds_ack", "cancel", "sold", "auction_cancel", "order_cancel", "order_decline", "order_undeliver", "auction_bid"]);
+  if (_AUTH_OPS.has(op) && !opAuthOk(sid, b)) return res.status(401).json({ error: "market sign-in required to list, trade, or manage your proceeds" });
   if (op === "list") {
     const lid = stripTags(String(l.id || ("S" + Date.now() + Math.floor(Math.random() * 1e4)))).slice(0, 40);
     // IDEMPOTENT: a client may re-push a listing it made offline (reconcile). Don't duplicate an id.
@@ -3360,6 +3488,10 @@ app.post("/market/op", async (req, res) => {
     if (!row || row.state === "delivered") return res.json({ ok: true, delivered: false });
     if (row.sid === sid) return res.status(409).json({ error: "you can't deliver your own order" });
     if (!isPubkey(fw)) return res.status(400).json({ error: "connect your Phantom wallet — deliveries pay you real $CHIKI" });
+    // PROVE the filler wallet before locking the order + arming its real-$CHIKI payout to fw — else a
+    // tokenless caller could lock the whole order book and later collect returned goods / a payout for
+    // goods never staked. The filler is a distinct party from the poster, so gate on fw ownership, not sid.
+    if (mktWallet(b) !== fw) return res.status(401).json({ error: "sign in with the wallet you're delivering from" });
     if (fw === row.wallet) return res.status(409).json({ error: "you can't deliver to your own wallet" });
     row.state = "delivered";
     row.fillerSid = sid;
@@ -3404,9 +3536,10 @@ app.post("/market/op", async (req, res) => {
       if (marketAuctions.filter(x => x.sid === sid).length >= 2) return res.status(429).json({ error: "2 live auctions max" });
       marketAuctions.push({
         id: aid, seller: stripTags(String(l.seller || "Trainer")).slice(0, 20), sid,
+        wallet: mktWallet(b),   // proven seller wallet — puts the auction sid inside the anti-hijack surface
         species: stripTags(String(l.species || "")).slice(0, 24),
         lvl: clampF(l.lvl, 1, 50, 1) | 0, xp: clampF(l.xp, 0, 1e9, 0) | 0,
-        minBid: clampF(l.minBid, 1, 50000, 1) | 0, curBid: 0, curSid: "", curName: "",
+        minBid: clampF(l.minBid, 1, 50000, 1) | 0, curBid: 0, curSid: "", curName: "", curWallet: "",
         ts: Date.now(), endsAt: Date.now() + AUCTION_MS,
       });
     }
@@ -3423,8 +3556,9 @@ app.post("/market/op", async (req, res) => {
     if (row.curSid) queueAuctionRefund(row.curSid, row.id, row.curBid);
     row.curBid = amt;
     row.curSid = sid;
+    row.curWallet = mktWallet(b);   // proven bidder wallet — protects the bidder's sid + escrow refund
     row.curName = stripTags(String(b.buyerName || "Trainer")).slice(0, 20);
-    saveMarket();
+    await saveMarket();   // the escrow refund we just queued for the displaced bidder must persist
     return res.json({ ok: true, accepted: true, cur: amt, endsAt: row.endsAt });
   } else if (op === "auction_cancel") {
     // only a bid-less auction can be pulled — once money is on the table, the hammer falls
@@ -3434,28 +3568,18 @@ app.post("/market/op", async (req, res) => {
     marketAuctions = marketAuctions.filter(x => !(x.id === aid && x.sid === sid));
     cancelled = !!row;                        // the seller's client restores the stashed unit
   } else if (op === "refunds_ack") {
-    const rawIds = Array.isArray(b.ids) ? b.ids : [];
-    const ids = rawIds.map(x => String(x).slice(0, 64));
-    if (auctionRefunds[sid]) {
-      auctionRefunds[sid] = auctionRefunds[sid].filter(r => !ids.includes(r.rid));
-      if (!auctionRefunds[sid].length) delete auctionRefunds[sid];
-    }
+    // MARK settled, never DELETE (auth-gated above). A forged/replayed ack can no longer destroy an
+    // uncredited value row; the settled row stays a durable receipt until the short post-credit prune.
+    const ids = (Array.isArray(b.ids) ? b.ids : []).map(x => String(x).slice(0, 64));
+    for (const r of (auctionRefunds[sid] || [])) if (ids.includes(r.rid)) r.refunded = true;
   } else if (op === "fills_ack") {
-    const rawIds = Array.isArray(b.ids) ? b.ids : (b.listing && Array.isArray(b.listing.ids) ? b.listing.ids : []);
-    const ids = rawIds.map(x => String(x).slice(0, 40));
-    if (marketFills[sid]) {
-      marketFills[sid] = marketFills[sid].filter(f => !ids.includes(f.id));
-      if (!marketFills[sid].length) delete marketFills[sid];
-    }
+    const ids = (Array.isArray(b.ids) ? b.ids : (b.listing && Array.isArray(b.listing.ids) ? b.listing.ids : [])).map(x => String(x).slice(0, 40));
+    for (const f of (marketFills[sid] || [])) if (ids.includes(f.id)) f.granted = true;
   } else if (op === "sales_ack") {
-    const rawIds = Array.isArray(b.ids) ? b.ids : (b.listing && Array.isArray(b.listing.ids) ? b.listing.ids : []);
-    const ids = rawIds.map(x => String(x).slice(0, 40));
-    if (marketSales[sid]) {
-      marketSales[sid] = marketSales[sid].filter(s => !ids.includes(s.id));
-      if (!marketSales[sid].length) delete marketSales[sid];
-    }
+    const ids = (Array.isArray(b.ids) ? b.ids : (b.listing && Array.isArray(b.listing.ids) ? b.listing.ids : [])).map(x => String(x).slice(0, 40));
+    for (const s of (marketSales[sid] || [])) if (ids.includes(s.id)) s.credited = true;
   }
-  saveMarket();
+  await saveMarket();
   res.json({ ok: true, cancelled, listings: marketListings.slice(-300) });
 });
 
