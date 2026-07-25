@@ -2905,7 +2905,7 @@ function worldSnapshot(wallet, x, z) {
     if (now - p.ts > WORLD_TTL_MS) { worldPlayers.delete(w); continue; }
     if (w === wallet) continue;
     if (Math.hypot((p.x || 0) - x, (p.z || 0) - z) > WORLD_RADIUS) continue;
-    out.push({ wallet: w, x: p.x, z: p.z, dir: p.dir, handle: p.handle, leg: p.leg, el: p.el, br: p.br, avatar: p.avatar, comp: p.comp, party: p.party, mount: p.mount || "" });
+    out.push({ wallet: w, x: p.x, z: p.z, dir: p.dir, handle: p.handle, leg: p.leg, el: p.el, br: p.br, avatar: p.avatar, comp: p.comp, party: p.party, mount: p.mount || "", act: p.act || "" });
   }
   return out.slice(0, 60);   // cap payload
 }
@@ -2922,7 +2922,8 @@ app.post("/world/move", (req, res) => {
     avatar: stripTags(String(b.avatar || "classic")).slice(0, 20),   // player's chosen look → remote renders the real rig
     comp: stripTags(String(b.comp || "")).slice(0, 24),              // player's lead chikimon → remote renders it beside them
     party: String(b.party || "").split(",").filter(Boolean).slice(0, 3).map(s => stripTags(String(s)).slice(0, 24)).join(","),
-    mount: stripTags(String(b.mount || "")).slice(0, 16),   // the steed they ride ("" = on foot) -> remote renders it   // full 3-slot party → remote renders the whole team
+    mount: stripTags(String(b.mount || "")).slice(0, 16),   // the steed they ride ("" = on foot)
+    act: stripTags(String(b.act || "")).slice(0, 24),      // what they're DOING ("chop:axe") -> remotes play it
     br: clampF(b.br, 1, 50, 1) | 0,   // companion LEVEL (cap 50) — not the Cup 1..30 BR
     ts: Date.now(),
   });
