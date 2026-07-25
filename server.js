@@ -2899,13 +2899,49 @@ const worldPlayers = new Map();   // wallet -> { x, z, dir, handle, leg, el, br,
 const WORLD_TTL_MS = 12000;       // drop a trainer who hasn't pinged in 12s
 const WORLD_RADIUS = 4000;        // only return players within this distance (interest management)
 const clampF = (v, lo, hi, d) => { v = Number(v); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d; };
+// ---- SHARED RESOURCE NODES ----------------------------------------------------
+// Node LAYOUT is already identical on every client (Gather.gd seeds its RNG with fixed
+// constants), so a node needs no server-side position — only whether it is currently spent.
+// Without this each client tracked depletion privately, so the same rock could be mined by
+// several players at once and everyone saw a different world. One map, one truth.
+const worldNodes = new Map();          // "kind:ix:iz" -> respawnAtMs
+const NODE_MAX = 20000;                // hard cap so a flood can't grow this unbounded
+function nodeSweep(now) {
+  if (worldNodes.size < NODE_MAX) return;
+  for (const [k, t] of worldNodes) if (t <= now) worldNodes.delete(k);
+}
+function nodeId(s) { return String(s || "").replace(/[^A-Za-z0-9:_-]/g, "").slice(0, 40); }
+
+// claim a node: first caller wins, everyone else is told it is already taken
+app.post("/world/node/claim", (req, res) => {
+  const b = req.body || {};
+  if (!isPresenceId(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
+  const id = nodeId(b.id);
+  if (!id) return res.status(400).json({ error: "id required" });
+  const now = Date.now();
+  nodeSweep(now);
+  const until = worldNodes.get(id) || 0;
+  if (until > now) return res.json({ ok: false, taken: true, until });
+  const cd = Math.min(Math.max(clampF(b.cd, 1, 3600, 60), 1), 3600) * 1000;
+  worldNodes.set(id, now + cd);
+  res.json({ ok: true, taken: false, until: now + cd });
+});
+
+// the world's currently-spent nodes, so a client can hide what someone else already took
+app.get("/world/nodes", (_req, res) => {
+  const now = Date.now();
+  const out = {};
+  for (const [k, t] of worldNodes) if (t > now) out[k] = t - now;
+  res.json({ nodes: out, ts: now });
+});
+
 function worldSnapshot(wallet, x, z) {
   const now = Date.now(), out = [];
   for (const [w, p] of worldPlayers) {
     if (now - p.ts > WORLD_TTL_MS) { worldPlayers.delete(w); continue; }
     if (w === wallet) continue;
     if (Math.hypot((p.x || 0) - x, (p.z || 0) - z) > WORLD_RADIUS) continue;
-    out.push({ wallet: w, x: p.x, z: p.z, dir: p.dir, handle: p.handle, leg: p.leg, el: p.el, br: p.br, avatar: p.avatar, comp: p.comp, party: p.party, mount: p.mount || "", act: p.act || "" });
+    out.push({ wallet: w, x: p.x, y: p.y || 0, z: p.z, dir: p.dir, handle: p.handle, leg: p.leg, el: p.el, br: p.br, avatar: p.avatar, comp: p.comp, party: p.party, mount: p.mount || "", act: p.act || "" });
   }
   return out.slice(0, 60);   // cap payload
 }
@@ -2914,8 +2950,9 @@ app.post("/world/move", (req, res) => {
   const b = req.body || {}, wallet = b.wallet;
   if (!isPresenceId(wallet)) return res.status(400).json({ error: "valid wallet required" });
   const x = clampF(b.x, -100000, 100000, 0), z = clampF(b.z, -100000, 100000, 0);
+  const y = clampF(b.y, -1000, 100000, 0);   // height: without it every remote was ground-snapped and nobody could be seen jumping
   worldPlayers.set(wallet, {
-    x, z, dir: clampF(b.dir, -7, 7, 0),
+    x, y, z, dir: clampF(b.dir, -7, 7, 0),
     handle: stripTags(String(b.handle || "Trainer")).slice(0, 20),
     leg: clampF(b.leg, 0, 20, 14) | 0,                 // companion species index
     el: stripTags(String(b.el || "Fire")).slice(0, 10),
