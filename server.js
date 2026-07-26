@@ -2925,6 +2925,71 @@ function nodeSweep(now) {
   if (worldNodes.size < NODE_MAX) return;
   for (const [k, t] of worldNodes) if (t <= now) worldNodes.delete(k);
 }
+
+// ---- the world REMEMBERS what has been taken from it ----
+// worldNodes/worldNodeUses were in-memory only, so every restart instantly re-stood every felled
+// tree and refilled every mined rock — and with autoDeploy on, that happened on every push. A
+// shared world that forgets whenever you deploy is not a shared world.
+//
+// Absolute epoch timestamps are stored rather than remaining durations, so a respawn that came due
+// while the process was down is simply already expired at load and the node is free again. Writes
+// are debounced: a claim only marks state dirty, and one flush covers all of them, so a busy world
+// costs one small write every NODE_SAVE_MS instead of a DB round-trip per swing.
+let _nodesDirty = false;
+const NODE_SAVE_MS = 10000;
+function markNodesDirty() { _nodesDirty = true; }
+
+// Exported so a sim can round-trip the REAL functions rather than a copy of them: there is no
+// Postgres in the test environment, so serialise -> clear -> restore in one process is the only
+// honest way to prove a restart keeps the world.
+export function serializeWorldNodes(now = Date.now()) {
+  return {
+    nodes: [...worldNodes].filter(([, t]) => Number(t) > now).slice(-NODE_MAX),
+    uses: [...worldNodeUses].filter(([, u]) => u && now - Number(u.ts) <= NODE_USES_TTL_MS).slice(-NODE_MAX),
+  };
+}
+
+// Restoring trusts NOTHING: this blob came out of a database that a future bug could corrupt, so
+// ids are re-sanitised through nodeId(), counts are re-clamped, and anything already expired is
+// dropped rather than resurrected.
+export function restoreWorldNodes(v, now = Date.now()) {
+  if (!v || typeof v !== "object") return { nodes: 0, uses: 0 };
+  let n = 0, u = 0;
+  for (const e of (Array.isArray(v.nodes) ? v.nodes : [])) {
+    if (!Array.isArray(e)) continue;
+    const id = nodeId(e[0]), t = Number(e[1]);
+    if (id && Number.isFinite(t) && t > now) { worldNodes.set(id, t); n++; }
+  }
+  for (const e of (Array.isArray(v.uses) ? v.uses : [])) {
+    if (!Array.isArray(e) || !e[1] || typeof e[1] !== "object") continue;
+    const id = nodeId(e[0]), left = Number(e[1].left), ts = Number(e[1].ts);
+    if (id && left > 0 && left <= 16 && Number.isFinite(ts) && now - ts <= NODE_USES_TTL_MS) {
+      worldNodeUses.set(id, { left, ts }); u++;
+    }
+  }
+  return { nodes: n, uses: u };
+}
+
+// test seam: let a sim empty the live world without reaching into module internals
+export function _clearWorldNodes() { worldNodes.clear(); worldNodeUses.clear(); }
+
+async function saveWorldNodes() {
+  if (!_nodesDirty) return;
+  _nodesDirty = false;
+  try {
+    await store.kvSet("world_nodes", serializeWorldNodes());
+  } catch (e) { _nodesDirty = true; }   // a failed write must not silently drop the world
+}
+setInterval(saveWorldNodes, NODE_SAVE_MS).unref?.();
+// Render sends SIGTERM on every deploy — flush so the last claims before a push are not lost.
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () => { saveWorldNodes().finally(() => process.exit(0)); });
+}
+
+store.kvGet("world_nodes").then(v => {
+  const r = restoreWorldNodes(v);
+  if (r.nodes || r.uses) console.log(`world nodes restored: ${r.nodes} spent, ${r.uses} part-worked`);
+}).catch(() => {});
 function nodeId(s) { return String(s || "").replace(/[^A-Za-z0-9:_-]/g, "").slice(0, 40); }
 
 // claim a node: first caller wins, everyone else is told it is already taken.
@@ -2995,14 +3060,17 @@ app.post("/world/node/claim", (req, res) => {
     const left = (rec ? rec.left : uses) - 1;
     if (left > 0) {
       worldNodeUses.set(id, { left, ts: now });
+      markNodesDirty();
       return res.json({ ok: true, taken: false, left, felled: false });
     }
     worldNodeUses.delete(id);
     worldNodes.set(id, now + cd);
+    markNodesDirty();
     return res.json({ ok: true, taken: false, left: 0, felled: true, until: now + cd });
   }
 
   worldNodes.set(id, now + cd);
+  markNodesDirty();
   res.json({ ok: true, taken: false, until: now + cd });
 });
 
