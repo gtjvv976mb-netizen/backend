@@ -141,3 +141,34 @@ curl -s "$URL/quest/state?wallet=<W>"                                           
 curl -s -X POST $URL/quest/claim    -H 'content-type: application/json' -d '{"wallet":"<W>"}'                      # pays real $CHIKI
 ```
 The claim only succeeds once the hot wallet actually holds $CHIKI + a little SOL for fees.
+
+---
+
+## 5. Public endpoints must never echo a server credential (2026-07)
+
+`GET /stats` is public and unauthenticated. It served:
+
+```js
+clientRpc: (process.env.CLIENT_RPC || process.env.RPC_URL || "")
+```
+
+`CLIENT_RPC` was unset, so it fell through to **`RPC_URL`** — the same Helius key the server uses to
+sign treasury payouts — and published it to anyone who called `/stats`. That is the second
+credential exposure in this project after the `TREASURY_SECRET` drain.
+
+**Fixed:** the fallback is gone. `clientRpc: (process.env.CLIENT_RPC || "")`.
+
+The point that matters: **a browser client cannot hold a secret.** Anything shipped to the client is
+public by definition, so the goal is not secrecy — it is *isolation*:
+
+| var | key | exposure |
+|---|---|---|
+| `RPC_URL` | server key — signs payouts | server only, never in a response |
+| `CLIENT_RPC` | restricted key, domain-locked | public **by design** |
+
+With the fallback removed, forgetting `CLIENT_RPC` disables on-chain buys **visibly** instead of
+quietly leaking the treasury's RPC credentials. Fail closed, not fail leaky.
+
+**Rule for any new field on a public route:** if its value comes from `process.env`, it is a
+credential until proven otherwise. Never `||`-chain a public field onto a private one — the
+fallback is invisible in review and only shows up in production.

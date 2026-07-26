@@ -1116,7 +1116,12 @@ async function chikiHolderCount() {
 let _statsCache = { t: 0, data: null };
 async function getStats() {
   if (_statsCache.data && Date.now() - _statsCache.t < 15000) return _statsCache.data;
-  const out = { network: NETWORK, minHold: MIN, whaleMin: WHALE_MIN, poolReserveSol: RESERVE, marketOnchain: MARKET_ONCHAIN, marketSplit: { seller: MARKET_SELLER_SHARE, team: MARKET_TEAM_TAX, burn: MARKET_BURN }, teamWallet: TEAM_WALLET || null, chikiMint: MINT ? MINT.toBase58() : null, chikiDecimals: CHIKI_DECIMALS, clientRpc: (process.env.CLIENT_RPC || process.env.RPC_URL || "") };
+  // FAIL-CLOSED RPC: clientRpc must NEVER fall back to RPC_URL. /stats is public and
+  // unauthenticated, so that fallback published the SERVER key — the one that signs treasury
+  // payouts — to anyone who asked. A browser client cannot hold a secret anyway: CLIENT_RPC is
+  // meant to be public and restricted. Unset it and on-chain buys disable visibly, which is the
+  // safe failure. (2026-07: the server key was live on this endpoint until it was rotated.)
+  const out = { network: NETWORK, minHold: MIN, whaleMin: WHALE_MIN, poolReserveSol: RESERVE, marketOnchain: MARKET_ONCHAIN, marketSplit: { seller: MARKET_SELLER_SHARE, team: MARKET_TEAM_TAX, burn: MARKET_BURN }, teamWallet: TEAM_WALLET || null, chikiMint: MINT ? MINT.toBase58() : null, chikiDecimals: CHIKI_DECIMALS, clientRpc: (process.env.CLIENT_RPC || "") };
   try { out.poolSol = await poolSol(); } catch (e) {}
   try { out.players = await store.count(); } catch (e) {}
   try { out.dailyPaidSol = await store.dailyTotal(); } catch (e) {}
