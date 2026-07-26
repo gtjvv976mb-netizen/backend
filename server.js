@@ -2903,6 +2903,7 @@ app.get("/fund", async (req, res) => {
 const worldPlayers = new Map();   // wallet -> { x, z, dir, handle, leg, el, br, ts }
 const WORLD_TTL_MS = 12000;       // drop a trainer who hasn't pinged in 12s
 const WORLD_RADIUS = 4000;        // only return players within this distance (interest management)
+const WORLD_MAX_PEERS = 60;       // hard cap on peers per snapshot — applied to the NEAREST, see worldSnapshot()
 const clampF = (v, lo, hi, d) => { v = Number(v); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d; };
 // ---- SHARED RESOURCE NODES ----------------------------------------------------
 // Node LAYOUT is already identical on every client (Gather.gd seeds its RNG with fixed
@@ -2911,7 +2912,16 @@ const clampF = (v, lo, hi, d) => { v = Number(v); return Number.isFinite(v) ? Ma
 // several players at once and everyone saw a different world. One map, one truth.
 const worldNodes = new Map();          // "kind:ix:iz" -> respawnAtMs
 const NODE_MAX = 20000;                // hard cap so a flood can't grow this unbounded
+// MULTI-LOAD nodes (trees). A rock is one claim and it is gone; a tree holds TREE_WOOD loads and
+// is worked several times before it falls. Depletion used to be entirely client-side, so two
+// trainers chopping the same trunk each saw a private forest — one felled a tree the other still
+// saw standing. The server now owns the load count, exactly as it already owns "is this rock spent".
+// id -> { left, ts }. `ts` only exists so an abandoned half-chopped trunk can be pruned.
+const worldNodeUses = new Map();
+const NODE_USES_TTL_MS = 30 * 60 * 1000;   // a trunk nobody has touched in 30 min grows its loads back
+
 function nodeSweep(now) {
+  for (const [k, u] of worldNodeUses) if (now - u.ts > NODE_USES_TTL_MS) worldNodeUses.delete(k);
   if (worldNodes.size < NODE_MAX) return;
   for (const [k, t] of worldNodes) if (t <= now) worldNodes.delete(k);
 }
@@ -2974,6 +2984,24 @@ app.post("/world/node/claim", (req, res) => {
   const until = worldNodes.get(id) || 0;
   if (until > now) return res.json({ ok: false, taken: true, until });
   const cd = Math.min(Math.max(clampF(b.cd, 1, 3600, 60), 1), 3600) * 1000;
+
+  // MULTI-LOAD (trees): `uses` is how many loads a FULL node holds. Each claim spends exactly one —
+  // the one-item-per-gather rule is unchanged, the trunk simply holds several. Only the claim that
+  // takes the last load puts the node on its respawn cooldown, and that is the moment it falls for
+  // everyone. A single-load node (every rock, bush and hive) never sends `uses` and is untouched.
+  const uses = Math.round(clampF(b.uses, 0, 16, 0));
+  if (uses > 1) {
+    const rec = worldNodeUses.get(id);
+    const left = (rec ? rec.left : uses) - 1;
+    if (left > 0) {
+      worldNodeUses.set(id, { left, ts: now });
+      return res.json({ ok: true, taken: false, left, felled: false });
+    }
+    worldNodeUses.delete(id);
+    worldNodes.set(id, now + cd);
+    return res.json({ ok: true, taken: false, left: 0, felled: true, until: now + cd });
+  }
+
   worldNodes.set(id, now + cd);
   res.json({ ok: true, taken: false, until: now + cd });
 });
@@ -2983,7 +3011,11 @@ app.get("/world/nodes", (_req, res) => {
   const now = Date.now();
   const out = {};
   for (const [k, t] of worldNodes) if (t > now) out[k] = t - now;
-  res.json({ nodes: out, ts: now });
+  // partially-worked multi-load nodes, so a client can reconcile a half-chopped trunk it never
+  // touched itself. Absent id = full. An older client simply ignores this field.
+  const uses = {};
+  for (const [k, u] of worldNodeUses) if (now - u.ts <= NODE_USES_TTL_MS) uses[k] = u.left;
+  res.json({ nodes: out, uses, ts: now });
 });
 
 function worldSnapshot(wallet, x, z) {
@@ -2991,10 +3023,21 @@ function worldSnapshot(wallet, x, z) {
   for (const [w, p] of worldPlayers) {
     if (now - p.ts > WORLD_TTL_MS) { worldPlayers.delete(w); continue; }
     if (w === wallet) continue;
-    if (Math.hypot((p.x || 0) - x, (p.z || 0) - z) > WORLD_RADIUS) continue;
-    out.push({ wallet: w, x: p.x, y: p.y || 0, z: p.z, dir: p.dir, handle: p.handle, leg: p.leg, el: p.el, br: p.br, avatar: p.avatar, comp: p.comp, party: p.party, mount: p.mount || "", act: p.act || "" });
+    const d = Math.hypot((p.x || 0) - x, (p.z || 0) - z);
+    if (d > WORLD_RADIUS) continue;
+    out.push({ d, wallet: w, x: p.x, y: p.y || 0, z: p.z, dir: p.dir, handle: p.handle, leg: p.leg, el: p.el, br: p.br, avatar: p.avatar, comp: p.comp, party: p.party, mount: p.mount || "", act: p.act || "" });
   }
-  return out.slice(0, 60);   // cap payload
+  // NEAREST FIRST, then cap. This used to `slice(0, 60)` straight off Map iteration order — which
+  // is INSERTION order, i.e. oldest sessions first. With more than 60 trainers in range, #61
+  // onward were permanently invisible no matter how close they were standing, and anyone who
+  // reconnected went to the back of the queue behind players on the far side of the island.
+  // Sorting by distance makes the cap mean "the 60 nearest", which is what interest management is
+  // for. The radius is deliberately left alone: it is wider than the island, so it excludes nobody
+  // today, and narrowing it would change who you can see — a gameplay change, not a fix.
+  out.sort((a, b) => a.d - b.d);
+  const near = out.slice(0, WORLD_MAX_PEERS);
+  for (const e of near) delete e.d;   // `d` is a sort key, never part of the wire contract
+  return near;
 }
 // Broadcast my position (and get nearby players back in one round-trip).
 app.post("/world/move", (req, res) => {
