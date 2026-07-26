@@ -2912,7 +2912,19 @@ function nodeSweep(now) {
 }
 function nodeId(s) { return String(s || "").replace(/[^A-Za-z0-9:_-]/g, "").slice(0, 40); }
 
-// claim a node: first caller wins, everyone else is told it is already taken
+// claim a node: first caller wins, everyone else is told it is already taken.
+//
+// AUTHORISED against the position the player is ALREADY broadcasting. Without this a scripted
+// client could claim every node on the island without ever moving, denying the whole realm its
+// resources - the griefing gets worse the more players there are. Three gates:
+//   1. you must have a LIVE presence (you are actually in the world right now)
+//   2. the node must be within reach of where you last said you were
+//   3. you cannot claim faster than a human can gather
+const CLAIM_RADIUS = 14;          // world units; in-game gather reach is ~7, doubled for latency
+const CLAIM_MIN_MS = 1800;        // the client's own anti-macro floor is 2s
+const CLAIM_BURST = 40;           // per wallet per minute, a generous ceiling on honest play
+const claimRate = new Map();      // wallet -> {last, count, windowStart}
+
 app.post("/world/node/claim", (req, res) => {
   const b = req.body || {};
   if (!isPresenceId(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
@@ -2920,6 +2932,40 @@ app.post("/world/node/claim", (req, res) => {
   if (!id) return res.status(400).json({ error: "id required" });
   const now = Date.now();
   nodeSweep(now);
+
+  // 1. you have to actually be in the world
+  const me = worldPlayers.get(b.wallet);
+  if (!me || now - me.ts > WORLD_TTL_MS) {
+    return res.status(403).json({ ok: false, error: "no live presence" });
+  }
+
+  // 2. the node has to be within reach of where you said you were. Ids are "kind:x:z", which is
+  //    what lets us check this without trusting any position the caller sends.
+  const parts = id.split(":");
+  const nx = Number(parts[1]), nz = Number(parts[2]);
+  if (!Number.isFinite(nx) || !Number.isFinite(nz)) {
+    return res.status(400).json({ ok: false, error: "malformed id" });
+  }
+  const dist = Math.hypot(nx - (me.x || 0), nz - (me.z || 0));
+  if (dist > CLAIM_RADIUS) {
+    return res.status(403).json({ ok: false, error: "out of reach", dist: Math.round(dist) });
+  }
+
+  // 3. no claiming faster than a human can gather
+  const r = claimRate.get(b.wallet) || { last: 0, count: 0, windowStart: now };
+  if (now - r.windowStart > 60000) { r.count = 0; r.windowStart = now; }
+  if (now - r.last < CLAIM_MIN_MS) {
+    return res.status(429).json({ ok: false, error: "too fast" });
+  }
+  if (r.count >= CLAIM_BURST) {
+    return res.status(429).json({ ok: false, error: "rate limited" });
+  }
+  r.last = now; r.count += 1;
+  claimRate.set(b.wallet, r);
+  if (claimRate.size > 5000) {
+    for (const [k, v] of claimRate) if (now - v.last > 120000) claimRate.delete(k);
+  }
+
   const until = worldNodes.get(id) || 0;
   if (until > now) return res.json({ ok: false, taken: true, until });
   const cd = Math.min(Math.max(clampF(b.cd, 1, 3600, 60), 1), 3600) * 1000;
