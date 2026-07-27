@@ -3013,6 +3013,10 @@ function nodeId(s) { return String(s || "").replace(/[^A-Za-z0-9:_-]/g, "").slic
 //   1. you must have a LIVE presence (you are actually in the world right now)
 //   2. the node must be within reach of where you last said you were
 //   3. you cannot claim faster than a human can gather
+// Respawn windows, in seconds, owned by the server. Mines are permanent landmarks that merely
+// refill (Gather.gd uses 10s for them); everything else is a normal node.
+const NODE_CD_S = { gold: 10, iron: 10, crystal_mine: 10 };
+const NODE_CD_DEFAULT_S = 60;
 const CLAIM_RADIUS = 14;          // world units; in-game gather reach is ~7, doubled for latency
 const CLAIM_MIN_MS = 1800;        // the client's own anti-macro floor is 2s
 const CLAIM_BURST = 40;           // per wallet per minute, a generous ceiling on honest play
@@ -3061,7 +3065,13 @@ app.post("/world/node/claim", (req, res) => {
 
   const until = worldNodes.get(id) || 0;
   if (until > now) return res.json({ ok: false, taken: true, until });
-  const cd = Math.min(Math.max(clampF(b.cd, 1, 3600, 60), 1), 3600) * 1000;
+  // COOLDOWN IS THE SERVER'S, NOT THE CALLER'S. `cd` used to come straight from the request body,
+  // clamped only to 1..3600s — so a griefer could claim a node and ask for a FULL HOUR, locking it
+  // for everyone. (Honest clients never actually chose it: no node carries a `cd` key, so
+  // Gather.gd's best.get("cd", 60.0) always sent 60. Nothing legitimate depended on it.)
+  // Derived from the node KIND, which is the part of the id the reach check already trusts.
+  const kind = String(parts[0] || "");
+  const cd = (NODE_CD_S[kind] || NODE_CD_DEFAULT_S) * 1000;
 
   // MULTI-LOAD (trees): `uses` is how many loads a FULL node holds. Each claim spends exactly one —
   // the one-item-per-gather rule is unchanged, the trunk simply holds several. Only the claim that
