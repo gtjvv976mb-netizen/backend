@@ -3163,7 +3163,14 @@ app.post("/world/chat", (req, res) => {
   if (!isPresenceId(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
   const text = stripTags(String(b.text || "")).slice(0, 200).trim();
   if (text) {
-    worldChat.push({ handle: stripTags(String(b.handle || "Trainer")).slice(0, 20), short: b.wallet.slice(0, 4) + "…" + b.wallet.slice(-4), text, ts: Date.now() });
+    // `wallet` is what makes a name in World chat clickable-to-whisper. Without it the client fell
+    // back to `short` — an ellipsised "3J57…iji3" — which it then POSTed as the whisper recipient.
+    // U+2026 fails isPresenceId(), so /world/dm 400'd and, because the client never reads that
+    // response, the message vanished with no error. Only replying to a whisper worked, since the DM
+    // route does send a full `from`. The same fallback also broke the unread badge, which compares
+    // the sender id against your own full presence id. Messages stored before this fix have no
+    // `wallet` and stay unwhisperable; new ones work.
+    worldChat.push({ wallet: b.wallet, handle: stripTags(String(b.handle || "Trainer")).slice(0, 20), short: b.wallet.slice(0, 4) + "…" + b.wallet.slice(-4), text, ts: Date.now() });
     if (worldChat.length > 1000) worldChat.shift();
     saveWorldChat();
   }
@@ -3660,8 +3667,16 @@ app.post("/market/op", async (req, res) => {
     const id = stripTags(String(l.id || "")).slice(0, 40);
     const before = marketListings.length;
     marketListings = marketListings.filter(x => !(x.id === id && x.sid === sid));
-    _consumeListing(id);
     cancelled = marketListings.length < before;   // true ONLY if a still-live listing was removed (else it already sold)
+    // Blacklist ONLY an id this caller actually owned. _consumeListing used to run here
+    // unconditionally, outside the sid check — so any signed-in player could POST cancel with ids
+    // they had never owned and blacklist them for MARKET_TTL_MS. Client listing ids are a
+    // sequential L<n> counter, so a few thousand such calls poisoned the entire practical id
+    // space: every later list() answered ok:true while the server silently dropped the row, and
+    // the seller's client had already deducted the goods. Goods destroyed, seller never told.
+    // A genuine sale is already consumed by the buy path above, so gating on `cancelled` here
+    // loses nothing.
+    if (cancelled) _consumeListing(id);
   } else if (op === "order_post") {
     // WTB craft order — REAL-$CHIKI ONLY. No escrow moves at post time: the poster's wallet
     // rides on the order and they sign the real 75/20/5 payment (via /market/order-pay) when a
