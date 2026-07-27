@@ -2105,7 +2105,16 @@ app.post("/quest/claim", async (req, res) => {
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
   try {
     const wrow = await store.winnerGet(wallet);
-    if (!wrow) return res.status(409).json({ error: "finish the whole questline to earn a winner slot", won: false, winnersRemaining: await store.winnersRemaining(WINNER_CAP) });
+    if (!wrow) {
+      const qr = (await store.qrGet(wallet)) || {};
+      const earned = Math.min(QUEST_REWARD_TOTAL, questEarned(qr.done_mask));
+      const paid = Number(qr.paid_amount) || 0;
+      const owed = Math.max(0, Math.floor(earned - paid));
+      return res.json({ ok: true, won: false, questRewardEarned: earned,
+        questRewardPaid: paid, owed, status: owed > 0 ? "queued" : "none",
+        winnersRemaining: await store.winnersRemaining(WINNER_CAP),
+        message: owed > 0 ? `${owed} $CHIKI is queued for the next reward-pool release.` : "No quest reward is currently owed." });
+    }
     res.json({ ok: true, won: true, rank: wrow.rank, prize: WINNER_REWARD,
       paid: !!wrow.paid, payoutSig: wrow.paid ? wrow.payout_sig : null,
       status: wrow.paid ? "paid" : "queued",
@@ -2936,7 +2945,7 @@ const NODE_USES_TTL_MS = 30 * 60 * 1000;   // a trunk nobody has touched in 30 m
 function nodeSweep(now) {
   for (const [k, u] of worldNodeUses) if (now - u.ts > NODE_USES_TTL_MS) worldNodeUses.delete(k);
   if (worldNodes.size < NODE_MAX) return;
-  for (const [k, t] of worldNodes) if (t <= now) worldNodes.delete(k);
+  for (const [k, t] of worldNodes) if (!(t > now)) worldNodes.delete(k);
 }
 
 // ---- the world REMEMBERS what has been taken from it ----
@@ -3015,7 +3024,9 @@ function nodeId(s) { return String(s || "").replace(/[^A-Za-z0-9:_-]/g, "").slic
 //   3. you cannot claim faster than a human can gather
 // Respawn windows, in seconds, owned by the server. Mines are permanent landmarks that merely
 // refill (Gather.gd uses 10s for them); everything else is a normal node.
-const NODE_CD_S = { gold: 10, iron: 10, crystal_mine: 10 };
+const NODE_CD_S = Object.freeze(Object.assign(Object.create(null), { gold: 10, iron: 10, crystal_mine: 10 }));
+const NODE_USES = Object.freeze(Object.assign(Object.create(null), { wood: 3 }));
+const CLAIM_RADIUS_KIND = Object.freeze(Object.assign(Object.create(null), { pig: 24, cow: 24 }));
 const NODE_CD_DEFAULT_S = 60;
 const CLAIM_RADIUS = 14;          // world units; in-game gather reach is ~7, doubled for latency
 const CLAIM_MIN_MS = 1800;        // the client's own anti-macro floor is 2s
@@ -3039,12 +3050,14 @@ app.post("/world/node/claim", (req, res) => {
   // 2. the node has to be within reach of where you said you were. Ids are "kind:x:z", which is
   //    what lets us check this without trusting any position the caller sends.
   const parts = id.split(":");
+  const kind = String(parts[0] || "");
   const nx = Number(parts[1]), nz = Number(parts[2]);
   if (!Number.isFinite(nx) || !Number.isFinite(nz)) {
     return res.status(400).json({ ok: false, error: "malformed id" });
   }
   const dist = Math.hypot(nx - (me.x || 0), nz - (me.z || 0));
-  if (dist > CLAIM_RADIUS) {
+  const claimRadius = Object.hasOwn(CLAIM_RADIUS_KIND, kind) ? CLAIM_RADIUS_KIND[kind] : CLAIM_RADIUS;
+  if (dist > claimRadius) {
     return res.status(403).json({ ok: false, error: "out of reach", dist: Math.round(dist) });
   }
 
@@ -3070,14 +3083,13 @@ app.post("/world/node/claim", (req, res) => {
   // for everyone. (Honest clients never actually chose it: no node carries a `cd` key, so
   // Gather.gd's best.get("cd", 60.0) always sent 60. Nothing legitimate depended on it.)
   // Derived from the node KIND, which is the part of the id the reach check already trusts.
-  const kind = String(parts[0] || "");
-  const cd = (NODE_CD_S[kind] || NODE_CD_DEFAULT_S) * 1000;
+  const cd = (Object.hasOwn(NODE_CD_S, kind) ? NODE_CD_S[kind] : NODE_CD_DEFAULT_S) * 1000;
 
   // MULTI-LOAD (trees): `uses` is how many loads a FULL node holds. Each claim spends exactly one —
   // the one-item-per-gather rule is unchanged, the trunk simply holds several. Only the claim that
   // takes the last load puts the node on its respawn cooldown, and that is the moment it falls for
   // everyone. A single-load node (every rock, bush and hive) never sends `uses` and is untouched.
-  const uses = Math.round(clampF(b.uses, 0, 16, 0));
+  const uses = Object.hasOwn(NODE_USES, kind) ? NODE_USES[kind] : 1;
   if (uses > 1) {
     const rec = worldNodeUses.get(id);
     const left = (rec ? rec.left : uses) - 1;
@@ -3669,7 +3681,12 @@ app.post("/market/op", async (req, res) => {
     // IDEMPOTENT: a client may re-push a listing it made offline (reconcile). Don't duplicate an id.
     if (_soldListings.has(lid)) {
       // a stale reconcile re-pushing an already-SOLD listing — never resurrect it (double-sale exploit)
-    } else if (!marketListings.some(x => x.id === lid)) {
+      return res.status(409).json({ error: "That listing id was already used. Your goods remain safely escrowed; cancel and re-list them." });
+    }
+    const listingClash = marketListings.find(x => x.id === lid);
+    if (listingClash && listingClash.sid !== sid) {
+      return res.status(409).json({ error: "Listing id collision — cancel and re-list with a fresh id." });
+    } else if (!listingClash) {
       if (marketListings.filter(x => x.sid === sid).length >= 12) return res.status(429).json({ error: "too many listings" });
       marketListings.push({
         id: lid,
@@ -3712,8 +3729,9 @@ app.post("/market/op", async (req, res) => {
       if (!arr.some(s => s.id === row.id) && arr.length < 50)
         arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, buyer: sid.slice(0, 8), buyerName, ts: Date.now() });
     }
+    const before = marketListings.length;
     marketListings = marketListings.filter(x => x.id !== id);
-    _consumeListing(id);   // SOLD -> a re-push can never resurrect it
+    if (marketListings.length < before) _consumeListing(id);   // only a REAL removed row enters the guard
   } else if (op === "cancel" || op === "sold") {
     const id = stripTags(String(l.id || "")).slice(0, 40);
     const before = marketListings.length;
