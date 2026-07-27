@@ -3446,10 +3446,19 @@ store.kvGet("market_auctions").then(v => { if (Array.isArray(v)) marketAuctions 
 // fresh id, so they're unaffected. Kept for MARKET_TTL_MS (matches the listing + client-save lifetime).
 const _soldListings = new Map();   // listing id -> ts consumed
 store.kvGet("market_sold_ids").then(v => { if (Array.isArray(v)) for (const e of v) { if (e && e.id) _soldListings.set(String(e.id), Number(e.ts) || Date.now()); } }).catch(() => {});
+// test seam: lets a sim backdate a consumed id to prove it is NOT forgotten by age. Read-only use
+// in production; nothing in the server calls it.
+export function _soldIdsForTest() { return _soldListings; }
+
 function _consumeListing(id) {
   if (!id) return;
   _soldListings.set(String(id), Date.now());
-  if (_soldListings.size > 8000) { const cut = Date.now() - MARKET_TTL_MS; for (const [k, t] of _soldListings) if (t < cut) _soldListings.delete(k); }
+  // bounded by COUNT, oldest-first — never by age (see pruneMarket). A Map keeps insertion order and
+  // re-setting an existing key does not move it, so the first keys are genuinely the oldest.
+  if (_soldListings.size > 8000) {
+    let drop = _soldListings.size - 8000;
+    for (const k of _soldListings.keys()) { if (drop-- <= 0) break; _soldListings.delete(k); }
+  }
 }
 store.kvGet("auction_refunds").then(v => { if (v && typeof v === "object") auctionRefunds = v; }).catch(() => {});
 async function saveMarket() {
@@ -3575,7 +3584,13 @@ function pruneMarket() {
   if (!_sidSeeded) { _sidSeeded = true; seedSidOwnerFromBoard(); }   // one-time: protect pre-deploy rows from seizure
   sweepAuctions(now);
   marketListings = marketListings.filter(l => now - (l.ts || 0) < MARKET_TTL_MS);
-  { const cut = now - MARKET_TTL_MS; for (const [k, t] of _soldListings) if (t < cut) _soldListings.delete(k); }   // forget consumed ids after the listing TTL
+  // NOTE: _soldListings is deliberately NOT pruned by age here. The seller's client keeps its own
+  // copy of a listing forever (it rides in the signed save and is rehydrated unconditionally), and
+  // on login it re-pushes any "mine" listing the board lacks BEFORE the sales poll clears the sold
+  // one. So if the server forgot a sold id after 24h, a listing that had already been bought went
+  // straight back on the board and could be bought a SECOND time — duplicating the goods and paying
+  // the seller real on-chain $CHIKI twice, through entirely normal play (sell, stay offline a day,
+  // log back in). The memory is bounded by COUNT instead, in _consumeListing.
   _pruneValueMap(marketSales, "credited", now);   // uncredited proceeds survive 60d, not 7
   // orders: drop LEGACY soft-escrow rows (no wallet — pre-real-rail, unpayable); a DELIVERED
   // order is exempt from the open-order TTL but auto-returns its goods when the pay window ends
@@ -3636,7 +3651,13 @@ app.post("/market/op", async (req, res) => {
       marketListings.push({
         id: lid,
         seller: stripTags(String(l.seller || "Trainer")).slice(0, 20), sid,
-        wallet: stripTags(String(l.wallet || "")).slice(0, 44),   // seller's on-chain wallet (for on-chain buys)
+        // PROVEN identity only. This used to be taken verbatim from the caller's request body, so a
+        // seller could list with wallet:"" — which slipped past the on-chain interlock below (it
+        // only fired for rows that HAD a wallet) and let them soft-buy their own listing through
+        // the unauthenticated op:buy for price*0.75 in soft $CHIKI. That credit lands in trade_in,
+        // which raises the wallet's own earn ceiling, so the anti-cheat clamp never clawed it back.
+        // "list" is in _AUTH_OPS, so mktWallet(b) is a wallet this caller has actually proven.
+        wallet: mktWallet(b),
         kind: (["chikimon", "ffish", "pot"].includes(String(l.kind)) ? String(l.kind) : "mat"),
         item: stripTags(String(l.item || "wood")).slice(0, 24),
         qty: clampF(l.qty, 1, 999999, 1) | 0, price: clampF(l.price, 1, 9999999, 1) | 0,
@@ -3652,6 +3673,13 @@ app.post("/market/op", async (req, res) => {
     // seller could POST a fake buy against their own listing to mint soft $CHIKI for nothing.
     if (row && MARKET_ONCHAIN && isPubkey(String(row.wallet || ""))) {
       return res.status(409).json({ error: "this listing settles on-chain — buy it through the on-chain flow" });
+    }
+    // A row with NO wallet cannot be paid on-chain at all, so while the on-chain rail is live it
+    // must not be settleable through this unauthenticated soft path either — that hole was the
+    // mint. New listings always carry a proven wallet (above); only pre-fix rows can be wallet-less
+    // and they age out with the listing TTL.
+    if (row && MARKET_ONCHAIN && !isPubkey(String(row.wallet || ""))) {
+      return res.status(409).json({ error: "this listing cannot settle — it has no payable wallet" });
     }
     // record the sale for the seller BEFORE the listing disappears — this is the
     // player-to-player settlement: without it the seller's goods vanish for nothing
