@@ -2797,7 +2797,7 @@ function availableJoin(body) {
   if (!isPubkey(wallet)) return { error: "wallet required" };
   cleanAvail();
   const cur = pvpPlayerMatch.get(wallet), curM = cur && pvpMatches.get(cur);
-  if (curM && curM.status === "active") { pvpAvail.delete(wallet); return { players: [], challenges: [], matched: { matchId: cur, side: pvpSideOf(curM, wallet) } }; }
+  if (curM && curM.status === "active") { pvpAvail.delete(wallet); const sd = pvpSideOf(curM, wallet); return { players: [], challenges: [], matched: { matchId: cur, side: sd, sec: sd === "a" ? curM.secA : curM.secB } }; }
   if (snap && snap.element) pvpAvail.set(wallet, { name: String(name || "Trainer").slice(0, 20), snap, ts: Date.now(), searching: !!searching });
   else pvpAvail.delete(wallet);
   // auto-match: if I'm actively searching, pair me with ANY other searching Trainer not already in a battle
@@ -2809,7 +2809,8 @@ function availableJoin(body) {
       const match = pvpStartMatch(op, me, { turnMs: 30000 });   // earlier searcher = side a
       pvpAvail.delete(w); pvpAvail.delete(wallet);
       pvpChallenges = pvpChallenges.filter(c => c.from !== w && c.to !== w && c.from !== wallet && c.to !== wallet);
-      return { players: [], challenges: [], matched: { matchId: match.id, side: pvpSideOf(match, wallet) } };
+      { const sd = pvpSideOf(match, wallet);
+        return { players: [], challenges: [], matched: { matchId: match.id, side: sd, sec: sd === "a" ? match.secA : match.secB } }; }
     }
   }
   const players = [...pvpAvail.entries()].filter(([w]) => w !== wallet).map(([w, v]) => ({ wallet: w, name: v.name, searching: !!v.searching }));
@@ -2841,7 +2842,8 @@ app.post("/pvp/challenge/accept", (req, res) => {
   const m = pvpStartMatch(ch.snap, snap, { turnMs: 30000 });   // challenger = side a, accepter = side b
   pvpAvail.delete(ch.from); pvpAvail.delete(wallet);
   pvpChallenges = pvpChallenges.filter(c => c.from !== ch.from && c.to !== ch.from && c.from !== wallet && c.to !== wallet);
-  res.json({ ok: true, matchId: m.id, side: pvpSideOf(m, wallet) });
+  { const side = pvpSideOf(m, wallet);
+    res.json({ ok: true, matchId: m.id, side, sec: side === "a" ? m.secA : m.secB }); }
 });
 // Decline / clear a challenge.
 app.post("/pvp/challenge/decline", (req, res) => {
@@ -2866,9 +2868,20 @@ app.get("/pvp/spectate", (req, res) => {
 });
 
 // Player: lock in your cards for the current turn. body: { matchId, wallet, cards:[handIndex,...] }
+// Resolve the caller's side from their per-match secret, falling back to the wallet ONLY for
+// matches created before secrets existed (in-memory and short-lived, so this drains within minutes).
+function pvpAuthSide(m, body) {
+  const sec = String(body?.sec || "");
+  if (m.secA || m.secB) {
+    if (sec && sec === m.secA) return "a";
+    if (sec && sec === m.secB) return "b";
+    return null;
+  }
+  return pvpSideOf(m, body?.wallet);
+}
 app.post("/pvp/move", (req, res) => {
   const m = pvpMatches.get(req.body?.matchId); if (!m) return res.status(404).json({ error: "match not found" });
-  const who = pvpSideOf(m, req.body?.wallet); if (!who) return res.status(403).json({ error: "not your match" });
+  const who = pvpAuthSide(m, req.body); if (!who) return res.status(403).json({ error: "not your match" });
   const r = pvpSubmit(m, who, Array.isArray(req.body?.cards) ? req.body.cards : []);
   if (!r.ok) return res.status(400).json({ error: r.error });
   res.json(pvpView(m, who));
@@ -2877,7 +2890,7 @@ app.post("/pvp/move", (req, res) => {
 // Player: leave the battle → instant loss; the opponent wins immediately (no waiting for the timer).
 app.post("/pvp/forfeit", (req, res) => {
   const m = pvpMatches.get(req.body?.matchId); if (!m) return res.status(404).json({ error: "match not found" });
-  const who = pvpSideOf(m, req.body?.wallet); if (!who) return res.status(403).json({ error: "not your match" });
+  const who = pvpAuthSide(m, req.body); if (!who) return res.status(403).json({ error: "not your match" });
   pvpForfeit(m, who);
   res.json({ ok: true, ...pvpView(m, who) });
 });

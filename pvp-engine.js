@@ -183,6 +183,12 @@ function createMatch(aSnap, bSnap, opts={}){
   const rng = mulberry32(hashStr(String(seed)));
   const m = {
     id: opts.id || ("m"+Math.random().toString(36).slice(2,9)),
+    // Per-SIDE secret. The wallet used to be the only credential on /pvp/move and /pvp/forfeit, and
+    // wallets are fully public — they ride on the market board, in world chat and in /world/roster.
+    // So anyone who learned a match id (a spectate link, a screenshot) could forfeit a stranger's
+    // duel or burn their turn. Handed out once, when the side learns it is in a match.
+    secA: Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2),
+    secB: Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2),
     seed, status:"active", turnMs: opts.turnMs || TURN_MS_DEFAULT,
     walletA: aSnap.wallet||null, walletB: bSnap.wallet||null,
     rng, aSnap, bSnap, sides:{ a:makeSide(aSnap,"a",rng), b:makeSide(bSnap,"b",rng) },

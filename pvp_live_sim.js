@@ -34,6 +34,13 @@ const inbox = await post("/pvp/available", { wallet: B, name: "Bob", snap: snapB
 const mine = (inbox.challenges || []).find(c => c.from === A);
 chk(!!mine, "Bob sees the challenge in his inbox");
 const acc = await post("/pvp/challenge/accept", { wallet: B, challengeId: mine && mine.id, snap: snapB });
+// per-match secrets: /pvp/move and /pvp/forfeit now require them (the wallet alone is public, so it
+// could never have authorised a mutation). The accepter gets theirs here; the challenger gets
+// theirs from /pvp/available when they discover the match.
+const secB = acc.sec;
+const availA = await post("/pvp/available", { wallet: A, name: "Alice", snap: snapA });
+const secA = availA.matched && availA.matched.sec;
+const secOf = (w) => (w === A ? secA : secB);
 chk(acc.ok === true && !!acc.matchId, `Bob accepts -> a live match exists (${acc.matchId})`);
 const mid = acc.matchId;
 
@@ -51,11 +58,11 @@ const sneak = await get(`/pvp/state?matchId=${mid}&wallet=${stranger}`);
 chk(!!sneak.error, "a stranger is refused the battle state");
 
 console.log("— a turn RESOLVES only when both have committed —");
-const m1 = await post("/pvp/move", { matchId: mid, wallet: A, cards: [0] });
+const m1 = await post("/pvp/move", { matchId: mid, wallet: A, sec: secA, cards: [0] });
 chk(!m1.error, "Alice locks in a card");
 const midTurn = await get(`/pvp/state?matchId=${mid}&wallet=${B}`);
 chk(midTurn.turn !== undefined && midTurn.turn === sa.turn, "the turn has NOT advanced on one player alone");
-const m2 = await post("/pvp/move", { matchId: mid, wallet: B, cards: [0] });
+const m2 = await post("/pvp/move", { matchId: mid, wallet: B, sec: secB, cards: [0] });
 chk(!m2.error, "Bob locks in a card");
 await new Promise(r => setTimeout(r, 250));
 const after = await get(`/pvp/state?matchId=${mid}&wallet=${A}`);
@@ -77,10 +84,10 @@ const commit = async (wal, v) => {
   const hand = (v.you && v.you.hand) || [];
   for (const idx of [0, 1, 2]) {
     if (idx >= hand.length) break;
-    const r = await post("/pvp/move", { matchId: mid, wallet: wal, cards: [idx] });
+    const r = await post("/pvp/move", { matchId: mid, wallet: wal, sec: secOf(wal), cards: [idx] });
     if (!r.error) return true;
   }
-  const p = await post("/pvp/move", { matchId: mid, wallet: wal, cards: [] });   // pass
+  const p = await post("/pvp/move", { matchId: mid, wallet: wal, sec: secOf(wal), cards: [] });   // pass
   return !p.error;
 };
 for (let i = 0; i < 900; i++) {
@@ -104,7 +111,9 @@ console.log("— walking out is an instant loss, not a hang —");
   const inb = await post("/pvp/available", { wallet: D, name: "Dev", snap: { ...snapB, name: "Dev" } });
   const c2 = (inb.challenges || []).find(x => x.from === C);
   const a2 = await post("/pvp/challenge/accept", { wallet: D, challengeId: c2 && c2.id, snap: { ...snapB, name: "Dev" } });
-  const ff = await post("/pvp/forfeit", { matchId: a2.matchId, wallet: C });
+  const availC = await post("/pvp/available", { wallet: C, name: "Cara", snap: { ...snapA, name: "Cara" } });
+  const secC = availC.matched && availC.matched.sec;
+  const ff = await post("/pvp/forfeit", { matchId: a2.matchId, wallet: C, sec: secC });
   chk(ff.ok === true, "the quitter's forfeit is accepted");
   const end = await get(`/pvp/state?matchId=${a2.matchId}&wallet=${D}`);
   chk(end.status === "finished", "the match ends immediately for the player who stayed");
