@@ -3250,6 +3250,274 @@ function presenceOk(id, body) {
 }
 
 
+// ============ ASSET REGISTRY — server-minted, permanent, transfer-only ============
+// The ledger below INFERS provenance from consecutive cloud saves. That can be sharpened but never
+// finished, because the save is authored and sampled by the client: it can only ever check that the
+// player's own story is self-consistent. Six things are unreachable by any refinement of it —
+// avatars and scrolls (never transmitted anywhere the server records), backdated egg timers
+// (client-authored), material quantities, mount identity (a six-value namespace with no per-instance
+// id), the existence of an egg at all, and cross-wallet cloning (one forged legendary sold to five
+// buyers is five unrelated "new units").
+//
+// Every one of those becomes a lookup the moment the SERVER mints the asset. This registry is that:
+//   * an id the server issues and the client cannot choose
+//   * a birth timestamp the server writes, so incubation is real elapsed time
+//   * a hatch ROLL the server performs, so a cheater cannot pick the griffin
+//   * a provenance chain that is append-only
+//   * ownership that changes only through a verified transfer
+//
+// A registered asset therefore CANNOT BE ERASED OR FORGED: a save that omits it does not destroy it
+// (the registry is authoritative and hands it back), and a save that invents one cannot produce a
+// registry id, because ids come from here. Eggs are consumed, never deleted — a consumed egg keeps
+// its row and points at what hatched from it. That permanence, plus a stable id and a full lineage,
+// is exactly what a future NFT mint needs in order to trust the record.
+//
+// ADDITIVE BY DESIGN. These are new endpoints; the live client does not call them yet, so no
+// existing behaviour changes. As the client adopts them, assets gain registry identity — and the
+// ledger keeps covering everything that predates adoption.
+const assetReg = new Map();             // assetId -> row
+const assetsByOwner = new Map();        // wallet  -> Set(assetId)
+const ASSET_REG_MAX = 400000;
+
+// Mirrors of the client's own tables (Econ.gd). The hatch rolls HERE, so these must match, and a
+// mismatch shows up as a species the client cannot render rather than as a silent exploit.
+const SPECIES_NORMAL = Object.freeze(["drolax", "electrox", "firix", "forestle", "healix",
+                                      "jellox", "mushrow", "owzard", "scorplex", "solarix"]);
+const SPECIES_LEGEND = Object.freeze(["galador", "adalor", "tyrannos", "grovador", "dragonos"]);
+const SPECIES_MEME   = Object.freeze(["popcat", "moodeng", "doge", "pepe", "chillguy", "alon"]);
+// supply-weighted exactly as Econ.MOUNTS: the Mythic griffin is the longest shot, and rolling it
+// server-side is the point — a crafted save used to simply name it.
+const MOUNT_SUPPLY = Object.freeze([["chicken", 15], ["boar", 20], ["gator", 15],
+                                    ["horse", 10], ["wolf", 10], ["griffin", 5]]);
+const AVATAR_IDS = Object.freeze(["classic", "Knight", "Mystic", "Navigator", "Star",
+                                  "chemist", "electro", "fire", "night", "sailor"]);
+const EGG_KIND_POOL = Object.freeze(Object.assign(Object.create(null), {
+  normal: SPECIES_NORMAL, legendary: SPECIES_LEGEND, meme: SPECIES_MEME,
+}));
+const AVATARS_MAX = 2;                  // the client's own hard cap (GameHUD._azulon_buy)
+
+let _regSeq = 0;
+function mintAssetId(type) {
+  // Unguessable and unique: the client must never be able to name an id it does not already hold.
+  return `${type[0]}${Date.now().toString(36)}${(++_regSeq).toString(36)}${crypto.randomBytes(6).toString("hex")}`;
+}
+function ownerSet(w) { let s = assetsByOwner.get(w); if (!s) { s = new Set(); assetsByOwner.set(w, s); } return s; }
+function regOwned(wallet, type, state = "active") {
+  const out = [];
+  for (const id of (assetsByOwner.get(wallet) || [])) {
+    const r = assetReg.get(id);
+    if (r && r.type === type && (!state || r.state === state)) out.push(r);
+  }
+  return out;
+}
+// Append-only history. Nothing in this file ever rewrites or removes a chain entry — the chain IS
+// the provenance, and a mutable provenance is not one.
+function regEvent(row, what, extra) { row.chain.push(Object.assign({ at: Date.now(), what }, extra || {})); }
+
+function mintAsset(type, wallet, fields, origin, parent) {
+  if (assetReg.size >= ASSET_REG_MAX) throw new Error("asset registry is full");
+  const id = mintAssetId(type);
+  const row = Object.assign({
+    id, type, owner: wallet, born: Date.now(), origin, state: "active",
+    parent: parent || null, chain: [],
+  }, fields || {});
+  regEvent(row, "minted", { to: wallet, origin });
+  assetReg.set(id, row);
+  ownerSet(wallet).add(id);
+  _assetsDirty = true;
+  return row;
+}
+
+// Ownership moves ONLY through here, and the old owner's claim is removed in the same step — which
+// is what makes a registered asset impossible to clone: it exists once, in one place.
+function transferAsset(id, from, to, why, extra) {
+  const row = assetReg.get(id);
+  if (!row || row.owner !== from || row.state !== "active") return null;
+  row.owner = to;
+  ownerSet(from).delete(id);
+  ownerSet(to).add(id);
+  regEvent(row, "transferred", Object.assign({ from, to, why }, extra || {}));
+  _assetsDirty = true;
+  return row;
+}
+
+function eggReadyAt(row) { return row.born + (EGG_HOURS[row.kind] || 3) * 3600 * 1000; }
+
+// Deterministic-free, server-side roll. crypto.randomInt is used rather than Math.random because
+// this decides real value — which mount, which legendary — and a predictable roll is a cheat.
+function pickWeighted(pairs) {
+  const total = pairs.reduce((a, p) => a + p[1], 0);
+  if (total <= 0) return null;
+  let roll = crypto.randomInt(total);
+  for (const [id, w] of pairs) { if (roll < w) return id; roll -= w; }
+  return pairs[pairs.length - 1][0];
+}
+
+// What this wallet already holds, from BOTH sources: the registry (what the server minted) and the
+// ledger (what predates it). The client's rule is one of each species ever, so the roll must respect
+// everything the player owns, not just the part this system issued.
+function ownedSpecies(wallet) {
+  const own = new Set();
+  for (const r of regOwned(wallet, "chikimon")) own.add(r.sp);
+  const lrec = assetLedger.get(wallet);
+  if (lrec) for (const u of Object.values(lrec.units)) own.add(u.sp);
+  return own;
+}
+function ownedMounts(wallet) {
+  const own = new Set();
+  for (const r of regOwned(wallet, "mount")) own.add(r.sp);
+  const lrec = assetLedger.get(wallet);
+  if (lrec) for (const id of Object.keys(lrec.mounts)) own.add(id);
+  return own;
+}
+
+// ---- endpoints -----------------------------------------------------------------------------
+// Every one requires a PROVEN wallet (the market token bound at /verify) — a bare wallet address is
+// public and proves nothing.
+function regWallet(req) {
+  const b = req.body || {};
+  const w = String(b.wallet || "");
+  return mktWallet({ wallet: w, mktToken: String(b.mktToken || "") });
+}
+const EGG_CLAIM_MIN_MS = 5000;          // a human bartering at Mithra cannot beat this
+const _lastEggClaim = new Map();
+
+// Issue an egg. The client has already taken the barter from the player's own inventory; what the
+// server adds — and what the client cannot fake — is the identity and the clock.
+app.post("/assets/egg/claim", (req, res) => {
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const wallet = regWallet(req);
+  if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
+  const kind = String(req.body?.kind || "");
+  if (!["normal", "legendary", "meme", "mount"].includes(kind)) return res.status(400).json({ error: "unknown egg kind" });
+  const now = Date.now();
+  if (now - (_lastEggClaim.get(wallet) || 0) < EGG_CLAIM_MIN_MS) return res.status(429).json({ error: "too fast" });
+  // the client's own rule: one egg of each kind at a time (Profile.gd start_egg)
+  if (regOwned(wallet, "egg").some(e => e.kind === kind)) {
+    return res.status(409).json({ error: "your nest already cradles an egg of that kind" });
+  }
+  _lastEggClaim.set(wallet, now);
+  const row = mintAsset("egg", wallet, { kind, sp: kind }, "issued");
+  res.json({ ok: true, egg: { id: row.id, kind, born: row.born, readyAt: eggReadyAt(row) } });
+});
+
+// Hatch. The server checks the clock IT wrote, rolls the result ITSELF, consumes the egg forever,
+// and mints the creature. A crafted save can do none of those four things.
+app.post("/assets/egg/hatch", (req, res) => {
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const wallet = regWallet(req);
+  if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
+  const id = String(req.body?.id || "").slice(0, 64);
+  const row = assetReg.get(id);
+  if (!row || row.type !== "egg" || row.owner !== wallet) return res.status(404).json({ error: "no such egg" });
+  if (row.state !== "active") return res.status(409).json({ error: "that egg has already hatched" });
+  const ready = eggReadyAt(row);
+  if (Date.now() < ready) return res.status(425).json({ error: "still incubating", readyIn: ready - Date.now() });
+
+  let born;
+  if (row.kind === "mount") {
+    const have = ownedMounts(wallet);
+    const pool = MOUNT_SUPPLY.filter(([mid]) => !have.has(mid));
+    if (!pool.length) return res.status(409).json({ error: "your stable is already full" });
+    born = mintAsset("mount", wallet, { sp: pickWeighted(pool), kind: "mount" }, "hatched", row.id);
+  } else {
+    const have = ownedSpecies(wallet);
+    const pool = (EGG_KIND_POOL[row.kind] || SPECIES_NORMAL).filter(s => !have.has(s));
+    if (!pool.length) return res.status(409).json({ error: "you already own every species from that egg" });
+    const sp = pool[crypto.randomInt(pool.length)];
+    born = mintAsset("chikimon", wallet, { sp, kind: row.kind === "normal" ? "normal" : row.kind, lvl: 1 }, "hatched", row.id);
+  }
+  // CONSUMED, NOT DELETED. The egg keeps its row and points at what came out of it, so the
+  // creature's lineage is readable forever — and the egg can never vouch a second hatch.
+  row.state = "consumed";
+  row.hatchedTo = born.id;
+  regEvent(row, "hatched", { into: born.id, sp: born.sp });
+  _assetsDirty = true;
+  res.json({ ok: true, hatched: { id: born.id, type: born.type, sp: born.sp, kind: born.kind, born: born.born, from: row.id } });
+});
+
+// Redeem an Avatar Scroll. Avatars had NO server record of any kind — adding one to a save was free
+// and permanent, and each carries a rarity-scaled perk that converts into materials, which do sell
+// on the real rail. The look is rolled here, from what the wallet does not already own.
+app.post("/assets/scroll/redeem", (req, res) => {
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const wallet = regWallet(req);
+  if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
+  const held = regOwned(wallet, "avatar");
+  if (held.length >= AVATARS_MAX) return res.status(409).json({ error: "you already carry two looks" });
+  const have = new Set(held.map(a => a.sp));
+  // the ceremony look every player is awarded is theirs whether or not it was ever registered
+  const pool = AVATAR_IDS.filter(a => !have.has(a) && a !== "classic");
+  if (!pool.length) return res.status(409).json({ error: "no looks left" });
+  const row = mintAsset("avatar", wallet, { sp: pool[crypto.randomInt(pool.length)], kind: "avatar" }, "scroll");
+  res.json({ ok: true, avatar: { id: row.id, sp: row.sp, born: row.born } });
+});
+
+// The authoritative holdings. This is what makes "cannot be erased" true in practice: whatever a
+// save says, this is what the wallet owns, and the client can reconcile against it.
+app.get("/assets/mine", (req, res) => {
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const w = String(req.query?.wallet || "");
+  if (!isPubkey(w)) return res.status(400).json({ error: "valid wallet required" });
+  if (!cupAdminOk(req) && mktWallet({ wallet: w, mktToken: String(req.query?.mktToken || "") }) !== w) {
+    return res.status(403).json({ error: "prove this wallet first" });
+  }
+  const out = { eggs: [], chikimon: [], mounts: [], avatars: [] };
+  for (const id of (assetsByOwner.get(w) || [])) {
+    const r = assetReg.get(id);
+    if (!r) continue;
+    const card = { id: r.id, sp: r.sp, kind: r.kind, born: r.born, origin: r.origin, state: r.state };
+    if (r.type === "egg") { card.readyAt = eggReadyAt(r); card.hatchedTo = r.hatchedTo || null; out.eggs.push(card); }
+    else if (r.type === "chikimon") { card.lvl = r.lvl; out.chikimon.push(card); }
+    else if (r.type === "mount") out.mounts.push(card);
+    else if (r.type === "avatar") out.avatars.push(card);
+  }
+  res.json(out);
+});
+
+// One asset's full lineage — the record a future NFT mint would carry as its provenance.
+app.get("/assets/cert", (req, res) => {
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const id = String(req.query?.id || "").slice(0, 64);
+  const r = assetReg.get(id);
+  if (!r) return res.status(404).json({ error: "no such asset" });
+  const lineage = [];
+  for (let cur = r, guard = 0; cur && guard < 8; guard++) {
+    lineage.push({ id: cur.id, type: cur.type, sp: cur.sp, born: cur.born, origin: cur.origin });
+    cur = cur.parent ? assetReg.get(cur.parent) : null;
+  }
+  // owner is public here on purpose: a certificate nobody can check is not a certificate.
+  res.json({ id: r.id, type: r.type, sp: r.sp, kind: r.kind, born: r.born, origin: r.origin,
+             state: r.state, owner: r.owner, lineage, chain: r.chain.slice(0, 64) });
+});
+
+export function serializeAssetReg() {
+  return { rows: [...assetReg.values()].slice(-ASSET_REG_MAX) };
+}
+export function restoreAssetReg(v) {
+  if (!v || typeof v !== "object" || !Array.isArray(v.rows)) return 0;
+  let n = 0;
+  for (const src of v.rows) {
+    if (!src || typeof src !== "object") continue;
+    const id = String(src.id || "").slice(0, 64), owner = String(src.owner || "").slice(0, 64);
+    const type = String(src.type || "");
+    if (!id || !isPubkey(owner) || !["egg", "chikimon", "mount", "avatar"].includes(type)) continue;
+    const row = { id, type, owner, sp: String(src.sp || "").slice(0, 24), kind: String(src.kind || "").slice(0, 12),
+                  born: Number(src.born) || Date.now(), origin: String(src.origin || "issued").slice(0, 16),
+                  state: src.state === "consumed" ? "consumed" : "active",
+                  parent: src.parent ? String(src.parent).slice(0, 64) : null,
+                  hatchedTo: src.hatchedTo ? String(src.hatchedTo).slice(0, 64) : undefined,
+                  lvl: Number(src.lvl) || undefined,
+                  chain: Array.isArray(src.chain) ? src.chain.slice(0, 64) : [] };
+    assetReg.set(id, row); ownerSet(owner).add(id); n++;
+  }
+  return n;
+}
+export function _clearAssetReg() { assetReg.clear(); assetsByOwner.clear(); }
+// test seam: age an egg past its incubation window without waiting real hours
+export function _ageAsset(id, ms) { const r = assetReg.get(id); if (r) { r.born -= ms; return true; } return false; }
+export function _transferAssetForTest(id, from, to, why) { return transferAsset(id, from, to, why); }
+
 // ============ ASSET AUTHENTICITY LEDGER ============
 // The server stored profile.mmo verbatim, so it had no idea what a wallet SHOULD own: a save
 // carrying 12 fabricated level-50 legendaries, every mount and a conjured egg was accepted and
@@ -3524,16 +3792,22 @@ let _assetsReady = false;
 async function saveAssetLedger() {
   if (!_assetsDirty || !_assetsReady) return;
   _assetsDirty = false;
-  try { await store.kvSet("asset_ledger", serializeAssetLedger()); }
-  catch (e) { _assetsDirty = true; }    // a failed write must not silently drop the record
+  try {
+    // The REGISTRY goes first. It holds minted assets that exist nowhere else — losing a row means
+    // destroying a player's property, which the ledger (a derived record) can never do. If the
+    // registry write fails, the ledger write is abandoned too so the pair cannot drift apart.
+    await store.kvSet("asset_registry", serializeAssetReg());
+    await store.kvSet("asset_ledger", serializeAssetLedger());
+  } catch (e) { _assetsDirty = true; }   // a failed write must not silently drop the record
 }
 setInterval(saveAssetLedger, ASSET_SAVE_MS).unref?.();   // SIGTERM flush lives with saveWorldNodes
-store.kvGet("asset_ledger").then(v => {
-  const n = restoreAssetLedger(v);
+Promise.all([store.kvGet("asset_registry"), store.kvGet("asset_ledger")]).then(([rv, lv]) => {
+  const rn = restoreAssetReg(rv);
+  const n = restoreAssetLedger(lv);
   _assetsReady = true;
-  if (n) console.log(`asset ledger restored: ${n} wallets`);
+  if (rn || n) console.log(`assets restored: ${rn} registered, ${n} ledger wallets`);
 }).catch(e => {
-  console.error("asset ledger restore FAILED — auditing is suspended until a restart reads it:", e && e.message);
+  console.error("asset restore FAILED — issuing and auditing are suspended until a restart reads it:", e && e.message);
 });
 
 app.post("/world/move", (req, res) => {
