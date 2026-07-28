@@ -3053,8 +3053,12 @@ async function saveWorldNodes() {
 }
 setInterval(saveWorldNodes, NODE_SAVE_MS).unref?.();
 // Render sends SIGTERM on every deploy — flush so the last claims before a push are not lost.
+// ONE handler for everything that needs flushing: a second handler calling process.exit() would
+// race this one and kill the process mid-write. saveAssetLedger is a hoisted declaration below.
 for (const sig of ["SIGTERM", "SIGINT"]) {
-  process.on(sig, () => { saveWorldNodes().finally(() => process.exit(0)); });
+  process.on(sig, () => {
+    Promise.allSettled([saveWorldNodes(), saveAssetLedger()]).finally(() => process.exit(0));
+  });
 }
 
 store.kvGet("world_nodes").then(v => {
@@ -3291,12 +3295,78 @@ function auditAssets(wallet, mmo) {
     if (origin === "unverified") { rec.unverified++; flagged.push(`mount:${id}`); }
   }
   rec.eggsLast = eggsNow;
+  if (newUnits || newMounts) _assetsDirty = true;
+
+  // EVICTION MUST NEVER AMNESTY. Dropping a record does not just lose history: the wallet's next
+  // save reads as firstEver, so everything it holds is re-stamped "legacy" and its flags are gone.
+  // So only ever evict CLEAN records (unverified === 0) — a flagged wallet stays until it is dealt
+  // with. If every record is flagged the map simply stops shrinking, which is the safe direction.
   if (assetLedger.size > ASSET_LEDGER_MAX) {
-    const oldest = [...assetLedger.entries()].sort((a, b) => a[1].first - b[1].first).slice(0, 500);
-    for (const [k] of oldest) assetLedger.delete(k);
+    const clean = [...assetLedger.entries()].filter(([, r]) => !r.unverified)
+      .sort((a, b) => a[1].first - b[1].first).slice(0, 500);
+    for (const [k] of clean) assetLedger.delete(k);
+    _assetsDirty = true;
   }
   return { firstEver, newUnits, newMounts, eggsSpent, flagged, unverified: rec.unverified };
 }
+
+// PERSISTENCE. Render restarts on every deploy and spins down when idle. An in-memory-only ledger
+// would see each wallet's first save after every restart as firstEver and re-stamp a forged roster
+// as "legacy" — the record would launder exactly what it exists to catch. So it goes to the store,
+// same shape as the world nodes above, exported so a sim can round-trip the REAL functions.
+let _assetsDirty = false;
+const ASSET_SAVE_MS = 30000;
+
+export function serializeAssetLedger() {
+  return { w: [...assetLedger.entries()].slice(-ASSET_LEDGER_MAX) };
+}
+
+// Restoring trusts NOTHING — this blob came back from a database, so every field is re-typed and
+// re-clamped, and `unverified` is RECOUNTED from the origins rather than believed, so a corrupted
+// (or edited) counter cannot clear a wallet's flags.
+export function restoreAssetLedger(v) {
+  if (!v || typeof v !== "object" || !Array.isArray(v.w)) return 0;
+  let n = 0;
+  for (const e of v.w) {
+    if (!Array.isArray(e) || typeof e[1] !== "object" || !e[1]) continue;
+    const w = String(e[0] || "").slice(0, 64), src = e[1];
+    if (!w) continue;
+    const rec = { first: Number(src.first) || Date.now(), units: {}, mounts: {},
+                  eggsLast: Number.isFinite(Number(src.eggsLast)) ? Number(src.eggsLast) : null,
+                  unverified: 0 };
+    const su = (src.units && typeof src.units === "object") ? src.units : {};
+    for (const uid of Object.keys(su).slice(0, 400)) {
+      const u = su[uid] || {}, origin = ORIGINS.has(u.origin) ? u.origin : "unverified";
+      rec.units[String(uid).slice(0, 40)] = { sp: String(u.sp || "?").slice(0, 24), kind: String(u.kind || "?").slice(0, 12),
+                                              lvl: Number(u.lvl) || 1, ts: Number(u.ts) || rec.first, origin };
+      if (origin === "unverified") rec.unverified++;
+    }
+    const sm = (src.mounts && typeof src.mounts === "object") ? src.mounts : {};
+    for (const id of Object.keys(sm).slice(0, 40)) {
+      const m = sm[id] || {}, origin = ORIGINS.has(m.origin) ? m.origin : "unverified";
+      rec.mounts[String(id).slice(0, 24)] = { ts: Number(m.ts) || rec.first, origin };
+      if (origin === "unverified") rec.unverified++;
+    }
+    assetLedger.set(w, rec); n++;
+  }
+  return n;
+}
+const ORIGINS = new Set(["legacy", "hatched", "unverified"]);
+
+// test seam: let a sim empty the ledger without reaching into module internals
+export function _clearAssetLedger() { assetLedger.clear(); }
+
+async function saveAssetLedger() {
+  if (!_assetsDirty) return;
+  _assetsDirty = false;
+  try { await store.kvSet("asset_ledger", serializeAssetLedger()); }
+  catch (e) { _assetsDirty = true; }    // a failed write must not silently drop the record
+}
+setInterval(saveAssetLedger, ASSET_SAVE_MS).unref?.();   // SIGTERM flush lives with saveWorldNodes
+store.kvGet("asset_ledger").then(v => {
+  const n = restoreAssetLedger(v);
+  if (n) console.log(`asset ledger restored: ${n} wallets`);
+}).catch(() => {});
 
 app.post("/world/move", (req, res) => {
   const b = req.body || {}, wallet = b.wallet;
