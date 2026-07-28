@@ -3219,6 +3219,43 @@ app.post("/world/node/claim", (req, res) => {
   res.json({ ok: true, taken: false, until: now + cd, drop: drop3 });
 });
 
+// ============ STEP 6 OF SERVER AUTHORITY: fishing joins the observed faucet (observe-only) ============
+// Gathering has been server-observed since Step 1 (recordGather from /world/node/claim). Fishing was
+// the one high-frequency MATERIAL faucet the server never saw at all — the "fish" material entered a
+// save with no server event. That blind spot actively MISFIRED the oversold signal: it compares fish
+// LISTED against gatherCount["fish"], which was permanently 0, so every honest angler who listed >50
+// fish already looked suspicious. This closes it exactly the way gathering is closed: the client
+// reports each catch, the server records ONE fish per catch into the same gatherCount tally.
+//
+// OBSERVE-ONLY, and deliberately not enforcement. The client still credits the fish locally (fishing
+// stays client-authoritative until the whole material count is enforced — that flip waits for live
+// data, like every gate in this migration). This only lets the server learn the plausible ceiling of
+// fish a wallet has caught, so `caught >= held + sold` becomes a real invariant for fish. recordGather
+// already counts pubkey wallets only, so an unsigned net_id catch is harmlessly ignored (they cannot
+// sell on the market either). A live world presence is required (same gate as a node claim), and the
+// COUNT is rate-capped to a human catch pace so a spammed report cannot inflate the ceiling it exists
+// to bound — the cap under-counts nothing an honest angler could actually do (the reel minigame is
+// slower than this), it only refuses a tight machine-gun loop.
+const FISH_REC_MIN_MS = 800;         // cap the COUNTED rate to human scale; honest play never beats it
+const _lastFishRec = new Map();      // wallet -> last COUNTED catch ms (anti-inflation, not a refusal)
+app.post("/world/fish/report", (req, res) => {
+  const b = req.body || {};
+  if (!isPresenceId(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
+  const now = Date.now();
+  // you have to actually be in the world (same presence gate as a node claim)
+  const me = worldPlayers.get(String(b.wallet));
+  if (!me || now - me.ts > WORLD_TTL_MS) return res.status(403).json({ ok: false, error: "no live presence" });
+  // count at most one fish per human-plausible interval — a spammed loop cannot inflate the ceiling
+  const last = _lastFishRec.get(String(b.wallet)) || 0;
+  if (now - last < FISH_REC_MIN_MS) return res.json({ ok: true, counted: false });
+  _lastFishRec.set(String(b.wallet), now);
+  if (_lastFishRec.size > 20000) {   // bound the map like every other per-wallet map here
+    for (const [k, t] of _lastFishRec) { if (now - t > 120000) _lastFishRec.delete(k); }
+  }
+  recordGather(String(b.wallet), "fish", ["fish"]);   // pubkey-only inside; net_id catches are ignored
+  res.json({ ok: true, counted: true });
+});
+
 // the world's currently-spent nodes, so a client can hide what someone else already took
 // Provenance for one wallet's assets: what it holds, when each first appeared, and how.
 // Readable by the PROVEN owner or an admin — an asset record is as sensitive as the roster itself.
