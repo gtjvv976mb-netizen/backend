@@ -3602,6 +3602,26 @@ function owedEggs(mmo) {
     const has = held.filter(e => e && String(e.kind) === kind).length;
     if (made - hatched - has > 0) out.push(kind);       // one per kind, never a stack
   }
+
+  // THE STARTER EGG LEAVES NO COUNTER. Every egg Mithra conjures bumps prog.eggmake_<kind>, but the
+  // award-ceremony egg every new player receives is appended straight to the nest by Onboarding —
+  // no counter at all — and the nest is exactly what the tamper wipe clears. So the arithmetic
+  // above is blind to the one egg that a brand-new player is most likely to have lost.
+  //
+  // The evidence for it is circumstantial but unambiguous: they finished onboarding, they hold no
+  // egg, they have never hatched anything, and they own no chikimon. A player who still had their
+  // starter would hold it; one who hatched it would have the creature. Only someone whose nest was
+  // emptied lands in all four at once.
+  if (!out.includes("normal")) {
+    const onboarded = !!(mmo && mmo.onboarded);
+    const units = (mmo && mmo.units && typeof mmo.units === "object") ? Object.keys(mmo.units).length : 0;
+    let hatchedAny = 0;
+    for (const kind of RESTITUTION_KINDS) hatchedAny += Math.max(0, Number(prog[`hatch_${kind}`]) || 0);
+    const madeAny = RESTITUTION_KINDS.reduce((n, k) => n + Math.max(0, Number(prog[`eggmake_${k}`]) || 0), 0);
+    if (onboarded && held.length === 0 && units === 0 && hatchedAny === 0 && madeAny === 0) {
+      out.push("normal");
+    }
+  }
   return out;
 }
 

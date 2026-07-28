@@ -145,5 +145,39 @@ sec("the response carries exactly the fields the client reads");
   chk(Array.isArray(empty.body.granted), `"granted" is an array even when nothing is owed (${JSON.stringify(empty.body.granted)})`);
 }
 
+
+sec("the counter-less STARTER egg is covered too");
+{
+  const W = await mkWallet();
+  // onboarded, nest empty, nothing ever hatched, no chikimon — only an emptied nest looks like this
+  await save(W, { onboarded: true, eggs: [], units: {}, mounts: [], prog: {} });
+  const q = await owedOf(W);
+  chk(q.body.owed.length === 1 && q.body.owed[0] === "normal",
+      `a wiped starter egg is owed back (${JSON.stringify(q.body.owed)})`);
+  const c = await claim(W);
+  chk(c.body.granted.length === 1 && c.body.granted[0].kind === "normal",
+      `and granted (${c.body.granted[0]?.kind})`);
+
+  // CONTROLS — each of the four conditions alone must stop it being owed
+  const still = await mkWallet();
+  await save(still, { onboarded: true, eggs: [{ kind: "normal", started: 1 }], units: {}, mounts: [], prog: {} });
+  chk((await claim(still)).body.granted.length === 0, `someone still holding their starter gets nothing`);
+
+  const hatchedIt = await mkWallet();
+  await save(hatchedIt, { onboarded: true, eggs: [], units: { u1: { species: "firix", kind: "normal", level: 3 } },
+                          mounts: [], prog: { hatch_normal: 1 } });
+  chk((await claim(hatchedIt)).body.granted.length === 0, `someone who hatched theirs gets nothing`);
+
+  const fresh = await mkWallet();
+  await save(fresh, { onboarded: false, eggs: [], units: {}, mounts: [], prog: {} });
+  chk((await claim(fresh)).body.granted.length === 0, `someone who never onboarded gets nothing`);
+
+  const veteran = await mkWallet();
+  await save(veteran, { onboarded: true, eggs: [], units: {}, mounts: [], prog: { eggmake_meme: 1, hatch_meme: 1 } });
+  const v = await claim(veteran);
+  chk(!v.body.granted.some(g => g.kind === "normal"),
+      `a veteran who has hatched before is not handed a second starter (${JSON.stringify(v.body.granted.map(g=>g.kind))})`);
+}
+
 console.log(`\nEGGRESTITUTION_DONE pass=${pass} fail=${fail}`);
 process.exit(fail ? 1 : 0);
