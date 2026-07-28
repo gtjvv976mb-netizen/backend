@@ -197,5 +197,40 @@ sec("transferAsset validates its destination");
   chk(!!SRV._transferAssetForTest(id, W.wallet, W2.wallet, "real"), `(control) a real transfer still works`);
 }
 
+
+sec("a level rewrite is RECORDED — and deliberately blocks nothing");
+{
+  const W = await mkWallet();
+  SRV._setWalletFirstSeenForTest(W.wallet, Date.UTC(2025, 0, 1));   // a real pre-ledger player
+  await save(W, { eggs: [], units: { u1: unit("pipmoth", "normal", 2) }, mounts: [] });
+  const before = await audit(W);
+  chk(before.units.u1.lvl === 2 && before.units.u1.origin === "legacy",
+      `starts at lvl 2, legacy (${before.units.u1.lvl}/${before.units.u1.origin})`);
+  await save(W, { eggs: [], units: { u1: unit("pipmoth", "normal", 50) }, mounts: [] });
+  const after = await audit(W);
+  chk(after.units.u1.jump === 48, `the 2 -> 50 rewrite is recorded as a jump (${after.units.u1.jump})`);
+  chk(after.units.u1.origin === "legacy", `but the unit is NOT condemned on a guessed threshold (${after.units.u1.origin})`);
+  chk(after.unverified === 0, `and the player carries no flag (${after.unverified})`);
+  const sum = (await get("/assets/summary?key=test-admin-key")).body;
+  chk(Array.isArray(sum.biggestLevelJumps) && sum.biggestLevelJumps.some(j => j.jump === 48),
+      `it surfaces to the admin summary for threshold-setting (${sum.biggestLevelJumps?.length} entries)`);
+  // ordinary progress must NOT register as a jump worth reporting
+  const W2 = await mkWallet();
+  SRV._setWalletFirstSeenForTest(W2.wallet, Date.UTC(2025, 0, 1));
+  await save(W2, { eggs: [], units: { u1: unit("leafcub", "normal", 7) }, mounts: [] });
+  await save(W2, { eggs: [], units: { u1: unit("leafcub", "normal", 8) }, mounts: [] });
+  const a2 = await audit(W2);
+  chk((a2.units.u1.jump || 0) <= 1, `(control) a normal level-up is a jump of 1 (${a2.units.u1.jump || 0})`);
+  const sum2 = (await get("/assets/summary?key=test-admin-key")).body;
+  chk(!sum2.biggestLevelJumps.some(j => j.uid === "u1" && j.jump === 1),
+      `(control) and does not clutter the report`);
+  // and it survives a restart, or the observation resets on every deploy
+  const blob = JSON.parse(JSON.stringify(SRV.serializeAssetLedger()));
+  SRV._clearAssetLedger();
+  SRV.restoreAssetLedger(blob);
+  const sum3 = (await get("/assets/summary?key=test-admin-key")).body;
+  chk(sum3.biggestLevelJumps.some(j => j.jump === 48), `the observation survives a restart`);
+}
+
 console.log(`\nASSETPERIM_DONE pass=${pass} fail=${fail}`);
 process.exit(fail ? 1 : 0);

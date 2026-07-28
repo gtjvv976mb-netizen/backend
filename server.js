@@ -3205,13 +3205,20 @@ app.get("/assets/summary", (req, res) => {
   if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
   let wallets = 0, units = 0, mounts = 0, unver = 0;
   const byOrigin = {};
-  for (const [, r] of assetLedger) {
+  // observed single-save level jumps, so a plausibility threshold can be set from the real
+  // distribution rather than guessed. Nothing is blocked on this yet.
+  const jumps = [];
+  for (const [w, r] of assetLedger) {
     wallets++;
-    for (const u of Object.values(r.units)) { units++; byOrigin[u.origin] = (byOrigin[u.origin] || 0) + 1; }
+    for (const [uid, u] of Object.entries(r.units)) {
+      units++; byOrigin[u.origin] = (byOrigin[u.origin] || 0) + 1;
+      if (u.jump > 4) jumps.push({ w: w.slice(0, 8), uid, sp: u.sp, jump: u.jump, lvl: u.lvl, origin: u.origin });
+    }
     for (const m of Object.values(r.mounts)) { mounts++; byOrigin[m.origin] = (byOrigin[m.origin] || 0) + 1; }
     unver += r.unverified;
   }
-  res.json({ wallets, units, mounts, unverified: unver, byOrigin });
+  jumps.sort((a, b) => b.jump - a.jump);
+  res.json({ wallets, units, mounts, unverified: unver, byOrigin, biggestLevelJumps: jumps.slice(0, 40) });
 });
 
 app.get("/world/nodes", (_req, res) => {
@@ -3756,7 +3763,19 @@ function auditAssets(wallet, mmo, walletFirstSeen = 0) {
         if (r.origin !== "unverified") { r.origin = "unverified"; flag(`rebrand:${uid}:${r.sp}->${sp}`); }
         r.sp = sp; r.kind = kd;
       }
-      r.lvl = Number(u.level) || r.lvl;
+      // LEVEL IS PRICED VALUE — listings and auctions both carry it and buyers pay for it — and it
+      // was overwritten unconditionally, so a level-2 creature could be rewritten to 50 in place and
+      // advertised at 50 with nothing recorded. Note the biggest single-save jump.
+      //
+      // OBSERVE ONLY, deliberately. This does NOT touch `origin` and so blocks nothing, because the
+      // threshold for an "implausible" jump is a balance judgement (offline accrual, quest rewards
+      // and a long gap between saves all move levels legitimately) and guessing it wrong would
+      // refuse a real player on a money path. It records the evidence so the threshold can be set
+      // from real data instead of from my assumption.
+      const newLvl = Number(u.level) || r.lvl;
+      const jump = newLvl - (r.lvl || 1);
+      if (jump > (r.jump || 0)) r.jump = jump;
+      r.lvl = newLvl;
       continue;
     }
     newUnits++;
@@ -3860,7 +3879,8 @@ export function restoreAssetLedger(v) {
     for (const uid of uids.slice(0, 400)) {
       const u = su[uid] || {}, origin = ORIGINS.has(u.origin) ? u.origin : "unverified";
       rec.units[uid] = { sp: String(u.sp || "?").slice(0, 24), kind: String(u.kind || "?").slice(0, 12),
-                         lvl: Number(u.lvl) || 1, ts: Number(u.ts) || rec.first, origin };
+                         lvl: Number(u.lvl) || 1, ts: Number(u.ts) || rec.first, origin,
+                         jump: Number(u.jump) > 0 ? Number(u.jump) : undefined };
       if (origin === "unverified") rec.unverified++;
     }
     const sm = (src.mounts && typeof src.mounts === "object") ? src.mounts : {};
