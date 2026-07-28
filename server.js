@@ -3483,6 +3483,95 @@ app.post("/assets/egg/hatch", (req, res) => {
 // Redeem an Avatar Scroll. Avatars had NO server record of any kind — adding one to a save was free
 // and permanent, and each carries a rarity-scaled perk that converts into materials, which do sell
 // on the real rail. The look is rolled here, from what the wallet does not already own.
+// ============ v8 EGG RESTITUTION ============
+// WHAT HAPPENED. The egg seal floor shipped enforced-immediately at 2026-07-27 18:41 UTC and the
+// grace window was restored at 2026-07-28 00:10 UTC. For those ~5.5 hours a v8 save carrying an egg
+// was forced through the v9 payload, failed its signature, and took the ordinary tamper response —
+// which zeroes d["eggs"]. Restoring the deadline stopped further losses; it did not give anything
+// back, and profiles are stored with ON CONFLICT DO UPDATE, so there is no previous version to
+// recover. Nobody was made whole.
+//
+// WHAT CAN BE RECONSTRUCTED. The tamper response clears chests/nest/eggs/quest_vault/
+// last_verified_balance/trade_in — it does NOT clear d["prog"], and the lifetime counters live
+// there: `eggmake_<kind>` when Mithra conjures one, `hatch_<kind>` when it hatches. So for each kind
+//
+//     owed = eggmake  -  hatched  -  still held
+//
+// is exactly what this player paid fantasy fish and materials for and never received. It is not a
+// gift and it cannot inflate: a wallet that never made an egg is owed nothing.
+//
+// CAPPED AT ONE PER KIND, on purpose. The client permits only one egg of each kind nesting at a
+// time, so a single wipe event could take at most one of each — and `prog` rides in the save, which
+// is client-authored, so an inflated counter must not buy a stack. One per kind is the most a real
+// victim can have lost.
+const EGG_RESTITUTION_UNTIL = Date.UTC(2026, 7, 4);   // 7 days, closes 2026-08-04 00:00 UTC
+const eggRestitutionDone = new Map();                 // wallet -> { at, granted:[kind] }
+const RESTITUTION_KINDS = Object.freeze(["normal", "legendary", "meme", "mount"]);
+
+function owedEggs(mmo) {
+  const prog = (mmo && mmo.prog && typeof mmo.prog === "object") ? mmo.prog : {};
+  const held = Array.isArray(mmo && mmo.eggs) ? mmo.eggs : [];
+  const out = [];
+  for (const kind of RESTITUTION_KINDS) {
+    const made = Math.max(0, Number(prog[`eggmake_${kind}`]) || 0);
+    const hatched = Math.max(0, Number(prog[`hatch_${kind}`]) || 0);
+    const has = held.filter(e => e && String(e.kind) === kind).length;
+    if (made - hatched - has > 0) out.push(kind);       // one per kind, never a stack
+  }
+  return out;
+}
+
+// What am I owed? Read-only, so a player can see the answer before claiming.
+app.get("/assets/egg/restitution", async (req, res) => {
+  const w = String(req.query?.wallet || "");
+  if (!isPubkey(w)) return res.status(400).json({ error: "valid wallet required" });
+  if (!cupAdminOk(req) && mktWallet({ wallet: w, mktToken: String(req.query?.mktToken || "") }) !== w) {
+    return res.status(403).json({ error: "prove this wallet first" });
+  }
+  const open = Date.now() < EGG_RESTITUTION_UNTIL;
+  const prior = eggRestitutionDone.get(w);
+  let owed = [];
+  try {
+    const p = await store.getProfile(w);
+    if (p && p.mmo) owed = owedEggs(p.mmo);
+  } catch (e) { return res.status(503).json({ error: "could not read your save — try again shortly" }); }
+  res.json({ open, closesAt: EGG_RESTITUTION_UNTIL, alreadyClaimed: !!prior,
+             claimedAt: prior?.at || null, owed: prior ? [] : owed });
+});
+
+// Claim it. One shot per wallet, inside the window, and every returned egg is MINTED THROUGH THE
+// REGISTRY — so a made-good egg carries the same provenance as one that was earned, rather than
+// being injected into a save where it would be indistinguishable from a forgery.
+app.post("/assets/egg/restitution", async (req, res) => {
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const wallet = regWallet(req);
+  if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
+  if (Date.now() >= EGG_RESTITUTION_UNTIL) return res.status(410).json({ error: "the egg restitution window has closed" });
+  if (eggRestitutionDone.has(wallet)) return res.status(409).json({ error: "you have already claimed your eggs" });
+
+  let mmo = null;
+  try { const p = await store.getProfile(wallet); mmo = p && p.mmo; }
+  catch (e) { return res.status(503).json({ error: "could not read your save — try again shortly" }); }
+  if (!mmo) return res.status(404).json({ error: "no cloud save to check" });
+
+  const owed = owedEggs(mmo);
+  if (!owed.length) return res.json({ ok: true, granted: [], note: "nothing is owed on this wallet" });
+
+  // CLAIM THE ONE-SHOT BEFORE MINTING, not after: a crash or a retry between the two must not be
+  // able to pay twice. The same rule the meme-egg signature guard follows.
+  eggRestitutionDone.set(wallet, { at: Date.now(), granted: owed.slice() });
+  _assetsDirty = true;
+  const granted = [];
+  for (const kind of owed) {
+    try {
+      const row = mintAsset("egg", wallet, { kind, sp: kind }, "restitution");
+      granted.push({ id: row.id, kind, born: row.born, readyAt: eggReadyAt(row) });
+    } catch (e) { /* capacity: keep what was granted, the rest stays owed on the record */ }
+  }
+  console.log(`egg restitution: ${wallet.slice(0, 8)} granted ${granted.map(g => g.kind).join(",") || "none"}`);
+  res.json({ ok: true, granted, note: "these are fresh eggs on a new incubation clock" });
+});
+
 app.post("/assets/scroll/redeem", (req, res) => {
   if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
   const wallet = regWallet(req);
@@ -3538,10 +3627,15 @@ app.get("/assets/cert", (req, res) => {
 });
 
 export function serializeAssetReg() {
-  return { rows: [...assetReg.values()].slice(-ASSET_REG_MAX) };
+  return { rows: [...assetReg.values()].slice(-ASSET_REG_MAX), restitution: [...eggRestitutionDone.entries()] };
 }
 export function restoreAssetReg(v) {
   if (!v || typeof v !== "object" || !Array.isArray(v.rows)) return 0;
+  for (const e of (Array.isArray(v.restitution) ? v.restitution : [])) {
+    if (!Array.isArray(e) || !isPubkey(String(e[0] || ""))) continue;
+    eggRestitutionDone.set(String(e[0]), { at: Number(e[1]?.at) || 0,
+      granted: Array.isArray(e[1]?.granted) ? e[1].granted.slice(0, 4).map(String) : [] });
+  }
   let n = 0;
   for (const src of v.rows) {
     if (!src || typeof src !== "object") continue;
@@ -3571,7 +3665,7 @@ export function restoreAssetReg(v) {
   }
   return n;
 }
-export function _clearAssetReg() { assetReg.clear(); assetsByOwner.clear(); }
+export function _clearAssetReg() { assetReg.clear(); assetsByOwner.clear(); eggRestitutionDone.clear(); }
 // test seam: age an egg past its incubation window without waiting real hours
 export function _ageAsset(id, ms) { const r = assetReg.get(id); if (r) { r.born -= ms; return true; } return false; }
 export function _transferAssetForTest(id, from, to, why) { return transferAsset(id, from, to, why); }
@@ -3611,7 +3705,7 @@ const _testFirstSeen = new Map();
 // Flagging is honest and reversible; blocking on a guess is not.
 const assetLedger = new Map();          // wallet -> { first, units:{}, mounts:{}, eggs:{}, eggsLast, unverified }
 const ASSET_LEDGER_MAX = 20000;
-const ORIGIN_CLEAN = new Set(["legacy", "hatched", "purchased", "issued", "traded"]);
+const ORIGIN_CLEAN = new Set(["legacy", "hatched", "purchased", "issued", "traded", "restitution"]);
 
 // A uid is arbitrary CLIENT TEXT. The client's own format is "u<seq>" (Profile.gd _mk_unit), and
 // anything else is a crafted save — including the Object.prototype key names, which a plain
@@ -3905,7 +3999,7 @@ export function restoreAssetLedger(v) {
   }
   return n;
 }
-const ORIGINS = new Set(["legacy", "hatched", "purchased", "issued", "traded", "unverified"]);
+const ORIGINS = new Set(["legacy", "hatched", "purchased", "issued", "traded", "restitution", "unverified"]);
 
 // test seams: empty the ledger, and AGE a wallet's eggs so a sim can prove the incubation floor in
 // both directions without waiting 12 real hours for a legendary.
