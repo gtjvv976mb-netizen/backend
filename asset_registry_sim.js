@@ -23,8 +23,11 @@ async function mkWallet() {
   const wallet = bs58.encode(kp.publicKey);
   const authMsg = `Chikoria sign-in\nwallet:${wallet}\nts:${Date.now()}`;
   const authSig = Buffer.from(nacl.sign.detached(Buffer.from(authMsg, "utf8"), kp.secretKey)).toString("base64");
-  const v = await post("/verify", { wallet, netId: "n" + Date.now() + "_" + (++_n), authMsg, authSig });
-  return { wallet, mktToken: v.body.mktToken };
+  // ONE netId: the sid must be the exact one bound at /verify, or every market op answers 401 and
+  // an assertion written as "not 409" passes without testing anything.
+  const netId = "n" + Date.now() + "_" + (++_n);
+  const v = await post("/verify", { wallet, netId, authMsg, authSig });
+  return { wallet, authMsg, authSig, sid: netId, mktToken: v.body.mktToken };
 }
 const wait = (ms) => new Promise(r => setTimeout(r, ms));
 const claim = (w, kind) => post("/assets/egg/claim", { wallet: w.wallet, mktToken: w.mktToken, kind });
@@ -188,6 +191,37 @@ sec("the whole registry survives a restart");
   chk(eggRow && eggRow.state === "consumed", `and the consumed egg is still consumed — it cannot re-hatch`);
   const rehatch = await hatch(W, e.id);
   chk(rehatch.status === 409, `proven: re-hatching after a restart is refused (${rehatch.status})`);
+}
+
+
+// The bridge case. Once the client hatches through the registry the egg never appears in mmo.eggs,
+// so the delta-based ledger sees a unit from nowhere. Without this, the server would condemn a
+// creature it minted itself — and the market gate would then refuse a genuine asset.
+sec("a registry-hatched creature is NOT condemned by the save-delta ledger");
+{
+  const W = await mkWallet();
+  const authMsg = W.authMsg, authSig = W.authSig;
+  const saveMmo = async (mmo) => { await wait(700); return post("/profile", { wallet: W.wallet, authMsg, authSig, profile: { mmo } }); };
+  await saveMmo({ eggs: [], units: {}, mounts: [] });                    // establish a ledger record
+  const e = (await claim(W, "normal")).body.egg;                        // egg lives in the REGISTRY
+  SRV._ageAsset(e.id, 4 * HOUR);
+  const h = await hatch(W, e.id);
+  chk(h.status === 200, `the registry hatched a creature (${h.body.hatched?.sp})`);
+  const sp = h.body.hatched.sp;
+  // the client now writes it into the save — with NO egg delta, because the egg was never in mmo.eggs
+  await saveMmo({ eggs: [], units: { u1: { species: sp, kind: "normal", level: 1 } }, mounts: [] });
+  const led = (await get(`/assets/audit?wallet=${W.wallet}&mktToken=${encodeURIComponent(W.mktToken)}`)).body;
+  chk(led.units.u1 && led.units.u1.origin === "issued",
+      `the ledger defers to the registry (${led.units?.u1?.origin})`);
+  chk(led.unverified === 0, `the honest player carries no flag (${led.unverified})`);
+  // and the market gate must let them sell it
+  const listed = await post("/market/op", { op: "list", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
+    listing: { id: "L-reg-1", kind: "chikimon", item: sp, lvl: 1, xp: 0, price: 100, qty: 1 } });
+  chk(listed.status === 200, `and they can list it on the market (${listed.status})`);
+  // control: a species they do NOT hold is still refused
+  const bad = await post("/market/op", { op: "list", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
+    listing: { id: "L-reg-2", kind: "chikimon", item: "dragonos", lvl: 50, xp: 0, price: 999999, qty: 1 } });
+  chk(bad.status === 409, `(control) a species they do not own is still refused (${bad.status})`);
 }
 
 console.log(`\nASSETREG_DONE pass=${pass} fail=${fail}`);

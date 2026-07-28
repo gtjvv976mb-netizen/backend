@@ -1308,17 +1308,25 @@ app.post("/profile", async (req, res) => {
       if (!("handle" in profile) && prev.handle != null) safe.handle = prev.handle;
       if (!("bal"    in profile) && prev.bal    != null) safe.bal    = prev.bal;
     }
-    if (hasMmo) safe.mmo = profile.mmo;   // the signed MMO cloud-save rides through verbatim
-    // record every asset this save presents, with where it came from. Never rejects — see the
-    // ledger's own note; a wrong rejection costs a real player their roster.
-    // Auditing must never break a save — but a SILENT swallow hid a working exploit entirely, so
-    // it logs. Suspended until the ledger restore lands, or the audit would grandfather forged
-    // rosters against an empty map (see _assetsReady).
+    // STORING THE SAVE AND AUDITING IT ARE SEPARATE CONCERNS, and conflating them destroyed data:
+    // this `else` belongs to hasMmo alone (an unsigned legacy write must not wipe the owner's cloud
+    // save). When an `&& _assetsReady` was bolted onto the audit condition, the else-branch started
+    // firing on SIGNED saves whenever the ledger had not loaded — silently replacing the player's
+    // new save with their previous one while answering 200 {ok:true}. That window is every deploy's
+    // boot, and the whole process lifetime after a failed store read.
+    if (hasMmo) safe.mmo = profile.mmo;                // the signed MMO cloud-save rides through verbatim
+    else if (prev && prev.mmo) safe.mmo = prev.mmo;    // SECURITY: legacy (unsigned) writes must NOT wipe it
+
+    // Record every asset this save presents, with where it came from. Never rejects — a wrong
+    // rejection costs a real player their roster. Auditing must never break a save, but a SILENT
+    // swallow once hid a working exploit completely, so it logs. Skipped (never fatal) until the
+    // restore lands, or the audit would grandfather forged rosters against an empty map.
     if (hasMmo && _assetsReady) {
-      try { auditAssets(wallet, profile.mmo); }
+      // prev.first_seen is the DB's own record of when this wallet first appeared — the only
+      // trustworthy answer to "does this player predate the ledger?"
+      try { auditAssets(wallet, profile.mmo, _testFirstSeen.get(wallet) || Number(prev?.first_seen) || 0); }
       catch (e) { console.error("auditAssets threw for", String(wallet).slice(0, 8), e && e.message); }
     }
-    else if (prev && prev.mmo) safe.mmo = prev.mmo;   // SECURITY: legacy (unsigned) writes must NOT wipe the owner's cloud-save — carry it forward
     safe._serverSavedAt = now;   // authoritative "last seen" for offline progression
     await store.setProfile(wallet, safe);
     res.json({ ok: true, serverSavedAt: safe._serverSavedAt });
@@ -3063,7 +3071,10 @@ setInterval(saveWorldNodes, NODE_SAVE_MS).unref?.();
 // race this one and kill the process mid-write. saveAssetLedger is a hoisted declaration below.
 for (const sig of ["SIGTERM", "SIGINT"]) {
   process.on(sig, () => {
-    Promise.allSettled([saveWorldNodes(), saveAssetLedger()]).finally(() => process.exit(0));
+    // await the IN-FLIGHT flush first, then run one more for anything minted since it started —
+    // exiting on a clean dirty flag aborted the write that was still carrying the newest assets.
+    Promise.allSettled([saveWorldNodes(), Promise.resolve(_assetsFlush).then(() => saveAssetLedger())])
+      .finally(() => process.exit(0));
   });
 }
 
@@ -3302,6 +3313,15 @@ function mintAssetId(type) {
   return `${type[0]}${Date.now().toString(36)}${(++_regSeq).toString(36)}${crypto.randomBytes(6).toString("hex")}`;
 }
 function ownerSet(w) { let s = assetsByOwner.get(w); if (!s) { s = new Set(); assetsByOwner.set(w, s); } return s; }
+// Does the registry hold an ACTIVE asset of this type and species for this wallet? This is the
+// bridge that stops the inference-based ledger from condemning something the server itself minted.
+function regVouchesSpecies(wallet, type, sp) {
+  for (const id of (assetsByOwner.get(wallet) || [])) {
+    const r = assetReg.get(id);
+    if (r && r.type === type && r.state === "active" && r.sp === sp) return true;
+  }
+  return false;
+}
 function regOwned(wallet, type, state = "active") {
   const out = [];
   for (const id of (assetsByOwner.get(wallet) || [])) {
@@ -3314,8 +3334,14 @@ function regOwned(wallet, type, state = "active") {
 // the provenance, and a mutable provenance is not one.
 function regEvent(row, what, extra) { row.chain.push(Object.assign({ at: Date.now(), what }, extra || {})); }
 
+let _regWarnAt = 0;
 function mintAsset(type, wallet, fields, origin, parent) {
   if (assetReg.size >= ASSET_REG_MAX) throw new Error("asset registry is full");
+  // the cap is a cliff for EVERY player at once, so it must never arrive unannounced
+  if (assetReg.size > ASSET_REG_MAX * 0.8 && Date.now() - _regWarnAt > 300000) {
+    _regWarnAt = Date.now();
+    console.warn(`asset registry at ${assetReg.size}/${ASSET_REG_MAX} — plan capacity before it fills`);
+  }
   const id = mintAssetId(type);
   const row = Object.assign({
     id, type, owner: wallet, born: Date.now(), origin, state: "active",
@@ -3331,6 +3357,10 @@ function mintAsset(type, wallet, fields, origin, parent) {
 // Ownership moves ONLY through here, and the old owner's claim is removed in the same step — which
 // is what makes a registered asset impossible to clone: it exists once, in one place.
 function transferAsset(id, from, to, why, extra) {
+  // Validate the DESTINATION. Without this, a transfer to a garbage string moved the asset to an
+  // owner no wallet can ever prove — an irrecoverable erase, and a griefing primitive the moment
+  // any route passes a client-supplied `to`.
+  if (!isPubkey(to) || to === from) return null;
   const row = assetReg.get(id);
   if (!row || row.owner !== from || row.state !== "active") return null;
   row.owner = to;
@@ -3397,7 +3427,9 @@ app.post("/assets/egg/claim", (req, res) => {
     return res.status(409).json({ error: "your nest already cradles an egg of that kind" });
   }
   _lastEggClaim.set(wallet, now);
-  const row = mintAsset("egg", wallet, { kind, sp: kind }, "issued");
+  let row;
+  try { row = mintAsset("egg", wallet, { kind, sp: kind }, "issued"); }
+  catch (e) { return res.status(503).json({ error: "the asset registry is at capacity — this is a server fault, not yours; nothing was consumed" }); }
   res.json({ ok: true, egg: { id: row.id, kind, born: row.born, readyAt: eggReadyAt(row) } });
 });
 
@@ -3415,6 +3447,7 @@ app.post("/assets/egg/hatch", (req, res) => {
   if (Date.now() < ready) return res.status(425).json({ error: "still incubating", readyIn: ready - Date.now() });
 
   let born;
+  try {
   if (row.kind === "mount") {
     const have = ownedMounts(wallet);
     const pool = MOUNT_SUPPLY.filter(([mid]) => !have.has(mid));
@@ -3426,6 +3459,10 @@ app.post("/assets/egg/hatch", (req, res) => {
     if (!pool.length) return res.status(409).json({ error: "you already own every species from that egg" });
     const sp = pool[crypto.randomInt(pool.length)];
     born = mintAsset("chikimon", wallet, { sp, kind: row.kind === "normal" ? "normal" : row.kind, lvl: 1 }, "hatched", row.id);
+  }
+  } catch (e) {
+    // the egg is NOT consumed on failure — a capacity fault must never destroy what a player paid for
+    return res.status(503).json({ error: "the asset registry is at capacity — your egg is safe, try again later" });
   }
   // CONSUMED, NOT DELETED. The egg keeps its row and points at what came out of it, so the
   // creature's lineage is readable forever — and the egg can never vouch a second hatch.
@@ -3449,7 +3486,9 @@ app.post("/assets/scroll/redeem", (req, res) => {
   // the ceremony look every player is awarded is theirs whether or not it was ever registered
   const pool = AVATAR_IDS.filter(a => !have.has(a) && a !== "classic");
   if (!pool.length) return res.status(409).json({ error: "no looks left" });
-  const row = mintAsset("avatar", wallet, { sp: pool[crypto.randomInt(pool.length)], kind: "avatar" }, "scroll");
+  let row;
+  try { row = mintAsset("avatar", wallet, { sp: pool[crypto.randomInt(pool.length)], kind: "avatar" }, "scroll"); }
+  catch (e) { return res.status(503).json({ error: "the asset registry is at capacity — this is a server fault, not yours; nothing was consumed" }); }
   res.json({ ok: true, avatar: { id: row.id, sp: row.sp, born: row.born } });
 });
 
@@ -3502,13 +3541,25 @@ export function restoreAssetReg(v) {
     const id = String(src.id || "").slice(0, 64), owner = String(src.owner || "").slice(0, 64);
     const type = String(src.type || "");
     if (!id || !isPubkey(owner) || !["egg", "chikimon", "mount", "avatar"].includes(type)) continue;
+    // ONE ROW PER ID. Without this the same id was set once in assetReg but added to BOTH owners'
+    // sets, so /assets/mine — the authoritative answer to "what do you own" — showed one asset in
+    // two wallets. A clone, produced by the very code meant to rebuild the registry faithfully.
+    if (assetReg.has(id)) continue;
+    // The registry has no eviction, so honour the cap on the way IN. mintAsset's guard cannot see
+    // rows arriving here, and a blob that exceeds MAX would be silently truncated on the next
+    // flush — deleting the earliest players' property.
+    if (assetReg.size >= ASSET_REG_MAX) break;
+    const hatchedTo = src.hatchedTo ? String(src.hatchedTo).slice(0, 64) : undefined;
+    const chain = Array.isArray(src.chain) ? src.chain.slice(0, 64) : [];
+    // A CONSUMED EGG IS CONSUMED FOREVER. Trusting the persisted `state` alone let a row be
+    // restored with state flipped back to "active", re-arming a spent egg to mint a second creature.
+    // The evidence that it hatched lives in the row itself and outranks the flag.
+    const spent = hatchedTo || chain.some(c => c && c.what === "hatched");
     const row = { id, type, owner, sp: String(src.sp || "").slice(0, 24), kind: String(src.kind || "").slice(0, 12),
                   born: Number(src.born) || Date.now(), origin: String(src.origin || "issued").slice(0, 16),
-                  state: src.state === "consumed" ? "consumed" : "active",
+                  state: (src.state === "consumed" || spent) ? "consumed" : "active",
                   parent: src.parent ? String(src.parent).slice(0, 64) : null,
-                  hatchedTo: src.hatchedTo ? String(src.hatchedTo).slice(0, 64) : undefined,
-                  lvl: Number(src.lvl) || undefined,
-                  chain: Array.isArray(src.chain) ? src.chain.slice(0, 64) : [] };
+                  hatchedTo, lvl: Number(src.lvl) || undefined, chain };
     assetReg.set(id, row); ownerSet(owner).add(id); n++;
   }
   return n;
@@ -3517,6 +3568,22 @@ export function _clearAssetReg() { assetReg.clear(); assetsByOwner.clear(); }
 // test seam: age an egg past its incubation window without waiting real hours
 export function _ageAsset(id, ms) { const r = assetReg.get(id); if (r) { r.born -= ms; return true; } return false; }
 export function _transferAssetForTest(id, from, to, why) { return transferAsset(id, from, to, why); }
+// test seams: fill the registry to its cap, force an auction to end, and backdate a wallet's
+// first-seen — all three model conditions a sim cannot otherwise reach (capacity, a 12h auction
+// clock, and a player who predates this system).
+export function _fillAssetRegForTest() {
+  while (assetReg.size < ASSET_REG_MAX) assetReg.set("pad" + assetReg.size, { id: "pad", type: "chikimon", state: "consumed", chain: [] });
+  return assetReg.size;
+}
+export function _endAuctionForTest(id) {
+  const a = marketAuctions.find(x => x.id === id);
+  if (!a) return false;
+  a.endsAt = Date.now() - 1;
+  sweepAuctions(Date.now());
+  return true;
+}
+export function _setWalletFirstSeenForTest(w, ts) { _testFirstSeen.set(w, ts); return ts; }
+const _testFirstSeen = new Map();
 
 // ============ ASSET AUTHENTICITY LEDGER ============
 // The server stored profile.mmo verbatim, so it had no idea what a wallet SHOULD own: a save
@@ -3557,6 +3624,15 @@ const EGG_HOURS = Object.freeze(Object.assign(Object.create(null),
 const EGG_DWELL_GRACE_MS = 10 * 60 * 1000;   // clock skew + the save that first reports an egg
 const EGG_KINDS_MAX = 4;                     // the client permits one egg per kind; >4 held is impossible
 
+// When this ledger began. A wallet the database first saw BEFORE this is a genuine pre-existing
+// player and is grandfathered in full; a wallet minted after it has no history to grandfather.
+const LEDGER_EPOCH = Date.UTC(2026, 6, 28);   // 2026-07-28
+// What a legitimate account can plausibly hold the first time it is audited. A fresh account starts
+// at zero and is awarded one ceremony egg, so this is deliberately generous rather than tight — it
+// only has to be smaller than a crafted roster. Anything past it needs evidence like everyone else.
+const NEW_WALLET_GRANDFATHER = 3;
+const NEW_WALLET_GRANDFATHER_MOUNTS = 1;
+
 function assetRec(wallet) {
   let r = assetLedger.get(wallet);
   if (!r) {
@@ -3594,18 +3670,37 @@ function claimAssetBuy(wallet, sp) {
 }
 
 // Fold one cloud-save into the ledger and return what was learned about it.
-function auditAssets(wallet, mmo) {
+function auditAssets(wallet, mmo, walletFirstSeen = 0) {
   if (!mmo || typeof mmo !== "object") return null;
   const rec = assetRec(wallet);
-  const firstEver = rec.eggsLast === null && Object.keys(rec.units).length === 0;
   const now = Date.now();
+
+  // GRANDFATHERING IS A PROPERTY OF TIME, NOT OF THE RECORD. `firstEver` only says "this ledger has
+  // not met you", which a brand-new wallet satisfies just as well as a three-year veteran — so a
+  // keypair generated today presented 12 level-50 legendaries and all six mounts on its FIRST save
+  // and had every one stamped "legacy" with unverified=0, then listed them on the real-$CHIKI rail.
+  // The amnesty existed for players who predate this system; it is now limited to exactly them.
+  //
+  // A wallet the DB first saw before the cutoff is a real pre-existing player and keeps the full
+  // amnesty. Anyone newer is grandfathered only up to what a legitimate account can actually be
+  // holding the first time it saves — and a fresh account starts at zero (see the fresh-start
+  // scrub in Profile.gd), so anything past a small allowance is a crafted roster, not history.
+  const preExisting = walletFirstSeen > 0 && walletFirstSeen < LEDGER_EPOCH;
+  const firstEver = rec.eggsLast === null && Object.keys(rec.units).length === 0;
 
   // ---- eggs get an IDENTITY and a server-side clock ----------------------------------------
   // Counting eggs made "the same egg" inexpressible: eggs:[E] -> eggs:[] -> eggs:[E] -> eggs:[]
   // re-presents byte-identical JSON forever, minting one "hatched" unit per cycle with no
   // rollback and no race. Keying each egg and timing it from the SERVER's first sighting makes a
   // hatch cost real wall-clock time, which is the one thing a crafted save cannot fabricate.
-  const eggArr = Array.isArray(mmo.eggs) ? mmo.eggs.slice(0, 32) : [];
+  const allEggs = Array.isArray(mmo.eggs) ? mmo.eggs : [];
+  const eggsNow = allEggs.length;
+  // Holding more eggs than the client can physically produce (one per kind) is a crafted save. This
+  // used to be a single cosmetic flag on the save that HELD them, and false again on the save that
+  // dropped them — so 32 declared eggs cost one flag that blocked nothing and returned 32 clean
+  // "hatched" legendaries. The taint has to live on the EGGS, not on the moment.
+  const eggGlutNow = eggsNow > EGG_KINDS_MAX;
+  const eggArr = allEggs.slice(0, EGG_KINDS_MAX * 2);
   const seenNow = new Set();
   let eggsHatchable = 0;
   for (const e of eggArr) {
@@ -3613,19 +3708,23 @@ function auditAssets(wallet, mmo) {
     const kind = String(e.kind || "?").slice(0, 12);
     const key = `${kind}:${Math.round(Number(e.started) || 0)}`;
     seenNow.add(key);
-    if (!has(rec.eggs, key)) rec.eggs[key] = { kind, firstSeen: now };
+    // a key first seen during a glut is marked, and stays marked for its whole life
+    if (!has(rec.eggs, key)) rec.eggs[key] = { kind, firstSeen: now, tainted: eggGlutNow };
   }
-  // an egg that VANISHED this save was consumed — was it old enough to have hatched?
+  // an egg that VANISHED this save was consumed — was it old enough, and honest enough, to vouch?
   for (const key of Object.keys(rec.eggs)) {
     if (seenNow.has(key)) continue;
     const eg = rec.eggs[key];
     const needMs = (EGG_HOURS[eg.kind] || 3) * 3600 * 1000;
-    if (now - eg.firstSeen + EGG_DWELL_GRACE_MS >= needMs) eggsHatchable++;
+    if (!eg.tainted && now - eg.firstSeen + EGG_DWELL_GRACE_MS >= needMs) eggsHatchable++;
     delete rec.eggs[key];                       // consumed: it can never vouch a second hatch
   }
-  // holding more eggs than the client can physically produce is itself a crafted save
-  const eggsNow = eggArr.length;
-  const eggGlut = eggsNow > EGG_KINDS_MAX;
+  if (Object.keys(rec.eggs).length > EGG_KINDS_MAX * 2) {
+    // a save that seeds keys faster than it spends them is farming vouchers
+    for (const k of Object.keys(rec.eggs).slice(EGG_KINDS_MAX * 2)) delete rec.eggs[k];
+    flagLater.push("eggfarm");
+  }
+  const eggGlut = eggGlutNow;
 
   // eggsLast FIRST: the call site swallows exceptions, and assetRec() has already created the
   // record. A throw between here and the end used to leave {eggsLast:null, units:{}} — exactly
@@ -3633,10 +3732,18 @@ function auditAssets(wallet, mmo) {
   rec.eggsLast = eggsNow;
 
   let newUnits = 0, newMounts = 0, flagged = [];
+  const flagLater = [];
   const flag = (why) => { rec.unverified++; flagged.push(why); };
 
   const units = (mmo.units && typeof mmo.units === "object") ? mmo.units : {};
-  for (const uid of Object.keys(units).slice(0, 400)) {
+  // NEVER TRUNCATE SILENTLY. These caps used to drop the overflow BEFORE it was examined, while
+  // /profile stored the save verbatim — so padding a save to exactly the cap hid a conjured griffin
+  // and a conjured level-50 legendary from the record entirely (unverified=0) with both still live
+  // in the player's roster. The cap stays, because the loops must stay bounded; what changes is
+  // that going past it is now itself the accusation, since no legal client can produce it.
+  const unitKeys = Object.keys(units);
+  if (unitKeys.length > 400) flagLater.push(`overflow:units:${unitKeys.length}`);
+  for (const uid of unitKeys.slice(0, 400)) {
     if (!UID_RE.test(uid)) { flag(`badeuid:${uid.slice(0, 24)}`); continue; }
     const u = (units[uid] && typeof units[uid] === "object") ? units[uid] : {};
     const sp = String(u.species || "?").slice(0, 24), kd = String(u.kind || "?").slice(0, 12);
@@ -3654,7 +3761,16 @@ function auditAssets(wallet, mmo) {
     }
     newUnits++;
     let origin;
-    if (firstEver) origin = "legacy";
+    // RARITY IS THE VALUE, so the new-wallet allowance never covers it. A fresh account starts at
+    // zero and is awarded one ceremony egg, so a couple of NORMAL creatures on a first save is
+    // ordinary; a legendary or a meme on a first save is not something a new account can have.
+    const commonEnough = kd === "normal" || kd === "?";
+    if (firstEver && (preExisting || (commonEnough && newUnits <= NEW_WALLET_GRANDFATHER))) origin = "legacy";
+    // THE REGISTRY OUTRANKS THE INFERENCE. Once the client hatches through /assets/egg/hatch the
+    // egg never appears in mmo.eggs at all, so the delta shows a unit from nowhere and the ledger
+    // would condemn a creature the SERVER ITSELF minted — and the listing gate would then refuse a
+    // genuine asset. Anything the registry vouches is vouched, full stop.
+    else if (regVouchesSpecies(wallet, "chikimon", sp)) origin = "issued";
     else if (claimAssetBuy(wallet, sp)) origin = "purchased";   // verified on-chain settlement
     else if (!eggGlut && eggsHatchable >= newUnits) origin = "hatched";
     else origin = "unverified";
@@ -3662,7 +3778,9 @@ function auditAssets(wallet, mmo) {
     if (origin === "unverified") flag(`unit:${uid}:${sp}`);
   }
 
-  const mounts = Array.isArray(mmo.mounts) ? mmo.mounts.slice(0, 40) : [];
+  const allMounts = Array.isArray(mmo.mounts) ? mmo.mounts : [];
+  if (allMounts.length > 40) flagLater.push(`overflow:mounts:${allMounts.length}`);
+  const mounts = allMounts.slice(0, 40);
   for (const m of mounts) {
     const id = String(m).slice(0, 24);
     if (has(rec.mounts, id)) continue;
@@ -3670,13 +3788,15 @@ function auditAssets(wallet, mmo) {
     // Mounts never consulted the egg evidence at all, so an HONEST mount-egg hatch was flagged
     // identically to appending all six ids. Same test as units — it is the same act.
     let origin;
-    if (firstEver) origin = "legacy";
+    if (firstEver && (preExisting || newMounts <= NEW_WALLET_GRANDFATHER_MOUNTS)) origin = "legacy";
+    else if (regVouchesSpecies(wallet, "mount", id)) origin = "issued";   // the server rolled it
     else if (!eggGlut && eggsHatchable >= newUnits + newMounts) origin = "hatched";
     else origin = "unverified";
     rec.mounts[id] = { ts: now, origin };
     if (origin === "unverified") flag(`mount:${id}`);
   }
   if (eggGlut) flag(`eggglut:${eggsNow}`);
+  for (const why of flagLater) flag(why);
   if (newUnits || newMounts || flagged.length) _assetsDirty = true;
 
   // EVICTION MUST NEVER AMNESTY. Dropping a record does not just lose history: the wallet's next
@@ -3765,7 +3885,7 @@ export function restoreAssetLedger(v) {
   }
   return n;
 }
-const ORIGINS = new Set(["legacy", "hatched", "purchased", "unverified"]);
+const ORIGINS = new Set(["legacy", "hatched", "purchased", "issued", "traded", "unverified"]);
 
 // test seams: empty the ledger, and AGE a wallet's eggs so a sim can prove the incubation floor in
 // both directions without waiting 12 real hours for a legendary.
@@ -3789,17 +3909,32 @@ export function _recordAssetBuyForTest(w, kind, item, lvl) { return recordAssetB
 // one. Permanent, not transient. Until a restore has actually succeeded the ledger neither audits
 // nor flushes, so an unreadable store costs provenance for new saves instead of destroying it.
 let _assetsReady = false;
+// The in-flight write is tracked so shutdown can WAIT for it. Clearing _assetsDirty before the
+// awaits meant a SIGTERM arriving mid-write saw a clean flag, returned instantly, and the
+// `process.exit(0)` in its .finally aborted the very write that carried a just-minted egg — an
+// asset the player paid fantasy fish for, gone, on a GRACEFUL shutdown.
+let _assetsFlush = null;
 async function saveAssetLedger() {
+  if (_assetsFlush) return _assetsFlush;          // re-entry joins the write already running
   if (!_assetsDirty || !_assetsReady) return;
   _assetsDirty = false;
-  try {
-    // The REGISTRY goes first. It holds minted assets that exist nowhere else — losing a row means
-    // destroying a player's property, which the ledger (a derived record) can never do. If the
-    // registry write fails, the ledger write is abandoned too so the pair cannot drift apart.
-    await store.kvSet("asset_registry", serializeAssetReg());
-    await store.kvSet("asset_ledger", serializeAssetLedger());
-  } catch (e) { _assetsDirty = true; }   // a failed write must not silently drop the record
+  _assetsFlush = (async () => {
+    try {
+      // The REGISTRY goes first. It holds minted assets that exist nowhere else — losing a row
+      // destroys a player's property, which the ledger (a derived record) can never do.
+      await store.kvSet("asset_registry", serializeAssetReg());
+      await store.kvSet("asset_ledger", serializeAssetLedger());
+    } catch (e) { _assetsDirty = true; }          // a failed write must not silently drop the record
+    finally { _assetsFlush = null; }
+  })();
+  return _assetsFlush;
 }
+// A crash is the same loss as a kill. There is an unhandledRejection handler already; without this
+// an uncaught throw takes up to a full flush interval of minted assets with it.
+process.on("uncaughtException", (e) => {
+  console.error("uncaughtException — flushing assets before exit:", e && e.stack);
+  Promise.resolve(_assetsFlush).then(() => saveAssetLedger()).finally(() => process.exit(1));
+});
 setInterval(saveAssetLedger, ASSET_SAVE_MS).unref?.();   // SIGTERM flush lives with saveWorldNodes
 Promise.all([store.kvGet("asset_registry"), store.kvGet("asset_ledger")]).then(([rv, lv]) => {
   const rn = restoreAssetReg(rv);
@@ -4264,6 +4399,26 @@ function seedSidOwnerFromBoard() {
 // provable owner, so value-destroying ops on it are refused outright (a stranger can't strand an
 // as-yet-unbound seller's proceeds, and a legit owner is always bound at /verify before they trade).
 function opAuthOk(sid, b) { const owner = sidOwner[sid]; return !!owner && mktWallet(b) === owner; }
+
+// Can this wallet put this species on the board? Returns an error string, or "" to allow.
+//
+// It lives here rather than inside `op:list` because the gate was written in the list branch alone
+// and AUCTIONS accepted the exact chikimon list had just refused — the auction settles into the
+// same real-$CHIKI transfer, one op name away. Any future path that puts kind "chikimon" on the
+// board must call this.
+//
+// Two sources of truth, and the REGISTRY OUTRANKS THE LEDGER: a registry row is an asset the server
+// minted itself, which is stronger evidence than any inference drawn from save deltas. Checking the
+// ledger alone refused creatures the server had just issued, because the ledger only learns about
+// them on the player's next cloud save.
+function chikimonSaleBlocked(wallet, sp) {
+  if (!wallet || !sp) return "";
+  if (regVouchesSpecies(wallet, "chikimon", sp)) return "";       // the server minted it
+  const lrec = assetLedger.get(wallet);
+  if (!lrec) return "";                                            // no record yet — grandfathered
+  if (Object.values(lrec.units).some(u => u.sp === sp && u.origin !== "unverified")) return "";
+  return "That chikimon isn't on your authenticity record yet — sync your game (it saves automatically) and try again. If it still won't list, contact support.";
+}
 const AUCTION_MS = 12 * 3600 * 1000;         // every auction runs 12h — snappy, two cycles a day
 // the outbid bidder's escrow goes home through this queue (their client re-credits + acks)
 function queueAuctionRefund(sid, id, amt) {
@@ -4278,15 +4433,23 @@ function sweepAuctions(now) {
     if (now < (a.endsAt || 0)) return true;
     if (a.curSid && a.curBid > 0) {
       const farr = marketFills[a.curSid] || (marketFills[a.curSid] = []);
-      if (!farr.some(f => f.id === a.id))
+      if (!farr.some(f => f.id === a.id)) {
         farr.push({ id: a.id, item: a.species, kind: "chikimon", qty: 1, lvl: a.lvl, xp: a.xp, price: a.curBid, fillerName: a.seller, ts: now });
+        // The winner legitimately acquired this creature — record it, or their next save presents a
+        // unit from nowhere and the ledger condemns an honest buyer. recordAssetBuy used to have a
+        // single call site (/market/buy-onchain), so every auction win was branded unverified.
+        recordAssetBuy(a.curWallet, "chikimon", a.species, a.lvl);
+      }
       const sarr = marketSales[a.sid] || (marketSales[a.sid] = []);
       if (!sarr.some(s => s.id === a.id))
         sarr.push({ id: a.id, item: a.species, kind: "chikimon", qty: 1, price: a.curBid, buyer: String(a.curSid).slice(0, 8), buyerName: a.curName || "a trainer", ts: now });
     } else {
       const rarr = marketFills[a.sid] || (marketFills[a.sid] = []);
-      if (!rarr.some(f => f.id === a.id))
+      if (!rarr.some(f => f.id === a.id)) {
         rarr.push({ id: a.id, item: a.species, kind: "chikimon", qty: 1, lvl: a.lvl, xp: a.xp, price: 0, fillerName: a.seller, returned: true, why: "noBids", ts: now });
+        // a no-bid return puts the creature back in the SELLER's hands — same reasoning as above
+        recordAssetBuy(a.wallet, "chikimon", a.species, a.lvl);
+      }
     }
     return false;
   });
@@ -4387,11 +4550,8 @@ app.post("/market/op", async (req, res) => {
       // ledger, or restored mid-flight) is allowed through — a false refusal would strand a real
       // player's asset, and grandfathering is the standing policy for everything predating this.
       if (String(l.kind) === "chikimon") {
-        const sw = mktWallet(b), lrec = assetLedger.get(sw);
-        const sp = stripTags(String(l.item || "")).slice(0, 24);
-        if (lrec && !Object.values(lrec.units).some(u => u.sp === sp && u.origin !== "unverified")) {
-          return res.status(409).json({ error: "That chikimon isn't on your authenticity record — it can't be listed. Contact support if you own it." });
-        }
+        const bad = chikimonSaleBlocked(mktWallet(b), stripTags(String(l.item || "")).slice(0, 24));
+        if (bad) return res.status(409).json({ error: bad });
       }
       marketListings.push({
         id: lid,
@@ -4542,6 +4702,9 @@ app.post("/market/op", async (req, res) => {
     if (!aid) return res.status(400).json({ error: "auction id required" });
     if (!marketAuctions.some(x => x.id === aid)) {
       if (marketAuctions.filter(x => x.sid === sid).length >= 2) return res.status(429).json({ error: "2 live auctions max" });
+      // an auction is a sale — same gate as op:list, or the gate is one op name wide
+      const bad = chikimonSaleBlocked(mktWallet(b), stripTags(String(l.species || "")).slice(0, 24));
+      if (bad) return res.status(409).json({ error: bad });
       marketAuctions.push({
         id: aid, seller: stripTags(String(l.seller || "Trainer")).slice(0, 20), sid,
         wallet: mktWallet(b),   // proven seller wallet — puts the auction sid inside the anti-hijack surface
