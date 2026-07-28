@@ -13,6 +13,15 @@ let pass = 0, fail = 0;
 const chk = (c, w) => { if (c) { pass++; console.log("  ok:", w); } else { fail++; console.log("  FAIL:", w); } };
 const post = async (p, b) => (await fetch(BASE + p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) })).json();
 const get = async (p) => (await fetch(BASE + p)).json();
+// sending a whisper AS a public wallet now needs proof (wallets are published in /world/roster,
+// so a bare one cannot authorise anything). Sign in properly, as a real client does.
+async function provenW(){
+  const kp=nacl.sign.keyPair(), w=bs58.encode(kp.publicKey), nid="n"+Math.random().toString(36).slice(2);
+  const msg=`Chikoria sign-in\nwallet:${w}\nts:${Date.now()}`;
+  const sg=Buffer.from(nacl.sign.detached(Buffer.from(msg,"utf8"),kp.secretKey)).toString("base64");
+  const v=await post("/verify",{wallet:w,netId:nid,authMsg:msg,authSig:sg});
+  return {w,tok:v.mktToken};
+}
 await import("./server.js");
 await new Promise(r => setTimeout(r, 1400));
 
@@ -59,10 +68,12 @@ console.log("— world chat carries the wallet, so a name is whisperable —");
   const last = ((await get("/world/chat?since=0")).messages || []).slice(-1)[0];
   chk(!!last && last.wallet === A.wallet, "the message now carries the full wallet");
   chk(!!last && String(last.short).includes("…"), "and still carries the short id for display");
-  const dm = await post("/world/dm", { wallet: B.wallet, handle: "Bob", to: last.wallet, text: "psst" });
+  const dm = await post("/world/dm", { wallet: B.wallet, mktToken: B.tok, handle: "Bob", to: last.wallet, text: "psst" });
   chk(!dm.error, `whispering the clicked name is accepted (${dm.error || "ok"})`);
-  chk(((await get(`/world/dm?wallet=${last.wallet}&since=0`)).messages || []).length > 0, "and the whisper actually arrives");
-  const bad = await post("/world/dm", { wallet: B.wallet, handle: "Bob", to: last.short, text: "x" });
+  // reading an inbox is proof-gated too, so read it as its owner
+  const rcv = await get(`/world/dm?wallet=${last.wallet}&since=0&mktToken=${encodeURIComponent(A.tok)}`);
+  chk(((rcv.messages) || []).length > 0, "and the whisper actually arrives");
+  const bad = await post("/world/dm", { wallet: B.wallet, mktToken: B.tok, handle: "Bob", to: last.short, text: "x" });
   chk(!!bad.error, `the ellipsised short id is still rejected (${bad.error}) — exactly what the client used to send`);
 }
 

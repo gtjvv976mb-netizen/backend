@@ -3162,12 +3162,37 @@ function worldSnapshot(wallet, x, z) {
   return near;
 }
 // Broadcast my position (and get nearby players back in one round-trip).
+// A presence id is EITHER a public wallet or a private net_id, and only one of those can act as a
+// credential. Wallets are published in /world/roster, world chat and on the market board — so a
+// route that trusts a bare wallet is trusting something anyone can read. A net_id never leaves its
+// owner's save, so it is still a shared secret between that client and this server.
+// Therefore: a WALLET must be proven with the market token /verify issued; a net_id may stand alone.
+// This keeps non-wallet and demo players working exactly as before while closing the exposure that
+// only affects wallet players — who are precisely the ones with something to lose.
+function presenceOk(id, body) {
+  if (!isPresenceId(id)) return false;
+  if (!isPubkey(id)) return true;                 // private net_id — the id IS the secret
+  return mktWallet(body) === id;                  // public wallet — must be proven
+}
+
 app.post("/world/move", (req, res) => {
   const b = req.body || {}, wallet = b.wallet;
   if (!isPresenceId(wallet)) return res.status(400).json({ error: "valid wallet required" });
+  // PUPPETEERING: anyone can read a wallet off /world/roster, so a bare wallet cannot own a
+  // presence slot. But a hard gate here is wrong: a real player has a wallet id the moment they
+  // sign in, a beat BEFORE /verify returns their token, and freezing them in place for that window
+  // is worse than the bug. So the slot is CLAIMED instead — once a proven caller owns it, only a
+  // proven caller may move it. An unproven caller can still take an unclaimed slot (a player
+  // mid-sign-in, or a net_id) but can never seize one that is already proven.
+  const held = worldPlayers.get(wallet);
+  const iAmProven = presenceOk(wallet, b);
+  if (held && held.proven && !iAmProven) {
+    return res.status(403).json({ error: "that trainer is signed in — prove this wallet first" });
+  }
   const x = clampF(b.x, -100000, 100000, 0), z = clampF(b.z, -100000, 100000, 0);
   const y = clampF(b.y, -1000, 100000, 0);   // height: without it every remote was ground-snapped and nobody could be seen jumping
   worldPlayers.set(wallet, {
+    proven: iAmProven,
     x, y, z, dir: clampF(b.dir, -7, 7, 0),
     handle: stripTags(String(b.handle || "Trainer")).slice(0, 20),
     leg: clampF(b.leg, 0, 20, 14) | 0,                 // companion species index
@@ -3260,6 +3285,8 @@ function dmInbox(sid) { let a = worldDM.get(sid); if (!a) { a = []; worldDM.set(
 app.post("/world/dm", (req, res) => {
   const b = req.body || {};
   if (!isPresenceId(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
+  // impersonation: sending AS a public wallet you do not own
+  if (!presenceOk(String(b.wallet), b)) return res.status(403).json({ error: "prove this wallet first" });
   const to = String(b.to || "");
   if (!isPresenceId(to)) return res.status(400).json({ error: "valid recipient required" });
   const text = stripTags(String(b.text || "")).slice(0, 200).trim();
@@ -3277,6 +3304,11 @@ app.post("/world/dm", (req, res) => {
 app.get("/world/dm", (req, res) => {
   const sid = String(req.query?.wallet || "");
   if (!isPresenceId(sid)) return res.status(400).json({ error: "valid wallet required" });
+  // PRIVATE MESSAGE DISCLOSURE: this returned any player's whole whisper inbox to anyone who knew
+  // their wallet — and wallets are published in /world/roster. Reading someone's DMs required
+  // nothing but their address.
+  if (!presenceOk(sid, { wallet: sid, mktToken: String(req.query?.mktToken || "") }))
+    return res.status(403).json({ error: "prove this wallet first" });
   const since = Number(req.query?.since) || 0;
   res.json({ messages: (worldDM.get(sid) || []).filter(m => m.ts > since).slice(-40) });
 });
