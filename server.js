@@ -3273,7 +3273,7 @@ app.get("/assets/summary", (req, res) => {
     }
   }
   oversold.sort((a, b) => b.listed - a.listed);
-  res.json({ wallets, units, mounts, unverified: unver, byOrigin,
+  res.json({ wallets, units, mounts, unverified: unver, byOrigin, mountsAdopted: _mountsAdopted,
              nodeClaims: { proven: _provenClaims, unproven: _unprovenClaims,
                            provenPct: (_provenClaims + _unprovenClaims) ? Math.round(100 * _provenClaims / (_provenClaims + _unprovenClaims)) : 0 },
              biggestLevelJumps: jumps.slice(0, 40), oversoldMaterials: oversold.slice(0, 40) });
@@ -3604,6 +3604,61 @@ app.post("/assets/egg/consume", (req, res) => {
   regEvent(row, "hatched", { into: born.id, sp });
   _assetsDirty = true;
   res.json({ ok: true, hatched: { id: born.id, type: born.type, sp: born.sp, from: row.id } });
+});
+
+// ============ STEP 3 OF SERVER AUTHORITY: THE REGISTRY IS THE CANONICAL STABLE ============
+// Until now mount ownership lived in the client-authored save, and the server merely observed it
+// (the ledger's delta inference). This route flips that: it converts what the LEDGER already
+// believes a wallet holds into registry PROPERTY — carrying the ledger's own origin, so nothing is
+// laundered (an unverified mount stays unverified forever, on its own row) — and answers with the
+// registry's canonical species list, which the client adopts at sign-in.
+//
+// DELIBERATELY, THE REQUEST NAMES NO MOUNT. Adoption reads only the server's own records, so this
+// route adds zero attacker-controlled input: a crafted body cannot ask for anything. A species the
+// ledger has never seen is simply not adopted this pass — the wallet's next save audit records it,
+// and the sign-in after that adopts it. Convergence over two sign-ins, no shortcut to forge.
+//
+// The answer grows an honest stable — everything ledger-known is adopted before the list is read
+// back — with ONE exception: at ASSET_REG_MAX the mints fail and the answer can come back short of,
+// or emptier than, what the wallet actually holds (the species list is read from the registry, and
+// at capacity nothing was written to it). So the client must NOT trust this answer as a superset on
+// its own. The safety that lets the client replace its local list wholesale lives on the CLIENT:
+// _adopt_stable()'s superset guard keeps the local list untouched whenever the answer is missing a
+// catalog steed it already holds. Given that guard, a wiped or stale save recovers its steeds from
+// the registry, and a full registry simply defers recovery to a later sync — never a wipe. That is
+// "cannot be erased" made real, and it is the two halves together, not this route alone.
+const MOUNT_IDS = new Set(MOUNT_SUPPLY.map((m) => m[0]));
+let _mountsAdopted = 0;
+app.post("/assets/mounts/sync", (req, res) => {
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const wallet = regWallet(req);
+  if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
+
+  const ownedSp = new Set(regOwned(wallet, "mount").map((r) => r.sp));
+  const adopted = [];
+  const lrec = assetLedger.get(wallet);
+  if (lrec) {
+    for (const sp of Object.keys(lrec.mounts)) {
+      if (!MOUNT_IDS.has(sp)) continue;     // catalog species only — ledger keys are clamped text, not validated
+      if (ownedSp.has(sp)) continue;        // already property; adoption is one row per species per wallet
+      const lo = lrec.mounts[sp] && lrec.mounts[sp].origin;
+      const origin = ORIGINS.has(lo) ? lo : "unverified";   // the ledger's verdict rides along, never upgraded
+      try {
+        mintAsset("mount", wallet, { sp, kind: "mount" }, origin);
+        ownedSp.add(sp); adopted.push(sp); _mountsAdopted++;
+      } catch (e) { break; }   // capacity: adopt what fits — the rest stays ledger-known and retries next sync
+    }
+  }
+
+  // the canonical answer: unique active species, one card per species even if old consume reports
+  // ever minted a duplicate row
+  const seen = new Set(); const cards = [];
+  for (const r of regOwned(wallet, "mount")) {
+    if (seen.has(r.sp)) continue;
+    seen.add(r.sp);
+    cards.push({ id: r.id, sp: r.sp, origin: r.origin, born: r.born });
+  }
+  res.json({ ok: true, species: [...seen], mounts: cards, adopted });
 });
 
 // Redeem an Avatar Scroll. Avatars had NO server record of any kind — adding one to a save was free
