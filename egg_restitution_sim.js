@@ -124,5 +124,26 @@ sec("the window is real and it closes");
   chk(open.body.closesAt === Date.UTC(2026, 7, 4), `and closes 2026-08-04 — 7 days (${new Date(open.body.closesAt).toISOString().slice(0, 10)})`);
 }
 
+
+// THE SEAM. Chain.gd _claim_egg_restitution() reads exactly three things off this response:
+// j["granted"], and per entry .kind and .id. Renaming any of them server-side would not fail any
+// test — it would just silently stop delivering eggs to players. Pin them.
+sec("the response carries exactly the fields the client reads");
+{
+  const W = await mkWallet();
+  await save(W, { eggs: [], units: {}, mounts: [], prog: { eggmake_legendary: 1 } });
+  const c = await claim(W);
+  chk(Array.isArray(c.body.granted), `"granted" is an array (${typeof c.body.granted})`);
+  const g = c.body.granted[0];
+  chk(g && typeof g.kind === "string" && g.kind.length > 0, `each entry has a string "kind" (${g?.kind})`);
+  chk(g && typeof g.id === "string" && g.id.length > 0, `each entry has a string "id" (${String(g?.id).slice(0, 12)}…)`);
+  // the kind must be one the client can label and nest — an unknown string would toast "Egg" and
+  // put an unrecognised egg in the nest
+  chk(["normal", "legendary", "meme", "mount"].includes(g.kind), `and the kind is one the client knows (${g.kind})`);
+  // the empty case must still be an array, or `got.is_empty()` in GDScript would error on null
+  const empty = await claim(await (async () => { const X = await mkWallet(); await save(X, { eggs: [], units: {}, mounts: [], prog: {} }); return X; })());
+  chk(Array.isArray(empty.body.granted), `"granted" is an array even when nothing is owed (${JSON.stringify(empty.body.granted)})`);
+}
+
 console.log(`\nEGGRESTITUTION_DONE pass=${pass} fail=${fail}`);
 process.exit(fail ? 1 : 0);
