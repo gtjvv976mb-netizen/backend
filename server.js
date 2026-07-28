@@ -967,16 +967,43 @@ function cupSnapshot(forWallet) {
   return out;
 }
 // Validate + clamp a client-supplied legendary snapshot against the wallet's stored roster (anti-inflation).
-async function cupSnapFromBody(wallet, snap) {
+// exported as a test seam so a sim can assert the deck is derived, not accepted
+export async function cupSnapFromBody(wallet, snap) {
   const prof = await store.getProfile(wallet);
   const roster = (prof && Array.isArray(prof.chikis)) ? prof.chikis : [];
   const legends = roster.filter(c => c && c.isLegend);
   if (!legends.length) return { error: "Hatch a Legendary first to enter the Cup." };
   const bestBr = legends.reduce((m, c) => Math.max(m, Number(c.br) || 1), 1);
   const el = CUP_ELEMS.includes(snap?.element) ? snap.element : "Fire";
-  let skills = Array.isArray(snap?.arenaSkills) ? snap.arenaSkills.map(n => n | 0).filter(n => n >= 0 && n < 12) : [];
-  if (!skills.length) skills = [0, 1, 2];
-  const ct = {}; if (snap?.cardTier && typeof snap.cardTier === "object") for (const k in snap.cardTier) { const sl = k | 0; if (sl >= 0 && sl < 12) ct[sl] = Math.max(1, Math.min(5, Number(snap.cardTier[k]) || 1)); }
+  // THE DECK IS THE SERVER'S, NOT THE CALLER'S. br was already clamped to the player's best
+  // legendary, but arenaSkills and cardTier were taken straight from the request body and only
+  // range-checked — so an entrant could claim all 12 ability cards at tier 5 regardless of what
+  // they had actually unlocked, in a tournament that pays real SOL. The stored profile already
+  // holds the true per-chiki deck (and /profile rate-limits how fast it may grow, CARD_MIN_SEC),
+  // so that is the authority. The caller may still CHOOSE among the cards it owns — the body is
+  // treated as a preference, intersected with the truth, never as the source.
+  const champ = legends.reduce((b, c) => ((Number(c.br) || 1) >= (Number(b.br) || 1) ? c : b), legends[0]);
+  const ownedSkills = Array.isArray(champ?.arenaSkills)
+    ? champ.arenaSkills.map(n => n | 0).filter(n => n >= 0 && n < 12) : [];
+  const wanted = Array.isArray(snap?.arenaSkills)
+    ? snap.arenaSkills.map(n => n | 0).filter(n => n >= 0 && n < 12) : [];
+  let skills = ownedSkills.length
+    ? (wanted.length ? wanted.filter(n => ownedSkills.includes(n)) : ownedSkills)
+    : wanted;                                   // legacy record with no stored deck: fall back
+  if (!skills.length) skills = ownedSkills.length ? ownedSkills.slice(0, 3) : [0, 1, 2];
+  const ownedCt = (champ?.cardTier && typeof champ.cardTier === "object") ? champ.cardTier : null;
+  const ct = {};
+  if (snap?.cardTier && typeof snap.cardTier === "object") {
+    for (const k in snap.cardTier) {
+      const sl = k | 0;
+      if (sl < 0 || sl >= 12) continue;
+      let v = Math.max(1, Math.min(5, Number(snap.cardTier[k]) || 1));
+      if (ownedCt) v = Math.min(v, Math.max(1, Math.min(5, Number(ownedCt[sl]) || 1)));  // never above what is owned
+      ct[sl] = v;
+    }
+  } else if (ownedCt) {
+    for (const k in ownedCt) { const sl = k | 0; if (sl >= 0 && sl < 12) ct[sl] = Math.max(1, Math.min(5, Number(ownedCt[k]) || 1)); }
+  }
   const br = Math.max(1, Math.min(MAX_BR, Math.min(Number(snap?.br) || bestBr, bestBr)));   // can't claim a higher BR than your best legendary
   const name = stripTags(snap?.name || (prof?.handle) || wallet.slice(0, 4)).slice(0, 18) || wallet.slice(0, 4);
   const player = stripTags(prof?.handle || "").slice(0, 18) || null;   // the PLAYER's profile name (shown in the Hub, not the Chikimon's name)
