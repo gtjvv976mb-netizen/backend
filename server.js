@@ -3100,6 +3100,23 @@ const CLAIM_RADIUS_KIND = Object.freeze(Object.assign(Object.create(null), { pig
 const NODE_CD_DEFAULT_S = 60;
 const CLAIM_RADIUS = 14;          // world units; in-game gather reach is ~7, doubled for latency
 const CLAIM_MIN_MS = 1800;        // the client's own anti-macro floor is 2s
+// WHAT A NODE DROPS, decided here rather than by the client. Transcribed from Gather.gd:694-729,
+// which is the behaviour players have today — this names the drop, it does not rebalance it.
+//
+// An ALLOWLIST, never a default: a node id is "kind:ix:iz" and the handler accepts any kind string
+// in it, so falling back to a material for an unknown kind would be a faucet. Unknown -> nothing.
+//
+// The cow really does yield TWO items from one claim and that is deliberate and live, so this maps
+// to a LIST. Everything else is exactly one, which is the standing rule.
+const NODE_DROP = Object.freeze(Object.assign(Object.create(null), {
+  wood: ["wood"], stone: ["stone"], crystal: ["crystal"], crystal_mine: ["crystal"],
+  gold: ["gold"], iron: ["iron"], seashell: ["seashell"], honey: ["honey"],
+  flower: ["flower"], berries: ["berries"], pig: ["pork"], cow: ["beef", "hide"],
+}));
+const nodeDrop = (kind) => (Object.hasOwn(NODE_DROP, kind) ? NODE_DROP[kind] : []);
+// how many claims arrive with a provable identity — read from /assets/summary, so the decision to
+// start refusing unproven ones is made on a real number rather than a guess
+let _provenClaims = 0, _unprovenClaims = 0;
 const CLAIM_BURST = 40;           // per wallet per minute, a generous ceiling on honest play
 const claimRate = new Map();      // wallet -> {last, count, windowStart}
 
@@ -3132,13 +3149,30 @@ app.post("/world/node/claim", (req, res) => {
   }
 
   // 3. no claiming faster than a human can gather
+  // WHO IS ACTUALLY CLAIMING? The handler accepts any presence id, but a WALLET is public — it is
+  // published in /world/roster, world chat and on the market board — so a bare wallet here proves
+  // nothing, and anyone can burn a victim's nodes and their claim budget in their name. A net_id is
+  // different: it never leaves its owner's save, so it stands alone (same rule as presenceOk).
+  //
+  // OBSERVE ONLY for now. Refusing today would silence every already-shipped client, whose claims
+  // carry no token — their nodes would stay standing for everyone else, which is the very desync
+  // this is meant to fix. So it is recorded and reported, and the gate comes after the roster shows
+  // the tokened client is in the wild.
+  const claimProven = presenceOk(String(b.wallet), b);
+  if (!claimProven) _unprovenClaims++;
+  else _provenClaims++;
+
   const r = claimRate.get(b.wallet) || { last: 0, count: 0, windowStart: now };
   if (now - r.windowStart > 60000) { r.count = 0; r.windowStart = now; }
   if (now - r.last < CLAIM_MIN_MS) {
-    return res.status(429).json({ ok: false, error: "too fast" });
+    // TELL THE CLIENT WHEN TO COME BACK. This returns BEFORE r.last is refreshed below, so a
+    // rejected call does not extend the window — a client that waits retryInMs and re-sends gets
+    // through. Without this a queued claim was simply lost, and the node stayed standing for
+    // everyone else, which is exactly what the shared world is supposed to prevent.
+    return res.status(429).json({ ok: false, error: "too fast", retryInMs: CLAIM_MIN_MS - (now - r.last) });
   }
   if (r.count >= CLAIM_BURST) {
-    return res.status(429).json({ ok: false, error: "rate limited" });
+    return res.status(429).json({ ok: false, error: "rate limited", retryInMs: Math.max(0, 60000 - (now - r.windowStart)) });
   }
   r.last = now; r.count += 1;
   claimRate.set(b.wallet, r);
@@ -3166,20 +3200,23 @@ app.post("/world/node/claim", (req, res) => {
     if (left > 0) {
       worldNodeUses.set(id, { left, ts: now });
       markNodesDirty();
-      recordGather(b.wallet, kind);
-      return res.json({ ok: true, taken: false, left, felled: false });
+      const drop1 = nodeDrop(kind);
+      recordGather(b.wallet, kind, drop1);
+      return res.json({ ok: true, taken: false, left, felled: false, drop: drop1 });
     }
     worldNodeUses.delete(id);
     worldNodes.set(id, now + cd);
     markNodesDirty();
-    recordGather(b.wallet, kind);
-    return res.json({ ok: true, taken: false, left: 0, felled: true, until: now + cd });
+    const drop2 = nodeDrop(kind);
+    recordGather(b.wallet, kind, drop2);
+    return res.json({ ok: true, taken: false, left: 0, felled: true, until: now + cd, drop: drop2 });
   }
 
   worldNodes.set(id, now + cd);
   markNodesDirty();
-  recordGather(b.wallet, kind);   // the SINGLE-USE path — every node except wood comes through here
-  res.json({ ok: true, taken: false, until: now + cd });
+  const drop3 = nodeDrop(kind);   // the SINGLE-USE path — every node except wood comes through here
+  recordGather(b.wallet, kind, drop3);
+  res.json({ ok: true, taken: false, until: now + cd, drop: drop3 });
 });
 
 // the world's currently-spent nodes, so a client can hide what someone else already took
@@ -3237,6 +3274,8 @@ app.get("/assets/summary", (req, res) => {
   }
   oversold.sort((a, b) => b.listed - a.listed);
   res.json({ wallets, units, mounts, unverified: unver, byOrigin,
+             nodeClaims: { proven: _provenClaims, unproven: _unprovenClaims,
+                           provenPct: (_provenClaims + _unprovenClaims) ? Math.round(100 * _provenClaims / (_provenClaims + _unprovenClaims)) : 0 },
              biggestLevelJumps: jumps.slice(0, 40), oversoldMaterials: oversold.slice(0, 40) });
 });
 
@@ -3301,14 +3340,17 @@ function presenceOk(id, body) {
 // discrepancy is visible and a rule can be written from real data rather than from my assumption.
 const gatherCount = new Map();          // wallet -> { kind: n }
 const GATHER_WALLETS_MAX = 20000;
-function recordGather(wallet, kind) {
+function recordGather(wallet, kind, drop) {
   if (!isPubkey(String(wallet || "")) || !kind) return;
+  // Count the MATERIALS, not the node kind. The oversold check compares this against what a wallet
+  // lists for sale, and nobody sells a "cow" — they sell beef and hide.
+  const mats = Array.isArray(drop) && drop.length ? drop : [kind];
   let g = gatherCount.get(wallet);
   if (!g) {
     if (gatherCount.size >= GATHER_WALLETS_MAX) return;
     g = Object.create(null); gatherCount.set(wallet, g);
   }
-  g[kind] = (g[kind] || 0) + 1;
+  for (const m of mats) g[m] = (g[m] || 0) + 1;
   _assetsDirty = true;
 }
 export function _gatheredFor(wallet) { return gatherCount.get(wallet) || null; }
