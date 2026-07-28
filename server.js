@@ -3273,7 +3273,8 @@ app.get("/assets/summary", (req, res) => {
     }
   }
   oversold.sort((a, b) => b.listed - a.listed);
-  res.json({ wallets, units, mounts, unverified: unver, byOrigin, mountsAdopted: _mountsAdopted,
+  res.json({ wallets, units, mounts, unverified: unver, byOrigin,
+             mountsAdopted: _mountsAdopted, chikisAdopted: _chikisAdopted,
              nodeClaims: { proven: _provenClaims, unproven: _unprovenClaims,
                            provenPct: (_provenClaims + _unprovenClaims) ? Math.round(100 * _provenClaims / (_provenClaims + _unprovenClaims)) : 0 },
              biggestLevelJumps: jumps.slice(0, 40), oversoldMaterials: oversold.slice(0, 40) });
@@ -3407,12 +3408,21 @@ function mintAssetId(type) {
   return `${type[0]}${Date.now().toString(36)}${(++_regSeq).toString(36)}${crypto.randomBytes(6).toString("hex")}`;
 }
 function ownerSet(w) { let s = assetsByOwner.get(w); if (!s) { s = new Set(); assetsByOwner.set(w, s); } return s; }
-// Does the registry hold an ACTIVE asset of this type and species for this wallet? This is the
-// bridge that stops the inference-based ledger from condemning something the server itself minted.
+// Does the registry hold an ACTIVE, CLEAN-ORIGIN asset of this type and species for this wallet?
+// This is the bridge that stops the inference-based ledger from condemning something the server
+// itself minted — but a vouch must come only from a CLEAN origin. The adoption routes
+// (/assets/mounts/sync, /assets/chikimon/sync) mint registry rows for ledger units of EVERY origin,
+// including "unverified", so that a flagged creature still has a permanent, honestly-labelled record.
+// Without the origin gate those adopted-unverified rows would vouch: the sale gate's species fallback
+// would flip block→allow for a flagged creature listed without its real uid, and the audit grader
+// would launder a churned re-save (fresh uid) from "unverified" to "issued". An unverified row is the
+// server declining to vouch — it must never itself become a vouch. ORIGIN_CLEAN excludes exactly
+// "unverified"; every legitimate origin (legacy/hatched/purchased/issued/traded/restitution) still
+// vouches, so no genuine hatch or legacy creature is affected.
 function regVouchesSpecies(wallet, type, sp) {
   for (const id of (assetsByOwner.get(wallet) || [])) {
     const r = assetReg.get(id);
-    if (r && r.type === type && r.state === "active" && r.sp === sp) return true;
+    if (r && r.type === type && r.state === "active" && r.sp === sp && ORIGIN_CLEAN.has(r.origin)) return true;
   }
   return false;
 }
@@ -3659,6 +3669,62 @@ app.post("/assets/mounts/sync", (req, res) => {
     cards.push({ id: r.id, sp: r.sp, origin: r.origin, born: r.born });
   }
   res.json({ ok: true, species: [...seen], mounts: cards, adopted });
+});
+
+// ============ STEP 5 OF SERVER AUTHORITY: legacy chikimon become permanent registry assets ============
+// Before this, only chikimon HATCHED-and-reported through the egg routes had a registry row; every
+// legacy creature existed only in the delta-inference LEDGER (capped at 20k wallets, evictable when
+// clean, gone if a save is wiped). This adopts the wallet's ledger-known, currently-held creatures
+// into the registry as permanent property, carrying the ledger's own origin — so an "unverified"
+// creature mints an "unverified" row and stays blocked, exactly as mounts/sync does. After this a
+// chikimon cannot be forged or erased: whatever a save says, the registry is the record.
+//
+// TWO HARD DIFFERENCES FROM MOUNTS, forced by the data shapes (see the recon):
+//   1. A chikimon is IDENTITY + a save-only progression bundle (level, BR, skill points, card tiers,
+//      battle XP, nickname, mood) the registry never stored and cannot regenerate. So this route is
+//      ADOPT-ONLY: it makes the creature a permanent asset, but the client must NEVER replace its
+//      roster from this answer (that would wipe every level). The client only stamps the registry id
+//      onto its matching creature — additive, never a state overwrite.
+//   2. The registry has no per-creature save uid, so adoption is SPECIES-LEVEL (one row per species,
+//      the exact granularity regVouchesSpecies and the sale gate already consume). The birth `lvl`
+//      is meaningless (always 1) and is deliberately not returned as live state.
+// The sale gate is unchanged and NEUTRAL to this: its strong per-uid check still runs first and still
+// blocks a known-unverified or no-longer-held uid; a species this route vouches was already vouchable
+// via the ledger's species fallback, so nothing that could not be listed before can be listed now.
+const CHIKIMON_IDS = new Set([...SPECIES_NORMAL, ...SPECIES_LEGEND, ...SPECIES_MEME]);
+let _chikisAdopted = 0;
+app.post("/assets/chikimon/sync", (req, res) => {
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const wallet = regWallet(req);
+  if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
+
+  const ownedSp = new Set(regOwned(wallet, "chikimon").map((r) => r.sp));
+  const adopted = [];
+  const lrec = assetLedger.get(wallet);
+  if (lrec) {
+    for (const uid of Object.keys(lrec.units)) {
+      const u = lrec.units[uid];
+      if (!u || u.held === false) continue;      // only creatures currently in the roster
+      const sp = String(u.sp || "");
+      if (!CHIKIMON_IDS.has(sp)) continue;        // catalog species only — ledger keys are clamped text
+      if (ownedSp.has(sp)) continue;              // already property; one row per species per wallet
+      const origin = ORIGINS.has(u.origin) ? u.origin : "unverified";   // the ledger's verdict rides along, never upgraded
+      try {
+        mintAsset("chikimon", wallet, { sp, kind: String(u.kind || "normal").slice(0, 12), lvl: 1 }, origin);
+        ownedSp.add(sp); adopted.push(sp); _chikisAdopted++;
+      } catch (e) { break; }   // capacity: adopt what fits — the rest stays ledger-known and retries next sync
+    }
+  }
+
+  // the canonical answer: unique active species with provenance, one card per species. `lvl` is the
+  // frozen birth level (1) — NOT live state; the client keeps its own level and only reads id/sp.
+  const seen = new Set(); const cards = [];
+  for (const r of regOwned(wallet, "chikimon")) {
+    if (seen.has(r.sp)) continue;
+    seen.add(r.sp);
+    cards.push({ id: r.id, sp: r.sp, kind: r.kind, origin: r.origin, born: r.born });
+  }
+  res.json({ ok: true, species: [...seen], chikimon: cards, adopted });
 });
 
 // Redeem an Avatar Scroll. Avatars had NO server record of any kind — adding one to a save was free
