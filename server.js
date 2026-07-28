@@ -1309,6 +1309,9 @@ app.post("/profile", async (req, res) => {
       if (!("bal"    in profile) && prev.bal    != null) safe.bal    = prev.bal;
     }
     if (hasMmo) safe.mmo = profile.mmo;   // the signed MMO cloud-save rides through verbatim
+    // record every asset this save presents, with where it came from. Never rejects — see the
+    // ledger's own note; a wrong rejection costs a real player their roster.
+    if (hasMmo) { try { auditAssets(wallet, profile.mmo); } catch (e) {} }
     else if (prev && prev.mmo) safe.mmo = prev.mmo;   // SECURITY: legacy (unsigned) writes must NOT wipe the owner's cloud-save — carry it forward
     safe._serverSavedAt = now;   // authoritative "last seen" for offline progression
     await store.setProfile(wallet, safe);
@@ -3156,6 +3159,35 @@ app.post("/world/node/claim", (req, res) => {
 });
 
 // the world's currently-spent nodes, so a client can hide what someone else already took
+// Provenance for one wallet's assets: what it holds, when each first appeared, and how.
+// Readable by the PROVEN owner or an admin — an asset record is as sensitive as the roster itself.
+app.get("/assets/audit", (req, res) => {
+  const w = String(req.query?.wallet || "");
+  if (!isPubkey(w)) return res.status(400).json({ error: "valid wallet required" });
+  const admin = cupAdminOk(req);   // same ADMIN_KEY / admin-wallet gate the Cup uses
+  if (!admin && mktWallet({ wallet: w, mktToken: String(req.query?.mktToken || "") }) !== w) {
+    return res.status(403).json({ error: "prove this wallet first" });
+  }
+  const rec = assetLedger.get(w);
+  if (!rec) return res.json({ wallet: w, known: false, units: {}, mounts: {}, unverified: 0 });
+  res.json({ wallet: w, known: true, firstSeen: rec.first, unverified: rec.unverified,
+             units: rec.units, mounts: rec.mounts, eggsHeld: rec.eggsLast });
+});
+
+// Game-wide authenticity summary (admin): how much of what exists cannot be accounted for.
+app.get("/assets/summary", (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  let wallets = 0, units = 0, mounts = 0, unver = 0;
+  const byOrigin = {};
+  for (const [, r] of assetLedger) {
+    wallets++;
+    for (const u of Object.values(r.units)) { units++; byOrigin[u.origin] = (byOrigin[u.origin] || 0) + 1; }
+    for (const m of Object.values(r.mounts)) { mounts++; byOrigin[m.origin] = (byOrigin[m.origin] || 0) + 1; }
+    unver += r.unverified;
+  }
+  res.json({ wallets, units, mounts, unverified: unver, byOrigin });
+});
+
 app.get("/world/nodes", (_req, res) => {
   const now = Date.now();
   const out = {};
@@ -3200,6 +3232,70 @@ function presenceOk(id, body) {
   if (!isPresenceId(id)) return false;
   if (!isPubkey(id)) return true;                 // private net_id — the id IS the secret
   return mktWallet(body) === id;                  // public wallet — must be proven
+}
+
+
+// ============ ASSET AUTHENTICITY LEDGER ============
+// The server stored profile.mmo verbatim, so it had no idea what a wallet SHOULD own: a save
+// carrying 12 fabricated level-50 legendaries, every mount and a conjured egg was accepted and
+// handed straight back (forged_roster_sim.js). The client's tamper seal does not close this — its
+// salt must ship in the client to sign saves, AND the tamper path clears currency/chests/eggs but
+// leaves units and mounts untouched, so a flagged save keeps its forged roster.
+//
+// This is the record of what actually exists. Every asset a wallet has ever presented is recorded
+// once, with when it first appeared and where it came from:
+//   legacy     — present on the first save under this system; grandfathered, not vouched for
+//   hatched    — appeared in the same save that consumed an egg, which is how chikimon are made
+//   purchased  — appeared alongside a matching drop in the wallet's own recorded balance
+//   unverified — appeared from nowhere. Not blocked, but permanently on the record.
+//
+// It deliberately does NOT reject saves. Rejecting would break legitimate play the moment any
+// acquisition path was not modelled here, and a wrong rejection costs a real player their progress.
+// Flagging is honest and reversible; blocking on a guess is not.
+const assetLedger = new Map();          // wallet -> { first, units:{}, mounts:{}, eggsLast, flags }
+const ASSET_LEDGER_MAX = 20000;
+
+function assetRec(wallet) {
+  let r = assetLedger.get(wallet);
+  if (!r) { r = { first: Date.now(), units: {}, mounts: {}, eggsLast: null, unverified: 0 }; assetLedger.set(wallet, r); }
+  return r;
+}
+
+// Fold one cloud-save into the ledger and return what was learned about it.
+function auditAssets(wallet, mmo) {
+  if (!mmo || typeof mmo !== "object") return null;
+  const rec = assetRec(wallet);
+  const firstEver = rec.eggsLast === null && Object.keys(rec.units).length === 0;
+  const eggsNow = Array.isArray(mmo.eggs) ? mmo.eggs.length : 0;
+  const eggsSpent = rec.eggsLast === null ? 0 : Math.max(0, rec.eggsLast - eggsNow);
+  let newUnits = 0, newMounts = 0, flagged = [];
+
+  const units = (mmo.units && typeof mmo.units === "object") ? mmo.units : {};
+  for (const uid of Object.keys(units)) {
+    const u = units[uid] || {};
+    if (rec.units[uid]) { rec.units[uid].lvl = Number(u.level) || rec.units[uid].lvl; continue; }
+    newUnits++;
+    // an egg consumed in this same save is the ordinary way a chikimon appears
+    const origin = firstEver ? "legacy" : (eggsSpent >= newUnits ? "hatched" : "unverified");
+    rec.units[uid] = { sp: String(u.species || "?").slice(0, 24), kind: String(u.kind || "?").slice(0, 12),
+                       lvl: Number(u.level) || 1, ts: Date.now(), origin };
+    if (origin === "unverified") { rec.unverified++; flagged.push(`unit:${uid}:${rec.units[uid].sp}`); }
+  }
+  const mounts = Array.isArray(mmo.mounts) ? mmo.mounts : [];
+  for (const m of mounts) {
+    const id = String(m).slice(0, 24);
+    if (rec.mounts[id]) continue;
+    newMounts++;
+    const origin = firstEver ? "legacy" : "unverified";
+    rec.mounts[id] = { ts: Date.now(), origin };
+    if (origin === "unverified") { rec.unverified++; flagged.push(`mount:${id}`); }
+  }
+  rec.eggsLast = eggsNow;
+  if (assetLedger.size > ASSET_LEDGER_MAX) {
+    const oldest = [...assetLedger.entries()].sort((a, b) => a[1].first - b[1].first).slice(0, 500);
+    for (const [k] of oldest) assetLedger.delete(k);
+  }
+  return { firstEver, newUnits, newMounts, eggsSpent, flagged, unverified: rec.unverified };
 }
 
 app.post("/world/move", (req, res) => {
