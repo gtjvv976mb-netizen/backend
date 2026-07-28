@@ -12,19 +12,34 @@ const get=async(p)=>(await fetch(BASE+p)).json();
 const wallet=()=>bs58.encode(nacl.sign.keyPair().publicKey);
 await import("./server.js"); await new Promise(r=>setTimeout(r,1400));
 
-const A=wallet(), B=wallet(), ATTACKER=wallet();
+// proven identities: /verify issues a wallet-bound market token, which is what now gates the secret
+async function proven() {
+  const kp=nacl.sign.keyPair(), w=bs58.encode(kp.publicKey), nid="n"+Math.random().toString(36).slice(2);
+  const msg=`Chikoria sign-in\nwallet:${w}\nts:${Date.now()}`;
+  const sg=Buffer.from(nacl.sign.detached(Buffer.from(msg,"utf8"),kp.secretKey)).toString("base64");
+  const v=await post("/verify",{wallet:w,netId:nid,authMsg:msg,authSig:sg});
+  return {w, tok:v.mktToken};
+}
+const PA=await proven(), PB=await proven();
+const A=PA.w, B=PB.w, ATTACKER=wallet();
 const snapA={element:"Fire",name:"Alice",br:8,cardTier:1,arenaSkills:[]};
 const snapB={element:"Water",name:"Bob",br:8,cardTier:1,arenaSkills:[]};
 await post("/pvp/challenge",{from:A,fromName:"Alice",to:B,snap:snapA});
-const inbox=await post("/pvp/available",{wallet:B,name:"Bob",snap:snapB});
+const inbox=await post("/pvp/available",{wallet:B,name:"Bob",snap:snapB,mktToken:PB.tok});
 const ch=(inbox.challenges||[]).find(c=>c.from===A);
-const acc=await post("/pvp/challenge/accept",{wallet:B,challengeId:ch&&ch.id,snap:snapB});
+const acc=await post("/pvp/challenge/accept",{wallet:B,challengeId:ch&&ch.id,snap:snapB,mktToken:PB.tok});
 chk(acc.ok===true&&!!acc.matchId,`a match starts (${acc.matchId})`);
 chk(typeof acc.sec==="string"&&acc.sec.length>=16,"the accepter is handed a per-match secret");
-const av=await post("/pvp/available",{wallet:A,name:"Alice",snap:snapA});
+const av=await post("/pvp/available",{wallet:A,name:"Alice",snap:snapA,mktToken:PA.tok});
 chk(!!(av.matched&&av.matched.sec),"the challenger gets theirs when they discover the match");
 chk(av.matched.sec!==acc.sec,"the two sides get DIFFERENT secrets");
 const mid=acc.matchId;
+
+console.log("— a stranger CANNOT obtain the victim's secret by asking for it —");
+const leak=await post("/pvp/available",{wallet:A,name:"NotAlice",snap:snapA});   // no token
+chk(!(leak.matched&&leak.matched.sec), "/pvp/available refuses the secret to an unproven caller");
+const leak2=await post("/pvp/challenge/accept",{wallet:A,challengeId:"x",snap:snapA});
+chk(!leak2.sec, "/pvp/challenge/accept refuses it too");
 
 console.log("— a stranger who knows the match id AND the victim's public wallet —");
 const ff=await post("/pvp/forfeit",{matchId:mid,wallet:B});

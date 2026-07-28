@@ -2806,7 +2806,19 @@ function availableJoin(body) {
   if (!isPubkey(wallet)) return { error: "wallet required" };
   cleanAvail();
   const cur = pvpPlayerMatch.get(wallet), curM = cur && pvpMatches.get(cur);
-  if (curM && curM.status === "active") { pvpAvail.delete(wallet); const sd = pvpSideOf(curM, wallet); return { players: [], challenges: [], matched: { matchId: cur, side: sd, sec: sd === "a" ? curM.secA : curM.secB } }; }
+  if (curM && curM.status === "active") {
+    pvpAvail.delete(wallet);
+    const sd = pvpSideOf(curM, wallet);
+    // THE SECRET IS A CREDENTIAL — hand it out only to a caller who has PROVEN this wallet.
+    // This route is authorised by the wallet alone, and wallets are public (roster, world chat,
+    // market board). Returning `sec` here unconditionally meant anyone could ask for a victim's
+    // secret and then forfeit their duel — re-opening the exact hole the secrets were added to
+    // close. Proving costs nothing for a real player: /verify already issued them a market token.
+    const proven = mktWallet(body) === wallet;
+    const out = { players: [], challenges: [], matched: { matchId: cur, side: sd } };
+    if (proven) out.matched.sec = (sd === "a" ? curM.secA : curM.secB);
+    return out;
+  }
   if (snap && snap.element) pvpAvail.set(wallet, { name: String(name || "Trainer").slice(0, 20), snap, ts: Date.now(), searching: !!searching });
   else pvpAvail.delete(wallet);
   // auto-match: if I'm actively searching, pair me with ANY other searching Trainer not already in a battle
@@ -2819,7 +2831,10 @@ function availableJoin(body) {
       pvpAvail.delete(w); pvpAvail.delete(wallet);
       pvpChallenges = pvpChallenges.filter(c => c.from !== w && c.to !== w && c.from !== wallet && c.to !== wallet);
       { const sd = pvpSideOf(match, wallet);
-        return { players: [], challenges: [], matched: { matchId: match.id, side: sd, sec: sd === "a" ? match.secA : match.secB } }; }
+        const proven2 = mktWallet(body) === wallet;      // same rule as above — see the note there
+        const out2 = { players: [], challenges: [], matched: { matchId: match.id, side: sd } };
+        if (proven2) out2.matched.sec = (sd === "a" ? match.secA : match.secB);
+        return out2; }
     }
   }
   const players = [...pvpAvail.entries()].filter(([w]) => w !== wallet).map(([w, v]) => ({ wallet: w, name: v.name, searching: !!v.searching }));
@@ -2852,7 +2867,11 @@ app.post("/pvp/challenge/accept", (req, res) => {
   pvpAvail.delete(ch.from); pvpAvail.delete(wallet);
   pvpChallenges = pvpChallenges.filter(c => c.from !== ch.from && c.to !== ch.from && c.from !== wallet && c.to !== wallet);
   { const side = pvpSideOf(m, wallet);
-    res.json({ ok: true, matchId: m.id, side, sec: side === "a" ? m.secA : m.secB }); }
+    // same credential rule as /pvp/available: only a proven wallet receives the per-match secret
+    const body = req.body || {};
+    const r2 = { ok: true, matchId: m.id, side };
+    if (mktWallet(body) === wallet) r2.sec = (side === "a" ? m.secA : m.secB);
+    res.json(r2); }
 });
 // Decline / clear a challenge.
 app.post("/pvp/challenge/decline", (req, res) => {

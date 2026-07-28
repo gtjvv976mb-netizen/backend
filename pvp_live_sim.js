@@ -23,22 +23,33 @@ const get = async (p) => (await fetch(BASE + p)).json();
 await import("./server.js");
 await new Promise(r => setTimeout(r, 1400));
 
-const A = wallet(), B = wallet();
+// the per-match secret is only issued to a caller that has PROVEN its wallet (a /verify market
+// token), so these identities sign in properly — an anonymous client cannot obtain one by design.
+async function proven() {
+  const kp = nacl.sign.keyPair(), w = bs58.encode(kp.publicKey), nid = "n" + Math.random().toString(36).slice(2);
+  const msg = `Chikoria sign-in\nwallet:${w}\nts:${Date.now()}`;
+  const sg = Buffer.from(nacl.sign.detached(Buffer.from(msg, "utf8"), kp.secretKey)).toString("base64");
+  const v = await post("/verify", { wallet: w, netId: nid, authMsg: msg, authSig: sg });
+  return { w, tok: v.mktToken };
+}
+const PA = await proven(), PB = await proven();
+const A = PA.w, B = PB.w;
+const TOK = { [A]: PA.tok, [B]: PB.tok };
 const snapA = { element: "Fire",  name: "Alice", br: 8, cardTier: 1, arenaSkills: [] };
 const snapB = { element: "Water", name: "Bob",   br: 8, cardTier: 1, arenaSkills: [] };
 
 console.log("— matchmaking —");
 const ch = await post("/pvp/challenge", { from: A, fromName: "Alice", to: B, snap: snapA });
 chk(ch.ok === true, "Alice challenges Bob");
-const inbox = await post("/pvp/available", { wallet: B, name: "Bob", snap: snapB });
+const inbox = await post("/pvp/available", { wallet: B, name: "Bob", snap: snapB, mktToken: PB.tok });
 const mine = (inbox.challenges || []).find(c => c.from === A);
 chk(!!mine, "Bob sees the challenge in his inbox");
-const acc = await post("/pvp/challenge/accept", { wallet: B, challengeId: mine && mine.id, snap: snapB });
+const acc = await post("/pvp/challenge/accept", { wallet: B, challengeId: mine && mine.id, snap: snapB, mktToken: PB.tok });
 // per-match secrets: /pvp/move and /pvp/forfeit now require them (the wallet alone is public, so it
 // could never have authorised a mutation). The accepter gets theirs here; the challenger gets
 // theirs from /pvp/available when they discover the match.
 const secB = acc.sec;
-const availA = await post("/pvp/available", { wallet: A, name: "Alice", snap: snapA });
+const availA = await post("/pvp/available", { wallet: A, name: "Alice", snap: snapA, mktToken: PA.tok });
 const secA = availA.matched && availA.matched.sec;
 const secOf = (w) => (w === A ? secA : secB);
 chk(acc.ok === true && !!acc.matchId, `Bob accepts -> a live match exists (${acc.matchId})`);
@@ -106,12 +117,13 @@ chk(done && (done.result === "win" || done.result === "loss"), `it has a real wi
 
 console.log("— walking out is an instant loss, not a hang —");
 {
-  const C = wallet(), D = wallet();
+  const PC = await proven(), PD = await proven();
+  const C = PC.w, D = PD.w;
   await post("/pvp/challenge", { from: C, fromName: "Cara", to: D, snap: { ...snapA, name: "Cara" } });
-  const inb = await post("/pvp/available", { wallet: D, name: "Dev", snap: { ...snapB, name: "Dev" } });
+  const inb = await post("/pvp/available", { wallet: D, name: "Dev", snap: { ...snapB, name: "Dev" }, mktToken: PD.tok });
   const c2 = (inb.challenges || []).find(x => x.from === C);
-  const a2 = await post("/pvp/challenge/accept", { wallet: D, challengeId: c2 && c2.id, snap: { ...snapB, name: "Dev" } });
-  const availC = await post("/pvp/available", { wallet: C, name: "Cara", snap: { ...snapA, name: "Cara" } });
+  const a2 = await post("/pvp/challenge/accept", { wallet: D, challengeId: c2 && c2.id, snap: { ...snapB, name: "Dev" }, mktToken: PD.tok });
+  const availC = await post("/pvp/available", { wallet: C, name: "Cara", snap: { ...snapA, name: "Cara" }, mktToken: PC.tok });
   const secC = availC.matched && availC.matched.sec;
   const ff = await post("/pvp/forfeit", { matchId: a2.matchId, wallet: C, sec: secC });
   chk(ff.ok === true, "the quitter's forfeit is accepted");
