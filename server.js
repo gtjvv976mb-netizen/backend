@@ -3166,16 +3166,19 @@ app.post("/world/node/claim", (req, res) => {
     if (left > 0) {
       worldNodeUses.set(id, { left, ts: now });
       markNodesDirty();
+      recordGather(b.wallet, kind);
       return res.json({ ok: true, taken: false, left, felled: false });
     }
     worldNodeUses.delete(id);
     worldNodes.set(id, now + cd);
     markNodesDirty();
+    recordGather(b.wallet, kind);
     return res.json({ ok: true, taken: false, left: 0, felled: true, until: now + cd });
   }
 
   worldNodes.set(id, now + cd);
   markNodesDirty();
+  recordGather(b.wallet, kind);   // the SINGLE-USE path — every node except wood comes through here
   res.json({ ok: true, taken: false, until: now + cd });
 });
 
@@ -3197,7 +3200,8 @@ app.get("/assets/audit", (req, res) => {
   const rec = assetLedger.get(w);
   if (!rec) return res.json({ wallet: w, units: {}, mounts: {}, unverified: 0 });
   res.json({ wallet: w, firstSeen: rec.first, unverified: rec.unverified,
-             units: rec.units, mounts: rec.mounts, eggsHeld: rec.eggsLast });
+             units: rec.units, mounts: rec.mounts, eggsHeld: rec.eggsLast,
+             gathered: gatherCount.get(w) || {} });
 });
 
 // Game-wide authenticity summary (admin): how much of what exists cannot be accounted for.
@@ -3218,7 +3222,22 @@ app.get("/assets/summary", (req, res) => {
     unver += r.unverified;
   }
   jumps.sort((a, b) => b.jump - a.jump);
-  res.json({ wallets, units, mounts, unverified: unver, byOrigin, biggestLevelJumps: jumps.slice(0, 40) });
+  // materials on sale vs materials ever gathered. NOT an accusation — crafting, quests, chests and
+  // trades all add materials the claim counter never saw — but a wallet selling six figures of a
+  // material it has pulled twenty of is worth a human look.
+  const oversold = [];
+  for (const row of marketListings) {
+    if (!isPubkey(String(row.wallet || ""))) continue;
+    if (!["mat", "ffish", "pot"].includes(String(row.kind))) continue;
+    const got = (gatherCount.get(row.wallet) || {})[row.item] || 0;
+    const qty = Number(row.qty) || 0;
+    if (qty > Math.max(50, got * 10)) {
+      oversold.push({ w: row.wallet.slice(0, 8), item: row.item, kind: row.kind, listed: qty, everGathered: got });
+    }
+  }
+  oversold.sort((a, b) => b.listed - a.listed);
+  res.json({ wallets, units, mounts, unverified: unver, byOrigin,
+             biggestLevelJumps: jumps.slice(0, 40), oversoldMaterials: oversold.slice(0, 40) });
 });
 
 app.get("/world/nodes", (_req, res) => {
@@ -3267,6 +3286,32 @@ function presenceOk(id, body) {
   return mktWallet(body) === id;                  // public wallet — must be proven
 }
 
+
+// ---- MATERIAL PROVENANCE (observe only) --------------------------------------------------------
+// Materials, fantasy fish and potions are listable on the real-$CHIKI rail and have no provenance
+// record at all — a crafted save can set mats.crystal = 999999 and sell it, leaving strictly less
+// evidence than a forged chikimon does. There is, however, one thing the server already owns:
+// node claims. Ids are "kind:ix:iz", every claim is position-authorised and rate-limited, and the
+// game's hard rule is exactly one item per gather. So the claim count IS the honest ceiling on how
+// much of a material a wallet has ever pulled out of the ground.
+//
+// OBSERVE ONLY, for the same reason the level jump is: materials also arrive from crafting, quests,
+// chests and trades, so `sold > gathered` is not proof of anything and a gate here would refuse
+// real players. This records the ceiling and puts it next to what they are selling, so the
+// discrepancy is visible and a rule can be written from real data rather than from my assumption.
+const gatherCount = new Map();          // wallet -> { kind: n }
+const GATHER_WALLETS_MAX = 20000;
+function recordGather(wallet, kind) {
+  if (!isPubkey(String(wallet || "")) || !kind) return;
+  let g = gatherCount.get(wallet);
+  if (!g) {
+    if (gatherCount.size >= GATHER_WALLETS_MAX) return;
+    g = Object.create(null); gatherCount.set(wallet, g);
+  }
+  g[kind] = (g[kind] || 0) + 1;
+  _assetsDirty = true;
+}
+export function _gatheredFor(wallet) { return gatherCount.get(wallet) || null; }
 
 // ============ ASSET REGISTRY — server-minted, permanent, transfer-only ============
 // The ledger below INFERS provenance from consecutive cloud saves. That can be sharpened but never
@@ -3478,6 +3523,45 @@ app.post("/assets/egg/hatch", (req, res) => {
   regEvent(row, "hatched", { into: born.id, sp: born.sp });
   _assetsDirty = true;
   res.json({ ok: true, hatched: { id: born.id, type: born.type, sp: born.sp, kind: born.kind, born: born.born, from: row.id } });
+});
+
+// Report a hatch that the CLIENT rolled, so the registered egg is consumed and the creature it
+// produced inherits its lineage. This is the halfway house between "no registry at all" and the
+// fully server-authoritative /assets/egg/hatch above: the species is still the client's choice here,
+// so the creature is recorded as "hatched" rather than "issued" — a real lineage, honestly labelled,
+// not a claim that the server rolled it.
+//
+// What it DOES buy, and the reason it exists: the egg is marked consumed with a server timestamp,
+// so it can never be presented again or vouch a second hatch, and the creature carries a permanent
+// parent link back to the egg that was genuinely paid for.
+app.post("/assets/egg/consume", (req, res) => {
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const wallet = regWallet(req);
+  if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
+  const id = String(req.body?.id || "").slice(0, 64);
+  const row = assetReg.get(id);
+  if (!row || row.type !== "egg" || row.owner !== wallet) return res.status(404).json({ error: "no such egg" });
+  if (row.state !== "active") return res.status(409).json({ error: "that egg has already hatched" });
+  // the same incubation floor the server-rolled hatch enforces — a registered egg cannot be
+  // reported as hatched before it could possibly have finished
+  const ready = eggReadyAt(row);
+  if (Date.now() < ready) return res.status(425).json({ error: "still incubating", readyIn: ready - Date.now() });
+
+  const sp = String(req.body?.sp || "").slice(0, 24);
+  const isMount = row.kind === "mount";
+  const pool = isMount ? MOUNT_SUPPLY.map(m => m[0]) : (EGG_KIND_POOL[row.kind] || SPECIES_NORMAL);
+  if (!pool.includes(sp)) return res.status(400).json({ error: "that is not something this egg can produce" });
+
+  let born;
+  try {
+    born = mintAsset(isMount ? "mount" : "chikimon", wallet,
+      { sp, kind: isMount ? "mount" : (row.kind === "normal" ? "normal" : row.kind), lvl: 1 }, "hatched", row.id);
+  } catch (e) { return res.status(503).json({ error: "the asset registry is at capacity — your egg is safe, try again later" }); }
+  row.state = "consumed";
+  row.hatchedTo = born.id;
+  regEvent(row, "hatched", { into: born.id, sp });
+  _assetsDirty = true;
+  res.json({ ok: true, hatched: { id: born.id, type: born.type, sp: born.sp, from: row.id } });
 });
 
 // Redeem an Avatar Scroll. Avatars had NO server record of any kind — adding one to a save was free
@@ -3891,6 +3975,12 @@ function auditAssets(wallet, mmo, walletFirstSeen = 0) {
     if (origin === "unverified") flag(`unit:${uid}:${sp}`);
   }
 
+  // HELD vs RECORDED. The record is permanent — hiding an asset never erases it — but you cannot
+  // SELL what you are no longer holding, and after a sale the client removes the unit from d.units.
+  // Without this the seller's own record would keep vouching a creature they had already sold.
+  const present = new Set(unitKeys.filter(k => UID_RE.test(k)));
+  for (const uid of Object.keys(rec.units)) rec.units[uid].held = present.has(uid);
+
   const allMounts = Array.isArray(mmo.mounts) ? mmo.mounts : [];
   if (allMounts.length > 40) flagLater.push(`overflow:mounts:${allMounts.length}`);
   const mounts = allMounts.slice(0, 40);
@@ -3947,7 +4037,7 @@ export function serializeAssetLedger() {
                     || (b[1].seen || b[1].first) - (a[1].seen || a[1].first));
     all.length = ASSET_LEDGER_MAX;
   }
-  return { w: all, buys: [...assetBuys.entries()].slice(-5000) };
+  return { w: all, buys: [...assetBuys.entries()].slice(-5000), gather: [...gatherCount.entries()].slice(-GATHER_WALLETS_MAX) };
 }
 
 // Restoring trusts NOTHING — this blob came back from a database, so every field is re-typed and
@@ -3974,7 +4064,8 @@ export function restoreAssetLedger(v) {
       const u = su[uid] || {}, origin = ORIGINS.has(u.origin) ? u.origin : "unverified";
       rec.units[uid] = { sp: String(u.sp || "?").slice(0, 24), kind: String(u.kind || "?").slice(0, 12),
                          lvl: Number(u.lvl) || 1, ts: Number(u.ts) || rec.first, origin,
-                         jump: Number(u.jump) > 0 ? Number(u.jump) : undefined };
+                         jump: Number(u.jump) > 0 ? Number(u.jump) : undefined,
+                         held: u.held === false ? false : undefined };
       if (origin === "unverified") rec.unverified++;
     }
     const sm = (src.mounts && typeof src.mounts === "object") ? src.mounts : {};
@@ -3991,6 +4082,14 @@ export function restoreAssetLedger(v) {
     }
     assetLedger.set(w, rec); n++;
   }
+  for (const e of (Array.isArray(v.gather) ? v.gather : [])) {
+    if (!Array.isArray(e) || !e[1] || typeof e[1] !== "object") continue;
+    const g = Object.create(null);
+    for (const k of Object.keys(e[1]).filter(k => has(e[1], k)).slice(0, 40)) {
+      const n = Number(e[1][k]); if (n > 0) g[String(k).slice(0, 24)] = n;
+    }
+    gatherCount.set(String(e[0] || "").slice(0, 64), g);
+  }
   for (const e of (Array.isArray(v.buys) ? v.buys : [])) {
     if (!Array.isArray(e) || !Array.isArray(e[1])) continue;
     assetBuys.set(String(e[0] || "").slice(0, 64), e[1].slice(0, 200).map(b => ({
@@ -4003,7 +4102,7 @@ const ORIGINS = new Set(["legacy", "hatched", "purchased", "issued", "traded", "
 
 // test seams: empty the ledger, and AGE a wallet's eggs so a sim can prove the incubation floor in
 // both directions without waiting 12 real hours for a legendary.
-export function _clearAssetLedger() { assetLedger.clear(); assetBuys.clear(); _assetsReady = true; }
+export function _clearAssetLedger() { assetLedger.clear(); assetBuys.clear(); gatherCount.clear(); _assetsReady = true; }
 export function _ageAssetEggs(wallet, ms) {
   const r = assetLedger.get(wallet);
   if (!r) return 0;
@@ -4425,6 +4524,7 @@ store.kvGet("market_sold_ids").then(v => { if (Array.isArray(v)) for (const e of
 export function _soldIdsForTest() { return _soldListings; }
 
 function _consumeListing(id) {
+  releaseUnitFor(id);   // the row is gone: its creature is free to be listed again
   if (!id) return;
   _soldListings.set(String(id), Date.now());
   // bounded by COUNT, oldest-first — never by age (see pruneMarket). A Map keeps insertion order and
@@ -4525,10 +4625,46 @@ function opAuthOk(sid, b) { const owner = sidOwner[sid]; return !!owner && mktWa
 // minted itself, which is stronger evidence than any inference drawn from save deltas. Checking the
 // ledger alone refused creatures the server had just issued, because the ledger only learns about
 // them on the player's next cloud save.
-function chikimonSaleBlocked(wallet, sp) {
+// ONE LIVE SALE PER CREATURE. Matching on species alone let a single recorded chikimon back up to
+// 12 simultaneous listings — the per-sid cap was the only limit, and each row settles independently
+// into its own real-$CHIKI transfer. A creature is one thing and can be sold once at a time.
+const unitReserved = new Map();          // "wallet|uid" -> listing/auction id
+const _resKey = (w, uid) => `${w}|${uid}`;
+function reserveUnit(wallet, uid, rowId) {
+  if (!wallet || !uid) return true;                       // nothing to reserve (older client)
+  const k = _resKey(wallet, uid), held = unitReserved.get(k);
+  if (held && held !== rowId) return false;               // already on the board under another row
+  unitReserved.set(k, rowId);
+  return true;
+}
+function releaseUnitFor(rowId) {
+  if (!rowId) return;
+  for (const [k, v] of unitReserved) if (v === rowId) unitReserved.delete(k);
+}
+
+function chikimonSaleBlocked(wallet, sp, uid, rowId) {
   if (!wallet || !sp) return "";
-  if (regVouchesSpecies(wallet, "chikimon", sp)) return "";       // the server minted it
   const lrec = assetLedger.get(wallet);
+
+  // PER-UNIT when the client tells us which one. Market.gd already carries `uid` on every listing,
+  // so this is the precise check: that exact creature, on the record, clean, still in their roster,
+  // and not already up for sale somewhere else.
+  if (uid && lrec) {
+    const u = has(lrec.units, uid) ? lrec.units[uid] : null;
+    if (u) {
+      if (u.origin === "unverified") return "That chikimon isn't on your authenticity record. If you believe this is wrong, contact support.";
+      if (u.sp !== sp) return "That chikimon doesn't match what your record says it is — sync your game and try again.";
+      if (u.held === false) return "That chikimon isn't in your roster any more, so it can't be sold.";
+      if (!reserveUnit(wallet, uid, rowId)) return "That chikimon is already up for sale — cancel the other listing first.";
+      return "";
+    }
+    // a uid the ledger has never seen: fall through to the species check rather than refusing, so a
+    // creature acquired since the last cloud save is not stranded
+  }
+
+  // SPECIES fallback — an older client, an auction, or a unit the ledger has not met yet. The
+  // registry outranks the ledger: a row it minted is stronger evidence than any inference.
+  if (regVouchesSpecies(wallet, "chikimon", sp)) return "";
   if (!lrec) return "";                                            // no record yet — grandfathered
   if (Object.values(lrec.units).some(u => u.sp === sp && u.origin !== "unverified")) return "";
   return "That chikimon isn't on your authenticity record yet — sync your game (it saves automatically) and try again. If it still won't list, contact support.";
@@ -4565,6 +4701,7 @@ function sweepAuctions(now) {
         recordAssetBuy(a.wallet, "chikimon", a.species, a.lvl);
       }
     }
+    releaseUnitFor(a.id);   // the auction is over: its creature can be listed again
     return false;
   });
   _pruneValueMap(auctionRefunds, "refunded", now);   // un-returned escrow survives 60d, not 7
@@ -4664,7 +4801,8 @@ app.post("/market/op", async (req, res) => {
       // ledger, or restored mid-flight) is allowed through — a false refusal would strand a real
       // player's asset, and grandfathering is the standing policy for everything predating this.
       if (String(l.kind) === "chikimon") {
-        const bad = chikimonSaleBlocked(mktWallet(b), stripTags(String(l.item || "")).slice(0, 24));
+        const bad = chikimonSaleBlocked(mktWallet(b), stripTags(String(l.item || "")).slice(0, 24),
+                                        stripTags(String(l.uid || "")).slice(0, 40), lid);
         if (bad) return res.status(409).json({ error: bad });
       }
       marketListings.push({
@@ -4817,7 +4955,8 @@ app.post("/market/op", async (req, res) => {
     if (!marketAuctions.some(x => x.id === aid)) {
       if (marketAuctions.filter(x => x.sid === sid).length >= 2) return res.status(429).json({ error: "2 live auctions max" });
       // an auction is a sale — same gate as op:list, or the gate is one op name wide
-      const bad = chikimonSaleBlocked(mktWallet(b), stripTags(String(l.species || "")).slice(0, 24));
+      const bad = chikimonSaleBlocked(mktWallet(b), stripTags(String(l.species || "")).slice(0, 24),
+                                      stripTags(String(l.uid || "")).slice(0, 40), aid);
       if (bad) return res.status(409).json({ error: bad });
       marketAuctions.push({
         id: aid, seller: stripTags(String(l.seller || "Trainer")).slice(0, 20), sid,
@@ -4851,6 +4990,7 @@ app.post("/market/op", async (req, res) => {
     const row = marketAuctions.find(x => x.id === aid && x.sid === sid);
     if (row && row.curSid) return res.status(409).json({ error: "there's already a bid — the auction must run its course" });
     marketAuctions = marketAuctions.filter(x => !(x.id === aid && x.sid === sid));
+    if (row) releaseUnitFor(aid);             // pulled from the board: its creature is free again
     cancelled = !!row;                        // the seller's client restores the stashed unit
   } else if (op === "refunds_ack") {
     // MARK settled, never DELETE (auth-gated above). A forged/replayed ack can no longer destroy an

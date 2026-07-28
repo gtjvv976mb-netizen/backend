@@ -232,5 +232,105 @@ sec("a level rewrite is RECORDED — and deliberately blocks nothing");
   chk(sum3.biggestLevelJumps.some(j => j.jump === 48), `the observation survives a restart`);
 }
 
+
+sec("ONE creature, ONE live sale — species matching let a single unit back 12 rows");
+{
+  const W = await mkWallet();
+  SRV._setWalletFirstSeenForTest(W.wallet, Date.UTC(2025, 0, 1));
+  await save(W, { eggs: [], units: { u1: unit("pipmoth", "normal", 2), u2: unit("leafcub", "normal", 3) }, mounts: [] });
+  const listUid = (id, uid, sp) => post("/market/op", { op: "list", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
+    listing: { id, kind: "chikimon", item: sp, uid, lvl: 2, xp: 0, price: 500, qty: 1 } });
+  const a = await listUid("U-1", "u1", "pipmoth");
+  chk(a.status === 200, `the creature lists once (${a.status})`);
+  const b2 = await listUid("U-2", "u1", "pipmoth");
+  chk(b2.status === 409, `the SAME creature cannot back a second row (${b2.status})`);
+  const other = await listUid("U-3", "u2", "leafcub");
+  chk(other.status === 200, `(control) a different creature still lists (${other.status})`);
+  // an auction is the same sale, so it must see the same reservation
+  const auc = await post("/market/op", { op: "auction_post", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
+    listing: { id: "U-A", species: "pipmoth", uid: "u1", lvl: 2, xp: 0, minBid: 10 } });
+  chk(auc.status === 409, `nor can it be auctioned while listed (${auc.status})`);
+  // cancelling frees it again — a reservation that never releases strands a real player's creature
+  await post("/market/op", { op: "cancel", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken, listing: { id: "U-1" } });
+  const relist = await listUid("U-4", "u1", "pipmoth");
+  chk(relist.status === 200, `after cancelling it lists again (${relist.status})`);
+}
+
+sec("the per-unit gate refuses the forgery and the sold-on creature, not the owner");
+{
+  const W = await mkWallet();
+  SRV._setWalletFirstSeenForTest(W.wallet, Date.UTC(2025, 0, 1));
+  await save(W, { eggs: [], units: { u1: unit("pipmoth", "normal", 2) }, mounts: [] });
+  // a uid the record says is a DIFFERENT species
+  const wrong = await post("/market/op", { op: "list", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
+    listing: { id: "M-1", kind: "chikimon", item: "azulon", uid: "u1", lvl: 50, xp: 0, price: 9e6, qty: 1 } });
+  chk(wrong.status === 409, `listing u1 as a different species is refused (${wrong.status})`);
+  // sell it: the client drops the unit from the save, so the seller no longer HOLDS it
+  await save(W, { eggs: [], units: {}, mounts: [] });
+  const gone = await post("/market/op", { op: "list", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
+    listing: { id: "M-2", kind: "chikimon", item: "pipmoth", uid: "u1", lvl: 2, xp: 0, price: 500, qty: 1 } });
+  chk(gone.status === 409, `a creature no longer in the roster cannot be sold again (${gone.status})`);
+  const rec = await audit(W);
+  chk(!!rec.units.u1, `but its RECORD is still there — hiding it never erases history`);
+  chk(rec.units.u1.origin === "legacy", `with its origin intact (${rec.units.u1.origin})`);
+}
+
+sec("an older client that sends no uid is not stranded");
+{
+  const W = await mkWallet();
+  SRV._setWalletFirstSeenForTest(W.wallet, Date.UTC(2025, 0, 1));
+  await save(W, { eggs: [], units: { u1: unit("pipmoth", "normal", 2) }, mounts: [] });
+  const noUid = await post("/market/op", { op: "list", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
+    listing: { id: "O-1", kind: "chikimon", item: "pipmoth", lvl: 2, xp: 0, price: 500, qty: 1 } });
+  chk(noUid.status === 200, `a payload with no uid still lists on the species check (${noUid.status})`);
+  const forged = await post("/market/op", { op: "list", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
+    listing: { id: "O-2", kind: "chikimon", item: "azulon", lvl: 50, xp: 0, price: 9e6, qty: 1 } });
+  chk(forged.status === 409, `and a species they do not own is still refused (${forged.status})`);
+}
+
+
+sec("materials: the server now knows the honest ceiling, and reports what exceeds it");
+{
+  const W = await mkWallet();
+  SRV._setWalletFirstSeenForTest(W.wallet, Date.UTC(2025, 0, 1));
+  await save(W, { eggs: [], units: {}, mounts: [] });
+  // stand next to a crystal node and actually gather it, twice — the claim is position-authorised
+  const move = (x, z) => post("/world/move", { wallet: W.wallet, mktToken: W.mktToken, sid: W.sid, x, y: 0, z, act: "" });
+  await move(100, 100);
+  let claimed = 0;
+  for (const nid of ["crystal:100:100", "crystal:101:100"]) {
+    const r = await post("/world/node/claim", { wallet: W.wallet, mktToken: W.mktToken, sid: W.sid, id: nid, x: 100, y: 0, z: 100 });
+    if (r.body && r.body.ok) claimed++;
+    await wait(1900);                       // CLAIM_MIN_MS is 1800ms per wallet
+  }
+  chk(claimed >= 1, `the wallet really gathered crystal (${claimed} claim(s))`);
+  const rec = await audit(W);
+  chk((rec.gathered || {}).crystal >= 1, `and the server recorded the ceiling (${(rec.gathered || {}).crystal})`);
+
+  // now list six figures of it — far past anything they pulled out of the ground
+  await post("/market/op", { op: "list", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
+    listing: { id: "MAT-1", kind: "mat", item: "crystal", qty: 999999, price: 1000 } });
+  const sum = (await get("/assets/summary?key=test-admin-key")).body;
+  const hit = (sum.oversoldMaterials || []).find(o => o.item === "crystal");
+  chk(!!hit, `the admin report flags it (${JSON.stringify(hit || null)})`);
+  chk(hit && hit.listed === 999999 && hit.everGathered >= 1,
+      `showing both numbers side by side (listed ${hit?.listed} vs gathered ${hit?.everGathered})`);
+  // it must NOT block — materials also come from crafting, quests, chests and trades
+  const board = await get("/market/list");
+  chk(board.body.listings.some(l => l.id === "MAT-1"), `but the listing is NOT blocked — this observes, it does not accuse`);
+
+  // and an ordinary sale does not clutter the report
+  await post("/market/op", { op: "list", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
+    listing: { id: "MAT-2", kind: "mat", item: "wood", qty: 5, price: 10 } });
+  const sum2 = (await get("/assets/summary?key=test-admin-key")).body;
+  chk(!(sum2.oversoldMaterials || []).some(o => o.item === "wood"), `(control) a 5-wood listing is not reported`);
+
+  // the ceiling survives a restart, or it resets on every deploy
+  const blob = JSON.parse(JSON.stringify(SRV.serializeAssetLedger()));
+  SRV._clearAssetLedger();
+  SRV.restoreAssetLedger(blob);
+  chk((SRV._gatheredFor(W.wallet) || {}).crystal >= 1, `and it survives a restart (${(SRV._gatheredFor(W.wallet) || {}).crystal})`);
+}
+
 console.log(`\nASSETPERIM_DONE pass=${pass} fail=${fail}`);
 process.exit(fail ? 1 : 0);

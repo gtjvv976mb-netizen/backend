@@ -224,5 +224,29 @@ sec("a registry-hatched creature is NOT condemned by the save-delta ledger");
   chk(bad.status === 409, `(control) a species they do not own is still refused (${bad.status})`);
 }
 
+
+sec("a client-rolled hatch still consumes its registered egg and records the lineage");
+{
+  const W = await mkWallet();
+  const e = (await claim(W, "legendary")).body.egg;
+  const early = await post("/assets/egg/consume", { wallet: W.wallet, mktToken: W.mktToken, id: e.id, sp: "galador" });
+  chk(early.status === 425, `it cannot be reported hatched before it could have finished (${early.status})`);
+  SRV._ageAsset(e.id, 13 * HOUR);
+  const bogus = await post("/assets/egg/consume", { wallet: W.wallet, mktToken: W.mktToken, id: e.id, sp: "griffin" });
+  chk(bogus.status === 400, `a species that egg cannot produce is refused (${bogus.status})`);
+  const ok = await post("/assets/egg/consume", { wallet: W.wallet, mktToken: W.mktToken, id: e.id, sp: "galador" });
+  chk(ok.status === 200, `a legitimate report is accepted (${ok.status})`);
+  const again = await post("/assets/egg/consume", { wallet: W.wallet, mktToken: W.mktToken, id: e.id, sp: "adalor" });
+  chk(again.status === 409, `and the egg can never be spent twice (${again.status})`);
+  const cert = await get(`/assets/cert?id=${ok.body.hatched.id}`);
+  chk(cert.body.lineage.length === 2 && cert.body.lineage[1].type === "egg",
+      `the creature's lineage walks back to the egg (${cert.body.lineage.map(l => l.type).join(" <- ")})`);
+  chk(cert.body.origin === "hatched",
+      `and it is labelled 'hatched', NOT 'issued' — the server did not roll this one (${cert.body.origin})`);
+  const stranger = await mkWallet();
+  const steal = await post("/assets/egg/consume", { wallet: stranger.wallet, mktToken: stranger.mktToken, id: e.id, sp: "adalor" });
+  chk(steal.status === 404, `a stranger cannot consume someone else's egg (${steal.status})`);
+}
+
 console.log(`\nASSETREG_DONE pass=${pass} fail=${fail}`);
 process.exit(fail ? 1 : 0);
