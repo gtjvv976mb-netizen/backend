@@ -315,6 +315,21 @@ const _memQR = new Map();         // memStore only: wallet -> {wallet,done_mask,
 let _memWLock = Promise.resolve();
 function _memWith(fn){ const r=_memWLock.then(fn,fn); _memWLock=r.catch(()=>{}); return r; }
 
+// POSTGRES JSONB REJECTS an escaped NUL. JSON.stringify happily emits it, and the in-memory store swallows
+// it without complaint — so a NUL byte anywhere in user text (a chat line, a handle, a nickname, a
+// listing name) throws "unsupported Unicode escape sequence in type jsonb" ONLY once DATABASE_URL is
+// set. That is a production-only failure invisible in every dev run, and it lands on the persist
+// path: the write fails and the state it carried is not saved. stripTags removes < and > and
+// nothing else, so nothing upstream was catching it. Every ::jsonb parameter goes through here.
+// A NUL is never legitimate game data, so dropping it loses nothing.
+// Sanitise the VALUES, not the serialised text: stripping the six-character escape out of the JSON
+// string would also mangle a string that legitimately contains those literal characters (its
+// backslash is escaped, so a text-level strip eats half the pair and leaves invalid JSON that fails
+// to parse on restore). A replacer only ever touches real string values.
+const NUL_RE = /\u0000/g;
+const jsonbSafe = (v) => JSON.stringify(v, (_k, val) =>
+  (typeof val === "string" && val.indexOf("\u0000") !== -1) ? val.replace(NUL_RE, "") : val);
+export function _jsonbSafe(v) { return jsonbSafe(v); }
 function pgStore() {
   const pool = new pg.Pool({
     connectionString: DATABASE_URL,
@@ -371,7 +386,7 @@ function pgStore() {
         await pool.query(`ALTER TABLE quest_rewards ALTER COLUMN done_mask TYPE BIGINT`);
     },
     async kvGet(k) { const r = await pool.query(`SELECT v FROM kv WHERE k=$1`, [k]); return r.rows[0]?.v ?? null; },
-    async kvSet(k, v) { await pool.query(`INSERT INTO kv(k,v) VALUES($1,$2::jsonb) ON CONFLICT(k) DO UPDATE SET v=$2::jsonb`, [k, JSON.stringify(v)]); },
+    async kvSet(k, v) { await pool.query(`INSERT INTO kv(k,v) VALUES($1,$2::jsonb) ON CONFLICT(k) DO UPDATE SET v=$2::jsonb`, [k, jsonbSafe(v)]); },
     async firstSeen(wallet) { const r = await pool.query(`SELECT first_seen FROM players WHERE wallet=$1`, [wallet]); return r.rows[0] ? Number(r.rows[0].first_seen) : 0; },
     async winnersRemaining(cap) { const n = Number((await pool.query(`SELECT COUNT(*)::int n FROM quest_winners`)).rows[0].n); return Math.max(0, cap - n); },
     async winnerGet(wallet) { const r = await pool.query(`SELECT wallet,rank,won_at,balance_at_win,paid,payout_sig FROM quest_winners WHERE wallet=$1`, [wallet]); return r.rows[0] || null; },
@@ -443,7 +458,7 @@ function pgStore() {
       await pool.query(
         `INSERT INTO presence(wallet,last_active,chikis,roster) VALUES($1,$2::bigint,$3,$4::jsonb)
          ON CONFLICT(wallet) DO UPDATE SET last_active=$2::bigint, chikis=$3, roster=$4::jsonb`,
-        [wallet, Date.now(), Math.max(0, chikis | 0), JSON.stringify(Array.isArray(roster) ? roster.slice(0, 8) : [])]);
+        [wallet, Date.now(), Math.max(0, chikis | 0), jsonbSafe(Array.isArray(roster) ? roster.slice(0, 8) : [])]);
     },
     async presence(windowMs) {
       const r = await pool.query(
@@ -477,7 +492,7 @@ function pgStore() {
         `INSERT INTO players(wallet,first_seen,last_claim,profile)
          VALUES($1,$2::bigint,$3::bigint,$4::jsonb)
          ON CONFLICT(wallet) DO UPDATE SET profile=$4::jsonb`,
-        [wallet, now, now - 60000, JSON.stringify(profile)]);
+        [wallet, now, now - 60000, jsonbSafe(profile)]);
     },
     async touch(wallet, eligible, balance) {
       const now = Date.now();
@@ -1071,7 +1086,7 @@ function makeChat() {
         const set = new Set(rx[emoji] || []);
         if (set.has(wallet)) set.delete(wallet); else set.add(wallet);   // toggle
         if (set.size) rx[emoji] = [...set]; else delete rx[emoji];
-        await pool.query(`UPDATE chat SET reactions=$2::jsonb WHERE id=$1`, [id, JSON.stringify(rx)]);
+        await pool.query(`UPDATE chat SET reactions=$2::jsonb WHERE id=$1`, [id, jsonbSafe(rx)]);
         return rx;
       },
     };
