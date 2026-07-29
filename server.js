@@ -3256,6 +3256,38 @@ app.post("/world/fish/report", (req, res) => {
   res.json({ ok: true, counted: true });
 });
 
+// ============ STEP 6: combat essence joins the observed faucet (observe-only) ============
+// "essence" (Dark Energy) is the ONLY other material with no gather node — it drops from combat
+// kills (Profile.on_kill), never from the ground. So, exactly like fishing was, it had gatherCount 0
+// forever, which meant EVERY wallet listing >50 essence tripped the oversold signal. With fishing +
+// this, all 14 materials now have a server-observed source and that whole false-positive class is
+// gone. A kill is a discrete event like a catch, so the client reports it and the server records a
+// per-kill CEILING of essence into the same gatherCount tally.
+//
+// A CEILING, deliberately over-generous, because the real drop is variable (mob essence 1..3 x an
+// avatar perk up to 1.40 = at most 4 today) and the client must not be trusted for the amount. The
+// server credits ESSENCE_PER_KILL (6) per counted kill — always >= what a kill could really give, so
+// the bound never under-counts an honest fighter (and essence starts at 0 for everyone, so this can
+// only ever REDUCE false positives, never create one). Same presence gate and rate-cap as fishing;
+// the cap only refuses a machine-gun loop, never a human's combat pace.
+const ESSENCE_PER_KILL = 6;          // >= max real essence per kill (3 x 1.40 perk = 4), with headroom
+const KILL_REC_MIN_MS = 500;         // combat is slower than this; the cap only stops a spammed loop
+const _lastKillRec = new Map();      // wallet -> last COUNTED kill ms (anti-inflation, not a refusal)
+app.post("/world/kill/report", (req, res) => {
+  const b = req.body || {};
+  if (!isPresenceId(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
+  const now = Date.now();
+  const me = worldPlayers.get(String(b.wallet));
+  if (!me || now - me.ts > WORLD_TTL_MS) return res.status(403).json({ ok: false, error: "no live presence" });
+  const last = _lastKillRec.get(String(b.wallet)) || 0;
+  if (now - last < KILL_REC_MIN_MS) return res.json({ ok: true, counted: false });
+  _lastKillRec.set(String(b.wallet), now);
+  if (_lastKillRec.size > 20000) { for (const [k, t] of _lastKillRec) { if (now - t > 120000) _lastKillRec.delete(k); } }
+  // record the per-kill ceiling of essence — pubkey-only inside recordGather, net_id kills ignored
+  recordGather(String(b.wallet), "essence", new Array(ESSENCE_PER_KILL).fill("essence"));
+  res.json({ ok: true, counted: true });
+});
+
 // the world's currently-spent nodes, so a client can hide what someone else already took
 // Provenance for one wallet's assets: what it holds, when each first appeared, and how.
 // Readable by the PROVEN owner or an admin — an asset record is as sensitive as the roster itself.
