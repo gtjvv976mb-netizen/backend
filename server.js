@@ -3317,7 +3317,10 @@ app.post("/world/raid/claim", (req, res) => {
   const now = Date.now();
   const me = worldPlayers.get(String(b.wallet));
   if (!me || now - me.ts > WORLD_TTL_MS) return res.status(403).json({ ok: false, error: "no live presence" });
-  if (!isPubkey(String(b.wallet))) return res.json({ ok: true, granted: true });   // net_id: no server record to keep
+  // A net_id has no server-side record to gate against, so answering "granted" would hand every
+  // unlinked client an unlimited weekly prize — worse than the client gate it replaced. Say so
+  // explicitly instead: the client keeps using its own local weekly gate for these players.
+  if (!isPubkey(String(b.wallet))) return res.json({ ok: true, granted: false, unmanaged: true });
   const week = RAID_WEEK();
   const w = String(b.wallet);
   if (raidClaim.get(w) === week) return res.json({ ok: true, granted: false, week });
@@ -5391,13 +5394,20 @@ app.post("/market/op", async (req, res) => {
     if (!marketAuctions.some(x => x.id === aid)) {
       if (marketAuctions.filter(x => x.sid === sid).length >= 2) return res.status(429).json({ error: "2 live auctions max" });
       // an auction is a sale — same gate as op:list, or the gate is one op name wide
-      const bad = chikimonSaleBlocked(mktWallet(b), stripTags(String(l.species || "")).slice(0, 24),
+      const aSpecies = stripTags(String(l.species || "")).slice(0, 24);
+      // THE SPECIES MUST BE A REAL ONE. This was stored verbatim, and auction_cancel echoes it back
+      // as the authoritative identity of the returning creature — so an unrecognised string became
+      // whatever the client wanted, and Econ.unit_kind() maps anything it does not know to
+      // "legendary". A catalog check makes the echoed record mean something even for a wallet the
+      // ledger has never seen.
+      if (!CHIKIMON_IDS.has(aSpecies)) return res.status(400).json({ error: "that is not a chikimon" });
+      const bad = chikimonSaleBlocked(mktWallet(b), aSpecies,
                                       stripTags(String(l.uid || "")).slice(0, 40), aid);
       if (bad) return res.status(409).json({ error: bad });
       marketAuctions.push({
         id: aid, seller: stripTags(String(l.seller || "Trainer")).slice(0, 20), sid,
         wallet: mktWallet(b),   // proven seller wallet — puts the auction sid inside the anti-hijack surface
-        species: stripTags(String(l.species || "")).slice(0, 24),
+        species: aSpecies,                 // catalog-checked above
         lvl: clampF(l.lvl, 1, 50, 1) | 0, xp: clampF(l.xp, 0, 1e9, 0) | 0,
         minBid: clampF(l.minBid, 1, 50000, 1) | 0, curBid: 0, curSid: "", curName: "", curWallet: "",
         ts: Date.now(), endsAt: Date.now() + AUCTION_MS,

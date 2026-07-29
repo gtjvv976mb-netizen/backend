@@ -117,5 +117,21 @@ sec("a corrupt persisted gate cannot poison or crash the restore");
 }
 
 // ---------------------------------------------------------------------------
+sec("an UNLINKED net_id is not granted a server prize — it keeps its own local weekly gate");
+{
+  // A net_id has no server record to gate against. Answering "granted" here handed every unlinked
+  // client an UNLIMITED weekly prize (worse than the client gate this replaced), because the
+  // client trusts the server's answer over its own gate.
+  const nid = "godot-deadbeef";
+  await post("/world/move", { wallet: nid, x: 5, z: 5, dir: 0, handle: "Unlinked" });
+  const seen = [];
+  for (let i = 0; i < 6; i++) seen.push((await post("/world/raid/claim", { wallet: nid })).body);
+  chk(seen.every(r => r.ok === true), "the route still answers ok (never blocks an unlinked player)");
+  chk(seen.every(r => r.granted === false), `and never grants (${seen.filter(r => r.granted).length}/6 granted)`);
+  chk(seen.every(r => r.unmanaged === true), "it says so explicitly, so the client falls back to its local gate");
+  chk(SRV._raidWeekFor(nid) === null, "no week is recorded for a net_id (nothing to keep)");
+}
+
+// ---------------------------------------------------------------------------
 console.log(`\nRAID_CLAIM_SIM pass=${pass} fail=${fail}`);
 process.exit(fail ? 1 : 0);
