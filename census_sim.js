@@ -149,5 +149,41 @@ sec("the whole catalog is always present, so the dex can render every slot");
 }
 
 // ---------------------------------------------------------------------------
+sec("THE PUBLIC DEX: open to everyone, and it leaks nothing");
+{
+  const pub = await get("/assets/dex");
+  chk(pub.status === 200, `no key needed (${pub.status})`);
+  const d = pub.body;
+  chk(Array.isArray(d.chikimon) && d.chikimon.length === 21, `all 21 chikimon (${d.chikimon.length})`);
+  chk(d.mounts.length === 6 && d.avatars.length === 10, `6 mounts, 10 avatars (${d.mounts.length}/${d.avatars.length})`);
+
+  // THE LEAK TEST — an origin count would tell a cheater whether their forgery was caught
+  const blob = JSON.stringify(d);
+  chk(!blob.includes("unverified"), "the word 'unverified' appears NOWHERE in the public payload");
+  chk(!blob.includes("byOrigin") && !blob.includes("legacy") && !blob.includes("hatched\":"),
+    "no origin breakdown of any kind is exposed");
+  chk(!blob.includes("minted"), "the registry/minted split is admin-only, not public");
+  chk(d.chikimon.every(x => Object.keys(x).sort().join() === "owners,sp"),
+    `each entry is exactly {sp, owners} (${JSON.stringify(d.chikimon[0])})`);
+
+  // the admin view still HAS what the public one drops — proving the strip is real, not vacuous
+  const adm = await census();
+  chk(JSON.stringify(adm).includes("byOrigin"), "the admin census still carries byOrigin (the strip is real)");
+
+  // and the numbers agree with the admin view
+  const firixPub = d.chikimon.find(x => x.sp === "firix").owners;
+  const firixAdm = find(adm.chikimon, "firix").holders;
+  chk(firixPub === firixAdm, `public owners matches admin holders (${firixPub} = ${firixAdm})`);
+}
+
+sec("the public board is cached, so a dex screen cannot hammer the ledger");
+{
+  const a = await get("/assets/dex");
+  const b = await get("/assets/dex");
+  chk(a.body.generatedAt === b.body.generatedAt, `two calls share one computation (${a.body.generatedAt})`);
+  chk(a.body.ttlMs === 60000, `it declares its own staleness window (${a.body.ttlMs}ms)`);
+}
+
+// ---------------------------------------------------------------------------
 console.log(`\nCENSUS_SIM pass=${pass} fail=${fail}`);
 process.exit(fail ? 1 : 0);

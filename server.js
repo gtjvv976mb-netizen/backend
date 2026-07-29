@@ -3549,10 +3549,7 @@ app.get("/assets/summary", (req, res) => {
 //
 // FRESHNESS CAVEAT, stated in the payload: the ledger only knows what it has SEEN in cloud saves,
 // so these numbers start near zero after a database change and fill in as players sign in.
-app.get("/assets/census", (req, res) => {
-  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
-  if (!_assetsReady) return res.status(503).json({ error: "asset ledger is still loading" });
-
+function computeCensus() {
   const mk = (list) => { const m = Object.create(null); for (const id of list) m[id] = { holders: 0, minted: 0, byOrigin: {} }; return m; };
   const chikimon = mk([...SPECIES_NORMAL, ...SPECIES_LEGEND, ...SPECIES_MEME]);
   const mounts   = mk(MOUNT_SUPPLY.map((m) => m[0]));
@@ -3603,7 +3600,7 @@ app.get("/assets/census", (req, res) => {
     .sort((a, b) => (b.holders - a.holders) || (b.minted - a.minted) || a.sp.localeCompare(b.sp));
   const tot = (tbl) => Object.values(tbl).reduce((n, v) => n + v.holders, 0);
 
-  res.json({
+  return {
     generatedAt: Date.now(),
     note: "holders = wallets observed holding one in a cloud save; minted = issued/adopted through the registry. " +
           "The ledger only knows what it has seen, so counts fill in as players sign in.",
@@ -3612,7 +3609,47 @@ app.get("/assets/census", (req, res) => {
     totals: { chikimonHeld: tot(chikimon), mountsHeld: tot(mounts), avatarsHeld: tot(avatars),
               eggsClaimed: Object.values(eggs.claimed).reduce((a, b) => a + b, 0),
               eggsHatched: Object.values(eggs.hatched).reduce((a, b) => a + b, 0) },
-  });
+  };
+}
+
+app.get("/assets/census", (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  if (!_assetsReady) return res.status(503).json({ error: "asset ledger is still loading" });
+  res.json(computeCensus());
+});
+
+// ---- THE PUBLIC DEX BOARD -----------------------------------------------------------------------
+// The same census with everything sensitive taken out, so the in-game dex can show "N trainers own
+// this" beside each species. Two things are deliberately absent:
+//
+//   ORIGINS. The admin view breaks each species down by origin, including "unverified". Published,
+//   that is a free oracle: a cheater forges a Dragonos, refreshes the dex, and learns from the
+//   unverified count whether the ledger caught them. Same reason /assets/audit answers 503 rather
+//   than known:false. The public board reports ONE number per species and nothing about provenance.
+//
+//   PER-WALLET ANYTHING. It was already aggregate; this keeps it that way.
+//
+// CACHED, because this is the one census endpoint every client may hit. Walking every ledger record
+// per request would make a dex screen a self-inflicted load test; the numbers move slowly and a
+// minute-stale count is indistinguishable from a live one to a reader.
+const DEX_TTL_MS = 60000;
+let _dexCache = null, _dexAt = 0;
+app.get("/assets/dex", (_req, res) => {
+  if (!_assetsReady) return res.status(503).json({ error: "the dex is still loading" });
+  const now = Date.now();
+  if (!_dexCache || now - _dexAt > DEX_TTL_MS) {
+    const c = computeCensus();
+    const strip = (arr) => arr.map((x) => ({ sp: x.sp, owners: x.holders }));   // no origins, no minted
+    _dexCache = {
+      generatedAt: c.generatedAt, ttlMs: DEX_TTL_MS,
+      chikimon: strip(c.chikimon), mounts: strip(c.mounts), avatars: strip(c.avatars),
+      eggsHatched: Object.values(c.eggs.hatched).reduce((a, b) => a + b, 0),
+      trainers: c.ledgerWallets,
+    };
+    _dexAt = now;
+  }
+  res.set("Cache-Control", "public, max-age=60");
+  res.json(_dexCache);
 });
 
 app.get("/world/nodes", (_req, res) => {
