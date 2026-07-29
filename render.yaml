@@ -16,7 +16,7 @@ services:
       - key: RPC_URL              # paste your DEVNET Helius URL in the dashboard
         sync: false
       - key: CHIKI_MINT
-        value: 5A5sXRYqTaNaocjEJvpNC8Feh3eUonuBTndjnWJupump
+        value: CPYrgdAYWFQD74ZtsR8mEBWW7qnrXnegcn7gDMobpump
       - key: MIN_HOLD
         value: "500000"
       - key: VERIFY_HOLDERS
