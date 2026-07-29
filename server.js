@@ -3241,6 +3241,11 @@ const _lastFishRec = new Map();      // wallet -> last COUNTED catch ms (anti-in
 app.post("/world/fish/report", (req, res) => {
   const b = req.body || {};
   if (!isPresenceId(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
+  // PROVE THE WALLET, don't just name it. A wallet is PUBLIC — /world/roster publishes every one —
+  // so accepting a bare wallet let anyone write into a stranger's record (and manufacture the
+  // "presence" below by POSTing /world/move in their name). presenceOk demands the market token for
+  // a public wallet; a private net_id still stands alone, exactly as node claims work.
+  if (!presenceOk(String(b.wallet), b)) return res.status(403).json({ ok: false, error: "prove this wallet first" });
   const now = Date.now();
   // you have to actually be in the world (same presence gate as a node claim)
   const me = worldPlayers.get(String(b.wallet));
@@ -3276,6 +3281,7 @@ const _lastKillRec = new Map();      // wallet -> last COUNTED kill ms (anti-inf
 app.post("/world/kill/report", (req, res) => {
   const b = req.body || {};
   if (!isPresenceId(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
+  if (!presenceOk(String(b.wallet), b)) return res.status(403).json({ ok: false, error: "prove this wallet first" });
   const now = Date.now();
   const me = worldPlayers.get(String(b.wallet));
   if (!me || now - me.ts > WORLD_TTL_MS) return res.status(403).json({ ok: false, error: "no live presence" });
@@ -3286,6 +3292,84 @@ app.post("/world/kill/report", (req, res) => {
   // record the per-kill ceiling of essence — pubkey-only inside recordGather, net_id kills ignored
   recordGather(String(b.wallet), "essence", new Array(ESSENCE_PER_KILL).fill("essence"));
   res.json({ ok: true, counted: true });
+});
+
+// ============ STEP 6: the FULL material flow becomes observable (observe-only) ============
+// gatherCount (+ the fish/kill reports) now covers every material SOURCE with a world event. What the
+// server still could not see: materials LEAVING a wallet (crafting, egg tending, barters, feeding)
+// and the handful of reward faucets with no world event (chests, tasks, raids, level milestones,
+// masterwork refunds). The client now reports those as a batched stream of flow events.
+//
+// TWO TALLIES, KEPT DELIBERATELY SEPARATE FROM gatherCount:
+//   matSpent  — client-declared spends. Declaring MORE spend only lowers the declarer's own plausible
+//               balance, so this direction cannot be gamed upward.
+//   matGained — client-declared non-gather gains. This IS the laundering direction (a cheater could
+//               claim huge chest luck to explain a forged stockpile), so it is whitelisted to real
+//               materials, quantity-capped per event, rate-limited per wallet — and it NEVER feeds
+//               gatherCount or the oversold signal, which stay on position-authorized evidence only.
+//               matGained exists as telemetry: it shows the true magnitude of the reward faucets
+//               across the honest fleet, which is exactly the data the eventual enforcement
+//               thresholds must be designed from. Enforcement itself will not trust these numbers;
+//               it will move the reward rolls server-side (as egg hatches already did) — documented
+//               in the migration plan, deliberately not attempted here.
+// OBSERVE-ONLY: nothing here blocks, clamps, or rejects anything a player does.
+const MAT_IDS = new Set(["wood", "stone", "iron", "gold", "crystal", "seashell", "hide", "fish",
+                         "honey", "berries", "flower", "pork", "beef", "essence"]);
+const FLOW_SPEND = new Set(["craft", "tend", "eggtrade", "scroll", "eggrecipe", "feed"]);
+const FLOW_GAIN = new Set(["chest", "task", "raid", "milestone", "refund"]);
+const FLOW_MIN_MS = 3000;            // count at most one batch per wallet per 3s (client pushes ~5s)
+const FLOW_EV_MAX = 32;              // events per counted batch
+const FLOW_QTY_MAX = 600;            // > the largest legitimate single event (rod10 wood = 258)
+const matSpent = new Map();          // wallet -> { mat: n }  (null-proto values)
+const matGained = new Map();         // wallet -> { mat: n }
+const _lastFlowRec = new Map();      // wallet -> last COUNTED batch ms
+function _flowAdd(map, wallet, mat, n) {
+  const g = _tallyRow(map, wallet);               // same evict-oldest policy as gatherCount
+  g[mat] = (g[mat] || 0) + n;
+}
+export function _flowFor(wallet) { return { spent: matSpent.get(wallet) || null, gained: matGained.get(wallet) || null }; }
+// A value the client sent may be a hostile OBJECT, and both String(x) and Number(x) invoke its
+// toString/valueOf — so `{"toString":1,"valueOf":1}` throws a TypeError inside the handler. That
+// answered 500, aborted the batch mid-loop (dropping the honest events after the poison), and burnt
+// the wallet's rate window. Coerce only primitives; anything else is simply not a value.
+const safeStr = (v) => (typeof v === "string" ? v : (typeof v === "number" || typeof v === "boolean") ? String(v) : "");
+const safeNum = (v) => (typeof v === "number" ? v : (typeof v === "string" ? Number(v) : NaN));
+app.post("/world/mat/flow", (req, res) => {
+  const b = req.body || {};
+  if (!isPresenceId(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
+  // PROVE THE WALLET (see /world/fish/report) — a public wallet is not a credential
+  if (!presenceOk(String(b.wallet), b)) return res.status(403).json({ ok: false, error: "prove this wallet first" });
+  const now = Date.now();
+  const me = worldPlayers.get(String(b.wallet));
+  if (!me || now - me.ts > WORLD_TTL_MS) return res.status(403).json({ ok: false, error: "no live presence" });
+  if (!isPubkey(String(b.wallet))) return res.json({ ok: true, counted: false });   // telemetry is wallet-keyed
+  const last = _lastFlowRec.get(String(b.wallet)) || 0;
+  if (now - last < FLOW_MIN_MS) return res.json({ ok: true, counted: false });
+  const evs = Array.isArray(b.ev) ? b.ev.slice(0, FLOW_EV_MAX) : [];
+  if (!evs.length) return res.json({ ok: true, counted: false });
+  _lastFlowRec.set(String(b.wallet), now);
+  if (_lastFlowRec.size > 20000) { for (const [k, t] of _lastFlowRec) { if (now - t > 120000) _lastFlowRec.delete(k); } }
+  let counted = 0;
+  for (const ev of evs) {
+    if (!ev || typeof ev !== "object") continue;
+    const kind = safeStr(ev.k);
+    const isSpend = FLOW_SPEND.has(kind);
+    if (!isSpend && !FLOW_GAIN.has(kind)) continue;                  // unknown kinds are ignored
+    const m = (ev.m && typeof ev.m === "object") ? ev.m : {};
+    for (const mat of Object.keys(m)) {
+      if (!Object.prototype.hasOwnProperty.call(m, mat)) continue;
+      if (!MAT_IDS.has(mat)) continue;                               // real materials only — junk keys never touch a map
+      const q = safeNum(m[mat]);
+      if (!Number.isFinite(q) || !(q > 0)) continue;
+      // CLAMP, don't bit-twiddle. `q | 0` is ToInt32, so 2147483648 wrapped to -2147483648 and a
+      // "cap" wrote a NEGATIVE tally that no lower bound caught. Floor into [1, FLOW_QTY_MAX].
+      _flowAdd(isSpend ? matSpent : matGained, String(b.wallet), mat,
+               Math.max(1, Math.min(FLOW_QTY_MAX, Math.floor(q))));
+      counted++;
+    }
+  }
+  if (counted) _assetsDirty = true;
+  res.json({ ok: true, counted: counted > 0 });
 });
 
 // the world's currently-spent nodes, so a client can hide what someone else already took
@@ -3304,10 +3388,18 @@ app.get("/assets/audit", (req, res) => {
   // attacker on request. A ledger that has not restored yet answers 503 instead.
   if (!_assetsReady) return res.status(503).json({ error: "asset ledger is still loading" });
   const rec = assetLedger.get(w);
-  if (!rec) return res.json({ wallet: w, units: {}, mounts: {}, unverified: 0 });
+  // A wallet with no ledger record still has telemetry — and that shape (activity, no cloud save) is
+  // exactly the bot shape most worth reviewing. Returning bare zeros here hid it from the one view
+  // built to look at it.
+  if (!rec) return res.json({ wallet: w, units: {}, mounts: {}, unverified: 0,
+                              gathered: gatherCount.get(w) || {},
+                              spent: matSpent.get(w) || {}, gained: matGained.get(w) || {} });
   res.json({ wallet: w, firstSeen: rec.first, unverified: rec.unverified,
              units: rec.units, mounts: rec.mounts, eggsHeld: rec.eggsLast,
-             gathered: gatherCount.get(w) || {} });
+             gathered: gatherCount.get(w) || {},
+             // Step 6 flow telemetry: spends are self-limiting; gains are CLIENT-CLAIMED and never
+             // feed the oversold signal — shown here so a human reads all three side by side
+             spent: matSpent.get(w) || {}, gained: matGained.get(w) || {} });
 });
 
 // Game-wide authenticity summary (admin): how much of what exists cannot be accounted for.
@@ -3335,7 +3427,12 @@ app.get("/assets/summary", (req, res) => {
   for (const row of marketListings) {
     if (!isPubkey(String(row.wallet || ""))) continue;
     if (!["mat", "ffish", "pot"].includes(String(row.kind))) continue;
-    const got = (gatherCount.get(row.wallet) || {})[row.item] || 0;
+    // `item` is attacker-chosen free text and the `|| {}` fallback used to be a PLAIN object, so
+    // listing an item named "toString" resolved to a function, `got * 10` was NaN, and `qty > NaN`
+    // is false — the check silently disabled itself. Own-property lookup only, numbers only.
+    const _grow = gatherCount.get(row.wallet);
+    const _gv = (_grow && Object.prototype.hasOwnProperty.call(_grow, row.item)) ? Number(_grow[row.item]) : 0;
+    const got = Number.isFinite(_gv) && _gv > 0 ? _gv : 0;
     const qty = Number(row.qty) || 0;
     if (qty > Math.max(50, got * 10)) {
       oversold.push({ w: row.wallet.slice(0, 8), item: row.item, kind: row.kind, listed: qty, everGathered: got });
@@ -3344,6 +3441,7 @@ app.get("/assets/summary", (req, res) => {
   oversold.sort((a, b) => b.listed - a.listed);
   res.json({ wallets, units, mounts, unverified: unver, byOrigin,
              mountsAdopted: _mountsAdopted, chikisAdopted: _chikisAdopted,
+             matFlow: { spendingWallets: matSpent.size, gainingWallets: matGained.size },
              nodeClaims: { proven: _provenClaims, unproven: _unprovenClaims,
                            provenPct: (_provenClaims + _unprovenClaims) ? Math.round(100 * _provenClaims / (_provenClaims + _unprovenClaims)) : 0 },
              biggestLevelJumps: jumps.slice(0, 40), oversoldMaterials: oversold.slice(0, 40) });
@@ -3410,16 +3508,29 @@ function presenceOk(id, body) {
 // discrepancy is visible and a rule can be written from real data rather than from my assumption.
 const gatherCount = new Map();          // wallet -> { kind: n }
 const GATHER_WALLETS_MAX = 20000;
+// THE BOUND MUST NOT BECOME THE WEAPON. These maps used to REFUSE a new wallet once full, which
+// turned the cap into a denial-of-record: fill 20k slots with junk and every player who arrives
+// afterwards is never recorded, so their honest listings read as "gathered 0" and are flagged
+// forever while the flooder hides in the noise. Evicting the OLDEST rows instead means a flood ages
+// itself out as real play continues, and a newcomer is always recordable. Map iterates in insertion
+// order, so this drops the least-recently-created rows. Losing an old telemetry row is harmless —
+// unlike assetLedger rows, nothing here is evidence of ownership or a flag anyone can be judged on.
+function _tallyRow(map, wallet) {
+  let g = map.get(wallet);
+  if (g) return g;
+  if (map.size >= GATHER_WALLETS_MAX) {
+    let drop = Math.max(1, Math.floor(GATHER_WALLETS_MAX * 0.05));   // shed 5% so this is rare
+    for (const k of map.keys()) { if (drop-- <= 0) break; map.delete(k); }
+  }
+  g = Object.create(null); map.set(wallet, g);
+  return g;
+}
 function recordGather(wallet, kind, drop) {
   if (!isPubkey(String(wallet || "")) || !kind) return;
   // Count the MATERIALS, not the node kind. The oversold check compares this against what a wallet
   // lists for sale, and nobody sells a "cow" — they sell beef and hide.
   const mats = Array.isArray(drop) && drop.length ? drop : [kind];
-  let g = gatherCount.get(wallet);
-  if (!g) {
-    if (gatherCount.size >= GATHER_WALLETS_MAX) return;
-    g = Object.create(null); gatherCount.set(wallet, g);
-  }
+  const g = _tallyRow(gatherCount, wallet);
   for (const m of mats) g[m] = (g[m] || 0) + 1;
   _assetsDirty = true;
 }
@@ -4289,7 +4400,8 @@ export function serializeAssetLedger() {
                     || (b[1].seen || b[1].first) - (a[1].seen || a[1].first));
     all.length = ASSET_LEDGER_MAX;
   }
-  return { w: all, buys: [...assetBuys.entries()].slice(-5000), gather: [...gatherCount.entries()].slice(-GATHER_WALLETS_MAX) };
+  return { w: all, buys: [...assetBuys.entries()].slice(-5000), gather: [...gatherCount.entries()].slice(-GATHER_WALLETS_MAX),
+           spent: [...matSpent.entries()].slice(-GATHER_WALLETS_MAX), gained: [...matGained.entries()].slice(-GATHER_WALLETS_MAX) };
 }
 
 // Restoring trusts NOTHING — this blob came back from a database, so every field is re-typed and
@@ -4342,6 +4454,24 @@ export function restoreAssetLedger(v) {
     }
     gatherCount.set(String(e[0] || "").slice(0, 64), g);
   }
+  // The flow tallies restore re-typed and null-proto — and RESTORE TRUSTS NOTHING the live route
+  // refuses. The route whitelists materials and bounds the map; a persisted blob is just as
+  // attacker-shaped as a request, so it gets the same three rules: real materials only (junk keys
+  // came back through here), FINITE positive numbers only (`n > 0` is true for Infinity, which then
+  // serialises to null in the audit view), and the same wallet bound the live path enforces.
+  for (const [src, map] of [[v.spent, matSpent], [v.gained, matGained]]) {
+    for (const e of (Array.isArray(src) ? src : [])) {
+      if (map.size >= GATHER_WALLETS_MAX) break;
+      if (!Array.isArray(e) || !e[1] || typeof e[1] !== "object") continue;
+      const g = Object.create(null);
+      for (const k of Object.keys(e[1]).filter(k => has(e[1], k)).slice(0, 40)) {
+        if (!MAT_IDS.has(k)) continue;
+        const n = Number(e[1][k]);
+        if (Number.isFinite(n) && n > 0) g[k] = Math.min(n, Number.MAX_SAFE_INTEGER);
+      }
+      map.set(String(e[0] || "").slice(0, 64), g);
+    }
+  }
   for (const e of (Array.isArray(v.buys) ? v.buys : [])) {
     if (!Array.isArray(e) || !Array.isArray(e[1])) continue;
     assetBuys.set(String(e[0] || "").slice(0, 64), e[1].slice(0, 200).map(b => ({
@@ -4354,7 +4484,9 @@ const ORIGINS = new Set(["legacy", "hatched", "purchased", "issued", "traded", "
 
 // test seams: empty the ledger, and AGE a wallet's eggs so a sim can prove the incubation floor in
 // both directions without waiting 12 real hours for a legendary.
-export function _clearAssetLedger() { assetLedger.clear(); assetBuys.clear(); gatherCount.clear(); _assetsReady = true; }
+// clears EVERY per-wallet tally this module owns — a seam that misses one leaves a sim with dirty
+// state that silently invalidates its assertions, so new tallies must be added here too
+export function _clearAssetLedger() { assetLedger.clear(); assetBuys.clear(); gatherCount.clear(); matSpent.clear(); matGained.clear(); _assetsReady = true; }
 export function _ageAssetEggs(wallet, ms) {
   const r = assetLedger.get(wallet);
   if (!r) return 0;
