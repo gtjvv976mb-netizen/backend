@@ -5206,6 +5206,7 @@ app.post("/market/op", async (req, res) => {
   const l = b.listing || {};
   if (!sid) return res.status(400).json({ error: "sid required" });
   let cancelled;                                 // set by the cancel op → tells the seller's client whether to reclaim
+  let returned;                                  // auction_cancel: the SERVER's record of the creature coming back
   pruneMarket();
   // AUTH GATE: every op that clears a player's own value queue, tears down their own listings/orders,
   // OR *creates* value under a sid must prove wallet ownership (market token) of that sid. Gating the
@@ -5427,6 +5428,12 @@ app.post("/market/op", async (req, res) => {
     marketAuctions = marketAuctions.filter(x => !(x.id === aid && x.sid === sid));
     if (row) releaseUnitFor(aid);             // pulled from the board: its creature is free again
     cancelled = !!row;                        // the seller's client restores the stashed unit
+    // NAME THE CREATURE COMING BACK. The seller's client held the withdrawn unit in an unsigned
+    // save field and restored it with no validation at all, so a forged stash returned a level-50
+    // chikimon that then settled on the real-$CHIKI rail. These are the stats the SERVER recorded
+    // when the auction was posted (clamped there), so the client can restore what actually went up
+    // rather than whatever its save happens to say. The no-bid return path already carries them.
+    if (row) returned = { species: row.species, lvl: row.lvl, xp: row.xp };
   } else if (op === "refunds_ack") {
     // MARK settled, never DELETE (auth-gated above). A forged/replayed ack can no longer destroy an
     // uncredited value row; the settled row stays a durable receipt until the short post-credit prune.
@@ -5440,7 +5447,7 @@ app.post("/market/op", async (req, res) => {
     for (const s of (marketSales[sid] || [])) if (ids.includes(s.id)) s.credited = true;
   }
   await saveMarket();
-  res.json({ ok: true, cancelled, listings: marketListings.slice(-300) });
+  res.json({ ok: true, cancelled, returned, listings: marketListings.slice(-300) });
 });
 
 // Open the port FIRST so Render detects it immediately (no "No open ports" timeout on a cold DB),
