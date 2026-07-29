@@ -3294,6 +3294,44 @@ app.post("/world/kill/report", (req, res) => {
   res.json({ ok: true, counted: true });
 });
 
+// ============ THE WEEKLY RAID PRIZE IS THE SERVER'S TO GIVE ============
+// MALGROTH pays 500 soft $CHIKI + 25 crystal, once a week. That "once" was enforced ENTIRELY by
+// d["last_raid_week"] in the client save — and that field is in no _econ_sig version, so a player
+// could reset it, keep a perfectly valid signature, and re-claim the prize as often as they could
+// re-kill the boss. Crystal feeds the real-$CHIKI market rail, so this was a live value leak.
+//
+// The week is now the SERVER's record, keyed to the proven wallet. The client asks before paying
+// out; a wallet that already claimed this week gets the consolation prize instead. Deliberately NOT
+// a roll — the prize is fixed, so there is nothing to randomise, only a claim to gate.
+//
+// Honest offline play is unaffected: if the server cannot be reached the client falls back to its
+// own weekly gate, which is exactly today's behaviour. That fallback is why sealing the field in the
+// save signature is still worth doing (it closes the save-editor path even with no network) — that
+// is a SIG_VER bump, batched with every other unsigned value gate rather than done piecemeal.
+const raidClaim = new Map();         // wallet -> ISO week index already claimed
+const RAID_WEEK = () => Math.floor(Date.now() / 604800000);
+app.post("/world/raid/claim", (req, res) => {
+  const b = req.body || {};
+  if (!isPresenceId(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
+  if (!presenceOk(String(b.wallet), b)) return res.status(403).json({ ok: false, error: "prove this wallet first" });
+  const now = Date.now();
+  const me = worldPlayers.get(String(b.wallet));
+  if (!me || now - me.ts > WORLD_TTL_MS) return res.status(403).json({ ok: false, error: "no live presence" });
+  if (!isPubkey(String(b.wallet))) return res.json({ ok: true, granted: true });   // net_id: no server record to keep
+  const week = RAID_WEEK();
+  const w = String(b.wallet);
+  if (raidClaim.get(w) === week) return res.json({ ok: true, granted: false, week });
+  // CLAIM BEFORE ANSWERING — the same rule the egg restitution and meme-egg guards follow, so two
+  // requests racing the same kill cannot both be told "granted"
+  raidClaim.set(w, week);
+  if (raidClaim.size > 20000) {      // bound it, evicting oldest, like every per-wallet map here
+    let drop = Math.max(1, Math.floor(20000 * 0.05));
+    for (const k of raidClaim.keys()) { if (drop-- <= 0) break; raidClaim.delete(k); }
+  }
+  _assetsDirty = true;
+  res.json({ ok: true, granted: true, week });
+});
+
 // ============ STEP 6: the FULL material flow becomes observable (observe-only) ============
 // gatherCount (+ the fish/kill reports) now covers every material SOURCE with a world event. What the
 // server still could not see: materials LEAVING a wallet (crafting, egg tending, barters, feeding)
@@ -4401,7 +4439,10 @@ export function serializeAssetLedger() {
     all.length = ASSET_LEDGER_MAX;
   }
   return { w: all, buys: [...assetBuys.entries()].slice(-5000), gather: [...gatherCount.entries()].slice(-GATHER_WALLETS_MAX),
-           spent: [...matSpent.entries()].slice(-GATHER_WALLETS_MAX), gained: [...matGained.entries()].slice(-GATHER_WALLETS_MAX) };
+           spent: [...matSpent.entries()].slice(-GATHER_WALLETS_MAX), gained: [...matGained.entries()].slice(-GATHER_WALLETS_MAX),
+           // the weekly raid gate MUST survive a deploy — otherwise every restart hands the whole
+           // playerbase a fresh claim, which is the very leak this gate exists to close
+           raid: [...raidClaim.entries()].slice(-20000) };
 }
 
 // Restoring trusts NOTHING — this blob came back from a database, so every field is re-typed and
@@ -4472,6 +4513,14 @@ export function restoreAssetLedger(v) {
       map.set(String(e[0] || "").slice(0, 64), g);
     }
   }
+  // weekly raid gate: wallet -> week index, re-typed and bounded like everything else here
+  for (const e of (Array.isArray(v.raid) ? v.raid : [])) {
+    if (raidClaim.size >= 20000) break;
+    if (!Array.isArray(e)) continue;
+    const wk = Number(e[1]);
+    if (!Number.isFinite(wk) || wk <= 0) continue;
+    raidClaim.set(String(e[0] || "").slice(0, 64), Math.floor(wk));
+  }
   for (const e of (Array.isArray(v.buys) ? v.buys : [])) {
     if (!Array.isArray(e) || !Array.isArray(e[1])) continue;
     assetBuys.set(String(e[0] || "").slice(0, 64), e[1].slice(0, 200).map(b => ({
@@ -4486,7 +4535,9 @@ const ORIGINS = new Set(["legacy", "hatched", "purchased", "issued", "traded", "
 // both directions without waiting 12 real hours for a legendary.
 // clears EVERY per-wallet tally this module owns — a seam that misses one leaves a sim with dirty
 // state that silently invalidates its assertions, so new tallies must be added here too
-export function _clearAssetLedger() { assetLedger.clear(); assetBuys.clear(); gatherCount.clear(); matSpent.clear(); matGained.clear(); _assetsReady = true; }
+export function _clearAssetLedger() { assetLedger.clear(); assetBuys.clear(); gatherCount.clear(); matSpent.clear(); matGained.clear(); raidClaim.clear(); _assetsReady = true; }
+export function _raidWeekFor(wallet) { return raidClaim.has(wallet) ? raidClaim.get(wallet) : null; }
+export function _setRaidWeekForTest(wallet, week) { raidClaim.set(wallet, week); }
 export function _ageAssetEggs(wallet, ms) {
   const r = assetLedger.get(wallet);
   if (!r) return 0;
