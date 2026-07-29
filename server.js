@@ -844,7 +844,13 @@ function memeReserved() { return memeHatches.filter(h => h.status === "incubatin
 function memeSupply() {
   const chars = {}; let hatched = 0;
   // per-character "minted" = species ROLLED at hatch (determined). Incubating eggs are a mystery and not counted per-character yet.
-  for (const c of MEME_CHARS) { const cap = capOf(c.key), m = memeMinted[c.key] || 0; chars[c.key] = { name: c.name, minted: m, cap, left: Math.max(0, cap - m), rarity: c.rarity }; hatched += m; }
+  // minted counts BOTH routes (see memeIssued) — the bar used to show only the paid sale, so a
+  // creature hatched from an in-game meme egg was invisible to the very number advertising its rarity
+  for (const c of MEME_CHARS) {
+    const cap = capOf(c.key), m = memeIssued(c.key);
+    chars[c.key] = { name: c.name, minted: m, cap, left: Math.max(0, cap - m), rarity: c.rarity, sold: memeMinted[c.key] || 0 };
+    hatched += m;
+  }
   const reserved = memeReserved();
   return { chars, totalLeft: Math.max(0, MEME_TOTAL - reserved), total: MEME_TOTAL, reserved, hatched, cap: MEME_CAP };
 }
@@ -894,8 +900,29 @@ async function reconcileMemeOwners() {
   } finally { _memeSyncBusy = false; _memeSyncAt = Date.now(); }
 }
 setInterval(() => { reconcileMemeOwners().catch(() => {}); }, 5 * 60 * 1000);   // background reconcile every 5 min
+// HOW MANY OF THIS MEME CHARACTER EXIST, COUNTING EVERY WAY ONE CAN BE OBTAINED.
+//
+// There are two disjoint routes to a Meme Dynasty chikimon and neither knew about the other:
+//   1. the paid Meme Dynasty sale  -> memeHatches -> memeMinted[char]
+//   2. the in-game MEME EGG        -> /assets/egg/hatch|consume -> a registry chikimon row
+// Only route 1 was counted, so the "x / 10" scarcity bar could read 0 while players genuinely owned
+// the creature — and, far worse, route 2 was capped by NOTHING, so the 10-edition promise on Alon
+// was not enforced at all. A cap that only one door respects is not a cap.
+//
+// The registry is authoritative for route 2 (one row per creature the server minted), and the two
+// stores are disjoint — the sale path writes no registry row — so adding them double-counts nothing.
+function memeRegistryCount(key) {
+  let n = 0;
+  for (const row of assetReg.values()) {
+    if (row && row.type === "chikimon" && row.sp === key && row.state === "active") n++;
+  }
+  return n;
+}
+function memeIssued(key) { return (memeMinted[key] || 0) + memeRegistryCount(key); }
+// is this meme species still mintable at all? used by every path that can create one
+function memeAtCap(key) { return memeIssued(key) >= capOf(key); }
 function pickMeme() {
-  const avail = MEME_CHARS.filter(c => (memeMinted[c.key] || 0) < capOf(c.key));
+  const avail = MEME_CHARS.filter(c => memeIssued(c.key) < capOf(c.key));
   if (!avail.length) return null;
   let tot = avail.reduce((s, c) => s + (c.weight || 1), 0), r = Math.random() * tot;
   for (const c of avail) { r -= (c.weight || 1); if (r <= 0) return c; }
@@ -3944,8 +3971,16 @@ app.post("/assets/egg/hatch", (req, res) => {
     born = mintAsset("mount", wallet, { sp: pickWeighted(pool), kind: "mount" }, "hatched", row.id);
   } else {
     const have = ownedSpecies(wallet);
-    const pool = (EGG_KIND_POOL[row.kind] || SPECIES_NORMAL).filter(s => !have.has(s));
-    if (!pool.length) return res.status(409).json({ error: "you already own every species from that egg" });
+    let pool = (EGG_KIND_POOL[row.kind] || SPECIES_NORMAL).filter(s => !have.has(s));
+    // THE EDITION CAP IS A PROMISE, so it binds here too. A meme egg used to roll freely from all
+    // six characters with no reference to how many of each already exist, which made "Alon, 1 of 10"
+    // decoration rather than a limit. Anything at its cap simply leaves the pool.
+    if (row.kind === "meme") pool = pool.filter((sp) => !memeAtCap(sp));
+    if (!pool.length) {
+      return res.status(409).json({ error: row.kind === "meme"
+        ? "every Meme Dynasty edition you could still receive has been claimed"
+        : "you already own every species from that egg" });
+    }
     const sp = pool[crypto.randomInt(pool.length)];
     born = mintAsset("chikimon", wallet, { sp, kind: row.kind === "normal" ? "normal" : row.kind, lvl: 1 }, "hatched", row.id);
   }
@@ -3988,6 +4023,10 @@ app.post("/assets/egg/consume", (req, res) => {
   const isMount = row.kind === "mount";
   const pool = isMount ? MOUNT_SUPPLY.map(m => m[0]) : (EGG_KIND_POOL[row.kind] || SPECIES_NORMAL);
   if (!pool.includes(sp)) return res.status(400).json({ error: "that is not something this egg can produce" });
+  // the client picked this species itself, so the cap has to be checked rather than assumed
+  if (row.kind === "meme" && memeAtCap(sp)) {
+    return res.status(409).json({ error: "that Meme Dynasty edition is fully claimed — your egg is safe, hatch it again" });
+  }
 
   let born;
   try {
@@ -4317,6 +4356,10 @@ export function restoreAssetReg(v) {
   }
   return n;
 }
+// test seams for the meme cap sim: mint a creature exactly as an in-game egg hatch does, and set
+// the paid-sale tally, so the two routes can be exercised independently
+export function _mintAssetForTest(type, wallet, fields, origin) { return mintAsset(type, wallet, fields, origin); }
+export function _setMemeMintedForTest(key, n) { memeMinted[key] = n; }
 export function _clearAssetReg() { assetReg.clear(); assetsByOwner.clear(); eggRestitutionDone.clear(); }
 // test seam: age an egg past its incubation window without waiting real hours
 export function _ageAsset(id, ms) { const r = assetReg.get(id); if (r) { r.born -= ms; return true; } return false; }
