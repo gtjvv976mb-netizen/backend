@@ -3534,6 +3534,87 @@ app.get("/assets/summary", (req, res) => {
              biggestLevelJumps: jumps.slice(0, 40), oversoldMaterials: oversold.slice(0, 40) });
 });
 
+// ---- THE DEX CENSUS: how many of each species actually exist, live ----------------------------
+// Per-species counts for the chikidex, mountdex and avatars, plus egg claim/hatch totals. Read-only
+// and admin-gated (same gate as /assets/summary) — it names no wallet, only aggregates.
+//
+// TWO SOURCES, AND THEY MEAN DIFFERENT THINGS. Both are reported rather than blended, because a
+// single merged number would hide which half it came from:
+//   holders  — from the delta-inference LEDGER: wallets observed holding one in a cloud save. This
+//              is the closest thing to "how many players actually have this".
+//   minted   — from the server-minted REGISTRY: assets the server itself issued or adopted. Always
+//              provable, but only covers what has passed through the registry.
+// A species can show holders with 0 minted (a legacy creature never yet adopted) or minted with 0
+// holders (issued but the owner has not cloud-saved since).
+//
+// FRESHNESS CAVEAT, stated in the payload: the ledger only knows what it has SEEN in cloud saves,
+// so these numbers start near zero after a database change and fill in as players sign in.
+app.get("/assets/census", (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  if (!_assetsReady) return res.status(503).json({ error: "asset ledger is still loading" });
+
+  const mk = (list) => { const m = Object.create(null); for (const id of list) m[id] = { holders: 0, minted: 0, byOrigin: {} }; return m; };
+  const chikimon = mk([...SPECIES_NORMAL, ...SPECIES_LEGEND, ...SPECIES_MEME]);
+  const mounts   = mk(MOUNT_SUPPLY.map((m) => m[0]));
+  const avatars  = mk(AVATAR_IDS);
+  const bump = (tbl, sp, field, origin) => {
+    if (!sp || !Object.hasOwn(tbl, sp)) return;
+    tbl[sp][field]++;
+    if (origin) tbl[sp].byOrigin[origin] = (tbl[sp].byOrigin[origin] || 0) + 1;
+  };
+
+  // ---- holders, from the ledger ----
+  let wallets = 0;
+  for (const [, r] of assetLedger) {
+    wallets++;
+    // one wallet can hold several of a species over time; count DISTINCT species per wallet so
+    // "holders" reads as players, not as rows
+    const seenSp = new Set();
+    for (const uid of Object.keys(r.units)) {
+      const u = r.units[uid];
+      if (!u || u.held === false) continue;            // sold or gone — not a current holder
+      const key = u.sp + "|" + u.origin;
+      if (seenSp.has(key)) continue;
+      seenSp.add(key);
+      bump(chikimon, u.sp, "holders", u.origin);
+    }
+    for (const sp of Object.keys(r.mounts)) bump(mounts, sp, "holders", (r.mounts[sp] || {}).origin);
+    for (const sp of Object.keys(r.avatars || {})) bump(avatars, sp, "holders", null);
+  }
+
+  // ---- minted, from the registry, plus the egg ledger ----
+  const eggs = { claimed: {}, hatched: {}, nesting: {} };
+  for (const row of assetReg.values()) {
+    if (!row) continue;
+    if (row.type === "chikimon") bump(chikimon, row.sp, "minted", row.origin);
+    else if (row.type === "mount") bump(mounts, row.sp, "minted", row.origin);
+    else if (row.type === "avatar") bump(avatars, row.sp, "minted", row.origin);
+    else if (row.type === "egg") {
+      const k = String(row.kind || "normal");
+      eggs.claimed[k] = (eggs.claimed[k] || 0) + 1;
+      // an egg row is CONSUMED the moment it hatches and keeps pointing at what came out
+      if (row.state === "consumed") eggs.hatched[k] = (eggs.hatched[k] || 0) + 1;
+      else eggs.nesting[k] = (eggs.nesting[k] || 0) + 1;
+    }
+  }
+
+  const rank = (tbl) => Object.keys(tbl)
+    .map((sp) => ({ sp, ...tbl[sp] }))
+    .sort((a, b) => (b.holders - a.holders) || (b.minted - a.minted) || a.sp.localeCompare(b.sp));
+  const tot = (tbl) => Object.values(tbl).reduce((n, v) => n + v.holders, 0);
+
+  res.json({
+    generatedAt: Date.now(),
+    note: "holders = wallets observed holding one in a cloud save; minted = issued/adopted through the registry. " +
+          "The ledger only knows what it has seen, so counts fill in as players sign in.",
+    ledgerWallets: wallets, registryRows: assetReg.size,
+    chikimon: rank(chikimon), mounts: rank(mounts), avatars: rank(avatars), eggs,
+    totals: { chikimonHeld: tot(chikimon), mountsHeld: tot(mounts), avatarsHeld: tot(avatars),
+              eggsClaimed: Object.values(eggs.claimed).reduce((a, b) => a + b, 0),
+              eggsHatched: Object.values(eggs.hatched).reduce((a, b) => a + b, 0) },
+  });
+});
+
 app.get("/world/nodes", (_req, res) => {
   const now = Date.now();
   const out = {};
@@ -4272,7 +4353,7 @@ function assetRec(wallet) {
   let r = assetLedger.get(wallet);
   if (!r) {
     r = { first: Date.now(), units: Object.create(null), mounts: Object.create(null),
-          eggs: Object.create(null), eggsLast: null, unverified: 0 };
+          eggs: Object.create(null), avatars: Object.create(null), eggsLast: null, unverified: 0 };
     assetLedger.set(wallet, r);
   }
   return r;
@@ -4448,9 +4529,28 @@ function auditAssets(wallet, mmo, walletFirstSeen = 0) {
     rec.mounts[id] = { ts: now, origin };
     if (origin === "unverified") flag(`mount:${id}`);
   }
+  // AVATARS — CENSUS ONLY, never flagged. Recorded so the dex can report how many of each look are
+  // actually out there; deliberately NOT graded into origins and NOT capable of raising a flag.
+  // An avatar is cosmetic (its perk converts to materials, but it cannot itself be listed or sold),
+  // and the honest ways to get one — the onboarding ceremony, the roulette, an Azulon scroll — leave
+  // no delta evidence the inference could read. Grading them would manufacture "unverified" noise
+  // against players who did nothing wrong, which is the one thing this ledger must never do.
+  const allAv = Array.isArray(mmo.avatars) ? mmo.avatars : [];
+  if (allAv.length > 40) flagLater.push(`overflow:avatars:${allAv.length}`);
+  let newAvatars = 0;
+  for (const a of allAv.slice(0, 40)) {
+    const id = String(a).slice(0, 24);
+    if (!id || has(rec.avatars, id)) continue;
+    rec.avatars[id] = { ts: now };
+    newAvatars++;
+  }
+  // the look they are WEARING counts too — a ceremony avatar can be worn without ever being listed
+  const worn = String(mmo.avatar || "").slice(0, 24);
+  if (worn && !has(rec.avatars, worn)) { rec.avatars[worn] = { ts: now }; newAvatars++; }
+
   if (eggGlut) flag(`eggglut:${eggsNow}`);
   for (const why of flagLater) flag(why);
-  if (newUnits || newMounts || flagged.length) _assetsDirty = true;
+  if (newUnits || newMounts || newAvatars || flagged.length) _assetsDirty = true;
 
   // EVICTION MUST NEVER AMNESTY. Dropping a record does not just lose history: the wallet's next
   // save reads as firstEver, so everything it holds is re-stamped "legacy" and its flags are gone.
@@ -4506,6 +4606,7 @@ export function restoreAssetLedger(v) {
     if (!w) continue;
     const rec = { first: Number(src.first) || Date.now(), seen: Number(src.seen) || 0,
                   units: Object.create(null), mounts: Object.create(null), eggs: Object.create(null),
+                  avatars: Object.create(null),
                   eggsLast: Number.isFinite(Number(src.eggsLast)) ? Number(src.eggsLast) : null,
                   unverified: 0 };
     const su = (src.units && typeof src.units === "object") ? src.units : {};
@@ -4527,6 +4628,11 @@ export function restoreAssetLedger(v) {
       const m = sm[id] || {}, origin = ORIGINS.has(m.origin) ? m.origin : "unverified";
       rec.mounts[String(id).slice(0, 24)] = { ts: Number(m.ts) || rec.first, origin };
       if (origin === "unverified") rec.unverified++;
+    }
+    // avatars are census-only, so there is no origin to re-type and nothing here can raise a flag
+    const sa = (src.avatars && typeof src.avatars === "object") ? src.avatars : {};
+    for (const id of Object.keys(sa).filter(k => has(sa, k)).slice(0, 40)) {
+      rec.avatars[String(id).slice(0, 24)] = { ts: Number((sa[id] || {}).ts) || rec.first };
     }
     const se = (src.eggs && typeof src.eggs === "object") ? src.eggs : {};
     for (const k of Object.keys(se).filter(k => has(se, k)).slice(0, 32)) {
