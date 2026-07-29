@@ -1267,7 +1267,15 @@ app.post("/verify", async (req, res) => {
     // since the net_id is private (in the owner's save) and arrives with a proven signature.
     const mktToken = signedIn ? mintMarketToken(wallet) : "";
     if (signedIn) bindSid(stripTags(String(req.body?.netId || "")).slice(0, 40), wallet);
-    res.json({ wallet, eligible, balance, chikis, whalePending, whaleReadyInMs, minHold: MIN, verified: verifyOn, firstSeen, profile: profile || null, dbOk, signedIn, isAdmin, mktToken });
+    // ONE LIVE SESSION PER WALLET. Cloud saves resolve by newest-saved_at, wholesale, with no field
+    // merge (merging inventories would be a duplication faucet) — so two devices on one wallet meant
+    // the loser's ENTIRE session was silently discarded, however long they had played. A sign-in now
+    // mints a session id and becomes the live one; an older session learns it has been superseded on
+    // its very next save and stops, instead of playing for an hour into a save that cannot land.
+    // TAKEOVER, never refusal: the NEWEST sign-in always wins, so a stale session can never lock a
+    // player out of their own wallet.
+    const sessionId = signedIn ? mintSession(wallet) : "";
+    res.json({ wallet, eligible, balance, chikis, whalePending, whaleReadyInMs, minHold: MIN, verified: verifyOn, firstSeen, profile: profile || null, dbOk, signedIn, isAdmin, mktToken, sessionId });
   } catch (e) { res.status(500).json({ error: "verify failed: " + String(e.message || e) }); }
 });
 
@@ -1293,6 +1301,13 @@ app.post("/profile", async (req, res) => {
   const isEstablished = !!(prev && prev.mmo);
   if ((hasMmo || touchesIdentity || isEstablished) && !verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig)) {
     return res.status(401).json({ error: "sign-in required to save progress" });
+  }
+  // SUPERSEDED SESSION — refuse BEFORE the write, or the loser clobbers the live session's save.
+  // Only ever fires for a client that sent a session id (older clients are unaffected), and only
+  // when a NEWER sign-in for this same wallet has taken over. The client stops pushing and tells
+  // the player, rather than playing on into saves that can never land.
+  if (hasMmo && sessionSuperseded(wallet, String(req.body?.sessionId || ""))) {
+    return res.status(409).json({ error: "this trainer was opened on another device", superseded: true });
   }
   const now = Date.now();
   if (now - (_lastSave.get(wallet) || 0) < 600) return res.json({ ok: true, throttled: true });   // ignore rapid-fire writes (anti-spam)
@@ -5004,6 +5019,32 @@ let marketTokens = {}, sidOwner = {}, walletSid = {};
 store.kvGet("market_tokens").then(v => { if (v && typeof v === "object") marketTokens = v; }).catch(() => {});
 store.kvGet("market_sid_owner").then(v => { if (v && typeof v === "object") sidOwner = v; }).catch(() => {});
 store.kvGet("market_wallet_sid").then(v => { if (v && typeof v === "object") walletSid = v; }).catch(() => {});
+// ---- LIVE SESSION per wallet (see the note at /verify) --------------------------------------
+// In memory only, on purpose: a redeploy forgetting every session is the SAFE direction — the first
+// save after it simply re-establishes one, and nobody is locked out. Bounded like every other
+// per-wallet map here.
+const liveSession = new Map();          // wallet -> { sid, ts }
+const SESSION_MAX = 20000;
+function mintSession(wallet) {
+  if (!isPubkey(wallet)) return "";
+  if (liveSession.size >= SESSION_MAX && !liveSession.has(wallet)) {
+    let drop = Math.max(1, Math.floor(SESSION_MAX * 0.05));
+    for (const k of liveSession.keys()) { if (drop-- <= 0) break; liveSession.delete(k); }
+  }
+  const sid = crypto.randomBytes(18).toString("hex");
+  liveSession.set(wallet, { sid, ts: Date.now() });
+  return sid;
+}
+// Has this caller's session been taken over by a newer sign-in? Unknown/absent session ids are
+// treated as CURRENT, so an older client that does not send one keeps working exactly as before.
+function sessionSuperseded(wallet, sid) {
+  if (!sid) return false;
+  const cur = liveSession.get(wallet);
+  if (!cur) return false;
+  return cur.sid !== sid;
+}
+export function _liveSessionFor(w) { return liveSession.get(w) || null; }
+export function _clearSessions() { liveSession.clear(); }
 function mintMarketToken(wallet) {
   if (!isPubkey(wallet)) return "";
   if (!marketTokens[wallet]) { marketTokens[wallet] = crypto.randomBytes(24).toString("hex"); store.kvSet("market_tokens", marketTokens).catch(() => {}); }

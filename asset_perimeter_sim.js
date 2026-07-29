@@ -39,7 +39,7 @@ sec("HOLE A: a wallet minted TODAY was grandfathered a forged roster on save #1"
 {
   const W = await mkWallet();
   const forged = {};
-  for (let i = 0; i < 12; i++) forged["u" + (i + 1)] = unit("azulon", "legendary", 50);
+  for (let i = 0; i < 12; i++) forged["u" + (i + 1)] = unit("dragonos", "legendary", 50);
   await save(W, { eggs: [], units: forged, mounts: ["chicken", "boar", "gator", "horse", "wolf", "griffin"] });
   const a = await audit(W);
   const legacy = Object.values(a.units).filter(u => u.origin === "legacy").length;
@@ -47,7 +47,7 @@ sec("HOLE A: a wallet minted TODAY was grandfathered a forged roster on save #1"
   chk(a.unverified >= 9, `the rest are flagged (${a.unverified})`);
   const mLegacy = Object.values(a.mounts).filter(m => m.origin === "legacy").length;
   chk(mLegacy <= 1, `nor all six mounts (${mLegacy} legacy)`);
-  const sale = await list(W, "L-holeA", "azulon", 50);
+  const sale = await list(W, "L-holeA", "dragonos", 50);
   chk(sale.status === 409, `and it cannot reach the real-$CHIKI rail (${sale.status})`);
 }
 
@@ -55,7 +55,7 @@ sec("HOLE A control: a genuinely pre-existing wallet keeps its full amnesty");
 {
   const W = await mkWallet();
   const forged = {};
-  for (let i = 0; i < 12; i++) forged["u" + (i + 1)] = unit("azulon", "legendary", 50);
+  for (let i = 0; i < 12; i++) forged["u" + (i + 1)] = unit("dragonos", "legendary", 50);
   // the DB's own first_seen is what decides; a real veteran predates the ledger epoch
   SRV._setWalletFirstSeenForTest?.(W.wallet, Date.UTC(2025, 0, 1));
   await save(W, { eggs: [], units: forged, mounts: [] });
@@ -73,7 +73,7 @@ sec("HOLE C2: 32 declared eggs bought 32 clean 'hatched' legendaries for one cos
   await save(W, { eggs: many, units: {}, mounts: [] });
   SRV._ageAssetEggs(W.wallet, 4 * HOUR);
   const forged = {};
-  for (let i = 0; i < 32; i++) forged["u" + (i + 10)] = unit("azulon", "legendary", 50);
+  for (let i = 0; i < 32; i++) forged["u" + (i + 10)] = unit("dragonos", "legendary", 50);
   await save(W, { eggs: [], units: forged, mounts: [] });
   const a = await audit(W);
   const hatched = Object.values(a.units).filter(u => u.origin === "hatched").length;
@@ -88,28 +88,28 @@ sec("HOLE H: padding a save to the cap hid a forged mount and legendary from the
   for (let i = 0; i < 400; i++) many["u" + i] = unit("leafcub", "normal", 1);
   const mounts40 = Array.from({ length: 40 }, (_, i) => "m" + i);
   await save(W, { eggs: [], units: many, mounts: mounts40 });
-  const padded = Object.assign({}, many); padded["u999"] = unit("azulon", "legendary", 50);
+  const padded = Object.assign({}, many); padded["u999"] = unit("dragonos", "legendary", 50);
   await save(W, { eggs: [], units: padded, mounts: mounts40.concat(["griffin"]) });
   const a = await audit(W);
   chk(a.unverified >= 1, `going past the cap is itself the accusation (${a.unverified} flags)`);
-  const sale = await list(W, "L-holeH", "azulon", 50);
+  const sale = await list(W, "L-holeH", "dragonos", 50);
   chk(sale.status === 409, `and the hidden legendary still cannot be sold (${sale.status})`);
 }
 
 sec("HOLE D: auctions accepted the exact chikimon that op:list had just refused");
 {
   const W = await mkWallet();
-  await save(W, { eggs: [], units: { u1: unit("pipmoth", "normal", 2) }, mounts: [] });
-  const l = await list(W, "L-holeD", "azulon", 50);
+  await save(W, { eggs: [], units: { u1: unit("firix", "normal", 2) }, mounts: [] });
+  const l = await list(W, "L-holeD", "dragonos", 50);
   chk(l.status === 409, `list refuses it (${l.status})`);
   const auc = await post("/market/op", { op: "auction_post", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
-    listing: { id: "A-holeD", species: "azulon", lvl: 50, xp: 0, minBid: 100 } });
+    listing: { id: "A-holeD", species: "dragonos", lvl: 50, xp: 0, minBid: 100 } });
   chk(auc.status === 409, `and so does the auction — the gate is no longer one op wide (${auc.status})`);
   const board = await get("/market/list");
   chk(!board.body.auctions.some(a => a.id === "A-holeD"), `it never reached the board`);
   // CONTROL: the creature they really own auctions fine
   const ok = await post("/market/op", { op: "auction_post", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
-    listing: { id: "A-real", species: "pipmoth", lvl: 2, xp: 0, minBid: 10 } });
+    listing: { id: "A-real", species: "firix", lvl: 2, xp: 0, minBid: 10 } });
   chk(ok.status === 200, `(control) their genuine chikimon still auctions (${ok.status})`);
 }
 
@@ -131,14 +131,14 @@ sec("FALSE REFUSAL: a creature the SERVER minted was refused before the player's
 sec("FALSE REFUSAL: an auction winner was branded unverified for an honest acquisition");
 {
   const S = await mkWallet(), Bw = await mkWallet();
-  await save(S, { eggs: [], units: { u1: unit("pipmoth", "normal", 2) }, mounts: [] });
+  await save(S, { eggs: [], units: { u1: unit("firix", "normal", 2) }, mounts: [] });
   await save(Bw, { eggs: [], units: {}, mounts: [] });
   await post("/market/op", { op: "auction_post", sid: S.sid, wallet: S.wallet, mktToken: S.mktToken,
-    listing: { id: "A-win", species: "pipmoth", lvl: 2, xp: 0, minBid: 10 } });
+    listing: { id: "A-win", species: "firix", lvl: 2, xp: 0, minBid: 10 } });
   await post("/market/op", { op: "auction_bid", sid: Bw.sid, wallet: Bw.wallet, mktToken: Bw.mktToken,
     listing: { id: "A-win", amount: 50 } });
   SRV._endAuctionForTest?.("A-win");
-  await save(Bw, { eggs: [], units: { u5: unit("pipmoth", "normal", 2) }, mounts: [] });
+  await save(Bw, { eggs: [], units: { u5: unit("firix", "normal", 2) }, mounts: [] });
   const a = await audit(Bw);
   chk(a.units.u5 && a.units.u5.origin === "purchased",
       `the winner's creature is recorded as purchased (${a.units?.u5?.origin})`);
@@ -202,11 +202,11 @@ sec("a level rewrite is RECORDED — and deliberately blocks nothing");
 {
   const W = await mkWallet();
   SRV._setWalletFirstSeenForTest(W.wallet, Date.UTC(2025, 0, 1));   // a real pre-ledger player
-  await save(W, { eggs: [], units: { u1: unit("pipmoth", "normal", 2) }, mounts: [] });
+  await save(W, { eggs: [], units: { u1: unit("firix", "normal", 2) }, mounts: [] });
   const before = await audit(W);
   chk(before.units.u1.lvl === 2 && before.units.u1.origin === "legacy",
       `starts at lvl 2, legacy (${before.units.u1.lvl}/${before.units.u1.origin})`);
-  await save(W, { eggs: [], units: { u1: unit("pipmoth", "normal", 50) }, mounts: [] });
+  await save(W, { eggs: [], units: { u1: unit("firix", "normal", 50) }, mounts: [] });
   const after = await audit(W);
   chk(after.units.u1.jump === 48, `the 2 -> 50 rewrite is recorded as a jump (${after.units.u1.jump})`);
   chk(after.units.u1.origin === "legacy", `but the unit is NOT condemned on a guessed threshold (${after.units.u1.origin})`);
@@ -237,22 +237,22 @@ sec("ONE creature, ONE live sale — species matching let a single unit back 12 
 {
   const W = await mkWallet();
   SRV._setWalletFirstSeenForTest(W.wallet, Date.UTC(2025, 0, 1));
-  await save(W, { eggs: [], units: { u1: unit("pipmoth", "normal", 2), u2: unit("leafcub", "normal", 3) }, mounts: [] });
+  await save(W, { eggs: [], units: { u1: unit("firix", "normal", 2), u2: unit("leafcub", "normal", 3) }, mounts: [] });
   const listUid = (id, uid, sp) => post("/market/op", { op: "list", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
     listing: { id, kind: "chikimon", item: sp, uid, lvl: 2, xp: 0, price: 500, qty: 1 } });
-  const a = await listUid("U-1", "u1", "pipmoth");
+  const a = await listUid("U-1", "u1", "firix");
   chk(a.status === 200, `the creature lists once (${a.status})`);
-  const b2 = await listUid("U-2", "u1", "pipmoth");
+  const b2 = await listUid("U-2", "u1", "firix");
   chk(b2.status === 409, `the SAME creature cannot back a second row (${b2.status})`);
   const other = await listUid("U-3", "u2", "leafcub");
   chk(other.status === 200, `(control) a different creature still lists (${other.status})`);
   // an auction is the same sale, so it must see the same reservation
   const auc = await post("/market/op", { op: "auction_post", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
-    listing: { id: "U-A", species: "pipmoth", uid: "u1", lvl: 2, xp: 0, minBid: 10 } });
+    listing: { id: "U-A", species: "firix", uid: "u1", lvl: 2, xp: 0, minBid: 10 } });
   chk(auc.status === 409, `nor can it be auctioned while listed (${auc.status})`);
   // cancelling frees it again — a reservation that never releases strands a real player's creature
   await post("/market/op", { op: "cancel", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken, listing: { id: "U-1" } });
-  const relist = await listUid("U-4", "u1", "pipmoth");
+  const relist = await listUid("U-4", "u1", "firix");
   chk(relist.status === 200, `after cancelling it lists again (${relist.status})`);
 }
 
@@ -260,15 +260,15 @@ sec("the per-unit gate refuses the forgery and the sold-on creature, not the own
 {
   const W = await mkWallet();
   SRV._setWalletFirstSeenForTest(W.wallet, Date.UTC(2025, 0, 1));
-  await save(W, { eggs: [], units: { u1: unit("pipmoth", "normal", 2) }, mounts: [] });
+  await save(W, { eggs: [], units: { u1: unit("firix", "normal", 2) }, mounts: [] });
   // a uid the record says is a DIFFERENT species
   const wrong = await post("/market/op", { op: "list", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
-    listing: { id: "M-1", kind: "chikimon", item: "azulon", uid: "u1", lvl: 50, xp: 0, price: 9e6, qty: 1 } });
+    listing: { id: "M-1", kind: "chikimon", item: "dragonos", uid: "u1", lvl: 50, xp: 0, price: 9e6, qty: 1 } });
   chk(wrong.status === 409, `listing u1 as a different species is refused (${wrong.status})`);
   // sell it: the client drops the unit from the save, so the seller no longer HOLDS it
   await save(W, { eggs: [], units: {}, mounts: [] });
   const gone = await post("/market/op", { op: "list", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
-    listing: { id: "M-2", kind: "chikimon", item: "pipmoth", uid: "u1", lvl: 2, xp: 0, price: 500, qty: 1 } });
+    listing: { id: "M-2", kind: "chikimon", item: "firix", uid: "u1", lvl: 2, xp: 0, price: 500, qty: 1 } });
   chk(gone.status === 409, `a creature no longer in the roster cannot be sold again (${gone.status})`);
   const rec = await audit(W);
   chk(!!rec.units.u1, `but its RECORD is still there — hiding it never erases history`);
@@ -279,12 +279,12 @@ sec("an older client that sends no uid is not stranded");
 {
   const W = await mkWallet();
   SRV._setWalletFirstSeenForTest(W.wallet, Date.UTC(2025, 0, 1));
-  await save(W, { eggs: [], units: { u1: unit("pipmoth", "normal", 2) }, mounts: [] });
+  await save(W, { eggs: [], units: { u1: unit("firix", "normal", 2) }, mounts: [] });
   const noUid = await post("/market/op", { op: "list", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
-    listing: { id: "O-1", kind: "chikimon", item: "pipmoth", lvl: 2, xp: 0, price: 500, qty: 1 } });
+    listing: { id: "O-1", kind: "chikimon", item: "firix", lvl: 2, xp: 0, price: 500, qty: 1 } });
   chk(noUid.status === 200, `a payload with no uid still lists on the species check (${noUid.status})`);
   const forged = await post("/market/op", { op: "list", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
-    listing: { id: "O-2", kind: "chikimon", item: "azulon", lvl: 50, xp: 0, price: 9e6, qty: 1 } });
+    listing: { id: "O-2", kind: "chikimon", item: "dragonos", lvl: 50, xp: 0, price: 9e6, qty: 1 } });
   chk(forged.status === 409, `and a species they do not own is still refused (${forged.status})`);
 }
 
