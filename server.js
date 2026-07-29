@@ -3697,7 +3697,7 @@ function worldSnapshot(wallet, x, z) {
     if (w === wallet) continue;
     const d = Math.hypot((p.x || 0) - x, (p.z || 0) - z);
     if (d > WORLD_RADIUS) continue;
-    out.push({ d, wallet: w, x: p.x, y: p.y || 0, z: p.z, dir: p.dir, handle: p.handle, leg: p.leg, el: p.el, br: p.br, avatar: p.avatar, comp: p.comp, party: p.party, mount: p.mount || "", act: p.act || "" });
+    out.push({ d, wallet: w, x: p.x, y: p.y || 0, z: p.z, dir: p.dir, handle: p.handle, leg: p.leg, el: p.el, br: p.br, avatar: p.avatar, comp: p.comp, party: p.party, mount: p.mount || "", act: p.act || "", eggs: p.eggs || "", spr: !!p.spr });
   }
   // NEAREST FIRST, then cap. This used to `slice(0, 60)` straight off Map iteration order — which
   // is INSERTION order, i.e. oldest sessions first. With more than 60 trainers in range, #61
@@ -4855,6 +4855,13 @@ app.post("/world/move", (req, res) => {
     party: String(b.party || "").split(",").filter(Boolean).slice(0, 3).map(s => stripTags(String(s)).slice(0, 24)).join(","),
     mount: stripTags(String(b.mount || "")).slice(0, 16),   // the steed they ride ("" = on foot)
     act: stripTags(String(b.act || "")).slice(0, 24),      // what they're DOING ("chop:axe") -> remotes play it
+    // The caravan of incubating eggs the trainer tows. It renders beside the local player and had no
+    // wire field at all, so to everyone else their carts simply did not exist. Comma-joined kinds,
+    // capped at 4 (the client nests one of each kind) and whitelisted to real kinds — this string is
+    // fed straight into a model lookup on every other client.
+    eggs: String(b.eggs || "").split(",").filter(Boolean).slice(0, 4)
+      .filter((k) => ["normal", "legendary", "meme", "mount"].includes(k)).join(","),
+    spr: !!b.spr,                                          // actually sprinting, vs inferred from speed
     br: clampF(b.br, 1, 50, 1) | 0,   // companion LEVEL (cap 50) — not the Cup 1..30 BR
     ts: Date.now(),
   });
