@@ -3325,6 +3325,25 @@ app.post("/world/kill/report", (req, res) => {
 // is a SIG_VER bump, batched with every other unsigned value gate rather than done piecemeal.
 const raidClaim = new Map();         // wallet -> ISO week index already claimed
 const RAID_WEEK = () => Math.floor(Date.now() / 604800000);
+const RAID_CLAIM_MAX = 20000;
+// EVICT ONLY SPENT WEEKS. Dropping the oldest rows blindly handed the evicted wallet its prize again
+// in the SAME week — the eviction itself became the re-claim. A row for a PAST week protects nothing
+// (the gate only ever compares against the current week), so those are free to drop; a current-week
+// row IS the record and is never evicted. If every row is current the map simply stops shrinking —
+// the safe direction, and the same doctrine the asset ledger's flagged-record eviction follows.
+function evictRaidClaims() {
+  if (raidClaim.size <= RAID_CLAIM_MAX) return 0;
+  const week = RAID_WEEK();
+  let drop = Math.max(1, Math.floor(RAID_CLAIM_MAX * 0.05)), n = 0;
+  for (const [k, wk] of raidClaim) {
+    if (drop <= 0) break;
+    if (wk !== week) { raidClaim.delete(k); drop--; n++; }
+  }
+  return n;
+}
+export function _clearRaidClaims() { raidClaim.clear(); }
+export function _raidClaimSize() { return raidClaim.size; }
+export function _evictRaidClaims() { return evictRaidClaims(); }
 app.post("/world/raid/claim", (req, res) => {
   const b = req.body || {};
   if (!isPresenceId(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
@@ -3342,10 +3361,7 @@ app.post("/world/raid/claim", (req, res) => {
   // CLAIM BEFORE ANSWERING — the same rule the egg restitution and meme-egg guards follow, so two
   // requests racing the same kill cannot both be told "granted"
   raidClaim.set(w, week);
-  if (raidClaim.size > 20000) {      // bound it, evicting oldest, like every per-wallet map here
-    let drop = Math.max(1, Math.floor(20000 * 0.05));
-    for (const k of raidClaim.keys()) { if (drop-- <= 0) break; raidClaim.delete(k); }
-  }
+  evictRaidClaims();
   _assetsDirty = true;
   res.json({ ok: true, granted: true, week });
 });
@@ -4988,6 +5004,17 @@ function _consumeListing(id) {
   }
 }
 store.kvGet("auction_refunds").then(v => { if (v && typeof v === "object") auctionRefunds = v; }).catch(() => {});
+const AUCTION_PERSIST_MAX = 5000;    // a runaway guard, far above any real live set (12h expiry)
+let _aucWarnAt = 0;
+function _capAuctions() {
+  if (marketAuctions.length <= AUCTION_PERSIST_MAX) return marketAuctions;
+  if (Date.now() - _aucWarnAt > 300000) {
+    _aucWarnAt = Date.now();
+    console.warn(`saveMarket: ${marketAuctions.length} live auctions exceeds ${AUCTION_PERSIST_MAX} — ` +
+                 `persisting the newest; escrowed creatures in the remainder are at risk, investigate.`);
+  }
+  return marketAuctions.slice(-AUCTION_PERSIST_MAX);
+}
 async function saveMarket() {
   try {
     await Promise.all([
@@ -4995,7 +5022,14 @@ async function saveMarket() {
       store.kvSet("market_sales", marketSales),
       store.kvSet("market_orders", marketOrders.slice(-200)),
       store.kvSet("market_fills", marketFills),
-      store.kvSet("market_auctions", marketAuctions.slice(-100)),
+      // AN AUCTION HOLDS A CREATURE. Persisting only the last 100 dropped the oldest live rows, and
+      // after a restart auction_cancel answered cancelled:false for them — so the seller's client
+      // never restored the stashed chikimon and it sat in my_auctions forever, unreachable. Sealing
+      // my_auctions (sig v14) closed the old hand-repair, so this was the last way out. Auctions
+      // expire on their own in 12h (sweepAuctions), so the live set is bounded by TIME, not count;
+      // the number here is a runaway guard, and per the never-truncate-silently rule it announces
+      // itself rather than quietly eating escrowed creatures.
+      store.kvSet("market_auctions", _capAuctions()),
       store.kvSet("auction_refunds", auctionRefunds),
       store.kvSet("market_sold_ids", [..._soldListings].slice(-4000).map(([id, ts]) => ({ id, ts }))),
     ]);

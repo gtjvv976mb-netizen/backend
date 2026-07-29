@@ -133,5 +133,28 @@ sec("an UNLINKED net_id is not granted a server prize — it keeps its own local
 }
 
 // ---------------------------------------------------------------------------
+sec("eviction never hands back a CURRENT-week claim");
+{
+  // The bound used to drop the oldest rows blindly, so an evicted wallet was granted its prize
+  // again in the same week — the eviction itself became the re-claim. Only spent weeks may go.
+  SRV._clearRaidClaims();
+  const wk = Math.floor(Date.now() / 604800000);
+  // fill past the bound: half stale weeks, half current
+  for (let i = 0; i < 12000; i++) SRV._setRaidWeekForTest("stale" + i, wk - 5);
+  for (let i = 0; i < 9000; i++) SRV._setRaidWeekForTest("cur" + i, wk);
+  const before = SRV._raidClaimSize();
+  const shed = SRV._evictRaidClaims();
+  const after = SRV._raidClaimSize();
+  chk(after < before, `eviction shed ${shed} rows (${before} -> ${after})`);
+  let curKept = 0;
+  for (let i = 0; i < 9000; i++) if (SRV._raidWeekFor("cur" + i) === wk) curKept++;
+  chk(curKept === 9000, `every CURRENT-week claim survived eviction (${curKept}/9000)`);
+  let staleGone = 0;
+  for (let i = 0; i < 12000; i++) if (SRV._raidWeekFor("stale" + i) === null) staleGone++;
+  chk(staleGone === shed, `and exactly the spent-week rows were the ones dropped (${staleGone})`);
+  SRV._clearRaidClaims();
+}
+
+// ---------------------------------------------------------------------------
 console.log(`\nRAID_CLAIM_SIM pass=${pass} fail=${fail}`);
 process.exit(fail ? 1 : 0);
