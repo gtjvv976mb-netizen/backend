@@ -3147,7 +3147,7 @@ for (const sig of ["SIGTERM", "SIGINT"]) {
   process.on(sig, () => {
     // await the IN-FLIGHT flush first, then run one more for anything minted since it started —
     // exiting on a clean dirty flag aborted the write that was still carrying the newest assets.
-    Promise.allSettled([saveWorldNodes(), Promise.resolve(_assetsFlush).then(() => saveAssetLedger())])
+    Promise.allSettled([saveWorldNodes(), saveWorldMobs(), Promise.resolve(_assetsFlush).then(() => saveAssetLedger())])
       .finally(() => process.exit(0));
   });
 }
@@ -3377,7 +3377,7 @@ app.post("/world/fish/report", (req, res) => {
   const now = Date.now();
   // you have to actually be in the world (same presence gate as a node claim)
   const me = worldPlayers.get(String(b.wallet));
-  if (!me || now - me.ts > WORLD_TTL_MS) { _mobHitsRefused++; return res.status(403).json({ ok: false, error: "no live presence" }); }
+  if (!me || now - me.ts > WORLD_TTL_MS) return res.status(403).json({ ok: false, error: "no live presence" });
   // count at most one fish per human-plausible interval — a spammed loop cannot inflate the ceiling
   const last = _lastFishRec.get(String(b.wallet)) || 0;
   if (now - last < FISH_REC_MIN_MS) return res.json({ ok: true, counted: false });
@@ -3433,7 +3433,12 @@ app.post("/world/kill/report", (req, res) => {
   // at KILL_REC_MIN_MS 500 the ceiling would have been 43,200 essence/hour of sellable credit on a
   // wallet that never fought anything, because this route verifies no combat whatsoever.
   recordGather(String(b.wallet), "essence", new Array(ESSENCE_PER_KILL).fill("essence"), false);
-  ownCredit(String(b.wallet), "mat", "essence", 1);
+  // ...but NOT if the server just watched this wallet kill something itself. The world tick credits on
+  // its own observation of a health pool it owns reaching zero; this route credits on the client's word.
+  // Both fired for the same fight, so one monster paid twice. The witnessed kill wins and this stands
+  // down — the telemetry tally above still records the report either way.
+  const _wk = lastWitnessedKill.get(String(b.wallet)) || 0;
+  if (Date.now() - _wk > KILL_DEDUPE_MS) ownCredit(String(b.wallet), "mat", "essence", 1);
   res.json({ ok: true, counted: true });
 });
 
@@ -3973,13 +3978,9 @@ app.post("/world/mob/hit", (req, res) => {
 
   // 1. you have to actually be in the world
   const me = worldPlayers.get(b.wallet);
-  if (!me || now - me.ts > WORLD_TTL_MS) return res.status(403).json({ ok: false, error: "no live presence" });
+  if (!me || now - me.ts > WORLD_TTL_MS) { _mobHitsRefused++; return res.status(403).json({ ok: false, error: "no live presence" }); }
 
-  // 2. and within reach of where the SERVER thinks that monster lives. Reach comes from the spawn
-  //    index, so a caller cannot claim to be standing somewhere they are not.
   const spec = MOB_SPAWNS[idx];
-  const dist = Math.hypot(spec[1] - (me.x || 0), spec[2] - (me.z || 0));
-  if (dist > MOB_HIT_R) { _mobHitsRefused++; return res.status(403).json({ ok: false, error: "out of reach", dist: Math.round(dist) }); }
 
   // 3. no swinging faster than a person can
   const last = mobHitRate.get(b.wallet) || 0;
@@ -3989,14 +3990,37 @@ app.post("/world/mob/hit", (req, res) => {
   }
   if (mobHitRate.size > 5000) { for (const [k, v] of mobHitRate) if (now - v > 120000) mobHitRate.delete(k); }
 
+  // STAMP BEFORE ANY EARLY RETURN. This sat below the corpse branch, so hitting a dead monster was
+  // never rate-limited at all — measured at 31,034 requests/minute on one wallet. A refused swing still
+  // costs you your swing; that is the whole point of a rate limit.
+  mobHitRate.set(b.wallet, now);
   worldMobTick(now);
   const m = mobRow(idx);
   if (m.deadAt) {
     // already down — tell them when it is back rather than letting them beat a corpse for credit
     return res.json({ ok: true, dead: true, back: Math.max(0, MOB_RESPAWN_MS - (now - m.deadAt)) | 0, gen: m.gen });
   }
-  mobHitRate.set(b.wallet, now);
   _mobHits++;
+
+  // 2. THE ANCHOR. The first strike of this life records where the fight is, from the striker's own
+  //    presence row — never from a position they sent us. Anyone joining must be standing near it.
+  const px = me.x || 0, pz = me.z || 0;
+  if (m.ax === undefined) {
+    // Refuse to anchor absurdly far from the spawn: a mob cannot have walked to the far side of the
+    // island, so an anchor out there is a claim about geography, not a fight.
+    const fromHome = Math.hypot(spec[1] - px, spec[2] - pz);
+    if (fromHome > MOB_ANCHOR_MAX) {
+      _mobHitsRefused++;
+      return res.status(403).json({ ok: false, error: "that monster is nowhere near there", dist: Math.round(fromHome) });
+    }
+    m.ax = px; m.az = pz;
+  } else {
+    const off = Math.hypot(m.ax - px, m.az - pz);
+    if (off > MOB_ANCHOR_R) {
+      _mobHitsRefused++;
+      return res.status(403).json({ ok: false, error: "too far from the fight", dist: Math.round(off) });
+    }
+  }
 
   // 4. the damage is CLAMPED. The client still computes it (gear and trainer level live in the
   //    client-authored save, so the server cannot derive it) but it can never exceed a real loadout,
@@ -4005,7 +4029,16 @@ app.post("/world/mob/hit", (req, res) => {
   m.hp = Math.max(0, m.hp - dmg);
   const wallet = String(b.wallet);
   m.hitters.set(wallet, (m.hitters.get(wallet) || 0) + dmg);
-  if (m.hitters.size > 40) { const first = m.hitters.keys().next().value; m.hitters.delete(first); }
+  // EVICT THE SMALLEST CONTRIBUTOR, NEVER THE OLDEST. A Map iterates in insertion order, so dropping
+  // `keys().next().value` dropped whoever opened the fight — measured: a trainer who dealt 360 of a
+  // 400-HP monster was evicted by forty identities chipping 59 HP between them, and was paid NOTHING
+  // while a 20-damage passer-by was paid in full. The bound has to shed the least invested, which is
+  // also exactly the direction that makes the bound useless as an attack.
+  if (m.hitters.size > MOB_HITTERS_MAX) {
+    let weakest = null, least = Infinity;
+    for (const [w, d] of m.hitters) if (d < least) { least = d; weakest = w; }
+    if (weakest !== null) m.hitters.delete(weakest);
+  }
 
   let killed = false;
   let paid = [];
@@ -4034,7 +4067,11 @@ app.post("/world/mob/hit", (req, res) => {
       .slice(0, MOB_PAYEES);
     for (const [w] of ranked) {
       ownCredit(w, "mat", "essence", ess);
+      lastWitnessedKill.set(w, now);   // silences kill/report's guess for KILL_DEDUPE_MS
       paid.push(w.slice(0, 8));
+    }
+    if (lastWitnessedKill.size > 5000) {
+      for (const [w, t] of lastWitnessedKill) if (now - t > KILL_DEDUPE_MS * 4) lastWitnessedKill.delete(w);
     }
   }
   res.json({ ok: true, hp: Math.round(m.hp), maxhp: mobMaxHp(idx), killed, gen: m.gen,
@@ -4151,16 +4188,37 @@ const MOB_SPAWNS = Object.freeze([
 const MOB_RESPAWN_MS = 90 * 1000;      // Econ.RESPAWN_S 90.0
 const MOB_HIT_MIN_MS = 400;            // per wallet; a human swing cycle is far slower
 const MOB_DMG_MAX = 120;               // per hit; the strongest real loadout is well under this
-// A mob wanders and chases, so reach cannot be tight around home. Measured drift peaks near 32 units
-// and DEAGGRO_R is 70, so 90 covers any legitimate position while still pinning the attacker to the
-// right region of a ~1000-unit island.
-const MOB_HIT_R = 90;
+// REACH IS NOT MEASURED FROM HOME, because home does not predict where a monster is. Monsters.gd's
+// only steering (447-451) is an annulus keeper around the island centre (2, -204): steer inward past
+// 620, outward inside 250, and NOTHING in between. There is no leash to home — home is only where a
+// respawn places it. All 24 of 24 spawn homes sit inside that unsteered band (measured: 287..560 from
+// centre), so every mob random-walks a 370-unit-wide ring and can sit hundreds of units from its own
+// spawn point. A 90-unit gate around home would therefore have refused the honest fighter most of the
+// time while stopping no bot at all, which is worse than having no gate: it is a coin flip that only
+// ever lands on real players.
+//
+// The ANCHOR is the honest replacement. The first accepted strike of a generation records where that
+// fight is happening, taken from the striker's own presence row — so it can never refuse the trainer
+// who opened the fight. Everyone else must be near that anchor, which makes shared credit mean "we
+// were standing together", the one positional property that survives /world/move having no speed
+// check. Be clear about the limit: a lone bot sets its own anchor, so this bounds co-op credit, not
+// solo farming. Solo farming is bounded by the respawn clock instead.
+const MOB_ANCHOR_R = 40;        // co-fighters must be within this of where the fight started
+const MOB_ANCHOR_MAX = 780;     // an anchor may not sit further from home than a mob could have walked
 // Who gets paid for a kill. MOB_PAYEES caps the reward multiplier at four no matter how many wallets
 // touched the monster; MOB_SHARE_MIN is only a tourist floor, deliberately low enough that an honest
 // 30-of-170 contribution still counts.
+const MOB_HITTERS_MAX = 40;    // contributors tracked per life; sheds the SMALLEST, see the hit route
 const MOB_PAYEES = 4;
 const MOB_SHARE_MIN = 0.05;
-const worldMobs = new Map();           // idx -> {hp, gen, deadAt, hitters:Map(wallet->dmg)}
+const worldMobs = new Map();           // idx -> {hp, gen, deadAt, hitters:Map(wallet->dmg), ax, az}
+// A WITNESSED KILL MUST SILENCE THE SELF-REPORTED ONE. /world/kill/report credits essence on the
+// client's word; this tick credits it on the server's own observation. Both fire for the same monster,
+// so the same fight paid twice — measured: mob kill credited 1, then kill/report answered
+// counted:true and credited another. The witnessed path is the truthful one, so it wins and the
+// reported one stands down for a window comfortably longer than one fight.
+const lastWitnessedKill = new Map();   // wallet -> ms of their last server-observed kill
+const KILL_DEDUPE_MS = 30000;
 let _mobKills = 0, _mobHits = 0, _mobHitsRefused = 0;
 
 function mobRow(idx) {
@@ -4169,7 +4227,7 @@ function mobRow(idx) {
   const spec = MOB_SPAWNS[idx];
   if (!spec) return null;
   const st = MOB_STATS[spec[0]];
-  m = { hp: st ? st.hp : 60, gen: 1, deadAt: 0, hitters: new Map() };
+  m = { hp: st ? st.hp : 60, gen: 1, deadAt: 0, hitters: new Map(), ax: undefined, az: undefined };
   worldMobs.set(idx, m);
   return m;
 }
@@ -4188,6 +4246,7 @@ function worldMobTick(now) {
     m.hp = mobMaxHp(idx);
     m.gen++;                           // a new life: credit for the old one can never be claimed again
     m.hitters.clear();
+    m.ax = undefined; m.az = undefined; // and a new life anchors wherever it is next found
   }
 }
 // What every client is told about the shared world. Only mobs that are NOT at full health or are dead
@@ -4202,6 +4261,48 @@ function mobSnapshot(now) {
   }
   return out;
 }
+// PERSIST THE DEAD, exactly as node cooldowns already are (serializeWorldNodes, 3091) and for the same
+// reason: Render's free plan restarts on every deploy and on idle spin-down, and an in-memory-only
+// world means 24 monsters resurrect at full health each time. That is a farm — kill the island, trigger
+// a restart, kill it again — and it also silently un-does a shared death everyone watched happen.
+// Only DEAD mobs are worth keeping: a live one is fully described by its spawn entry, and a respawn
+// that came due while the process was down should simply have happened.
+export function serializeWorldMobs(now = Date.now()) {
+  const out = [];
+  for (const [idx, m] of worldMobs) {
+    if (!m.deadAt) continue;
+    if (now - m.deadAt >= MOB_RESPAWN_MS) continue;     // due back anyway; do not carry a stale corpse
+    out.push([idx, { deadAt: m.deadAt, gen: m.gen }]);
+  }
+  return out;
+}
+// Trusts nothing, same as the node restore: an index must be a real spawn, a timestamp must be finite
+// and not in the future, and a corpse whose clock already ran out is simply not restored.
+export function restoreWorldMobs(v, now = Date.now()) {
+  if (!Array.isArray(v)) return 0;
+  let n = 0;
+  for (const e of v) {
+    if (!Array.isArray(e) || !e[1] || typeof e[1] !== "object") continue;
+    const idx = Math.floor(Number(e[0]));
+    if (!Number.isInteger(idx) || idx < 0 || idx >= MOB_SPAWNS.length) continue;
+    const deadAt = Number(e[1].deadAt);
+    if (!Number.isFinite(deadAt) || deadAt <= 0 || deadAt > now) continue;
+    if (now - deadAt >= MOB_RESPAWN_MS) continue;       // its respawn came due while we were down
+    const gen = Math.max(1, Math.floor(Number(e[1].gen)) || 1);
+    const m = mobRow(idx);
+    m.deadAt = deadAt; m.gen = gen; m.hp = 0;
+    m.hitters.clear(); m.ax = undefined; m.az = undefined;   // credit for that life is closed
+    n++;
+  }
+  return n;
+}
+store.kvGet("world_mobs").then((v) => { const n = restoreWorldMobs(v); if (n) console.log(`world mobs restored: ${n} still down`); }).catch(() => {});
+async function saveWorldMobs() {
+  try { await store.kvSet("world_mobs", serializeWorldMobs()); }
+  catch (e) { console.warn("saveWorldMobs failed:", String(e?.message || e)); }
+}
+setInterval(saveWorldMobs, 10000).unref?.();
+
 export function _clearWorldMobs() { worldMobs.clear(); _mobKills = 0; _mobHits = 0; _mobHitsRefused = 0; }
 export function _mobFor(idx) { const m = worldMobs.get(idx); return m ? { hp: m.hp, gen: m.gen, dead: !!m.deadAt, hitters: [...m.hitters.keys()] } : null; }
 export function _mobTickForTest(now) { worldMobTick(now || Date.now()); }

@@ -169,27 +169,50 @@ async function main() {
   ok(`...so the absolute ceiling is ${worstEssencePerHour} essence/hour vs the 43,200 faucet — a ${(43200 / worstEssencePerHour).toFixed(0)}x cut`,
      worstEssencePerHour < 43200 / 10, `${worstEssencePerHour}`);
 
-  // and it requires being in the right PLACE, which the old faucet did not
-  const farAway = await mk(0, 0);
-  const oor = await hit(farAway, DARKEON.idx, DMG_MAX);
-  ok("a hit from across the island is refused — reach comes from the spawn index, not a sent position",
-     oor.status === 403 && String(oor.json.error) === "out of reach", `status ${oor.status} dist=${oor.json.dist}`);
-  // ...and moving your presence marker does not help unless you really are there
-  await post("/world/move", { wallet: farAway.wallet, mktToken: farAway.tok, x: DARKEON.x, z: DARKEON.z, y: 6, dir: 0, handle: "T", leg: 1, el: "Fire", br: 1 });
-  const nowNear = await hit(farAway, DARKEON.idx, 10);
-  ok("...but a trainer who genuinely walked there can strike (position IS the gate, honestly applied)",
-     nowNear.status === 200, `status ${nowNear.status}`);
+  // ---------- 6b. THE ANCHOR, which replaced a reach gate that was a coin flip ----------
+  // Monsters.gd's only steering is an annulus around the island centre (447-451); there is NO leash to
+  // home, and all 24 of 24 homes sit inside the unsteered 250..620 band, so a mob random-walks a
+  // 370-unit ring and can sit hundreds of units from its spawn. A 90-unit gate around home would have
+  // refused the honest fighter most of the time and stopped no bot. The anchor records where the fight
+  // IS, taken from the first striker's own presence row.
+  srv._clearWorldMobs();
+  const AX = DARKEON.x + 300, AZ = DARKEON.z + 300;    // far from home: a mob really can wander here
+  const opener = await mk(AX, AZ);
+  const o1 = await hit(opener, DARKEON.idx, 10);
+  ok("the trainer who OPENS a fight is never refused, wherever the monster wandered to",
+     o1.status === 200, `status ${o1.status} ${JSON.stringify(o1.json.error || "")}`);
+  const buddy = await mk(AX + 20, AZ);
+  await sleep(HIT_MIN_MS + 60);
+  const o2 = await hit(buddy, DARKEON.idx, 10);
+  ok("...and someone standing beside them joins the SAME fight", o2.status === 200, `status ${o2.status}`);
+  const tourist = await mk(AX - 900, AZ);
+  await sleep(HIT_MIN_MS + 60);
+  const o3 = await hit(tourist, DARKEON.idx, 10);
+  ok("...but someone nowhere near it cannot claim a share",
+     o3.status === 403 && String(o3.json.error) === "too far from the fight",
+     `status ${o3.status} ${JSON.stringify(o3.json.error || "")} dist=${o3.json.dist}`);
+  srv._clearWorldMobs();
+  const liar2 = await mk(DARKEON.x + 3000, DARKEON.z + 3000);
+  const o4 = await hit(liar2, DARKEON.idx, 10);
+  ok("...and no fight can be anchored where a monster could never have walked",
+     o4.status === 403, `status ${o4.status} ${JSON.stringify(o4.json.error || "")} dist=${o4.json.dist}`);
 
-  // rate limit
+  srv._clearWorldMobs();
+  const farAway = await mk(DARKEON.x, DARKEON.z);
+
+  // rate limit — two swings back to back, so the second is genuinely inside the window
+  await hit(farAway, DARKEON.idx, 1);
   const spam = await hit(farAway, DARKEON.idx, DMG_MAX);
   ok("a second swing inside MOB_HIT_MIN_MS is refused", spam.status === 429, `status ${spam.status} retry=${spam.json.retryInMs}`);
 
-  // damage clamp: a modified client cannot delete a boss in one request
+  // damage clamp: a modified client cannot delete a boss in one request. Measured against the mob's
+  // CURRENT hp, not its max — the rate-limit test above already landed a swing on it.
   await sleep(HIT_MIN_MS + 60);
+  const hpBefore = srv._mobFor(DARKEON.idx).hp;
   const nuke = await hit(farAway, DARKEON.idx, 999999999);
   ok("a one-shot is clamped to MOB_DMG_MAX, so no client can delete a boss",
-     Number(nuke.json.hp) >= DARKEON.hp - DMG_MAX - 10 && !nuke.json.killed,
-     `hp=${nuke.json.hp}/${DARKEON.hp} killed=${nuke.json.killed}`);
+     hpBefore - Number(nuke.json.hp) <= DMG_MAX && !nuke.json.killed,
+     `${hpBefore} -> ${nuke.json.hp} (drop ${hpBefore - Number(nuke.json.hp)}, cap ${DMG_MAX}) killed=${nuke.json.killed}`);
   for (const junk of [NaN, -500, "abc", Infinity, null]) {
     await sleep(HIT_MIN_MS + 60);
     const before = srv._mobFor(DARKEON.idx).hp;
@@ -227,7 +250,20 @@ async function main() {
      offSnap.json.mobs === undefined, `mobs=${JSON.stringify(offSnap.json.mobs)}`);
   srv._setWorldTickForTest(true);
 
-  // ---------- 9. the operator can see it — READ BEFORE the reset below, or the counters read zero ----------
+  // ---------- 9. the operator can see it. Counters are cumulative across the run but _clearWorldMobs
+  // zeroes them, so land at least one fresh hit+kill here rather than trusting whatever survived. ----
+  srv._clearWorldMobs();
+  const opX = 99.6, opZ = 344.7;                       // spawn 0, darkeet, hp 170
+  const op = await mk(opX, opZ);
+  const bystander = await mk(opX + 800, opZ);          // will be refused: counts a refusal
+  await hit(bystander, 0, 5);
+  let opKilled = false;
+  for (let i = 0; i < 12 && !opKilled; i++) {
+    await sleep(HIT_MIN_MS + 60);
+    const r = await hit(op, 0, DMG_MAX);
+    if (r.json.killed) opKilled = true;
+  }
+  ok("a fresh hit/kill/refusal trio is produced for the counters", opKilled, `killed=${opKilled}`);
   const sum = await get("/assets/summary?key=" + encodeURIComponent(process.env.ADMIN_KEY));
   const wt = sum.json.worldTick || {};
   ok("the audit reports the world tick", wt.running === true, `running=${wt.running}`);
@@ -244,6 +280,50 @@ async function main() {
   const bytes = JSON.stringify(snap.json.mobs).length;
   ok(`a busy island's shared state is ${bytes} bytes — trivial beside the 307-byte-per-player rows`,
      bytes < 600, `${bytes} bytes for ${Object.keys(snap.json.mobs).length} mobs`);
+
+  // ---------- 11. A RESTART MUST NOT RESURRECT THE ISLAND ----------
+  // worldMobs was memory-only. Render's free plan restarts on every deploy and on idle spin-down, so
+  // 24 monsters came back at full health each time — a farm (kill the island, trigger a restart, kill
+  // it again) and a silent undo of a death everyone watched. Node cooldowns were already persisted for
+  // exactly this reason; mobs now are too.
+  srv._clearWorldMobs();
+  const pk = await mk(SPAWN0.x, SPAWN0.z);
+  let pKilled = false;
+  for (let i = 0; i < 12 && !pKilled; i++) {
+    await sleep(HIT_MIN_MS + 60);
+    const r = await hit(pk, 0, DMG_MAX);
+    if (r.json.killed) pKilled = true;
+  }
+  ok("a monster is down before the simulated restart", pKilled, `killed=${pKilled}`);
+  const blob = srv.serializeWorldMobs();
+  ok("...and the corpse is in the persisted blob", Array.isArray(blob) && blob.length === 1,
+     JSON.stringify(blob));
+  const genWas = srv._mobFor(0).gen;
+  srv._clearWorldMobs();                                   // the restart
+  ok("...the restart really does empty the map", srv._mobFor(0) === null, JSON.stringify(srv._mobFor(0)));
+  const restored = srv.restoreWorldMobs(blob);
+  ok("...and the restore brings the corpse back, not the monster", restored === 1, `restored=${restored}`);
+  const after = srv._mobFor(0);
+  ok("...still dead, on its original generation", after && after.dead === true && after.gen === genWas,
+     `dead=${after && after.dead} gen=${after && after.gen} (was ${genWas})`);
+  ok("...with its contributor list closed, so that life cannot be paid twice",
+     after && after.hitters.length === 0, JSON.stringify(after && after.hitters));
+
+  // hostile / stale input
+  const junkBlob = [
+    ["notanumber", { deadAt: Date.now(), gen: 1 }],
+    [999, { deadAt: Date.now(), gen: 1 }],                        // no such spawn
+    [2, { deadAt: Date.now() + 600000, gen: 1 }],                 // died in the future
+    [3, { deadAt: Date.now() - RESPAWN_MS - 5000, gen: 1 }],      // respawn already came due
+    [4, { deadAt: Date.now(), gen: 2 }],                          // the one good row
+  ];
+  srv._clearWorldMobs();
+  const kept = srv.restoreWorldMobs(junkBlob);
+  ok("restore keeps ONLY the plausible row and drops the rest", kept === 1, `kept=${kept} of ${junkBlob.length}`);
+  ok("...the one that survived is the real one", srv._mobFor(4) !== null && srv._mobFor(4).dead === true,
+     JSON.stringify(srv._mobFor(4)));
+  ok("...a monster whose respawn came due while we were down is simply alive again",
+     srv._mobFor(3) === null, JSON.stringify(srv._mobFor(3)));
 
   console.log(`\nWORLD_TICK_SIM  pass=${pass} fail=${fail}`);
   if (fail) { console.log("failures:"); for (const f of fails) console.log("  - " + f); }
