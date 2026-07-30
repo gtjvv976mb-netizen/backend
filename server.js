@@ -3558,6 +3558,12 @@ app.get("/assets/summary", (req, res) => {
              matFlow: { spendingWallets: matSpent.size, gainingWallets: matGained.size },
              nodeClaims: { proven: _provenClaims, unproven: _unprovenClaims,
                            provenPct: (_provenClaims + _unprovenClaims) ? Math.round(100 * _provenClaims / (_provenClaims + _unprovenClaims)) : 0 },
+             // Refused for an impossible quantity (LIST_QTY_MAX). Unlike oversoldMaterials — which is
+             // a soft signal, since materials also arrive from crafting/quests/chests/trades — every
+             // row here is a listing the game could not have produced, so it names an actual attempt.
+             impossibleListings: { refused: _overQtyListings, sellers: _overQtyBy.size,
+                                   worst: [..._overQtyBy].sort((a, b) => b[1].worst - a[1].worst).slice(0, 20)
+                                     .map(([w, r]) => ({ w: String(w).slice(0, 8), tried: r.worst, item: r.item, kind: r.kind, attempts: r.n })) },
              biggestLevelJumps: jumps.slice(0, 40), oversoldMaterials: oversold.slice(0, 40) });
 });
 
@@ -5160,6 +5166,35 @@ let marketFills = {};                        // buyer sid -> [ {id,item,kind,qty
 let marketAuctions = [];                     // 🔨 chikimon auctions: {id, seller, sid, species, lvl, xp, minBid, curBid, curSid, curName, ts, endsAt}
 let auctionRefunds = {};                     // sid -> [ {rid,id,amt,ts} ] — outbid escrow going home
 const MARKET_TTL_MS = 24 * 60 * 60 * 1000;   // listings expire after a day
+// ---- A LISTING'S QUANTITY MUST BE A QUANTITY THE GAME CAN ACTUALLY HOLD ----
+// A listing settles through /market/buy-onchain into a real 75/20/5 $CHIKI transfer, so a listing IS
+// a claim on a stranger's money. The qty was clamped to 999999 — 908x the most of one material any
+// player can carry — so a save with a fabricated `mats` value (the mmo blob rides through /profile
+// verbatim, and nothing clamps it) could ask a real buyer to pay for a million of something.
+//
+// These ceilings come from what the game can REPRESENT, measured, not guessed:
+//   BAG_CAP tops out at 1100 per material (Econ.gd:246), and every over-cap source is small and
+//   slow — all 12 TASKS together grant 9 crystal, level milestones ~45 lifetime, and the weekly
+//   raid 25 (RaidBoss.gd:203). Even a 200-week raider tops out near 6,150 of a single material.
+//   Fantasy fish are 1-in-42 per cast at the very best (tier-3 spot, Lv10 rod), so 2000 is on the
+//   order of 200 hours of ideal fishing. Potions are crafted, bounded by the mats they consume.
+//
+// DELIBERATELY NOT A PROVENANCE TEST. gatherCount is the honest ceiling on what a wallet ever pulled
+// from the ground, but it only began recording at Step 1 — a pre-Step-1 hoard reads as "gathered 0",
+// so enforcing it would refuse real players (which is exactly why it is observe-only). A magnitude
+// bound needs no per-wallet record at all, so it cannot false-positive on a grandfathered player.
+// It bounds the damage; it does not prove the goods are real. Only server-owned materials can.
+//
+// REFUSE, don't clamp: clamping would silently turn an absurd listing into a plausible one and
+// destroy the signal. A refusal is visible to the seller and counted for the operator below.
+// chikimon is absent on purpose — one creature is one row, and chikimonSaleBlocked already gates it.
+const LIST_QTY_MAX = Object.freeze(Object.assign(Object.create(null), {
+  mat: 20000,      // ~3.3x the ceiling a four-year raider could reach on one material
+  ffish: 2000,     // ~200h of best-case fantasy fishing
+  pot: 20000,      // crafted; bounded by the materials spent
+}));
+let _overQtyListings = 0;                    // observe: how often an impossible quantity was refused
+const _overQtyBy = new Map();                // wallet/sid -> {n, worst, item, kind, ts} (bounded below)
 // DURABILITY: a settled receipt lingers briefly for recovery, then drops; UNCREDITED value (owed
 // proceeds/goods/escrow) survives far longer so a player offline for weeks still recovers it on
 // return. Never blindly time-drop money that was never actually credited.
@@ -5514,6 +5549,24 @@ app.post("/market/op", async (req, res) => {
       return res.status(409).json({ error: "Listing id collision — cancel and re-list with a fresh id." });
     } else if (!listingClash) {
       if (marketListings.filter(x => x.sid === sid).length >= 12) return res.status(429).json({ error: "too many listings" });
+      // IMPOSSIBLE QUANTITY. Checked BEFORE the row is built, so an absurd listing never reaches the
+      // board and never becomes something a real buyer can pay for on-chain. See LIST_QTY_MAX.
+      const _lk = (["chikimon", "ffish", "pot"].includes(String(l.kind)) ? String(l.kind) : "mat");
+      const _lq = clampF(l.qty, 1, 999999, 1) | 0;
+      if (Object.hasOwn(LIST_QTY_MAX, _lk) && _lq > LIST_QTY_MAX[_lk]) {
+        _overQtyListings++;
+        // Bound this map like every other per-wallet map here, and keep the WORST attempt per seller
+        // rather than the latest — the biggest ask is the informative one.
+        const _who = String(mktWallet(b) || sid);
+        const _row = _overQtyBy.get(_who) || { n: 0, worst: 0, item: "", kind: "", ts: 0 };
+        _row.n++; _row.ts = Date.now();
+        if (_lq > _row.worst) { _row.worst = _lq; _row.item = stripTags(String(l.item || "")).slice(0, 24); _row.kind = _lk; }
+        _overQtyBy.set(_who, _row);
+        if (_overQtyBy.size > 5000) { let drop = 250; for (const k of _overQtyBy.keys()) { if (drop-- <= 0) break; _overQtyBy.delete(k); } }
+        // The client shows this string to the seller verbatim (Market.gd:836), and by now it has
+        // already taken the goods out of their bag locally — so say how to get them back.
+        return res.status(409).json({ error: `A ${_lk} listing cannot exceed ${LIST_QTY_MAX[_lk]}. Cancel the listing to put your goods back in your bag, then list a smaller amount.`, max: LIST_QTY_MAX[_lk] });
+      }
       // THE FLAG NEEDS A CONSUMER. A chikimon listing settles through /market/buy-onchain into a
       // real 75/20/5 $CHIKI transfer, so this is where a forged roster becomes money — and the
       // list op never asked whether the seller owns the creature. The ledger already knows.
