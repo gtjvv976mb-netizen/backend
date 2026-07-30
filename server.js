@@ -5241,8 +5241,13 @@ function _consumeListing(id) {
   _soldListings.set(String(id), Date.now());
   // bounded by COUNT, oldest-first — never by age (see pruneMarket). A Map keeps insertion order and
   // re-setting an existing key does not move it, so the first keys are genuinely the oldest.
-  if (_soldListings.size > 8000) {
-    let drop = _soldListings.size - 8000;
+  // RAISED 8000 -> 50000 (~2.5 MB). The cancel op now returns a seller's goods when an id was never
+  // consumed and carries no receipt, so forgetting that an id SOLD is the one way that branch could
+  // double-pay. The window is already near-impossible — crediting a sale removes the row from the
+  // seller's own client, so a client still holding it has an uncredited receipt, and those live 60
+  // days — but the memory is cheap and this pushes the eviction horizon out by years.
+  if (_soldListings.size > 50000) {
+    let drop = _soldListings.size - 50000;
     for (const k of _soldListings.keys()) { if (drop-- <= 0) break; _soldListings.delete(k); }
   }
 }
@@ -5274,7 +5279,7 @@ async function saveMarket() {
       // itself rather than quietly eating escrowed creatures.
       store.kvSet("market_auctions", _capAuctions()),
       store.kvSet("auction_refunds", auctionRefunds),
-      store.kvSet("market_sold_ids", [..._soldListings].slice(-4000).map(([id, ts]) => ({ id, ts }))),
+      store.kvSet("market_sold_ids", [..._soldListings].slice(-25000).map(([id, ts]) => ({ id, ts }))),
     ]);
   } catch (e) { console.warn("saveMarket persist failed:", String(e?.message || e)); }
 }
@@ -5629,6 +5634,22 @@ app.post("/market/op", async (req, res) => {
     const before = marketListings.length;
     marketListings = marketListings.filter(x => !(x.id === id && x.sid === sid));
     cancelled = marketListings.length < before;   // true ONLY if a still-live listing was removed (else it already sold)
+    // A ROW THE SERVER NEVER HAD IS NOT A SALE. `cancelled:false` was doing double duty — it meant
+    // both "this sold" and "I have no record of it" — and the client only reclaims on `true`
+    // (Market.gd:519). So any listing the server refused or dropped left the seller's goods deducted
+    // (Market.gd:405) with no way back: cancel answered false, the client kept the row and re-pushed
+    // it forever. The LIST_QTY_MAX refusal above walks straight into that, and its message tells the
+    // seller to cancel — advice that could not work until this branch existed.
+    //
+    // If the id was never consumed AND this seller holds no sale receipt for it, then nobody ever
+    // bought it, so returning the goods cannot double-pay. Both are durable: _soldListings persists
+    // (market_sold_ids) and marketSales keeps UNCREDITED receipts for KEEP_PENDING_MS (60 days),
+    // far longer than a listing's own 24h TTL.
+    if (!cancelled && !_soldListings.has(id) && !(marketSales[sid] || []).some(s => s.id === id)) {
+      cancelled = true;
+    }
+    // ...but NEVER blacklist an id on that branch. Consuming an id the server never had is exactly
+    // the id-poisoning bug described below, so the blacklist stays tied to a REAL removal.
     // Blacklist ONLY an id this caller actually owned. _consumeListing used to run here
     // unconditionally, outside the sid check — so any signed-in player could POST cancel with ids
     // they had never owned and blacklist them for MARKET_TTL_MS. Client listing ids are a
@@ -5637,7 +5658,7 @@ app.post("/market/op", async (req, res) => {
     // the seller's client had already deducted the goods. Goods destroyed, seller never told.
     // A genuine sale is already consumed by the buy path above, so gating on `cancelled` here
     // loses nothing.
-    if (cancelled) _consumeListing(id);
+    if (marketListings.length < before) _consumeListing(id);
   } else if (op === "order_post") {
     // WTB craft order — REAL-$CHIKI ONLY. No escrow moves at post time: the poster's wallet
     // rides on the order and they sign the real 75/20/5 payment (via /market/order-pay) when a
