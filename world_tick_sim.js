@@ -222,9 +222,25 @@ async function main() {
        after <= before && before - after <= DMG_MAX, `${before} -> ${after}`);
   }
 
+  // ---------- 6c. AN UNPROVEN WALLET CANNOT FIGHT OR BE PAID ----------
+  // This route credits sellable essence and had no proof gate, while /world/kill/report demands one.
+  // Requiring proof also stops a stranger reading a wallet off /world/roster and burning that
+  // trainer's swing budget from across the world.
+  srv._clearWorldMobs();
+  const victim = await mk(SPAWN0.x, SPAWN0.z);
+  const unproven = await post("/world/mob/hit", { wallet: victim.wallet, idx: 0, dmg: DMG_MAX });   // no mktToken
+  ok("a hit with no proof of the wallet is refused",
+     unproven.status === 403 && String(unproven.json.error) === "prove this wallet first",
+     `status ${unproven.status} ${JSON.stringify(unproven.json.error || "")}`);
+  ok("...and it did NOT consume the real owner's swing budget",
+     (await hit(victim, 0, 10)).status === 200, "owner can still swing immediately");
+
   // ---------- 7. A SELF-CHOSEN net_id EARNS NOTHING ----------
   // presenceOk returns true for any net_id with no signature, so it can create presence and swing —
   // but it is not an identity, and the acquisition bound only accepts pubkeys.
+  // fresh state: the test above left a real pubkey in mob 0's contributor list, and it was correctly
+  // paid — which made `paid` ambiguous here rather than wrong.
+  srv._clearWorldMobs(); srv._clearOwnBook();
   const ghost = { wallet: "godot-" + crypto.randomBytes(4).toString("hex"), tok: "" };
   await post("/world/move", { wallet: ghost.wallet, x: SPAWN0.x, z: SPAWN0.z, y: 6, dir: 0, handle: "G", leg: 1, el: "Fire", br: 1 });
   let ghostKill = null;

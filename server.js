@@ -3976,13 +3976,26 @@ app.post("/world/mob/hit", (req, res) => {
   if (!Number.isInteger(idx) || idx < 0 || idx >= MOB_SPAWNS.length) return res.status(400).json({ error: "unknown monster" });
   const now = Date.now();
 
-  // 1. you have to actually be in the world
+  // 1. PROVE THE WALLET. This route credits sellable essence, and it had no proof gate at all while
+  //    /world/kill/report right above it demands one — so an unproven keypair could damage a shared pool
+  //    and be paid for it, and, worse, anyone could read a wallet off /world/roster and post hits AS its
+  //    owner, exhausting that trainer's swing budget from across the world. Requiring proof closes both:
+  //    the limiter below is keyed on b.wallet, which is now necessarily the caller's own.
+  //    Residual, stated rather than hidden: presenceOk returns true for any self-chosen net_id, and
+  //    net_ids are published on the roster, so a demo player's swing budget is still griefable. They
+  //    earn nothing either way (ownCredit takes pubkeys only), so this costs a demo player a fight
+  //    rather than value.
+  if (!presenceOk(String(b.wallet), b)) {
+    _mobHitsRefused++;
+    return res.status(403).json({ ok: false, error: "prove this wallet first" });
+  }
+  // 2. you have to actually be in the world
   const me = worldPlayers.get(b.wallet);
   if (!me || now - me.ts > WORLD_TTL_MS) { _mobHitsRefused++; return res.status(403).json({ ok: false, error: "no live presence" }); }
 
   const spec = MOB_SPAWNS[idx];
 
-  // 3. no swinging faster than a person can
+  // 4. no swinging faster than a person can
   const last = mobHitRate.get(b.wallet) || 0;
   if (now - last < MOB_HIT_MIN_MS) {
     _mobHitsRefused++;
@@ -4002,7 +4015,7 @@ app.post("/world/mob/hit", (req, res) => {
   }
   _mobHits++;
 
-  // 2. THE ANCHOR. The first strike of this life records where the fight is, from the striker's own
+  // 3. THE ANCHOR. The first strike of this life records where the fight is, from the striker's own
   //    presence row — never from a position they sent us. Anyone joining must be standing near it.
   const px = me.x || 0, pz = me.z || 0;
   if (m.ax === undefined) {
@@ -4022,7 +4035,7 @@ app.post("/world/mob/hit", (req, res) => {
     }
   }
 
-  // 4. the damage is CLAMPED. The client still computes it (gear and trainer level live in the
+  // 5. the damage is CLAMPED. The client still computes it (gear and trainer level live in the
   //    client-authored save, so the server cannot derive it) but it can never exceed a real loadout,
   //    which is what stops a modified client deleting a boss in one request.
   const dmg = Math.max(1, Math.min(MOB_DMG_MAX, Math.floor(Number(b.dmg) || 1)));
@@ -4046,7 +4059,7 @@ app.post("/world/mob/hit", (req, res) => {
     killed = true;
     m.deadAt = now;
     _mobKills++;
-    // 5. THE REWARD IS THE SERVER'S, ONCE PER LIFE, SPLIT ACROSS EVERYONE WHO REALLY FOUGHT IT. The
+    // 6. THE REWARD IS THE SERVER'S, ONCE PER LIFE, SPLIT ACROSS EVERYONE WHO REALLY FOUGHT IT. The
     //    client never names it. Everyone who landed a hit on THIS generation gets the mob's own
     //    essence value — co-op pays both trainers rather than racing them for a last hit.
     const st = MOB_STATS[spec[0]];
