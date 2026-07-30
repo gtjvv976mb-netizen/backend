@@ -4110,14 +4110,58 @@ app.get("/world/nodes", (_req, res) => {
   res.json({ nodes: out, uses, ts: now });
 });
 
-function worldSnapshot(wallet, x, z) {
+// ---- DELTA ENCODING: stop resending what never changes ----
+// Measured from a live 2,396-snapshot capture: of the ~292 bytes in a player row, the fields that
+// NEVER change during a session — handle, avatar, party, comp, el, leg, br, eggs — account for ~123 of
+// them, and they were resent to everyone every 0.55 s. Snapshot egress is the scaling wall here (~33
+// KB/s downstream per player, ~18 KB per snapshot at the 60-peer cap), so this is the cheapest real
+// headroom available: roughly 40% off the wire without touching the tick rate or the peer cap, which
+// are the two knobs that would cost phones frames.
+//
+// STRICTLY OPT-IN, because the web bundle is cached and two live players were measured this session
+// still running a pre-pass-1 build. A caller must ask for deltas (`dl:1`); everyone else keeps getting
+// the identical full rows they get today. Nothing about the old contract moves.
+//
+// The per-caller memory of "which peers have I already described to you" lives ON THE CALLER'S OWN
+// worldPlayers row, so it is evicted by the same TTL sweep that evicts them — there is no second map
+// to prune and no way for it to outlive the session it belongs to. `sq` on each peer is bumped
+// whenever a static field actually changes, which re-sends that peer's full row exactly once.
+const STATIC_KEYS = ["handle", "leg", "el", "br", "avatar", "comp", "party", "eggs"];
+function bumpStaticSeq(prev, next) {
+  if (!prev) return 1;
+  for (const k of STATIC_KEYS) {
+    if (String(prev[k] === undefined ? "" : prev[k]) !== String(next[k] === undefined ? "" : next[k])) {
+      return (Number(prev.sq) || 1) + 1;
+    }
+  }
+  return Number(prev.sq) || 1;
+}
+function worldSnapshot(wallet, x, z, delta = false) {
   const now = Date.now(), out = [];
+  const me = delta ? worldPlayers.get(wallet) : null;
+  const seen = me ? (me.seen || (me.seen = new Map())) : null;
   for (const [w, p] of worldPlayers) {
     if (now - p.ts > WORLD_TTL_MS) { worldPlayers.delete(w); continue; }
     if (w === wallet) continue;
     const d = Math.hypot((p.x || 0) - x, (p.z || 0) - z);
     if (d > WORLD_RADIUS) continue;
-    out.push({ d, wallet: w, x: p.x, y: p.y || 0, z: p.z, dir: p.dir, handle: p.handle, leg: p.leg, el: p.el, br: p.br, avatar: p.avatar, comp: p.comp, party: p.party, mount: p.mount || "", act: p.act || "", eggs: p.eggs || "", spr: !!p.spr });
+    // volatile half: always sent, because it is what actually moves
+    const row = { d, wallet: w, x: p.x, y: p.y || 0, z: p.z, dir: p.dir, mount: p.mount || "", act: p.act || "", spr: !!p.spr };
+    const sq = Number(p.sq) || 1;
+    if (seen && seen.get(w) === sq) {
+      row.dl = 1;                       // "static half omitted — reuse what I already told you"
+    } else {
+      row.handle = p.handle; row.leg = p.leg; row.el = p.el; row.br = p.br;
+      row.avatar = p.avatar; row.comp = p.comp; row.party = p.party; row.eggs = p.eggs || "";
+      row.sq = sq;
+      if (seen) seen.set(w, sq);
+    }
+    out.push(row);
+  }
+  if (seen && seen.size > WORLD_MAX_PEERS * 3) {
+    // bounded by the peer cap it serves; drop the oldest rather than let a long session accumulate
+    let drop = seen.size - WORLD_MAX_PEERS * 2;
+    for (const k of seen.keys()) { if (drop-- <= 0) break; seen.delete(k); }
   }
   // NEAREST FIRST, then cap. This used to `slice(0, 60)` straight off Map iteration order — which
   // is INSERTION order, i.e. oldest sessions first. With more than 60 trainers in range, #61
@@ -5515,8 +5559,14 @@ app.post("/world/move", (req, res) => {
   }
   const x = clampF(b.x, -100000, 100000, 0), z = clampF(b.z, -100000, 100000, 0);
   const y = clampF(b.y, -1000, 100000, 0);   // height: without it every remote was ground-snapped and nobody could be seen jumping
-  worldPlayers.set(wallet, {
+  // The row is REPLACED wholesale every ping, so anything that must survive has to be carried over:
+  // `seen` is this caller's delta memory. `sq` is derived from the FINISHED row rather than a parallel
+  // copy — an earlier draft rebuilt the static fields separately with subtly different clamps, which
+  // would have made every ping look like a change and silently turned the delta back into a full send.
+  const _prev = worldPlayers.get(wallet);
+  const _row = {
     proven: iAmProven,
+    seen: _prev ? _prev.seen : undefined,
     x, y, z, dir: clampF(b.dir, -7, 7, 0),
     handle: stripTags(String(b.handle || "Trainer")).slice(0, 20),
     leg: clampF(b.leg, 0, 20, 14) | 0,                 // companion species index
@@ -5535,10 +5585,12 @@ app.post("/world/move", (req, res) => {
     spr: !!b.spr,                                          // actually sprinting, vs inferred from speed
     br: clampF(b.br, 1, 50, 1) | 0,   // companion LEVEL (cap 50) — not the Cup 1..30 BR
     ts: Date.now(),
-  });
+  };
+  _row.sq = bumpStaticSeq(_prev, _row);   // advances ONLY when a static field really changed
+  worldPlayers.set(wallet, _row);
   // The shared world rides the reply the client is ALREADY making, so co-op costs zero extra requests
   // and zero extra round trips. An older client ignores the field; a pristine island makes it empty.
-  res.json({ ok: true, players: worldSnapshot(wallet, x, z), online: worldPlayers.size,
+  res.json({ ok: true, players: worldSnapshot(wallet, x, z, !!b.dl), online: worldPlayers.size,
              mobs: _worldTickOn ? mobSnapshot(Date.now()) : undefined });
 });
 // Read-only: nearby online trainers (for spectators / light polling).
