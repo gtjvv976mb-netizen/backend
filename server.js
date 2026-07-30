@@ -3125,6 +3125,8 @@ export function _clearWorldNodes() { worldNodes.clear(); worldNodeUses.clear(); 
 // perimeter) and need a listing to reach the board. They turn enforcement off explicitly rather than
 // have their assertions quietly rewritten to match it. Never reachable from a request.
 export function _setOwnEnforceForTest(on) { _ownEnforce = !!on; return _ownEnforce; }
+// Lets the sim prove both sides of the flag without two server boots. Production reads the env var.
+export function _setFfishAuthorityForTest(on) { _ffishAuth = !!on; if (_ffishAuth) OWN_KINDS.add("ffish"); else OWN_KINDS.delete("ffish"); return _ffishAuth; }
 export function _grantOwnForTest(w, item, n, kind = "mat") { ownCredit(String(w), kind, item, n); return n; }
 export function _clearOwnBook() { ownBook.clear(); _ownWorst.clear(); _ownRefusals = 0; _ownSkipped = 0; _ownSnapshots = 0; _ownReady = true; _ownEnforce = true; }
 export function _ownFor(w) { const r = ownBook.get(String(w)); return r ? { open: r.open, cred: r.cred, sold: r.sold, used: r.used, openSrc: r.openSrc } : null; }
@@ -3309,6 +3311,60 @@ app.post("/world/node/claim", (req, res) => {
 // to bound — the cap under-counts nothing an honest angler could actually do (the reel minigame is
 // slower than this), it only refuses a tight machine-gun loop.
 const FISH_REC_MIN_MS = 800;         // cap the COUNTED rate to human scale; honest play never beats it
+// ============ THE SERVER ROLLS THE CATCH — fantasy fish become witnessed, like eggs ============
+// Fantasy fish are the PRIMARY ingredient of every egg (Econ.EGG_RECIPE), and an egg hatches into a
+// tradeable chikimon. So a fantasy fish is the most valuable thing in the game that the server had
+// never seen: /world/fish/report records a generic "fish" and discards the species, which meant the
+// client both DECIDED what it caught and OWNED the record of it. Claiming a Rainbow Fish (1-in-5000
+// at a calm spot) was a free assertion.
+//
+// This is the same move that fixed eggs in Step 4: THE SERVER ROLLS. A cast reports where and with
+// what; the server performs the roll with the mirrored odds, and only the server's answer is credited.
+// A modified client can no longer name its own catch — it has to win a rate-limited lottery.
+//
+// WHAT THE SERVER STILL CANNOT VERIFY, stated plainly: the spot TIER and the ROD level are both
+// client-asserted. Gear lives in the client-authored save and the 44 school positions are generated
+// client-side, so neither is checkable today. Both are clamped, which bounds the lie rather than
+// removing it: maximal lying (tier 3, rod 10) is a 4x odds multiplier and unlocks every species, so a
+// bot's best case is 1-in-1250 for a Rainbow at FISH_REC_MIN_MS 800 — about 17 minutes of continuous
+// requests per meme egg, against instantaneous before. Honest players are unaffected either way.
+// Closing it fully needs the spot table and gear server-side; this is the increment that makes the
+// species real.
+// ENFORCEMENT IS OFF UNTIL THE CLIENT ADOPTS THE SERVER'S ROLL, and this is not caution for its own
+// sake — shipping it early would break honest players. Player.gd:1917 _roll_catch still rolls locally,
+// so the client and the server now roll INDEPENDENTLY: a player sees "you caught a Golden Chikifish",
+// their save holds it, and the server never witnessed it. Enforcing the sale bind or Mithra's fish
+// price in that state refuses goods the player watched themselves catch — the exact class of harm the
+// gold-wipe and the v8 egg wipe caused.
+// So: the server ROLLS and CREDITS from today (data accrues, and the credit is real entitlement), and
+// the refusals turn on with the client release that renders the server's `legend` instead of its own.
+const FFISH_AUTHORITY = String(process.env.FFISH_AUTHORITY || "") === "1";
+let _ffishAuth = FFISH_AUTHORITY;   // test-overridable mirror; every gate below reads this
+const FFISH_ORDER = Object.freeze(["rainbow_fish", "mystic_eel", "crystal_koi", "golden_chikifish"]);
+const FFISH_SET = new Set(FFISH_ORDER);
+const FFISH_CATCH_BASE = Object.freeze(Object.assign(Object.create(null), {   // mirrors Econ.gd:675
+  golden_chikifish: 0.0060, crystal_koi: 0.0020, mystic_eel: 0.0007, rainbow_fish: 0.0002,
+}));
+const FFISH_ROD_REQ = Object.freeze(Object.assign(Object.create(null), {      // mirrors Econ.gd:684
+  golden_chikifish: 2, crystal_koi: 4, mystic_eel: 6, rainbow_fish: 8,
+}));
+const FFISH_ROD_FLOOR = 0.30;
+const FISH_TIER_MULT = Object.freeze({ 1: 1.0, 2: 2.2, 3: 4.0 });
+function ffishCatchChance(sp, tier, rod) {
+  if (!Object.hasOwn(FFISH_ROD_REQ, sp)) return 0;
+  const req = FFISH_ROD_REQ[sp];
+  if (rod < req) return 0;                       // below the unlock the fish never takes the line
+  const span = Math.max(1, 10 - req);
+  const t = Math.min(1, Math.max(0, (rod - req) / span));
+  const rodFactor = FFISH_ROD_FLOOR + (1 - FFISH_ROD_FLOOR) * t;
+  const mult = FISH_TIER_MULT[Math.min(3, Math.max(1, tier))] || 1.0;
+  return FFISH_CATCH_BASE[sp] * mult * rodFactor;
+}
+// Rarest first, so a Rainbow is never masked by a Golden — same order as the client had.
+function rollFantasyCatch(tier, rod) {
+  for (const sp of FFISH_ORDER) if (Math.random() < ffishCatchChance(sp, tier, rod)) return sp;
+  return "";
+}
 const _lastFishRec = new Map();      // wallet -> last COUNTED catch ms (anti-inflation, not a refusal)
 app.post("/world/fish/report", (req, res) => {
   const b = req.body || {};
@@ -3330,7 +3386,18 @@ app.post("/world/fish/report", (req, res) => {
     for (const [k, t] of _lastFishRec) { if (now - t > 120000) _lastFishRec.delete(k); }
   }
   recordGather(String(b.wallet), "fish", ["fish"]);   // pubkey-only inside; net_id catches are ignored
-  res.json({ ok: true, counted: true });
+  // NOTE: recordGather already credits the book one "fish" per entry (creditOwn defaults true), so
+  // there is deliberately no ownCredit for the ordinary catch here — adding one double-counted it.
+  // THE SERVER ROLLS THE LEGEND. tier and rod are client-asserted and only clamped (see the note at
+  // FFISH_ORDER) — but the ROLL is ours, so a client can no longer simply declare a Rainbow Fish.
+  const _tier = Math.min(3, Math.max(1, Math.floor(Number(b.tier)) || 1));
+  const _rod = Math.min(10, Math.max(0, Math.floor(Number(b.rod)) || 0));
+  const _legend = rollFantasyCatch(_tier, _rod);
+  if (_legend) ownCredit(String(b.wallet), "ffish", _legend, 1);
+  // The client renders what the SERVER says was caught. An older client ignores `legend` and keeps
+  // rolling its own for display only — it just gains no sellable entitlement from it, which is the
+  // point. `counted` keeps its old meaning so nothing existing changes shape.
+  res.json({ ok: true, counted: true, legend: _legend || null, tier: _tier, rod: _rod });
 });
 
 // ============ STEP 6: combat essence joins the observed faucet (observe-only) ============
@@ -3497,12 +3564,13 @@ export function _flowFor(wallet) { return { spent: matSpent.get(wallet) || null,
 // 4–8 of one material (Profile.gd:2526) or 6 crystal, plus craft refunds bounded by what was spent.
 // UNWITNESSED_ALLOWANCE covers all of it with a wide margin instead of refusing an honest player,
 // and it is per (wallet, item) so it cannot be pooled into one big sale.
-const OWN_KINDS = new Set(["mat"]);         // Stage 1 is materials only — see the ffish/pot note below
-// ffish is deliberately EXCLUDED: /world/fish/report records a generic "fish", never the species
-// (server.js:3317), so fantasy fish are not witnessed per-species and there is nothing to enforce
-// against yet. pot is excluded because potions are crafted, and crafting outputs are client-computed.
-// Enforcing either today would refuse honest sellers. They wait on the reward rolls moving server-side.
+const OWN_KINDS = new Set(FFISH_AUTHORITY ? ["mat", "ffish"] : ["mat"]);   // mutated by _setFfishAuthorityForTest
+// ffish is IN because the server now performs the catch roll itself (rollFantasyCatch) — a fantasy
+// fish is the primary ingredient of every egg, so it is the last thing that should have been taken on
+// the client's word. pot stays excluded: potions are crafted and crafting outputs are client-computed,
+// so enforcing them today would refuse honest sellers. That waits on craft rolls moving server-side.
 const UNWITNESSED_ALLOWANCE = 1500;         // per wallet per item; ~200 chests' worth, 13x under the qty cap
+const OWN_FFISH_OPEN_CAP = 60;              // a pre-epoch angler's legends; a Golden is 1-in-42 at best
 const OWN_OPEN_CAP = 6200;                 // the measured legitimate one-material ceiling (bag 1100 + tasks 9 + milestones ~45 + 25/wk raid over 200 weeks)
 // A wallet whose FIRST server-written save predates this is a real pre-existing player and gets a
 // one-time opening balance from that save. Anyone newer is covered by witnessed credits + allowance.
@@ -3526,9 +3594,14 @@ function _ownRow(w) {
   return r;
 }
 // Credit an acquisition the SERVER witnessed. Only ever called from a route that authorised the event.
+const ownItemOk = (kind, item) => (kind === "ffish" ? FFISH_SET.has(item) : MAT_IDS.has(item));
 function ownCredit(wallet, kind, item, n) {
   const w = String(wallet || "");
-  if (!isPubkey(w) || !OWN_KINDS.has(kind) || !MAT_IDS.has(item)) return;   // pubkeys only: a net_id is self-chosen
+  // CREDIT is always allowed for a kind we roll ourselves, even when ENFORCEMENT for it is still off —
+  // the book must already hold a player's real catches on the day the flag flips, or the flip refuses
+  // everyone. Enforcement reads OWN_KINDS; crediting deliberately does not.
+  const creditable = OWN_KINDS.has(kind) || kind === "ffish";
+  if (!isPubkey(w) || !creditable || !ownItemOk(kind, item)) return;   // pubkeys only: a net_id is self-chosen
   const q = Math.floor(Number(n));
   if (!Number.isFinite(q) || q <= 0) return;
   const r = _ownRow(w), k = ownKey(kind, item);
@@ -3538,7 +3611,7 @@ function ownCredit(wallet, kind, item, n) {
 // Record a completed SALE against the seller's lifetime total.
 function ownSold(wallet, kind, item, n) {
   const w = String(wallet || "");
-  if (!isPubkey(w) || !OWN_KINDS.has(kind) || !MAT_IDS.has(item)) return;
+  if (!isPubkey(w) || !OWN_KINDS.has(kind) || !ownItemOk(kind, item)) return;
   const q = Math.floor(Number(n));
   if (!Number.isFinite(q) || q <= 0) return;
   const r = _ownRow(w), k = ownKey(kind, item);
@@ -3552,7 +3625,7 @@ function ownSold(wallet, kind, item, n) {
 // stays closed.
 function ownDebit(wallet, kind, item, n) {
   const w = String(wallet || "");
-  if (!isPubkey(w) || !OWN_KINDS.has(kind) || !MAT_IDS.has(item)) return;
+  if (!isPubkey(w) || !OWN_KINDS.has(kind) || !ownItemOk(kind, item)) return;
   const q = Math.floor(Number(n));
   if (!Number.isFinite(q) || q <= 0) return;
   const r = _ownRow(w), k = ownKey(kind, item);
@@ -3580,7 +3653,12 @@ function ownAvailable(wallet, kind, item) {
   const cred = r ? (r.cred[k] || 0) : 0;
   const sold = r ? (r.sold[k] || 0) : 0;
   const used = r ? (r.used[k] || 0) : 0;
-  return (open + cred + UNWITNESSED_ALLOWANCE) - sold - used - ownEscrowed(wallet, kind, item);
+  // NO ALLOWANCE FOR FANTASY FISH. The allowance exists because real material arrives from chests,
+  // tasks and milestones the server never sees. A fantasy fish has exactly one source — a cast, which
+  // the server now rolls itself — so there is no unwitnessed channel to forgive, and forgiving 1500 of
+  // a 1-in-5000 fish would have been the whole exploit wearing a different hat.
+  const allow = kind === "ffish" ? 0 : UNWITNESSED_ALLOWANCE;
+  return (open + cred + allow) - sold - used - ownEscrowed(wallet, kind, item);
 }
 // ONE-TIME OPENING BALANCE. prev._serverSavedAt is the only clock the server writes itself
 // (safe._serverSavedAt = now, unconditional), so a client cannot forge its way into this branch —
@@ -3602,6 +3680,18 @@ function ownSnapshotOpening(wallet, mmo, prevSavedAt) {
       const q = Math.floor(Number(mats[m]));
       if (!Number.isFinite(q) || q <= 0) continue;
       r.open[ownKey("mat", m)] = Math.min(q, OWN_OPEN_CAP);
+    }
+  }
+  // A pre-epoch angler's caught legends are real property and must survive cutover — but capped hard,
+  // because these were client-recorded and a fantasy fish buys an egg. OWN_FFISH_OPEN_CAP is far above
+  // any plausible real holding (a Golden is 1-in-42 per cast at the very best) and far below a forgery.
+  const ff = (mmo && typeof mmo.ffish === "object" && mmo.ffish) || null;   // credited regardless of the flag, see ownCredit
+  if (ff) {
+    for (const sp of Object.keys(ff)) {
+      if (!FFISH_SET.has(sp)) continue;
+      const q = Math.floor(Number(ff[sp]));
+      if (!Number.isFinite(q) || q <= 0) continue;
+      r.open[ownKey("ffish", sp)] = Math.min(q, OWN_FFISH_OPEN_CAP);
     }
   }
   _ownSnapshots++; _ownDirty = true;
@@ -4130,6 +4220,14 @@ const EGG_CLAIM_MIN_MS = 5000;          // a human bartering at Mithra cannot be
 // NOT: /world/fish/report records a generic "fish" and never the species (server.js:3317), so the
 // server has never witnessed a golden chikifish. That half stays on the client until the catch roll
 // moves server-side. So this makes an egg cost real GATHERING; it does not yet make it cost a legend.
+// The fantasy fish each egg demands (Econ.gd EGG_RECIPE fish/fish_n; counts set by the owner
+// 2026-07-24). This is the PRIMARY ingredient — enforceable only because the server now rolls catches.
+const EGG_RECIPE_FISH = Object.freeze({
+  normal:    Object.freeze({ sp: "golden_chikifish", n: 3 }),
+  mount:     Object.freeze({ sp: "crystal_koi",      n: 2 }),
+  legendary: Object.freeze({ sp: "mystic_eel",       n: 1 }),
+  meme:      Object.freeze({ sp: "rainbow_fish",     n: 1 }),
+});
 const EGG_RECIPE_MATS = Object.freeze({
   normal:    Object.freeze({ wood: 30, berries: 24, essence: 8 }),
   mount:     Object.freeze({ seashell: 40, hide: 30, iron: 22, essence: 16 }),
@@ -4155,6 +4253,19 @@ app.post("/assets/egg/claim", (req, res) => {
   // CAN THIS WALLET AFFORD MITHRA'S PRICE? Fails OPEN while the book is loading — refusing a claim on
   // missing data would strand a real player's progression, which is worse than the egg.
   const _recipe = Object.hasOwn(EGG_RECIPE_MATS, kind) ? EGG_RECIPE_MATS[kind] : null;
+  const _fishReq = Object.hasOwn(EGG_RECIPE_FISH, kind) ? EGG_RECIPE_FISH[kind] : null;
+  if (_ffishAuth && _ownEnforce && _ownReady && _fishReq) {
+    // THE PRIMARY INGREDIENT. Now that the server rolls the catch, the legend it demands is one it
+    // witnessed itself — this is the half that was never enforceable before.
+    const haveF = ownAvailable(wallet, "ffish", _fishReq.sp);
+    if (haveF < _fishReq.n) {
+      _ownRefusals++;
+      return res.status(409).json({
+        error: `Mithra will not trade without the spark — she asks for ${_fishReq.n} ${_fishReq.sp.replace(/_/g, " ")}, and Chikoria has recorded you catching ${Math.max(0, haveF)}.`,
+        need: _fishReq.n, have: Math.max(0, haveF), fish: _fishReq.sp,
+      });
+    }
+  }
   if (_ownEnforce && _ownReady && _recipe) {
     for (const m of Object.keys(_recipe)) {
       const have = ownAvailable(wallet, "mat", m);
@@ -4166,8 +4277,9 @@ app.post("/assets/egg/claim", (req, res) => {
         });
       }
     }
-    // Charged only once every material cleared, so a partial payment is never taken.
+    // Charged only once every material AND the legend cleared, so a partial payment is never taken.
     for (const m of Object.keys(_recipe)) ownDebit(wallet, "mat", m, _recipe[m]);
+    if (_ffishAuth && _fishReq) ownDebit(wallet, "ffish", _fishReq.sp, _fishReq.n);
   } else if (_ownEnforce && !_ownReady) {
     _ownSkipped++;
   }
@@ -5525,7 +5637,7 @@ export function restoreOwnBook(v) {
         const cut = String(k).indexOf(":");
         if (cut < 1) continue;
         const kind = k.slice(0, cut), item = k.slice(cut + 1);
-        if (!OWN_KINDS.has(kind) || !MAT_IDS.has(item)) continue;
+        if (!OWN_KINDS.has(kind) || !ownItemOk(kind, item)) continue;
         const q = Number(src[k]);
         if (Number.isFinite(q) && q > 0) r[bucket][`${kind}:${item}`] = Math.min(q, Number.MAX_SAFE_INTEGER);
       }

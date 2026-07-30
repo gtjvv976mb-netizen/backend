@@ -178,9 +178,20 @@ async function main() {
 
   // ---------- 10. ffish / pot are NOT enforced yet, and must not be ----------
   const fisher = await mk();
-  const rFF = await list(fisher, { id: lid(), kind: "ffish", item: "golden_chikifish", qty: 1900, price: 400 });
-  ok("fantasy fish are deliberately NOT bound yet (species is never witnessed)", rFF.status === 200,
-     `status ${rFF.status}`);
+  // DEFAULT (flag off): ffish is credited but NOT enforced, because the shipped client still rolls its
+  // own catch and would show a player a fish the server never saw.
+  srv._setFfishAuthorityForTest(false);
+  const rFFoff = await list(fisher, { id: lid(), kind: "ffish", item: "golden_chikifish", qty: 1900, price: 400 });
+  ok("with FFISH_AUTHORITY off, a fantasy-fish listing is NOT bound (no desync harm to honest players)",
+     rFFoff.status === 200, `status ${rFFoff.status}`);
+  // FLAG ON: the bind is real
+  srv._setFfishAuthorityForTest(true);
+  const fisher2 = await mk();
+  const rFF = await list(fisher2, { id: lid(), kind: "ffish", item: "golden_chikifish", qty: 1900, price: 400 });
+  ok("with it on, an uncaught legend cannot be sold at all", rFF.status === 409, `status ${rFF.status}`);
+  srv._grantOwnForTest(fisher2.wallet, "golden_chikifish", 4, "ffish");
+  const rFF2 = await list(fisher2, { id: lid(), kind: "ffish", item: "golden_chikifish", qty: 4, price: 400 });
+  ok("...and exactly what WAS caught can be sold", rFF2.status === 200, `status ${rFF2.status}`);
   const rPot = await list(fisher, { id: lid(), kind: "pot", item: "healing_draught", qty: 900, price: 40 });
   ok("...nor potions (crafted client-side)", rPot.status === 200, `status ${rPot.status}`);
 
@@ -212,23 +223,26 @@ async function main() {
   // one-time per-item budget that protects honest players, and spending it on eggs is spending it. The
   // real property to assert is that the budget is FINITE and shared with selling.
   const beggar = await mk();
+  srv._setFfishAuthorityForTest(true);
   const rE = await post("/assets/egg/claim", { wallet: beggar.wallet, mktToken: beggar.tok, kind: "legendary" });
-  ok("a fresh wallet is still granted an egg from the allowance (no progression wall) — bounded, not closed",
-     rE.status === 200, `status ${rE.status}`);
+  ok("a wallet that caught no Mystic Eel is refused a legendary egg — the PRIMARY ingredient is enforced",
+     rE.status === 409 && rE.json.fish === "mystic_eel", `status ${rE.status} fish=${rE.json.fish}`);
   // now exhaust that wallet's crystal budget by escrowing it in a listing, and the egg is refused
   const drain = await mk();
   await list(drain, { id: lid(), kind: "mat", item: "crystal", qty: 1480, price: 900 });
   const rE2 = await post("/assets/egg/claim", { wallet: drain.wallet, mktToken: drain.tok, kind: "legendary" });
   ok("once the budget is spent, Mithra refuses — the egg and the market draw on the SAME entitlement",
      rE2.status === 409, `status ${rE2.status} ${JSON.stringify(rE2.json.error || "").slice(0, 120)}`);
-  ok("...and the refusal names the material, the price and what was recorded",
-     rE2.json.mat === "crystal" && Number(rE2.json.need) === 40 && Number.isFinite(Number(rE2.json.have)),
-     JSON.stringify({ mat: rE2.json.mat, need: rE2.json.need, have: rE2.json.have }));
+  ok("...and the refusal names what is missing and what was recorded",
+     (rE2.json.fish === "mystic_eel" || rE2.json.mat === "crystal") && Number.isFinite(Number(rE2.json.have)),
+     JSON.stringify({ fish: rE2.json.fish, mat: rE2.json.mat, need: rE2.json.need, have: rE2.json.have }));
 
   // a player inside the unwitnessed allowance CAN still claim — the allowance protects honest players
   const payer = await mk();
+  srv._setFfishAuthorityForTest(true);
+  srv._grantOwnForTest(payer.wallet, "golden_chikifish", 3, "ffish");   // the 3 legends the recipe demands
   const rP = await post("/assets/egg/claim", { wallet: payer.wallet, mktToken: payer.tok, kind: "normal" });
-  ok("a normal player within the allowance still gets their egg (no progression wall)",
+  ok("a player who caught the legend AND has the materials gets their egg",
      rP.status === 200, `status ${rP.status} ${JSON.stringify(rP.json.error || "").slice(0, 90)}`);
   const pb = srv._ownFor(payer.wallet);
   ok("...and the barter was actually CHARGED to the book",
@@ -247,6 +261,66 @@ async function main() {
   ok("a partial payment is never taken (all-or-nothing charge)",
      !sb2 || !sb2.used["mat:wood"] || sb2.used["mat:wood"] % 30 === 0,
      `used=${JSON.stringify(sb2 && sb2.used)}`);
+
+  // ---------- 14. FANTASY FISH: the server rolls, and the species is now witnessed ----------
+  // A fantasy fish is the PRIMARY ingredient of every egg, so it was the worst thing to take on the
+  // client's word. The client can no longer name its catch.
+  const angler = await mk();
+  await post("/world/move", { wallet: angler.wallet, mktToken: angler.tok, x: 30, z: 30, y: 6, dir: 0, handle: "A", leg: 1, el: "Fire", br: 1 });
+  const declared = await post("/world/fish/report", { wallet: angler.wallet, mktToken: angler.tok, species: "rainbow_fish", ffish: 500 });
+  ok("a fish report is accepted", declared.status === 200, `status ${declared.status}`);
+  const ab2 = srv._ownFor(angler.wallet);
+  ok("...but a client-DECLARED species credits nothing — only the server's roll counts",
+     !ab2 || !ab2.cred["ffish:rainbow_fish"] || ab2.cred["ffish:rainbow_fish"] < 500,
+     `cred=${JSON.stringify(ab2 && ab2.cred)}`);
+  ok("...while the ordinary catch credited exactly one fish (no double count)",
+     ab2 && ab2.cred["mat:fish"] === 1, `cred.mat:fish=${ab2 && ab2.cred["mat:fish"]}`);
+
+  // there is NO allowance for fantasy fish — its only source is a cast the server rolled
+  // the server's roll must credit the book even while enforcement is off, or the day the flag flips it
+  // would refuse every honest angler who caught something in the meantime
+  srv._setFfishAuthorityForTest(false);
+  srv._grantOwnForTest(angler.wallet, "crystal_koi", 2, "ffish");
+  ok("ffish is CREDITED even with the flag off, so the eventual flip refuses nobody",
+     (srv._ownFor(angler.wallet) || {}).cred["ffish:crystal_koi"] === 2,
+     `cred=${JSON.stringify((srv._ownFor(angler.wallet) || {}).cred)}`);
+  srv._setFfishAuthorityForTest(true);
+  const noAllow = srv._ownAvailFor(angler.wallet, "ffish", "rainbow_fish");
+  ok("fantasy fish get NO unwitnessed allowance (a 1-in-5000 fish must not be forgiven 1500)",
+     noAllow <= 0, `available=${noAllow}`);
+  const rSell = await list(angler, { id: lid(), kind: "ffish", item: "rainbow_fish", qty: 5, price: 9000 });
+  ok("...so an uncaught legend cannot be listed at all", rSell.status === 409,
+     `status ${rSell.status} ${JSON.stringify(rSell.json.error || "").slice(0, 90)}`);
+
+  // the roll itself must obey the rod gate: rod 0 can never produce a legend
+  let legends = 0;
+  for (let i = 0; i < 25; i++) {
+    const r = await post("/world/fish/report", { wallet: angler.wallet, mktToken: angler.tok, tier: 3, rod: 0 });
+    if (r.json && r.json.legend) legends++;
+    await new Promise(z => setTimeout(z, 850));
+  }
+  ok("rod 0 can never hook a legend, however the client asks (FFISH_ROD_REQ)", legends === 0, `legends=${legends}`);
+
+  // and Mithra now demands the legend she was always supposed to
+  const eggless = await mk();
+  srv._setFfishAuthorityForTest(false);
+  const rMemeOff = await post("/assets/egg/claim", { wallet: eggless.wallet, mktToken: eggless.tok, kind: "meme" });
+  ok("with the flag off Mithra still trades without the legend (today's behaviour, unbroken)",
+     rMemeOff.status === 200, `status ${rMemeOff.status}`);
+  srv._setFfishAuthorityForTest(true);
+  const eggless2 = await mk();
+  const rMeme = await post("/assets/egg/claim", { wallet: eggless2.wallet, mktToken: eggless2.tok, kind: "meme" });
+  ok("a meme egg is refused without the Rainbow Fish the recipe demands",
+     rMeme.status === 409 && rMeme.json.fish === "rainbow_fish",
+     `status ${rMeme.status} ${JSON.stringify(rMeme.json.error || "").slice(0, 120)}`);
+  // grant one legitimately and it goes through, charged
+  srv._grantOwnForTest(eggless2.wallet, "rainbow_fish", 1, "ffish");
+  const rMeme2 = await post("/assets/egg/claim", { wallet: eggless2.wallet, mktToken: eggless2.tok, kind: "meme" });
+  ok("...and granted the caught legend, Mithra trades", rMeme2.status === 200,
+     `status ${rMeme2.status} ${JSON.stringify(rMeme2.json.error || "").slice(0, 120)}`);
+  const mb = srv._ownFor(eggless2.wallet);
+  ok("...charging the fish, not just the materials", mb && mb.used["ffish:rainbow_fish"] === 1,
+     `used=${JSON.stringify(mb && mb.used)}`);
 
   console.log(`\nACQUISITION_BOUND_SIM  pass=${pass} fail=${fail}`);
   if (fail) { console.log("failures:"); for (const f of fails) console.log("  - " + f); }

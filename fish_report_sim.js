@@ -14,6 +14,9 @@ const B = `http://127.0.0.1:${process.env.PORT}`;
 const post = async (p, b) => { const r = await fetch(B + p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) }); return { status: r.status, body: await r.json() }; };
 const get = async (p) => { const r = await fetch(B + p); return { status: r.status, body: await r.json() }; };
 const SRV = await import("./server.js"); await new Promise(r => setTimeout(r, 1400));
+  // PREDATES THE ACQUISITION BOUND: this asserts on the observe-only oversold signal, which needs the
+  // listing to reach the board. The bound has its own sim.
+  SRV._setOwnEnforceForTest(false);
 
 let pass = 0, fail = 0;
 const chk = (c, m) => { c ? (pass++, console.log("  ok:", m)) : (fail++, console.log("  FAIL:", m)); };

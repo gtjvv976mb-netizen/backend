@@ -50,6 +50,7 @@ async function main() {
   const srv = await import("./server.js");
   await waitUp();
   srv._clearOwnBook();
+  srv._setFfishAuthorityForTest(false);   // this sim tests the MAGNITUDE cap, not the fish bind
   console.log("\n=== IMPOSSIBLE-QUANTITY LISTINGS ===\n");
 
   const mk = async () => {
