@@ -13,6 +13,11 @@ const post = async (p, b) => { const r = await fetch(B + p, { method: "POST", he
 const get = async (p) => { const r = await fetch(B + p); return { status: r.status, body: await r.json() }; };
 const SRV = await import("./server.js"); await new Promise(r => setTimeout(r, 1400));
 
+  // PREDATES THE ACQUISITION BOUND, and tests a different layer: these assertions need the listing to
+  // reach the board so the observe-only oversold signal can be examined. Turn enforcement off for this
+  // run rather than rewrite the assertions to match it — the bound has its own sim.
+  SRV._setOwnEnforceForTest(false);
+
 let pass = 0, fail = 0;
 const chk = (c, m) => { c ? (pass++, console.log("  ok:", m)) : (fail++, console.log("  FAIL:", m)); };
 const sec = (s) => console.log(`\n— ${s} —`);
@@ -309,11 +314,11 @@ sec("materials: the server now knows the honest ceiling, and reports what exceed
 
   // now list six figures of it — far past anything they pulled out of the ground
   await post("/market/op", { op: "list", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
-    listing: { id: "MAT-1", kind: "mat", item: "crystal", qty: 999999, price: 1000 } });
+    listing: { id: "MAT-1", kind: "mat", item: "crystal", qty: 19000, price: 1000 } });
   const sum = (await get("/assets/summary?key=test-admin-key")).body;
   const hit = (sum.oversoldMaterials || []).find(o => o.item === "crystal");
   chk(!!hit, `the admin report flags it (${JSON.stringify(hit || null)})`);
-  chk(hit && hit.listed === 999999 && hit.everGathered >= 1,
+  chk(hit && hit.listed === 19000 && hit.everGathered >= 1,
       `showing both numbers side by side (listed ${hit?.listed} vs gathered ${hit?.everGathered})`);
   // it must NOT block — materials also come from crafting, quests, chests and trades
   const board = await get("/market/list");

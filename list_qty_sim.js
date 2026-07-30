@@ -47,8 +47,9 @@ let seq = 0;
 const lid = () => "L" + (++seq) + "_" + crypto.randomBytes(3).toString("hex");
 
 async function main() {
-  await import("./server.js");
+  const srv = await import("./server.js");
   await waitUp();
+  srv._clearOwnBook();
   console.log("\n=== IMPOSSIBLE-QUANTITY LISTINGS ===\n");
 
   const mk = async () => {
@@ -62,6 +63,9 @@ async function main() {
 
   const a = await mk();
   ok("seller signed in with a market token", !!a.tok);
+  // This sim tests the MAGNITUDE cap, which now sits behind the acquisition bound. Grant the
+  // entitlement so a refusal here can only ever be the quantity ceiling under test.
+  for (const m of ["crystal", "wood", "stone", "honey"]) srv._grantOwnForTest(a.wallet, m, 60000);
 
   // ---------- 1. the attack: a fabricated hoard ----------
   const big = lid();
@@ -102,6 +106,7 @@ async function main() {
   // total 9, level milestones ~45 lifetime, weekly raid 25. A 200-week raider reaches ~6,150.
   const REAL_MAX = 1100 + 9 + 45 + 25 * 200;
   const honest = await mk();
+  for (const m of ["crystal", "wood", "stone"]) srv._grantOwnForTest(honest.wallet, m, 60000);
   const hid = lid();
   const rH = await list(honest, { id: hid, kind: "mat", item: "crystal", qty: REAL_MAX, price: 6000 });
   ok(`a four-year raider's whole crystal hoard (${REAL_MAX}) still lists`, rH.status === 200, `status ${rH.status}`);

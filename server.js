@@ -1371,6 +1371,10 @@ app.post("/profile", async (req, res) => {
     // firing on SIGNED saves whenever the ledger had not loaded — silently replacing the player's
     // new save with their previous one while answering 200 {ok:true}. That window is every deploy's
     // boot, and the whole process lifetime after a failed store read.
+    // THE ONE-TIME OPENING BALANCE. Taken from prev._serverSavedAt — the only clock the server writes
+    // itself — BEFORE this save overwrites it, so a pre-existing player's real hoard becomes sellable
+    // entitlement instead of being refused on cutover day.
+    if (hasMmo) ownSnapshotOpening(wallet, profile.mmo, prev && prev._serverSavedAt);
     if (hasMmo) safe.mmo = profile.mmo;                // the signed MMO cloud-save rides through verbatim
     else if (prev && prev.mmo) safe.mmo = prev.mmo;    // SECURITY: legacy (unsigned) writes must NOT wipe it
 
@@ -3114,6 +3118,17 @@ export function restoreWorldNodes(v, now = Date.now()) {
 
 // test seam: let a sim empty the live world without reaching into module internals
 export function _clearWorldNodes() { worldNodes.clear(); worldNodeUses.clear(); }
+// Sims that predate the acquisition bound test the observe-only oversold signal, which needs a
+// listing to actually reach the board. Granting entitlement directly keeps them fast — real gathering
+// is CLAIM_MIN_MS-paced — without weakening the live credit path, which only routes can reach.
+// Sims that predate the bound test a DIFFERENT layer (the observe-only oversold signal, the asset
+// perimeter) and need a listing to reach the board. They turn enforcement off explicitly rather than
+// have their assertions quietly rewritten to match it. Never reachable from a request.
+export function _setOwnEnforceForTest(on) { _ownEnforce = !!on; return _ownEnforce; }
+export function _grantOwnForTest(w, item, n, kind = "mat") { ownCredit(String(w), kind, item, n); return n; }
+export function _clearOwnBook() { ownBook.clear(); _ownWorst.clear(); _ownRefusals = 0; _ownSkipped = 0; _ownSnapshots = 0; _ownReady = true; _ownEnforce = true; }
+export function _ownFor(w) { const r = ownBook.get(String(w)); return r ? { open: r.open, cred: r.cred, sold: r.sold, used: r.used, openSrc: r.openSrc } : null; }
+export function _ownAvailFor(w, kind, item) { return ownAvailable(String(w), kind, item); }
 
 async function saveWorldNodes() {
   if (!_nodesDirty) return;
@@ -3347,7 +3362,11 @@ app.post("/world/kill/report", (req, res) => {
   _lastKillRec.set(String(b.wallet), now);
   if (_lastKillRec.size > 20000) { for (const [k, t] of _lastKillRec) { if (now - t > 120000) _lastKillRec.delete(k); } }
   // record the per-kill ceiling of essence — pubkey-only inside recordGather, net_id kills ignored
-  recordGather(String(b.wallet), "essence", new Array(ESSENCE_PER_KILL).fill("essence"));
+  // The ceiling (6) is for the observe-only tally ONLY. The book gets ONE essence per counted kill:
+  // at KILL_REC_MIN_MS 500 the ceiling would have been 43,200 essence/hour of sellable credit on a
+  // wallet that never fought anything, because this route verifies no combat whatsoever.
+  recordGather(String(b.wallet), "essence", new Array(ESSENCE_PER_KILL).fill("essence"), false);
+  ownCredit(String(b.wallet), "mat", "essence", 1);
   res.json({ ok: true, counted: true });
 });
 
@@ -3442,6 +3461,151 @@ function _flowAdd(map, wallet, mat, n) {
   g[mat] = (g[mat] || 0) + n;
 }
 export function _flowFor(wallet) { return { spent: matSpent.get(wallet) || null, gained: matGained.get(wallet) || null }; }
+
+// ============ THE ACQUISITION BOUND — you may not sell more than Chikoria saw you get ============
+// THE INVARIANT, and it is worth stating in the owner's own words rather than mine:
+//   No wallet may sell, in total, more of an item than this server recorded it acquiring.
+//
+// This is a LIFETIME ACQUISITION BOUND, not provenance. Say it that way. It closes the fabricated-save
+// class completely — the mmo blob rides through /profile verbatim (safe.mmo = profile.mmo) and nothing
+// clamps mmo.mats, so before this a save could simply assert a hoard and sell it for real $CHIKI. It
+// does NOT close botted-but-witnessed acquisition: material a wallet really did claim from real nodes
+// is real material, however it was driven. No server-side rule can tell those apart, and pretending
+// otherwise would be the security theatre this is meant to replace.
+//
+// MONOTONE BY DESIGN:  available = open + cred + ALLOWANCE − sold − escrowNow
+// `cred` only grows and `sold` only grows. Material SPENDS ARE NEVER DEBITED. That is a deliberate
+// over-credit in the player's favour, and it buys something specific: it removes the entire
+// "declare a spend, then re-declare the stock" laundering direction, and it makes the flow channel's
+// unreliability harmless. A player who crafts away their wood keeps the right to have sold it. The
+// bound is on lifetime sales, not on a live inventory the server cannot see.
+//
+// CREDITS COME ONLY FROM EVENTS THE SERVER ITSELF AUTHORISED:
+//   * a node claim  — position-checked against the server's own record of where you are, and the
+//     game's hard rule is exactly one item per gather, so a claim IS an exact unit of acquisition
+//   * a counted fish report / kill report — ONE unit each. Note kills credit 1, never
+//     ESSENCE_PER_KILL (6): that constant is a deliberately over-generous CEILING built for an
+//     observe-only signal, and at KILL_REC_MIN_MS 500 it would have been 43,200 essence/hour on a
+//     free wallet. An enforcement path must never share a constant with a telemetry ceiling.
+//   * a purchase — you bought it here, so you own it here
+// Declared /world/mat/flow gains are NOT credited. They are client-authored: presenceOk proves who
+// is talking, never that the goods were earned. One batch could assert FLOW_EV_MAX × MAT_IDS ×
+// FLOW_QTY_MAX units.
+//
+// SO WHAT ABOUT REAL UNWITNESSED MATERIAL? It exists and it is SMALL, measured from the real tables:
+// all 12 TASKS together grant 9, level milestones about 45 across a whole lifetime, a treasure chest
+// 4–8 of one material (Profile.gd:2526) or 6 crystal, plus craft refunds bounded by what was spent.
+// UNWITNESSED_ALLOWANCE covers all of it with a wide margin instead of refusing an honest player,
+// and it is per (wallet, item) so it cannot be pooled into one big sale.
+const OWN_KINDS = new Set(["mat"]);         // Stage 1 is materials only — see the ffish/pot note below
+// ffish is deliberately EXCLUDED: /world/fish/report records a generic "fish", never the species
+// (server.js:3317), so fantasy fish are not witnessed per-species and there is nothing to enforce
+// against yet. pot is excluded because potions are crafted, and crafting outputs are client-computed.
+// Enforcing either today would refuse honest sellers. They wait on the reward rolls moving server-side.
+const UNWITNESSED_ALLOWANCE = 1500;         // per wallet per item; ~200 chests' worth, 13x under the qty cap
+const OWN_OPEN_CAP = 6200;                 // the measured legitimate one-material ceiling (bag 1100 + tasks 9 + milestones ~45 + 25/wk raid over 200 weeks)
+// A wallet whose FIRST server-written save predates this is a real pre-existing player and gets a
+// one-time opening balance from that save. Anyone newer is covered by witnessed credits + allowance.
+const OWN_EPOCH_MS = Date.parse("2026-07-31T00:00:00Z");
+const ownBook = new Map();                  // wallet -> { open:{key:n}, cred:{key:n}, sold:{key:n}, openSrc:ms }
+let _ownReady = false;                      // its own flag — never ride _assetsReady
+let _ownDirty = false;                      // set by every credit/sale/opening; flushed with the board
+let _ownEnforce = true;                     // test-only switch (see _setOwnEnforceForTest); always on in production
+let _ownRefusals = 0, _ownSkipped = 0, _ownSnapshots = 0;
+const _ownWorst = new Map();                // wallet -> {short, item, asked, had} (bounded)
+const ownKey = (kind, item) => `${kind}:${item}`;
+function _ownRow(w) {
+  let r = ownBook.get(w);
+  if (r) return r;
+  if (ownBook.size >= GATHER_WALLETS_MAX) {   // same evict-oldest policy as every per-wallet map here
+    let drop = Math.max(1, Math.floor(GATHER_WALLETS_MAX * 0.05));
+    for (const k of ownBook.keys()) { if (drop-- <= 0) break; ownBook.delete(k); }
+  }
+  r = { open: Object.create(null), cred: Object.create(null), sold: Object.create(null), used: Object.create(null), openSrc: 0 };
+  ownBook.set(w, r);
+  return r;
+}
+// Credit an acquisition the SERVER witnessed. Only ever called from a route that authorised the event.
+function ownCredit(wallet, kind, item, n) {
+  const w = String(wallet || "");
+  if (!isPubkey(w) || !OWN_KINDS.has(kind) || !MAT_IDS.has(item)) return;   // pubkeys only: a net_id is self-chosen
+  const q = Math.floor(Number(n));
+  if (!Number.isFinite(q) || q <= 0) return;
+  const r = _ownRow(w), k = ownKey(kind, item);
+  r.cred[k] = Math.min((r.cred[k] || 0) + q, Number.MAX_SAFE_INTEGER);
+  _ownDirty = true;
+}
+// Record a completed SALE against the seller's lifetime total.
+function ownSold(wallet, kind, item, n) {
+  const w = String(wallet || "");
+  if (!isPubkey(w) || !OWN_KINDS.has(kind) || !MAT_IDS.has(item)) return;
+  const q = Math.floor(Number(n));
+  if (!Number.isFinite(q) || q <= 0) return;
+  const r = _ownRow(w), k = ownKey(kind, item);
+  r.sold[k] = Math.min((r.sold[k] || 0) + q, Number.MAX_SAFE_INTEGER);
+  _ownDirty = true;
+}
+// Consume material into a sink the SERVER itself authorised (today: Mithra's egg barter). This is not
+// the same thing as a client-DECLARED spend, which is still never debited — the client cannot reach
+// this, because the server decides that the egg was issued. So the book still only ever moves on
+// events this server authorised, in either direction, and the declare-a-spend laundering direction
+// stays closed.
+function ownDebit(wallet, kind, item, n) {
+  const w = String(wallet || "");
+  if (!isPubkey(w) || !OWN_KINDS.has(kind) || !MAT_IDS.has(item)) return;
+  const q = Math.floor(Number(n));
+  if (!Number.isFinite(q) || q <= 0) return;
+  const r = _ownRow(w), k = ownKey(kind, item);
+  r.used[k] = Math.min((r.used[k] || 0) + q, Number.MAX_SAFE_INTEGER);
+  _ownDirty = true;
+}
+// ESCROW IS NOT STORED. It is derived from the live board every time it is asked for. Every exit path
+// a listing has — cancel, TTL prune, the 400-row cap shift, a sale, an order decline or undeliver —
+// already removes the row, so escrow releases itself with zero bookkeeping and can never be
+// double-released, leaked, or forgotten across a restart. Storing it was the first thing the
+// adversarial pass broke.
+function ownEscrowed(wallet, kind, item) {
+  let n = 0;
+  for (const row of marketListings) {
+    if (String(row.wallet || "") !== wallet) continue;
+    if (String(row.kind || "mat") !== kind || String(row.item || "") !== item) continue;
+    n += Math.max(0, Number(row.qty) || 0);
+  }
+  return n;
+}
+function ownAvailable(wallet, kind, item) {
+  const r = ownBook.get(wallet);
+  const k = ownKey(kind, item);
+  const open = r ? (r.open[k] || 0) : 0;
+  const cred = r ? (r.cred[k] || 0) : 0;
+  const sold = r ? (r.sold[k] || 0) : 0;
+  const used = r ? (r.used[k] || 0) : 0;
+  return (open + cred + UNWITNESSED_ALLOWANCE) - sold - used - ownEscrowed(wallet, kind, item);
+}
+// ONE-TIME OPENING BALANCE. prev._serverSavedAt is the only clock the server writes itself
+// (safe._serverSavedAt = now, unconditional), so a client cannot forge its way into this branch —
+// unlike store.firstSeen, which /verify INSERTs for an unsigned address-only POST and which returns 0
+// for a wallet that never called /verify, putting a brand-new wallet in the grandfathered branch.
+// Capped per item at OWN_OPEN_CAP so a hoard fabricated just before cutover buys a bounded amount,
+// and taken ONCE (openSrc set) so a later save can never top it up.
+function ownSnapshotOpening(wallet, mmo, prevSavedAt) {
+  if (!_ownReady || !isPubkey(String(wallet || ""))) return;
+  const prev = Number(prevSavedAt) || 0;
+  if (!prev || prev >= OWN_EPOCH_MS) return;      // new account: witnessed credits + allowance cover it
+  const r = _ownRow(String(wallet));
+  if (r.openSrc) return;                          // already taken — never again
+  const mats = (mmo && typeof mmo.mats === "object" && mmo.mats) || null;
+  r.openSrc = prev;
+  if (mats) {
+    for (const m of Object.keys(mats)) {
+      if (!MAT_IDS.has(m)) continue;
+      const q = Math.floor(Number(mats[m]));
+      if (!Number.isFinite(q) || q <= 0) continue;
+      r.open[ownKey("mat", m)] = Math.min(q, OWN_OPEN_CAP);
+    }
+  }
+  _ownSnapshots++; _ownDirty = true;
+}
 // A value the client sent may be a hostile OBJECT, and both String(x) and Number(x) invoke its
 // toString/valueOf — so `{"toString":1,"valueOf":1}` throws a TypeError inside the handler. That
 // answered 500, aborted the batch mid-loop (dropping the honest events after the poison), and burnt
@@ -3500,7 +3664,17 @@ app.get("/assets/audit", (req, res) => {
   // self-service oracle telling a cheater the exact moment the ledger was empty — i.e. when a
   // forged roster would be grandfathered. It is the defender's blind spot, reported to the
   // attacker on request. A ledger that has not restored yet answers 503 instead.
-  if (!_assetsReady) return res.status(503).json({ error: "asset ledger is still loading" });
+  // ...and a distinct 503 was still distinguishing them. `known:false` was replaced by a status code
+  // that says the same thing in a different alphabet: poll this until it stops 503ing and you have
+  // found the window where auditAssets is skipped and nothing flushes (see _assetsReady, below).
+  // A non-admin caller now gets the SAME shape a wallet with no record gets, so the two are genuinely
+  // indistinguishable — which is what the paragraph above always meant. The telemetry maps restore
+  // with the ledger, so they are empty in this window anyway; the response is honest, just not
+  // diagnostic. An ADMIN still gets the truth, because an operator debugging a cold boot needs it.
+  if (!_assetsReady) {
+    if (admin) return res.status(503).json({ error: "asset ledger is still loading" });
+    return res.json({ wallet: w, units: {}, mounts: {}, unverified: 0, gathered: {}, spent: {}, gained: {} });
+  }
   const rec = assetLedger.get(w);
   // A wallet with no ledger record still has telemetry — and that shape (activity, no cloud save) is
   // exactly the bot shape most worth reviewing. Returning bare zeros here hid it from the one view
@@ -3561,6 +3735,11 @@ app.get("/assets/summary", (req, res) => {
              // Refused for an impossible quantity (LIST_QTY_MAX). Unlike oversoldMaterials — which is
              // a soft signal, since materials also arrive from crafting/quests/chests/trades — every
              // row here is a listing the game could not have produced, so it names an actual attempt.
+             // The acquisition bound. `skipped` is the one to watch: a nonzero value means listings went
+             // through unchecked because the book had not restored, which is safe but not enforcing.
+             acquisitionBound: { enforcing: _ownReady, refused: _ownRefusals, skipped: _ownSkipped,
+                                 openings: _ownSnapshots, wallets: ownBook.size,
+                                 worst: [..._ownWorst.values()].sort((a, b) => (b.asked - b.had) - (a.asked - a.had)).slice(0, 20) },
              impossibleListings: { refused: _overQtyListings, sellers: _overQtyBy.size,
                                    worst: [..._overQtyBy].sort((a, b) => b[1].worst - a[1].worst).slice(0, 20)
                                      .map(([w, r]) => ({ w: String(w).slice(0, 8), tried: r.worst, item: r.item, kind: r.kind, attempts: r.n })) },
@@ -3763,7 +3942,9 @@ function _tallyRow(map, wallet) {
   g = Object.create(null); map.set(wallet, g);
   return g;
 }
-function recordGather(wallet, kind, drop) {
+// creditOwn=false for callers whose per-unit count is a deliberately inflated telemetry CEILING
+// rather than a real acquisition (the kill report's ESSENCE_PER_KILL). Default true: a node claim.
+function recordGather(wallet, kind, drop, creditOwn = true) {
   if (!isPubkey(String(wallet || "")) || !kind) return;
   // Count the MATERIALS, not the node kind. The oversold check compares this against what a wallet
   // lists for sale, and nobody sells a "cow" — they sell beef and hide.
@@ -3771,6 +3952,11 @@ function recordGather(wallet, kind, drop) {
   const g = _tallyRow(gatherCount, wallet);
   for (const m of mats) g[m] = (g[m] || 0) + 1;
   _assetsDirty = true;
+  // THE ACQUISITION BOUND'S ONLY BULK CREDIT. A node claim is position-authorised against the
+  // server's own record of where this wallet is, and one gather is exactly one item, so each entry
+  // here is one witnessed unit. gatherCount keeps its own over-generous counts for the observe-only
+  // oversold signal; the book gets the honest one. They must not share a number.
+  if (creditOwn) for (const m of mats) ownCredit(wallet, "mat", m, 1);
 }
 export function _gatheredFor(wallet) { return gatherCount.get(wallet) || null; }
 
@@ -3932,6 +4118,24 @@ function regWallet(req) {
   return mktWallet({ wallet: w, mktToken: String(b.mktToken || "") });
 }
 const EGG_CLAIM_MIN_MS = 5000;          // a human bartering at Mithra cannot beat this
+// MITHRA'S PRICE, MIRRORED SERVER-SIDE (Econ.gd EGG_RECIPE). The route below used to charge nothing:
+// its comment said "the client has already taken the barter from the player's own inventory", so the
+// server owned the identity and the clock but not whether anyone had actually PAID. A proven wallet
+// could claim an egg every 5s — 15/day once the EGG_HOURS walls are accounted for — hatch it, and
+// receive a chikimon minted with clean "issued" provenance. That creature then passes
+// chikimonSaleBlocked and sells for real $CHIKI, which is a bypass straight THROUGH the acquisition
+// bound: the fraud happens at claim time and the registry certifies it afterwards.
+//
+// The MATERIAL half is enforceable and is now enforced against the book. THE FANTASY FISH HALF IS
+// NOT: /world/fish/report records a generic "fish" and never the species (server.js:3317), so the
+// server has never witnessed a golden chikifish. That half stays on the client until the catch roll
+// moves server-side. So this makes an egg cost real GATHERING; it does not yet make it cost a legend.
+const EGG_RECIPE_MATS = Object.freeze({
+  normal:    Object.freeze({ wood: 30, berries: 24, essence: 8 }),
+  mount:     Object.freeze({ seashell: 40, hide: 30, iron: 22, essence: 16 }),
+  legendary: Object.freeze({ crystal: 40, gold: 30, essence: 26 }),
+  meme:      Object.freeze({ crystal: 50, honey: 34, berries: 40, essence: 34 }),
+});
 const _lastEggClaim = new Map();
 
 // Issue an egg. The client has already taken the barter from the player's own inventory; what the
@@ -3947,6 +4151,25 @@ app.post("/assets/egg/claim", (req, res) => {
   // the client's own rule: one egg of each kind at a time (Profile.gd start_egg)
   if (regOwned(wallet, "egg").some(e => e.kind === kind)) {
     return res.status(409).json({ error: "your nest already cradles an egg of that kind" });
+  }
+  // CAN THIS WALLET AFFORD MITHRA'S PRICE? Fails OPEN while the book is loading — refusing a claim on
+  // missing data would strand a real player's progression, which is worse than the egg.
+  const _recipe = Object.hasOwn(EGG_RECIPE_MATS, kind) ? EGG_RECIPE_MATS[kind] : null;
+  if (_ownEnforce && _ownReady && _recipe) {
+    for (const m of Object.keys(_recipe)) {
+      const have = ownAvailable(wallet, "mat", m);
+      if (have < _recipe[m]) {
+        _ownRefusals++;
+        return res.status(409).json({
+          error: `Mithra counts your offering and shakes her head — you need ${_recipe[m]} ${m}, and Chikoria has recorded you acquiring ${Math.max(0, have)}.`,
+          need: _recipe[m], have: Math.max(0, have), mat: m,
+        });
+      }
+    }
+    // Charged only once every material cleared, so a partial payment is never taken.
+    for (const m of Object.keys(_recipe)) ownDebit(wallet, "mat", m, _recipe[m]);
+  } else if (_ownEnforce && !_ownReady) {
+    _ownSkipped++;
   }
   _lastEggClaim.set(wallet, now);
   let row;
@@ -4385,6 +4608,15 @@ export function _endAuctionForTest(id) {
   return true;
 }
 export function _setWalletFirstSeenForTest(w, ts) { _testFirstSeen.set(w, ts); return ts; }
+// The acquisition bound's opening balance keys off prev._serverSavedAt, which the server writes
+// itself and a test therefore cannot produce by simply saving. Same seam pattern as above.
+export async function _setServerSavedAtForTest(w, ts) {
+  const pr = await store.getProfile(w);
+  if (!pr) return 0;
+  pr._serverSavedAt = Number(ts) || 0;
+  await store.setProfile(w, pr);
+  return pr._serverSavedAt;
+}
 const _testFirstSeen = new Map();
 
 // ============ ASSET AUTHENTICITY LEDGER ============
@@ -5095,6 +5327,11 @@ app.post("/market/buy-onchain", async (req, res) => {
   // $CHIKI split. It is what lets the ledger stamp the buyer's new unit "purchased" instead of
   // condemning every honest Trading Post buyer as unverified.
   recordAssetBuy(buyer, row.kind, row.item, row.lvl);
+  // THE ACQUISITION BOUND. Reached only after txMarketSplit confirmed a real on-chain $CHIKI split,
+  // so this is a settled sale: it counts against the seller's lifetime total, and the buyer genuinely
+  // acquired the goods HERE, which is the strongest provenance a material can have.
+  ownSold(sellerWallet, String(row.kind || "mat"), String(row.item || ""), Number(row.qty) || 0);
+  ownCredit(buyer, String(row.kind || "mat"), String(row.item || ""), Number(row.qty) || 0);
   _usedTxSigs.set(sig, { listingId: id, buyer, released, ts: Date.now() });   // cache release for idempotent retry
   saveUsedSigs();
   // record the sale so the SELLER'S client shows the on-chain proceeds landed
@@ -5263,6 +5500,49 @@ function _capAuctions() {
   }
   return marketAuctions.slice(-AUCTION_PERSIST_MAX);
 }
+function serializeOwnBook() {
+  const out = [];
+  for (const [w, r] of ownBook) out.push([w, { open: r.open, cred: r.cred, sold: r.sold, used: r.used, openSrc: r.openSrc || 0 }]);
+  return out.slice(-GATHER_WALLETS_MAX);
+}
+// RESTORE TRUSTS NOTHING. This blob came out of a database a future bug could corrupt, and it now
+// carries SELLING RIGHTS, so it gets the same rules the live paths enforce: keys must be a real kind
+// and a real material, numbers must be finite and positive, wallets bounded. A count mismatch is
+// announced rather than swallowed — silently restoring fewer rows would hand players back a smaller
+// entitlement than they earned, which reads to them exactly like a wipe.
+export function restoreOwnBook(v) {
+  if (!Array.isArray(v)) { _ownReady = true; return 0; }
+  let n = 0;
+  for (const e of v) {
+    if (!Array.isArray(e) || !e[1] || typeof e[1] !== "object") continue;
+    const w = String(e[0] || "").slice(0, 64);
+    if (!isPubkey(w)) continue;
+    const r = { open: Object.create(null), cred: Object.create(null), sold: Object.create(null), used: Object.create(null), openSrc: 0 };
+    for (const bucket of ["open", "cred", "sold", "used"]) {
+      const src = e[1][bucket];
+      if (!src || typeof src !== "object") continue;
+      for (const k of Object.keys(src).filter(k => Object.hasOwn(src, k)).slice(0, 64)) {
+        const cut = String(k).indexOf(":");
+        if (cut < 1) continue;
+        const kind = k.slice(0, cut), item = k.slice(cut + 1);
+        if (!OWN_KINDS.has(kind) || !MAT_IDS.has(item)) continue;
+        const q = Number(src[k]);
+        if (Number.isFinite(q) && q > 0) r[bucket][`${kind}:${item}`] = Math.min(q, Number.MAX_SAFE_INTEGER);
+      }
+    }
+    const os = Number(e[1].openSrc);
+    r.openSrc = Number.isFinite(os) && os > 0 ? os : 0;
+    ownBook.set(w, r); n++;
+  }
+  if (n !== v.length) console.error(`restoreOwnBook: kept ${n} of ${v.length} rows — the remainder failed validation`);
+  _ownReady = true;
+  return n;
+}
+store.kvGet("own_book").then(v => restoreOwnBook(v)).catch(() => { _ownReady = true; });
+// A restore that never resolves must not leave enforcement permanently skipped OR permanently on a
+// half-book: the .catch above and this backstop both flip the flag, and a skip is counted either way.
+setTimeout(() => { if (!_ownReady) { _ownReady = true; console.error("own_book restore timed out — enforcing on what restored"); } }, 20000);
+
 async function saveMarket() {
   try {
     await Promise.all([
@@ -5280,6 +5560,10 @@ async function saveMarket() {
       store.kvSet("market_auctions", _capAuctions()),
       store.kvSet("auction_refunds", auctionRefunds),
       store.kvSet("market_sold_ids", [..._soldListings].slice(-25000).map(([id, ts]) => ({ id, ts }))),
+      // THE BOOK RIDES WITH THE BOARD. Escrow is derived from marketListings, so a book persisted on a
+      // different schedule than the listings it is read against would restore inconsistent. /market/op
+      // awaits this on every op, including list.
+      store.kvSet("own_book", serializeOwnBook()),
     ]);
   } catch (e) { console.warn("saveMarket persist failed:", String(e?.message || e)); }
 }
@@ -5572,6 +5856,33 @@ app.post("/market/op", async (req, res) => {
         // already taken the goods out of their bag locally — so say how to get them back.
         return res.status(409).json({ error: `A ${_lk} listing cannot exceed ${LIST_QTY_MAX[_lk]}. Cancel the listing to put your goods back in your bag, then list a smaller amount.`, max: LIST_QTY_MAX[_lk] });
       }
+      // ---- THE ACQUISITION BOUND: you may not sell more than Chikoria saw you acquire ----
+      // FAILS OPEN, always. If the book has not restored yet we do not know what this wallet acquired,
+      // and refusing on missing data is how a migration destroys a real player's afternoon. The skip
+      // is COUNTED so the operator can see it rather than discover it.
+      const _ow = mktWallet(b);
+      if (_ownEnforce && OWN_KINDS.has(_lk) && isPubkey(String(_ow || ""))) {
+        if (!_ownReady) {
+          _ownSkipped++;
+        } else {
+          const _item = stripTags(String(l.item || "")).slice(0, 24);
+          const _avail = ownAvailable(_ow, _lk, _item);
+          if (_lq > _avail) {
+            _ownRefusals++;
+            const _row = _ownWorst.get(_ow) || { short: String(_ow).slice(0, 8), item: "", asked: 0, had: 0, n: 0 };
+            _row.n++;
+            if (_lq - _avail > _row.asked - _row.had) { _row.item = _item; _row.asked = _lq; _row.had = Math.max(0, _avail); }
+            _ownWorst.set(_ow, _row);
+            if (_ownWorst.size > 5000) { let d = 250; for (const k of _ownWorst.keys()) { if (d-- <= 0) break; _ownWorst.delete(k); } }
+            // The client shows this verbatim (Market.gd:836) and has already taken the goods out of
+            // the bag, so it must say how to get them back — cancel can now actually do that.
+            return res.status(409).json({
+              error: `Chikoria has only recorded you acquiring ${Math.max(0, _avail)} of that. Cancel the listing to put your goods back in your bag.`,
+              available: Math.max(0, _avail),
+            });
+          }
+        }
+      }
       // THE FLAG NEEDS A CONSUMER. A chikimon listing settles through /market/buy-onchain into a
       // real 75/20/5 $CHIKI transfer, so this is where a forged roster becomes money — and the
       // list op never asked whether the seller owns the creature. The ledger already knows.
@@ -5628,7 +5939,12 @@ app.post("/market/op", async (req, res) => {
     }
     const before = marketListings.length;
     marketListings = marketListings.filter(x => x.id !== id);
-    if (marketListings.length < before) _consumeListing(id);   // only a REAL removed row enters the guard
+    if (marketListings.length < before) {
+      _consumeListing(id);   // only a REAL removed row enters the guard
+      // Same bookkeeping as the on-chain path. The buyer here is a sid, not necessarily a wallet, so
+      // only the SELLER's side is recordable — ownCredit ignores anything that is not a pubkey anyway.
+      if (row) ownSold(String(row.wallet || ""), String(row.kind || "mat"), String(row.item || ""), Number(row.qty) || 0);
+    }
   } else if (op === "cancel" || op === "sold") {
     const id = stripTags(String(l.id || "")).slice(0, 40);
     const before = marketListings.length;

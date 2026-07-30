@@ -17,6 +17,11 @@ const postRaw = async (p, text) => { const r = await fetch(B + p, { method: "POS
 const get = async (p) => { const r = await fetch(B + p); let j; try { j = await r.json(); } catch { j = null; } return { status: r.status, body: j }; };
 const SRV = await import("./server.js"); await new Promise(r => setTimeout(r, 1400));
 
+  // PREDATES THE ACQUISITION BOUND, and tests a different layer: these assertions need the listing to
+  // reach the board so the observe-only oversold signal can be examined. Turn enforcement off for this
+  // run rather than rewrite the assertions to match it — the bound has its own sim.
+  SRV._setOwnEnforceForTest(false);
+
 let pass = 0, fail = 0; const holes = [];
 const chk = (c, m) => { c ? (pass++, console.log("  ok  :", m)) : (fail++, console.log("  FAIL:", m)); };
 const hole = (m) => { holes.push(m); console.log("  HOLE:", m); };
@@ -95,8 +100,8 @@ sec("ATTACK 1 — THE LAUNDERING GUARD: can a declared GAIN ever become evidence
   chk((gath(C).crystal || 0) === 0, `gatherCount.crystal STILL 0 (actual ${gath(C).crystal || 0})`);
 
   // 1c. the money shot: list a forged stockpile and see whether the oversold flag survives
-  const L = await listMat(C, "crystal", 500000);
-  chk(L.status === 200, `the 500,000-crystal listing was accepted by the market (status ${L.status})`);
+  const L = await listMat(C, "crystal", 19000);
+  chk(L.status === 200, `the 19,000-crystal listing was accepted by the market (status ${L.status})`);
   const sum = await summary();
   const row = oversoldFor(sum, C, "crystal");
   chk(!!row, `the listing is STILL flagged oversold — declared gains bought nothing (row ${JSON.stringify(row)})`);
@@ -123,15 +128,15 @@ sec("ATTACK 1 — THE LAUNDERING GUARD: can a declared GAIN ever become evidence
   //     a PLAIN object, so for a wallet with NO gather record, item "toString" resolves a function.
   const X = await mkWallet("ProtoItem");
   chk(SRV._gatheredFor(X.wallet) === null, `the evader has no gatherCount row at all (${SRV._gatheredFor(X.wallet)})`);
-  await listMat(X, "toString", 999999);
-  await listMat(X, "constructor", 999999);
-  await listMat(X, "wood", 999999);        // control: a REAL material must still be flagged
+  await listMat(X, "toString", 19000);
+  await listMat(X, "constructor", 19000);
+  await listMat(X, "wood", 19000);        // control: a REAL material must still be flagged
   const sx = await summary();
   const rTo = oversoldFor(sx, X, "toString"), rCo = oversoldFor(sx, X, "constructor"), rWo = oversoldFor(sx, X, "wood");
-  console.log(`     JS: ({})["toString"] is ${typeof ({})["toString"]}; Math.max(50, that*10) = ${Math.max(50, ({}).toString * 10)}; 999999 > NaN = ${999999 > Math.max(50, ({}).toString * 10)}`);
-  chk(!!rWo, `CONTROL: the same wallet's 999,999 WOOD listing IS flagged (${JSON.stringify(rWo)})`);
+  console.log(`     JS: ({})["toString"] is ${typeof ({})["toString"]}; Math.max(50, that*10) = ${Math.max(50, ({}).toString * 10)}; 19000 > NaN = ${19000 > Math.max(50, ({}).toString * 10)}`);
+  chk(!!rWo, `CONTROL: the same wallet's 19,000 WOOD listing IS flagged (${JSON.stringify(rWo)})`);
   if (!rTo || !rCo) {
-    hole(`server.js:3412 oversold check — the \`|| {}\` fallback is a PLAIN object, so a prototype-named item id escapes the flag entirely for any wallet with no gatherCount row: item "toString" flagged=${!!rTo}, item "constructor" flagged=${!!rCo}, while item "wood" flagged=${!!rWo} at the same qty (999999).`);
+    hole(`server.js:3412 oversold check — the \`|| {}\` fallback is a PLAIN object, so a prototype-named item id escapes the flag entirely for any wallet with no gatherCount row: item "toString" flagged=${!!rTo}, item "constructor" flagged=${!!rCo}, while item "wood" flagged=${!!rWo} at the same qty (19000).`);
   } else {
     chk(true, `prototype-named item ids are still flagged (toString ${JSON.stringify(rTo)})`);
   }

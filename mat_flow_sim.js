@@ -18,6 +18,11 @@ const post = async (p, b) => { const r = await fetch(B + p, { method: "POST", he
 const get = async (p) => { const r = await fetch(B + p); return { status: r.status, body: await r.json() }; };
 const SRV = await import("./server.js"); await new Promise(r => setTimeout(r, 1400));
 
+  // PREDATES THE ACQUISITION BOUND, and tests a different layer: these assertions need the listing to
+  // reach the board so the observe-only oversold signal can be examined. Turn enforcement off for this
+  // run rather than rewrite the assertions to match it — the bound has its own sim.
+  SRV._setOwnEnforceForTest(false);
+
 let pass = 0, fail = 0;
 const chk = (c, m) => { c ? (pass++, console.log("  ok:", m)) : (fail++, console.log("  FAIL:", m)); };
 const sec = (s) => console.log(`\n— ${s} —`);
