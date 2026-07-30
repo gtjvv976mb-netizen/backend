@@ -341,6 +341,64 @@ async function main() {
   ok("...a monster whose respawn came due while we were down is simply alive again",
      srv._mobFor(3) === null, JSON.stringify(srv._mobFor(3)));
 
+  // ---------- 12. THE FINISHING BLOW: how combat ACTUALLY works here ----------
+  // Chikoria has no world chip damage — HIT_R is a HUD hint, and a monster is engaged into a private
+  // 1v1 card battle and killed outright on a win. So a client reports a KILL, and the defence is
+  // scarcity (24 spawns, 90 s respawn) rather than damage arithmetic the server cannot check.
+  srv._clearWorldMobs(); srv._clearOwnBook();
+  const FX = DARKEON.x, FZ = DARKEON.z;
+  const winner = await mk(FX, FZ);
+  const fin = await post("/world/mob/hit", { wallet: winner.wallet, mktToken: winner.tok, idx: DARKEON.idx, finish: true });
+  ok("a battle win kills the monster outright, whatever its HP",
+     fin.status === 200 && fin.json.killed === true && Number(fin.json.hp) === 0,
+     `status ${fin.status} hp=${fin.json.hp} killed=${fin.json.killed}`);
+  ok("...and pays the finisher", Number(fin.json.paid) >= 1, `paid=${fin.json.paid}`);
+  const fb = srv._ownFor(winner.wallet);
+  ok("...the mob's own essence value, through the acquisition bound",
+     fb && fb.cred["mat:essence"] === DARKEON.essence, `cred=${JSON.stringify(fb && fb.cred)}`);
+
+  // it is dead for EVERYONE
+  const seen2 = await get("/world/mobs");
+  ok("it is dead for everyone on a shared clock",
+     seen2.json.mobs[String(DARKEON.idx)] && seen2.json.mobs[String(DARKEON.idx)].dead === 1,
+     JSON.stringify(seen2.json.mobs[String(DARKEON.idx)]));
+
+  // a SECOND claim on the same life earns nothing — this is the whole faucet bound
+  await sleep(HIT_MIN_MS + 60);
+  const again = await post("/world/mob/hit", { wallet: winner.wallet, mktToken: winner.tok, idx: DARKEON.idx, finish: true });
+  ok("a second claim on the same life is refused", again.json.dead === true && !again.json.killed,
+     JSON.stringify(again.json));
+  const fb2 = srv._ownFor(winner.wallet);
+  ok("...and credits nothing further", fb2.cred["mat:essence"] === DARKEON.essence,
+     `cred=${JSON.stringify(fb2.cred)}`);
+
+  // and a stranger cannot finish a monster they are nowhere near
+  srv._clearWorldMobs();
+  const tourist2 = await mk(DARKEON.x + 3000, DARKEON.z + 3000);
+  const far = await post("/world/mob/hit", { wallet: tourist2.wallet, mktToken: tourist2.tok, idx: DARKEON.idx, finish: true });
+  ok("a finish from across the world is refused", far.status === 403, `status ${far.status} ${JSON.stringify(far.json.error||"")}`);
+  // ...and an unproven caller cannot either
+  const noproof = await post("/world/mob/hit", { wallet: winner.wallet, idx: DARKEON.idx, finish: true });
+  ok("...as is a finish with no proof of the wallet", noproof.status === 403, `status ${noproof.status}`);
+
+  // THE ISLAND-WIDE CEILING: 24 spawns on a 90 s clock is the real bound on this faucet
+  srv._clearWorldMobs(); srv._clearOwnBook();
+  const farmer = await mk(0, 0);
+  let taken = 0;
+  for (let i = 0; i < srv._mobSpawnCount(); i++) {
+    const sp = srv._mobSpawnAt(i);
+    await post("/world/move", { wallet: farmer.wallet, mktToken: farmer.tok, x: sp[1], z: sp[2], y: 6, dir: 0, handle: "F", leg: 1, el: "Fire", br: 1 });
+    await sleep(HIT_MIN_MS + 60);
+    const r = await post("/world/mob/hit", { wallet: farmer.wallet, mktToken: farmer.tok, idx: i, finish: true });
+    if (r.json.killed) taken++;
+  }
+  ok(`one wallet can clear the island but no further: ${taken} kills, then everything is on a ${RESPAWN_MS / 1000}s clock`,
+     taken === srv._mobSpawnCount(), `${taken}/${srv._mobSpawnCount()}`);
+  const perHour = (taken * srv._mobEssenceTotal() / taken) * (3600000 / RESPAWN_MS);
+  ok("...which is an island-wide ceiling far under the 43,200/hr the old report path allowed",
+     srv._mobEssenceTotal() * (3600000 / RESPAWN_MS) < 43200 / 10,
+     `${Math.round(srv._mobEssenceTotal() * (3600000 / RESPAWN_MS))} essence/hr for EVERYONE combined`);
+
   console.log(`\nWORLD_TICK_SIM  pass=${pass} fail=${fail}`);
   if (fail) { console.log("failures:"); for (const f of fails) console.log("  - " + f); }
   process.exit(fail ? 1 : 0);

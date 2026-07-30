@@ -4035,6 +4035,43 @@ app.post("/world/mob/hit", (req, res) => {
     }
   }
 
+  // THE FINISHING BLOW. Chikoria has NO world-space chip damage: HIT_R is only a HUD hint, and a
+  // monster is engaged into a private 1v1 card battle and killed outright on a win (Battle.gd:1281 ->
+  // kill_mob). So the damage pool below models a mechanic this game does not have, and a client that
+  // wins a battle needs to report a KILL, not 120 points of damage against a 400-HP boss it can never
+  // whittle down.
+  //
+  // The server cannot verify a card battle happened — exactly as it cannot verify /world/kill/report.
+  // So this is a claim, and the defence is not damage arithmetic, it is SCARCITY: there are 24 spawns
+  // and a 90 s respawn, so every player on the island together can claim at most 24 kills per 90
+  // seconds, and a second claim on the same life is refused outright. That is a hard island-wide
+  // ceiling of ~16 kills/minute shared by everyone, against the 43,200 essence/hour a single wallet
+  // could take from /world/kill/report. The proof gate, presence, anchor and dedupe above all still
+  // apply, and credit still flows through the acquisition bound.
+  if (b.finish === true) {
+    m.hp = 0;
+    m.deadAt = now;
+    m.finisher = String(b.wallet);
+    _mobKills++;
+    const _fst = MOB_STATS[spec[0]];
+    const ess = _fst ? _fst.essence : 1;
+    const paid = [];
+    // the finisher is always paid; anyone else who contributed to THIS life shares under the same
+    // rules the damage path uses, so a future chip mechanic needs no second reward system
+    const ranked = [...m.hitters.entries()]
+      .filter(([w, d]) => isPubkey(w) && (w === m.finisher || d / Math.max(1, _fst ? _fst.hp : 60) >= MOB_SHARE_MIN))
+      .sort((a, b2) => b2[1] - a[1]).slice(0, MOB_PAYEES);
+    if (!ranked.some(([w]) => w === m.finisher) && isPubkey(m.finisher)) ranked.unshift([m.finisher, 0]);
+    for (const [w] of ranked.slice(0, MOB_PAYEES)) {
+      ownCredit(w, "mat", "essence", ess);
+      lastWitnessedKill.set(w, now);
+      paid.push(w.slice(0, 8));
+    }
+    m.hitters.clear();
+    return res.json({ ok: true, killed: true, hp: 0, maxhp: (_fst ? _fst.hp : 60), gen: m.gen, paid: paid.length,
+                      back: MOB_RESPAWN_MS });
+  }
+
   // 5. the damage is CLAMPED. The client still computes it (gear and trainer level live in the
   //    client-authored save, so the server cannot derive it) but it can never exceed a real loadout,
   //    which is what stops a modified client deleting a boss in one request.
@@ -4360,6 +4397,11 @@ async function saveWorldMobs() {
 }
 setInterval(saveWorldMobs, 10000).unref?.();
 
+// Sim seams so the island-wide ceiling can be asserted against the REAL spawn table rather than a
+// number copied into the test (which would agree with itself forever if the table changed).
+export function _mobSpawnCount() { return MOB_SPAWNS.length; }
+export function _mobSpawnAt(i) { return MOB_SPAWNS[i]; }
+export function _mobEssenceTotal() { let t = 0; for (const sp of MOB_SPAWNS) { const st = MOB_STATS[sp[0]]; t += st ? st.essence : 1; } return t; }
 export function _clearWorldMobs() { worldMobs.clear(); _mobKills = 0; _mobHits = 0; _mobHitsRefused = 0; }
 export function _mobFor(idx) { const m = worldMobs.get(idx); return m ? { hp: m.hp, gen: m.gen, dead: !!m.deadAt, hitters: [...m.hitters.keys()] } : null; }
 export function _mobTickForTest(now) { worldMobTick(now || Date.now()); }
