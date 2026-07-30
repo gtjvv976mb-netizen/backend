@@ -3377,7 +3377,7 @@ app.post("/world/fish/report", (req, res) => {
   const now = Date.now();
   // you have to actually be in the world (same presence gate as a node claim)
   const me = worldPlayers.get(String(b.wallet));
-  if (!me || now - me.ts > WORLD_TTL_MS) return res.status(403).json({ ok: false, error: "no live presence" });
+  if (!me || now - me.ts > WORLD_TTL_MS) { _mobHitsRefused++; return res.status(403).json({ ok: false, error: "no live presence" }); }
   // count at most one fish per human-plausible interval — a spammed loop cannot inflate the ceiling
   const last = _lastFishRec.get(String(b.wallet)) || 0;
   if (now - last < FISH_REC_MIN_MS) return res.json({ ok: true, counted: false });
@@ -3827,6 +3827,9 @@ app.get("/assets/summary", (req, res) => {
              // row here is a listing the game could not have produced, so it names an actual attempt.
              // The acquisition bound. `skipped` is the one to watch: a nonzero value means listings went
              // through unchecked because the book had not restored, which is safe but not enforcing.
+             worldTick: { running: _worldTickOn, mobsTracked: worldMobs.size, hits: _mobHits,
+                          kills: _mobKills, hitsRefused: _mobHitsRefused,
+                          maxKillsPerHour: Math.round(MOB_SPAWNS.length * 3600000 / MOB_RESPAWN_MS) },
              acquisitionBound: { enforcing: _ownReady, refused: _ownRefusals, skipped: _ownSkipped,
                                  openings: _ownSnapshots, wallets: ownBook.size,
                                  worst: [..._ownWorst.values()].sort((a, b) => (b.asked - b.had) - (a.asked - a.had)).slice(0, 20) },
@@ -3954,6 +3957,98 @@ app.get("/assets/dex", (_req, res) => {
   res.json(_dexCache);
 });
 
+// ---- STRIKE A SHARED MONSTER -------------------------------------------------------------------
+// The co-op unlock. Two trainers hitting mob 7 are hitting ONE hp pool, it dies ONCE, and both are
+// paid. Modelled on /world/node/claim (server.js:3180) because that route already solved the same
+// problems: prove presence, derive reach from the id so no caller-sent position is trusted, own the
+// cooldown rather than accept one, and rate-limit per wallet.
+const mobHitRate = new Map();          // wallet -> last hit ms
+app.post("/world/mob/hit", (req, res) => {
+  const b = req.body || {};
+  if (!_worldTickOn) return res.status(503).json({ ok: false, error: "the shared world is not live yet", tick: false });
+  if (!isPresenceId(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
+  const idx = Math.floor(Number(b.idx));
+  if (!Number.isInteger(idx) || idx < 0 || idx >= MOB_SPAWNS.length) return res.status(400).json({ error: "unknown monster" });
+  const now = Date.now();
+
+  // 1. you have to actually be in the world
+  const me = worldPlayers.get(b.wallet);
+  if (!me || now - me.ts > WORLD_TTL_MS) return res.status(403).json({ ok: false, error: "no live presence" });
+
+  // 2. and within reach of where the SERVER thinks that monster lives. Reach comes from the spawn
+  //    index, so a caller cannot claim to be standing somewhere they are not.
+  const spec = MOB_SPAWNS[idx];
+  const dist = Math.hypot(spec[1] - (me.x || 0), spec[2] - (me.z || 0));
+  if (dist > MOB_HIT_R) { _mobHitsRefused++; return res.status(403).json({ ok: false, error: "out of reach", dist: Math.round(dist) }); }
+
+  // 3. no swinging faster than a person can
+  const last = mobHitRate.get(b.wallet) || 0;
+  if (now - last < MOB_HIT_MIN_MS) {
+    _mobHitsRefused++;
+    return res.status(429).json({ ok: false, error: "too fast", retryInMs: MOB_HIT_MIN_MS - (now - last) });
+  }
+  if (mobHitRate.size > 5000) { for (const [k, v] of mobHitRate) if (now - v > 120000) mobHitRate.delete(k); }
+
+  worldMobTick(now);
+  const m = mobRow(idx);
+  if (m.deadAt) {
+    // already down — tell them when it is back rather than letting them beat a corpse for credit
+    return res.json({ ok: true, dead: true, back: Math.max(0, MOB_RESPAWN_MS - (now - m.deadAt)) | 0, gen: m.gen });
+  }
+  mobHitRate.set(b.wallet, now);
+  _mobHits++;
+
+  // 4. the damage is CLAMPED. The client still computes it (gear and trainer level live in the
+  //    client-authored save, so the server cannot derive it) but it can never exceed a real loadout,
+  //    which is what stops a modified client deleting a boss in one request.
+  const dmg = Math.max(1, Math.min(MOB_DMG_MAX, Math.floor(Number(b.dmg) || 1)));
+  m.hp = Math.max(0, m.hp - dmg);
+  const wallet = String(b.wallet);
+  m.hitters.set(wallet, (m.hitters.get(wallet) || 0) + dmg);
+  if (m.hitters.size > 40) { const first = m.hitters.keys().next().value; m.hitters.delete(first); }
+
+  let killed = false;
+  let paid = [];
+  if (m.hp <= 0) {
+    killed = true;
+    m.deadAt = now;
+    _mobKills++;
+    // 5. THE REWARD IS THE SERVER'S, ONCE PER LIFE, SPLIT ACROSS EVERYONE WHO REALLY FOUGHT IT. The
+    //    client never names it. Everyone who landed a hit on THIS generation gets the mob's own
+    //    essence value — co-op pays both trainers rather than racing them for a last hit.
+    const st = MOB_STATS[spec[0]];
+    const ess = st ? st.essence : 1;
+    // A CONTRIBUTOR HAS TO HAVE ACTUALLY FOUGHT IT. Paying every hitter in full was a 40x sybil
+    // multiplier hiding in plain sight: hitters is capped at 40, so forty throwaway wallets each
+    // landing ONE point of damage would have collected forty rewards for one monster.
+    //
+    // The bound is on the NUMBER OF PAYEES, not on each one's share, and that distinction matters. A
+    // large minimum share (20% say) does cap the count, but it also cuts a trainer who honestly dealt
+    // 30 of a 170-health monster — a real contribution by any reading. Taking the top MOB_PAYEES by
+    // damage instead caps the multiplier at four whatever the fleet size, while a one-damage poke can
+    // never be top-four in the presence of anyone actually fighting. The small floor then excludes
+    // pure tourists even when nobody else showed up.
+    const ranked = [...m.hitters.entries()]
+      .filter(([w, dealt]) => isPubkey(w) && dealt >= mobMaxHp(idx) * MOB_SHARE_MIN)
+      .sort((p, q) => q[1] - p[1])
+      .slice(0, MOB_PAYEES);
+    for (const [w] of ranked) {
+      ownCredit(w, "mat", "essence", ess);
+      paid.push(w.slice(0, 8));
+    }
+  }
+  res.json({ ok: true, hp: Math.round(m.hp), maxhp: mobMaxHp(idx), killed, gen: m.gen,
+             back: killed ? MOB_RESPAWN_MS : 0, paid: paid.length });
+});
+
+// The shared world, read-only: which monsters are hurt or down, and when they return. A pristine
+// island answers with an empty object.
+app.get("/world/mobs", (_q, res) => {
+  const now = Date.now();
+  worldMobTick(now);
+  res.json({ tick: _worldTickOn, mobs: mobSnapshot(now), respawnMs: MOB_RESPAWN_MS, ts: now });
+});
+
 app.get("/world/nodes", (_req, res) => {
   const now = Date.now();
   const out = {};
@@ -4000,6 +4095,118 @@ function presenceOk(id, body) {
   return mktWallet(body) === id;                  // public wallet — must be proven
 }
 
+
+// ============ THE WORLD TICK — the server runs the world instead of remembering it ============
+// Everything else the server owns is a RECORD: who is online, which trees are on cooldown, what is for
+// sale, who owns which chikimon. It owns no causality. Every consequence in Chikoria was computed on a
+// client and reported afterwards, which is why /world/kill/report accepts a claim about combat it
+// cannot check (43,200 essence/hour, measured, on a wallet that never fought anything), and why two
+// players standing together fight DIFFERENT COPIES of the same monster. Measured with two independent
+// Monsters simulations in one tree: they drift up to 32 units apart — past HIT_R 9, so one player is in
+// strike range while their friend is not — and on a kill one client has dead=true while the other has
+// dead=false. There is no version of co-op available from that.
+//
+// So this is the first thing on the server that TICKS. Deliberately it owns only three facts per
+// monster — HP, death, and the respawn clock — because those are what make a kill shared and a reward
+// honest. It does NOT own position: mob motion can converge for free by seeding the wander from the
+// spawn index and a shared clock, and streaming 24 positions on the world tick would spend the
+// scarcest resource in the system (measured: 307 bytes/player-row, ~33 KB/s downstream per player,
+// bandwidth-bound long before CPU-bound).
+//
+// WHY THIS IS NOT A NEW FAUCET, which is the question that decides the whole design:
+//   * the CLIENT NEVER NAMES THE REWARD. A kill pays the mob's own essence value from MOB_STATS,
+//     credited ONCE per generation, split across whoever actually damaged it.
+//   * the SERVER OWNS THE RESPAWN CLOCK. 24 spawns on MOB_RESPAWN_MS means the entire island yields at
+//     most 24 kills per 90 s even if every one died instantly — a hard ceiling of ~960 kills/hour that
+//     no client can influence, versus a faucet that needed no movement at all. And collecting it means
+//     physically travelling between 24 fixed points spread across the map.
+//   * damage is CLAMPED and RATE-LIMITED per wallet, so a modified client cannot one-shot a boss.
+//   * a hit is POSITION-AUTHORISED against the server's own presence record, exactly like
+//     /world/node/claim (server.js:3180) — reach is derived from the spawn index, never from a
+//     position the caller sends.
+// Off by default (WORLD_TICK). The tick and the state exist and can be observed before anything is
+// enforced, which is the same staged shape mounts, eggs and chikimon each moved in.
+const WORLD_TICK_ON = String(process.env.WORLD_TICK || "") === "1";
+// Mirrors Econ.MOBS (Econ.gd:220) and Econ.RESPAWN_S (231). If these drift from the client the shared
+// HP bar lies, so they are asserted equal by world_tick_sim rather than trusted.
+const MOB_STATS = Object.freeze(Object.assign(Object.create(null), {
+  darkeet:   { hp: 170, essence: 1 },
+  shadowisp: { hp: 210, essence: 2 },
+  hogwert:   { hp: 260, essence: 2 },
+  darkeon:   { hp: 400, essence: 3 },
+}));
+// The 24 spawns, in the SAME ORDER Monsters.gd:111 walks monsters_meta.json — so the array index IS
+// the shared mob id on every client, with no negotiation and nothing to broadcast. This is the one
+// piece of luck in the whole problem and the reason it is tractable.
+const MOB_SPAWNS = Object.freeze([
+  ["darkeet", 99.6, 344.7], ["darkeet", 378.0, -415.0], ["darkeet", -94.2, 113.7],
+  ["darkeet", 307.3, 265.9], ["darkeet", -313.6, -15.3], ["darkeet", -408.3, -429.0],
+  ["hogwert", -74.5, 141.3], ["hogwert", 202.3, 51.5], ["hogwert", 323.9, -286.2],
+  ["hogwert", 143.1, 276.7], ["hogwert", 442.1, -199.5], ["hogwert", 356.1, -236.1],
+  ["darkeon", 426.9, -198.1], ["darkeon", -431.6, 115.4], ["darkeon", 58.2, -630.3],
+  ["darkeon", 264.5, -45.3], ["darkeon", 468.9, -308.6], ["darkeon", -436.9, -397.5],
+  ["shadowisp", 138.4, -472.4], ["shadowisp", 84.0, -478.9], ["shadowisp", -230.7, 58.3],
+  ["shadowisp", -460.2, -184.9], ["shadowisp", 289.8, -310.6], ["shadowisp", -170.1, 45.7],
+].map((r) => Object.freeze(r)));
+const MOB_RESPAWN_MS = 90 * 1000;      // Econ.RESPAWN_S 90.0
+const MOB_HIT_MIN_MS = 400;            // per wallet; a human swing cycle is far slower
+const MOB_DMG_MAX = 120;               // per hit; the strongest real loadout is well under this
+// A mob wanders and chases, so reach cannot be tight around home. Measured drift peaks near 32 units
+// and DEAGGRO_R is 70, so 90 covers any legitimate position while still pinning the attacker to the
+// right region of a ~1000-unit island.
+const MOB_HIT_R = 90;
+// Who gets paid for a kill. MOB_PAYEES caps the reward multiplier at four no matter how many wallets
+// touched the monster; MOB_SHARE_MIN is only a tourist floor, deliberately low enough that an honest
+// 30-of-170 contribution still counts.
+const MOB_PAYEES = 4;
+const MOB_SHARE_MIN = 0.05;
+const worldMobs = new Map();           // idx -> {hp, gen, deadAt, hitters:Map(wallet->dmg)}
+let _mobKills = 0, _mobHits = 0, _mobHitsRefused = 0;
+
+function mobRow(idx) {
+  let m = worldMobs.get(idx);
+  if (m) return m;
+  const spec = MOB_SPAWNS[idx];
+  if (!spec) return null;
+  const st = MOB_STATS[spec[0]];
+  m = { hp: st ? st.hp : 60, gen: 1, deadAt: 0, hitters: new Map() };
+  worldMobs.set(idx, m);
+  return m;
+}
+function mobMaxHp(idx) {
+  const spec = MOB_SPAWNS[idx];
+  const st = spec ? MOB_STATS[spec[0]] : null;
+  return st ? st.hp : 60;
+}
+// THE TICK. It advances one clock and nothing else — a dead mob comes back when its timer is up, for
+// everybody at once. Cheap and O(dead), so it costs nothing when the island is quiet.
+function worldMobTick(now) {
+  for (const [idx, m] of worldMobs) {
+    if (!m.deadAt) continue;
+    if (now - m.deadAt < MOB_RESPAWN_MS) continue;
+    m.deadAt = 0;
+    m.hp = mobMaxHp(idx);
+    m.gen++;                           // a new life: credit for the old one can never be claimed again
+    m.hitters.clear();
+  }
+}
+// What every client is told about the shared world. Only mobs that are NOT at full health or are dead
+// are worth sending — a pristine island is an empty object, so the common case costs ~2 bytes.
+function mobSnapshot(now) {
+  const out = {};
+  for (const [idx, m] of worldMobs) {
+    if (!m.deadAt && m.hp >= mobMaxHp(idx)) continue;
+    out[idx] = m.deadAt
+      ? { dead: 1, back: Math.max(0, MOB_RESPAWN_MS - (now - m.deadAt)) | 0, gen: m.gen }
+      : { hp: Math.round(m.hp), gen: m.gen };
+  }
+  return out;
+}
+export function _clearWorldMobs() { worldMobs.clear(); _mobKills = 0; _mobHits = 0; _mobHitsRefused = 0; }
+export function _mobFor(idx) { const m = worldMobs.get(idx); return m ? { hp: m.hp, gen: m.gen, dead: !!m.deadAt, hitters: [...m.hitters.keys()] } : null; }
+export function _mobTickForTest(now) { worldMobTick(now || Date.now()); }
+export function _setWorldTickForTest(on) { _worldTickOn = !!on; return _worldTickOn; }
+let _worldTickOn = WORLD_TICK_ON;
 
 // ---- MATERIAL PROVENANCE (observe only) --------------------------------------------------------
 // Materials, fantasy fish and potions are listable on the real-$CHIKI rail and have no provenance
@@ -5215,7 +5422,10 @@ app.post("/world/move", (req, res) => {
     br: clampF(b.br, 1, 50, 1) | 0,   // companion LEVEL (cap 50) — not the Cup 1..30 BR
     ts: Date.now(),
   });
-  res.json({ ok: true, players: worldSnapshot(wallet, x, z), online: worldPlayers.size });
+  // The shared world rides the reply the client is ALREADY making, so co-op costs zero extra requests
+  // and zero extra round trips. An older client ignores the field; a pristine island makes it empty.
+  res.json({ ok: true, players: worldSnapshot(wallet, x, z), online: worldPlayers.size,
+             mobs: _worldTickOn ? mobSnapshot(Date.now()) : undefined });
 });
 // Read-only: nearby online trainers (for spectators / light polling).
 app.get("/world/players", (req, res) => {
@@ -5234,6 +5444,11 @@ app.get("/world/roster", (_q, res) => {
   res.json({ users, count: users.length });
 });
 setInterval(() => { const now = Date.now(); for (const [w, p] of worldPlayers) if (now - p.ts > WORLD_TTL_MS) worldPlayers.delete(w); }, 10000);
+// THE WORLD TICK. Every other interval in this file is housekeeping — flush a ledger, prune a map.
+// This one advances the world: a monster killed anywhere comes back for everyone when its clock runs
+// out, whether or not a single client is polling. One second is plenty for a 90 s respawn and it costs
+// O(dead mobs), so a quiet island costs nothing.
+setInterval(() => { try { worldMobTick(Date.now()); } catch (e) {} }, 1000).unref?.();
 
 // Shared-world chat — a PERSISTED rolling log (kv), served in full so every player can scroll
 // back through everyone's messages, including from before they logged in. History survives

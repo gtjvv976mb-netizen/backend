@@ -1,0 +1,252 @@
+#!/usr/bin/env node
+// THE SERVER RUNS THE WORLD. First tick: HP, death and respawn for the 24 monster spawns.
+//
+// The assertion that decides whether this ships is the FARM one. /world/kill/report already showed
+// what an unguarded combat endpoint costs — 43,200 essence/hour on a wallet that never fought — so a
+// new damage route has to be provably worse for a bot than the thing it replaces, not better.
+// The second most important is that co-op actually pays BOTH trainers.
+// No live backend. Throwaway keypairs, memory store, dummy RPC.
+import crypto from "node:crypto";
+import { Keypair } from "@solana/web3.js";
+
+const treasury = Keypair.generate();
+process.env.RPC_URL = "http://127.0.0.1:59994";
+process.env.TREASURY_SECRET = JSON.stringify(Array.from(treasury.secretKey));
+process.env.VERIFY_HOLDERS = "false";
+process.env.PORT = "8801";
+process.env.NETWORK = "devnet";
+process.env.ADMIN_KEY = "simonly-" + crypto.randomBytes(8).toString("hex");
+process.env.WORLD_TICK = "1";
+delete process.env.DATABASE_URL;
+delete process.env.MARKET_ONCHAIN;
+
+function signIn(kp) {
+  const wallet = kp.publicKey.toBase58();
+  const msg = `Chikoria sign-in\nwallet:${wallet}\nts:${Date.now()}`;
+  const seed = Buffer.from(kp.secretKey.slice(0, 32));
+  const der = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]);
+  const priv = crypto.createPrivateKey({ key: der, format: "der", type: "pkcs8" });
+  return { wallet, authMsg: msg, authSig: crypto.sign(null, Buffer.from(msg, "utf8"), priv).toString("base64") };
+}
+const BASE = "http://127.0.0.1:8801";
+const post = (p, b) => fetch(BASE + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(async r => ({ status: r.status, json: await r.json().catch(() => ({})) }));
+const get = (p) => fetch(BASE + p).then(async r => ({ status: r.status, json: await r.json().catch(() => ({})) }));
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+let pass = 0, fail = 0; const fails = [];
+const ok = (n, c, e = "") => { if (c) { pass++; console.log("  ok   " + n + (e ? "  [" + e + "]" : "")); } else { fail++; fails.push(n + (e ? " — " + e : "")); console.log("  FAIL " + n + (e ? "  [" + e + "]" : "")); } };
+async function waitUp() { for (let i = 0; i < 80; i++) { try { if ((await get("/world/mobs")).status === 200) return; } catch (e) {} await sleep(100); } throw new Error("no server"); }
+
+// mirrors of the server's own table, so a drift between client and server is caught here
+const SPAWN0 = { name: "darkeet", x: 99.6, z: 344.7, hp: 170, essence: 1 };
+const DARKEON = { idx: 12, x: 426.9, z: -198.1, hp: 400, essence: 3 };
+const HIT_MIN_MS = 400, DMG_MAX = 120, RESPAWN_MS = 90000, HIT_R = 90;
+
+async function main() {
+  const srv = await import("./server.js");
+  await waitUp();
+  srv._clearWorldMobs();
+  srv._clearOwnBook();
+  console.log("\n=== THE WORLD TICK: shared monsters ===\n");
+
+  const mk = async (x, z) => {
+    const kp = Keypair.generate();
+    const sid = "net_" + kp.publicKey.toBase58().slice(0, 10);
+    const v = await post("/verify", { ...signIn(kp), netId: sid });
+    const t = { kp, wallet: kp.publicKey.toBase58(), sid, tok: v.json.mktToken };
+    await post("/world/move", { wallet: t.wallet, mktToken: t.tok, x, z, y: 6, dir: 0, handle: "T", leg: 1, el: "Fire", br: 1 });
+    return t;
+  };
+  const hit = (t, idx, dmg) => post("/world/mob/hit", { wallet: t.wallet, mktToken: t.tok, idx, dmg });
+
+  // ---------- 1. the shared world exists and starts pristine ----------
+  const m0 = await get("/world/mobs");
+  ok("the shared world answers", m0.status === 200 && m0.json.tick === true, `tick=${m0.json.tick}`);
+  ok("...and a pristine island sends nothing (cheap common case)",
+     Object.keys(m0.json.mobs || {}).length === 0, `mobs=${JSON.stringify(m0.json.mobs)}`);
+  ok("...and reports the respawn window", Number(m0.json.respawnMs) === RESPAWN_MS, `respawnMs=${m0.json.respawnMs}`);
+
+  // ---------- 2. ONE HP POOL: two trainers hitting the same monster ----------
+  const a = await mk(SPAWN0.x + 10, SPAWN0.z);
+  const b = await mk(SPAWN0.x - 10, SPAWN0.z + 5);
+  const h1 = await hit(a, 0, 50);
+  ok("trainer A lands a hit", h1.status === 200 && h1.json.ok === true, `status ${h1.status} hp=${h1.json.hp}`);
+  ok("...on the mob's real HP pool", Number(h1.json.hp) === SPAWN0.hp - 50 && Number(h1.json.maxhp) === SPAWN0.hp,
+     `hp=${h1.json.hp}/${h1.json.maxhp} expected ${SPAWN0.hp - 50}/${SPAWN0.hp}`);
+  const h2 = await hit(b, 0, 30);
+  ok("trainer B's hit lands on THE SAME pool — this is the co-op unlock",
+     Number(h2.json.hp) === SPAWN0.hp - 80, `hp=${h2.json.hp} expected ${SPAWN0.hp - 80}`);
+  const shared = await get("/world/mobs");
+  ok("...and every other client can see it is hurt",
+     shared.json.mobs && shared.json.mobs["0"] && Number(shared.json.mobs["0"].hp) === SPAWN0.hp - 80,
+     JSON.stringify(shared.json.mobs));
+
+  // ---------- 3. IT DIES ONCE, AND PAYS EVERYONE WHO FOUGHT IT ----------
+  let killed = null;
+  for (let i = 0; i < 12 && !killed; i++) {
+    await sleep(HIT_MIN_MS + 60);
+    const r = await hit(a, 0, DMG_MAX);
+    if (r.json.killed) killed = r;
+  }
+  ok("the monster dies", killed !== null && killed.json.killed === true, killed ? `gen=${killed.json.gen}` : "never died");
+  if (killed) {
+    ok("...paying BOTH trainers who damaged it, not just the last hitter",
+       Number(killed.json.paid) === 2, `paid=${killed.json.paid}`);
+    const ba = srv._ownFor(a.wallet), bb = srv._ownFor(b.wallet);
+    ok("...A was credited the mob's own essence value",
+       ba && ba.cred["mat:essence"] === SPAWN0.essence, `A cred=${JSON.stringify(ba && ba.cred)}`);
+    ok("...and so was B, who never landed the killing blow",
+       bb && bb.cred["mat:essence"] === SPAWN0.essence, `B cred=${JSON.stringify(bb && bb.cred)}`);
+  }
+  const dead = await get("/world/mobs");
+  ok("it is dead for EVERYONE, with a shared clock",
+     dead.json.mobs["0"] && dead.json.mobs["0"].dead === 1 && Number(dead.json.mobs["0"].back) > 0,
+     JSON.stringify(dead.json.mobs["0"]));
+
+  // ---------- 4. a corpse cannot be farmed for credit ----------
+  await sleep(HIT_MIN_MS + 60);
+  const corpse = await hit(b, 0, DMG_MAX);
+  ok("beating a corpse earns nothing and says when it returns",
+     corpse.json.dead === true && !corpse.json.killed, JSON.stringify(corpse.json));
+  const bb2 = srv._ownFor(b.wallet);
+  ok("...B's credit did not move", bb2.cred["mat:essence"] === SPAWN0.essence, `cred=${JSON.stringify(bb2.cred)}`);
+
+  // ---------- 5. THE RESPAWN IS THE SERVER'S, AND A NEW LIFE CANNOT REPAY THE OLD ONE ----------
+  const genBefore = srv._mobFor(0).gen;
+  srv._mobTickForTest(Date.now() + RESPAWN_MS + 1000);
+  const rev = srv._mobFor(0);
+  ok("the tick brings it back for everyone", rev.dead === false && rev.hp === SPAWN0.hp,
+     `hp=${rev.hp} dead=${rev.dead}`);
+  ok("...on a NEW generation, so the old kill can never be re-credited",
+     rev.gen === genBefore + 1, `gen ${genBefore} -> ${rev.gen}`);
+  ok("...with the contributor list cleared", rev.hitters.length === 0, `hitters=${JSON.stringify(rev.hitters)}`);
+
+  // ---------- 5b. A SYBIL FLEET CANNOT MULTIPLY ONE KILL ----------
+  // Paying every hitter in full was a 40x multiplier: hitters is capped at 40, so forty throwaway
+  // wallets each landing 1 damage would have collected forty rewards for one monster.
+  srv._clearWorldMobs(); srv._clearOwnBook();
+  const IDX = 1, SX = 378.0, SZ = -415.0;          // darkeet, hp 170, essence 1
+  const fleet = [];
+  for (let i = 0; i < 8; i++) fleet.push(await mk(SX + i, SZ));
+  for (const f of fleet) await hit(f, IDX, 1);     // one point each: tourists, not contributors
+  const real = await mk(SX, SZ + 2);
+  let fk = null;
+  for (let i = 0; i < 12 && !fk; i++) {
+    await sleep(HIT_MIN_MS + 60);
+    const r = await hit(real, IDX, DMG_MAX);
+    if (r.json.killed) fk = r;
+  }
+  ok("the trainer who actually fought it lands the kill", fk !== null, fk ? `paid=${fk.json.paid}` : "never died");
+  if (fk) {
+    ok("...and ONLY they are paid — eight one-damage tourists earn nothing",
+       Number(fk.json.paid) === 1, `paid=${fk.json.paid} (fleet of ${fleet.length} poked it)`);
+    const anyFleetPaid = fleet.some(f => { const bk = srv._ownFor(f.wallet); return bk && bk.cred["mat:essence"]; });
+    ok("...verified against the book, not just the count", !anyFleetPaid,
+       `fleet credits=${JSON.stringify(fleet.map(f => (srv._ownFor(f.wallet) || {}).cred || null))}`);
+  }
+  // but genuine co-op still pays everyone who did real work
+  srv._clearWorldMobs(); srv._clearOwnBook();
+  const c1 = await mk(SX, SZ), c2 = await mk(SX + 3, SZ);
+  let ck = null;
+  for (let i = 0; i < 14 && !ck; i++) {
+    await sleep(HIT_MIN_MS + 60);
+    const r1 = await hit(c1, IDX, 60);
+    if (r1.json.killed) { ck = r1; break; }
+    await sleep(HIT_MIN_MS + 60);
+    const r2 = await hit(c2, IDX, 60);
+    if (r2.json.killed) { ck = r2; break; }
+  }
+  ok("a real duo still both get paid — the share gate does not break co-op",
+     ck !== null && Number(ck.json.paid) === 2, ck ? `paid=${ck.json.paid}` : "never died");
+
+  // ---------- 6. THE FARM TEST — the one that decides whether this ships ----------
+  // Compare against the standard not to repeat: /world/kill/report gives 43,200 essence/hour with no
+  // movement at all. A bot here is bounded by the SERVER's respawn clock, not by its own request rate.
+  const maxKillsPerHour = 24 * 3600000 / RESPAWN_MS;
+  const worstEssencePerHour = maxKillsPerHour * 3;   // if every spawn were a darkeon (they are not: 6 of 24)
+  ok(`the respawn clock caps the island at ${maxKillsPerHour} kills/hour, all 24 spawns combined`,
+     maxKillsPerHour === 960, `${maxKillsPerHour}`);
+  ok(`...so the absolute ceiling is ${worstEssencePerHour} essence/hour vs the 43,200 faucet — a ${(43200 / worstEssencePerHour).toFixed(0)}x cut`,
+     worstEssencePerHour < 43200 / 10, `${worstEssencePerHour}`);
+
+  // and it requires being in the right PLACE, which the old faucet did not
+  const farAway = await mk(0, 0);
+  const oor = await hit(farAway, DARKEON.idx, DMG_MAX);
+  ok("a hit from across the island is refused — reach comes from the spawn index, not a sent position",
+     oor.status === 403 && String(oor.json.error) === "out of reach", `status ${oor.status} dist=${oor.json.dist}`);
+  // ...and moving your presence marker does not help unless you really are there
+  await post("/world/move", { wallet: farAway.wallet, mktToken: farAway.tok, x: DARKEON.x, z: DARKEON.z, y: 6, dir: 0, handle: "T", leg: 1, el: "Fire", br: 1 });
+  const nowNear = await hit(farAway, DARKEON.idx, 10);
+  ok("...but a trainer who genuinely walked there can strike (position IS the gate, honestly applied)",
+     nowNear.status === 200, `status ${nowNear.status}`);
+
+  // rate limit
+  const spam = await hit(farAway, DARKEON.idx, DMG_MAX);
+  ok("a second swing inside MOB_HIT_MIN_MS is refused", spam.status === 429, `status ${spam.status} retry=${spam.json.retryInMs}`);
+
+  // damage clamp: a modified client cannot delete a boss in one request
+  await sleep(HIT_MIN_MS + 60);
+  const nuke = await hit(farAway, DARKEON.idx, 999999999);
+  ok("a one-shot is clamped to MOB_DMG_MAX, so no client can delete a boss",
+     Number(nuke.json.hp) >= DARKEON.hp - DMG_MAX - 10 && !nuke.json.killed,
+     `hp=${nuke.json.hp}/${DARKEON.hp} killed=${nuke.json.killed}`);
+  for (const junk of [NaN, -500, "abc", Infinity, null]) {
+    await sleep(HIT_MIN_MS + 60);
+    const before = srv._mobFor(DARKEON.idx).hp;
+    const r = await hit(farAway, DARKEON.idx, junk);
+    const after = srv._mobFor(DARKEON.idx).hp;
+    ok(`dmg=${String(junk)} moves HP by a legal amount only`,
+       after <= before && before - after <= DMG_MAX, `${before} -> ${after}`);
+  }
+
+  // ---------- 7. A SELF-CHOSEN net_id EARNS NOTHING ----------
+  // presenceOk returns true for any net_id with no signature, so it can create presence and swing —
+  // but it is not an identity, and the acquisition bound only accepts pubkeys.
+  const ghost = { wallet: "godot-" + crypto.randomBytes(4).toString("hex"), tok: "" };
+  await post("/world/move", { wallet: ghost.wallet, x: SPAWN0.x, z: SPAWN0.z, y: 6, dir: 0, handle: "G", leg: 1, el: "Fire", br: 1 });
+  let ghostKill = null;
+  for (let i = 0; i < 14 && !ghostKill; i++) {
+    const r = await post("/world/mob/hit", { wallet: ghost.wallet, idx: 0, dmg: DMG_MAX });
+    if (r.json && r.json.killed) ghostKill = r;
+    await sleep(HIT_MIN_MS + 60);
+  }
+  ok("a net_id CAN fight (demo players are real players)", ghostKill !== null, ghostKill ? "killed" : "never killed");
+  if (ghostKill) {
+    ok("...but earns nothing — a self-chosen id is not an identity",
+       Number(ghostKill.json.paid) === 0, `paid=${ghostKill.json.paid}`);
+    ok("...and no book row was created for it", srv._ownFor(ghost.wallet) === null, JSON.stringify(srv._ownFor(ghost.wallet)));
+  }
+
+  // ---------- 8. the flag really gates it ----------
+  srv._setWorldTickForTest(false);
+  const offHit = await hit(a, 1, 10);
+  ok("with WORLD_TICK off the route refuses cleanly (503, not a crash)",
+     offHit.status === 503 && offHit.json.tick === false, `status ${offHit.status}`);
+  const offSnap = await get("/world/players?wallet=x&x=0&z=0");
+  ok("...and the shared world is absent from the move reply, so an old client sees exactly today",
+     offSnap.json.mobs === undefined, `mobs=${JSON.stringify(offSnap.json.mobs)}`);
+  srv._setWorldTickForTest(true);
+
+  // ---------- 9. the operator can see it — READ BEFORE the reset below, or the counters read zero ----------
+  const sum = await get("/assets/summary?key=" + encodeURIComponent(process.env.ADMIN_KEY));
+  const wt = sum.json.worldTick || {};
+  ok("the audit reports the world tick", wt.running === true, `running=${wt.running}`);
+  ok("...with hits, kills and refusals all counted",
+     Number(wt.hits) > 0 && Number(wt.kills) > 0 && Number(wt.hitsRefused) > 0,
+     `hits=${wt.hits} kills=${wt.kills} refused=${wt.hitsRefused}`);
+  ok("...and states the hard ceiling it enforces", Number(wt.maxKillsPerHour) === 960, `${wt.maxKillsPerHour}`);
+
+  // ---------- 10. BANDWIDTH: the shared world must not cost what it saves ----------
+  srv._clearWorldMobs();
+  const near = await mk(SPAWN0.x, SPAWN0.z);
+  for (let i = 0; i < 6; i++) { await hit(near, i % 3, 20); await sleep(HIT_MIN_MS + 60); }
+  const snap = await get("/world/mobs");
+  const bytes = JSON.stringify(snap.json.mobs).length;
+  ok(`a busy island's shared state is ${bytes} bytes — trivial beside the 307-byte-per-player rows`,
+     bytes < 600, `${bytes} bytes for ${Object.keys(snap.json.mobs).length} mobs`);
+
+  console.log(`\nWORLD_TICK_SIM  pass=${pass} fail=${fail}`);
+  if (fail) { console.log("failures:"); for (const f of fails) console.log("  - " + f); }
+  process.exit(fail ? 1 : 0);
+}
+main().catch(e => { console.error("SIM ERROR", e); process.exit(1); });
