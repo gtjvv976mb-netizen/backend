@@ -382,20 +382,34 @@ async function main() {
   const noproof = await post("/world/mob/hit", { wallet: winner.wallet, idx: DARKEON.idx, finish: true });
   ok("...as is a finish with no proof of the wallet", noproof.status === 403, `status ${noproof.status}`);
 
-  // THE ISLAND-WIDE CEILING: 24 spawns on a 90 s clock is the real bound on this faucet
+  // THE ISLAND-WIDE CEILING: 24 spawns on a 90 s clock was described as the real bound on this
+  // faucet — but it assumed a player can only be in one place, and NOTHING enforced that: measured
+  // 2026-07-31, one wallet teleported between all 24 spawns in 10.2 s (largest accepted jump 913.9
+  // units) and claimed 24/24 kills, taking the whole island's reward from everyone standing there.
+  // /world/move now stamps an implausible jump and the kill route stands down for WARP_HOLD_MS, so
+  // THE SWEEP IS THE THING THAT MUST FAIL. Each hop below is a blink between spawns hundreds of
+  // units apart, which is exactly the attack.
   srv._clearWorldMobs(); srv._clearOwnBook();
   const farmer = await mk(0, 0);
-  let taken = 0;
+  let taken = 0, breath = 0;
   for (let i = 0; i < srv._mobSpawnCount(); i++) {
     const sp = srv._mobSpawnAt(i);
     await post("/world/move", { wallet: farmer.wallet, mktToken: farmer.tok, x: sp[1], z: sp[2], y: 6, dir: 0, handle: "F", leg: 1, el: "Fire", br: 1 });
     await sleep(HIT_MIN_MS + 60);
     const r = await post("/world/mob/hit", { wallet: farmer.wallet, mktToken: farmer.tok, idx: i, finish: true });
     if (r.json.killed) taken++;
+    if (r.status === 403 && /catch your breath/.test(String(r.json.error || ""))) breath++;
   }
-  ok(`one wallet can clear the island but no further: ${taken} kills, then everything is on a ${RESPAWN_MS / 1000}s clock`,
-     taken === srv._mobSpawnCount(), `${taken}/${srv._mobSpawnCount()}`);
-  const perHour = (taken * srv._mobEssenceTotal() / taken) * (3600000 / RESPAWN_MS);
+  ok(`a TELEPORT sweep of all ${srv._mobSpawnCount()} spawns banks almost nothing: ${taken} kills, ${breath} refused "catch your breath"`,
+     taken <= 1 && breath >= srv._mobSpawnCount() - 2, `${taken}/${srv._mobSpawnCount()} kills, ${breath} stood down`);
+  // ...and a trainer who actually walks to ONE monster still kills it
+  srv._clearWorldMobs();
+  const sp0 = srv._mobSpawnAt(0);
+  const honest = await mk(sp0[1], sp0[2]);
+  await sleep(HIT_MIN_MS + 60);
+  const hk = await post("/world/mob/hit", { wallet: honest.wallet, mktToken: honest.tok, idx: 0, finish: true });
+  ok("an honest trainer standing at the monster still lands the finishing blow",
+     hk.json.killed === true, `killed=${hk.json.killed} paid=${hk.json.paid} status=${hk.status}`);
   ok("...which is an island-wide ceiling far under the 43,200/hr the old report path allowed",
      srv._mobEssenceTotal() * (3600000 / RESPAWN_MS) < 43200 / 10,
      `${Math.round(srv._mobEssenceTotal() * (3600000 / RESPAWN_MS))} essence/hr for EVERYONE combined`);

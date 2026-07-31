@@ -24,7 +24,11 @@ const PA=await proven(), PB=await proven();
 const A=PA.w, B=PB.w, ATTACKER=wallet();
 const snapA={element:"Fire",name:"Alice",br:8,cardTier:1,arenaSkills:[]};
 const snapB={element:"Water",name:"Bob",br:8,cardTier:1,arenaSkills:[]};
-await post("/pvp/challenge",{from:A,fromName:"Alice",to:B,snap:snapA});
+// PROVE `from` (2026-07-31): /pvp/challenge trusted the caller's `from` outright, so a duel
+// could be forged between a stranger and yourself and it occupied their match slot. It is now a
+// claimed-slot rule — an id nobody has proven may still challenge, one that IS proven must show
+// its /verify token, which the client already holds.
+await post("/pvp/challenge",{from:A,fromName:"Alice",to:B,snap:snapA,mktToken:PA.tok});
 const inbox=await post("/pvp/available",{wallet:B,name:"Bob",snap:snapB,mktToken:PB.tok});
 const ch=(inbox.challenges||[]).find(c=>c.from===A);
 const acc=await post("/pvp/challenge/accept",{wallet:B,challengeId:ch&&ch.id,snap:snapB,mktToken:PB.tok});

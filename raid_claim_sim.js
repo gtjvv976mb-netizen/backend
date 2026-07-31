@@ -26,7 +26,9 @@ async function mkWallet() {
   const v = await post("/verify", { wallet, netId, authMsg, authSig });
   return { wallet, sid: netId, mktToken: v.body.mktToken };
 }
-const move = (w) => post("/world/move", { wallet: w.wallet, mktToken: w.mktToken, x: 5, z: 5, dir: 0, handle: "Raider" });
+// AT THE ARENA. /world/raid/claim now requires presence within RAID_CLAIM_R of MALGROTH
+// (RaidBoss.gd BOSS_X/BOSS_Z = 359/259) — a raider stands on the arena, so that is where the sim stands.
+const move = (w) => post("/world/move", { wallet: w.wallet, mktToken: w.mktToken, x: 359, z: 259, dir: 0, handle: "Raider" });
 const claim = (w) => post("/world/raid/claim", { wallet: w.wallet, mktToken: w.mktToken });
 
 // ---------------------------------------------------------------------------
@@ -123,7 +125,7 @@ sec("an UNLINKED net_id is not granted a server prize — it keeps its own local
   // client an UNLIMITED weekly prize (worse than the client gate this replaced), because the
   // client trusts the server's answer over its own gate.
   const nid = "godot-deadbeef";
-  await post("/world/move", { wallet: nid, x: 5, z: 5, dir: 0, handle: "Unlinked" });
+  await post("/world/move", { wallet: nid, x: 359, z: 259, dir: 0, handle: "Unlinked" });
   const seen = [];
   for (let i = 0; i < 6; i++) seen.push((await post("/world/raid/claim", { wallet: nid })).body);
   chk(seen.every(r => r.ok === true), "the route still answers ok (never blocks an unlinked player)");

@@ -6,6 +6,7 @@ import dotenv from "dotenv";
 import bs58 from "bs58";
 import crypto from "node:crypto";   // built-in — used for Ed25519 chat-signature verification (no external dep)
 import pg from "pg";
+import WS from "ws";               // WebSocket world transport — a SECOND transport beside /world/move polling, never a replacement
 import {
   Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
@@ -228,22 +229,41 @@ function sanitizeProfile(prev, p, wallet) {
       let ctF = null, reqSum = 0;
       if (rawCT) { ctF = {}; for (const k in rawCT) { const slot = k | 0; if (slot >= 0 && slot < 12) { ctF[slot] = clampNum(rawCT[k], 1, 5, 1); reqSum += ctF[slot]; } } }
       let ctAt = Number(pc._ctAt) || now;
-      if (pc.cardTier == null) { ctAt = now; if (ctF) for (const k in ctF) ctF[k] = 1; }   // brand-new Chiki: every card starts at tier 1
+      // ===== ...AND WON, not merely WAITED =====
+      // The tier sum was gated on WALL CLOCK ALONE — nothing in this block read totalWins, skillPts
+      // or any balance, despite the line above it saying "upgrades cost BR + $CHIKI". Measured (with
+      // CARD_MIN_SEC forced to 1s; prod is 60): a save-editor took the tier sum 3 -> 11 with eight
+      // idle saves and the deck [0,1,2] -> all twelve slots in one save 11 seconds later, with no
+      // battles and no spend. At the prod floor that is a full 12-card tier-5 deck in ~57 minutes of
+      // doing nothing — and cupSnapFromBody then faithfully carries it into a 4.00 SOL tournament,
+      // where every honest entrant resolves to 3 cards at tier 1 because no shipped client writes
+      // these fields at all.
+      //
+      // So they get the ceiling BR already has: the server's own win ledger. GRANDFATHERED exactly
+      // the way BR is — the first time this Chiki is seen we snapshot the unconsumed win count, so
+      // nothing anyone already holds is ever reduced; only NEW growth has to be paid for in wins.
+      let ctWinBase = (pc._ctWinBase != null) ? Number(pc._ctWinBase) : totalWins;
+      const ctWinCeil = prevSum + Math.max(0, totalWins - ctWinBase);
+      if (pc.cardTier == null) { ctAt = now; ctWinBase = totalWins; if (ctF) for (const k in ctF) ctF[k] = 1; }   // brand-new Chiki: every card starts at tier 1
       else if (ctF && reqSum > prevSum) {
         let allowedSum = prevSum, budget = Math.max(0, now - ctAt);
         while (allowedSum < reqSum && budget >= CARD_MIN_SEC * 1000) { budget -= CARD_MIN_SEC * 1000; allowedSum++; }
+        allowedSum = Math.min(allowedSum, ctWinCeil);                     // real-time floor AND the real-win ceiling
         if (reqSum > allowedSum) { ctF = { ...prevCT }; }                 // grew faster than legit → reject, keep previous tiers
-        else { ctAt = now - budget; }                                     // accepted; carry leftover time
+        else { ctAt = now - budget; ctWinBase += (reqSum - prevSum); }    // accepted; consume the wins it cost
       }
-      // deck size (number of arena skills) can only grow one card per CARD_MIN_SEC; new Chikis keep their starting deck (≤3)
+      // deck size (number of arena skills) can only grow one card per CARD_MIN_SEC AND one per real
+      // server-resolved win — same grandfathered win ledger as the tiers above.
       const prevSkills = Array.isArray(pc.arenaSkills) ? pc.arenaSkills.slice(0, 12).map(s => clampNum(s, 0, 11, 0)) : null;
       let skillsF = Array.isArray(src.arenaSkills) ? src.arenaSkills.slice(0, 12).map(s => clampNum(s, 0, 11, 0)) : prevSkills;
       let dkAt = Number(pc._dkAt) || now;
-      if (prevSkills == null) { dkAt = now; if (skillsF && skillsF.length > 3) skillsF = skillsF.slice(0, 3); }
+      let dkWinBase = (pc._dkWinBase != null) ? Number(pc._dkWinBase) : totalWins;
+      if (prevSkills == null) { dkAt = now; dkWinBase = totalWins; if (skillsF && skillsF.length > 3) skillsF = skillsF.slice(0, 3); }
       else if (skillsF && skillsF.length > prevSkills.length) {
-        const grew = Math.floor(Math.max(0, now - dkAt) / (CARD_MIN_SEC * 1000));
+        const grew = Math.min(Math.floor(Math.max(0, now - dkAt) / (CARD_MIN_SEC * 1000)),
+                              Math.max(0, totalWins - dkWinBase));
         if (skillsF.length - prevSkills.length > grew) skillsF = prevSkills;   // added cards faster than legit → keep previous deck
-        else dkAt = now;
+        else { dkWinBase += (skillsF.length - prevSkills.length); dkAt = now; }
       }
       kept.push({
         sp, level: lv, isLegend, _lvlAt: lvAt, hungry: !!src.hungry, tending: !!src.tending,
@@ -255,6 +275,7 @@ function sanitizeProfile(prev, p, wallet) {
         sleepCycles: Math.max(clampNum(src.sleepCycles, 0, 1e9, 0), clampNum(pc.sleepCycles, 0, 1e9, 0)),
         renames: clampNum(src.renames, 0, 9, 0),
         br: brF, _brAt: brAt, _brWinBase: brWinBase, _ctAt: ctAt, _dkAt: dkAt,
+        _ctWinBase: ctWinBase, _dkWinBase: dkWinBase,
         battleXp: bxF,
         skillPts: skF,
         arenaSkills: skillsF,
@@ -760,6 +781,9 @@ const CUP_ELEMS = ["Water", "Fire", "Beast", "Storm", "Light"];
 let liveCup = null;                  // in-memory orchestrator (null until an admin creates one)
 let cupRound = null;                 // transient: the current round's LIVE PvP matches { battling, matchByWallet, side, matches }
 let cupPublic = true;                // true = open to ALL players (launched). Admin can flip to admin-only via /cup/public.
+// Flip to "1" ONLY after a client that sends authMsg/authSig (or mktToken) on /cup/register has
+// shipped — see the note on that route. Off = presence-gated; on = credential-gated.
+const CUP_AUTH_REQUIRED = String(process.env.CHIK_CUP_AUTH || "") === "1";
 let cupAuto = true;                  // AUTO-RUN: server starts/finalizes each round on its own (no admin clicking). Toggle via /cup/auto.
 let cupRoundStartedAt = 0;           // when the current battling round began (for the round time-limit)
 let cupAutoNextAt = 0;               // earliest time the auto-runner may act again (inter-round pause)
@@ -864,7 +888,7 @@ async function migrateMemeRandomize() {
   const recomputed = {};
   for (const h of memeHatches) { if ((h.status === "pending" || h.status === "minted") && h.char) recomputed[h.char] = (recomputed[h.char] || 0) + 1; }
   if (JSON.stringify(recomputed) !== JSON.stringify(memeMinted)) { memeMinted = recomputed; changed = true; }
-  if (changed) { try { await saveMeme(); } catch (e) {} console.log("meme: randomize migration applied — incubating eggs reset to mystery; per-char counts recomputed"); }
+  if (changed) { censusInvalidate(); try { await saveMeme(); } catch (e) {} console.log("meme: randomize migration applied — incubating eggs reset to mystery; per-char counts recomputed"); }
 }
 // A player may hold only ONE Meme Legendary that isn't up for sale. To get another, list (sell) the current one first.
 function memeOwnedActive(wallet) { return memeHatches.filter(h => h.wallet === wallet && !h.listed).length; }
@@ -909,16 +933,13 @@ setInterval(() => { reconcileMemeOwners().catch(() => {}); }, 5 * 60 * 1000);   
 // the creature — and, far worse, route 2 was capped by NOTHING, so the 10-edition promise on Alon
 // was not enforced at all. A cap that only one door respects is not a cap.
 //
-// The registry is authoritative for route 2 (one row per creature the server minted), and the two
-// stores are disjoint — the sale path writes no registry row — so adding them double-counts nothing.
-function memeRegistryCount(key) {
-  let n = 0;
-  for (const row of assetReg.values()) {
-    if (row && row.type === "chikimon" && row.sp === key && row.state === "active") n++;
-  }
-  return n;
-}
-function memeIssued(key) { return (memeMinted[key] || 0) + memeRegistryCount(key); }
+// Nor were the LEGACY ledger's meme creatures counted, and adding the sale counter to the registry
+// blind double-counted the one creature that is in both (a paid sale is granted in-game, reaches
+// the save, and is then adopted into the registry). So this is no longer a counter of its own: it
+// is a thin wrapper over trueIssued(), the ONE consolidation across registry + ledger + sales.
+// Two counters can drift; one cannot.
+function memeRegistryCount(key) { return trueIssued("chikimon", key).registry; }
+function memeIssued(key) { return trueIssued("chikimon", key).count; }
 // is this meme species still mintable at all? used by every path that can create one
 function memeAtCap(key) { return memeIssued(key) >= capOf(key); }
 function pickMeme() {
@@ -1471,7 +1492,9 @@ app.get("/admin/regrant-sale", (req, res) => {
                buyerName: "Sale restitution", ts: Date.now() });
     saveMarket();
     console.log("Admin restitution: re-issued", species, price, "sale for", wallet, "under sid", key);
-    res.json({ ok: true, wallet, sid: key, species, price, sellerWillNet: Math.round(price * 0.75),
+    // read the SPLIT CONSTANT, never a fourth hand-written copy of it — this field is what the
+    // operator is quoted, and txMarketSplit enforces MARKET_SELLER_SHARE
+    res.json({ ok: true, wallet, sid: key, species, price, sellerWillNet: Math.round(price * MARKET_SELLER_SHARE),
       note: "Have the seller open the game — their client credits 75% on the next market sync (~30s)." });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
@@ -1563,17 +1586,37 @@ function liveRarity(remaining, cap) {
   if (remaining <= Math.max(16, Math.round(cap * 0.70))) return "Rare";
   return "Uncommon";
 }
+// EVERY NUMBER HERE IS EXPLAINABLE. `issued` is the consolidated, deduped count across all three
+// record sources, and `breakdown` says exactly where it came from — registry rows, legacy ledger
+// entries, paid sales, and how many of those were the SAME creature seen twice. An owner who
+// cannot audit a scarcity number has to take it on faith, and so does every buyer.
+// Uncapped classes (normal/legendary chikimon, eggs) are published too, with cap 0: nothing the
+// world holds should be invisible just because nothing limits it.
 app.get("/world/rarity", (_req, res) => {
-  const out = { avatar: {}, mount: {}, chikimon: {} };
-  for (const [type, tbl] of Object.entries(ASSET_SUPPLY)) {
-    for (const sp of Object.keys(tbl)) {
-      const cap = tbl[sp], made = issuedCount(type, sp), left = Math.max(0, cap - made);
-      out[type][sp] = { cap, issued: made, remaining: left, rarity: liveRarity(left, cap) };
-    }
-  }
-  for (const c of MEME_CHARS) {
-    const cap = c.cap || MEME_CAP, made = memeIssued(c.key), left = Math.max(0, cap - made);
-    out.chikimon[c.key] = { cap, issued: made, remaining: left, rarity: liveRarity(left, cap) };
+  const out = { avatar: {}, mount: {}, chikimon: {}, egg: {}, unlisted: [] };
+  const done = new Set();
+  const emit = (type, sp, cap) => {
+    const k = _censusKey(type, sp);
+    if (done.has(k)) return;
+    done.add(k);
+    const t = trueIssued(type, sp);
+    const left = cap > 0 ? Math.max(0, cap - t.count) : -1;      // -1 = uncapped, nothing to run out of
+    const bucket = out[type] || (out[type] = {});
+    bucket[sp] = { cap, issued: t.count, remaining: left, rarity: cap > 0 ? liveRarity(left, cap) : "Uncapped",
+                   breakdown: { registry: t.registry, ledger: t.ledger, sales: t.sales,
+                                deduped: t.deduped, flagged: t.flagged } };
+  };
+  for (const [type, tbl] of Object.entries(ASSET_SUPPLY)) for (const sp of Object.keys(tbl)) emit(type, sp, tbl[sp]);
+  for (const c of MEME_CHARS) emit("chikimon", c.key, c.cap || MEME_CAP);
+  for (const sp of SPECIES_NORMAL) emit("chikimon", sp, 0);
+  for (const sp of SPECIES_LEGEND) emit("chikimon", sp, 0);
+  // Anything the world actually holds that NO supply table names — an old species, a renamed one, a
+  // crafted save's invention. Reported, never a crash, and never silently dropped from the count.
+  for (const c of censusAll().values()) {
+    const k = _censusKey(c.type, c.sp);
+    if (done.has(k) || (!c.count && !c.flagged)) continue;
+    emit(c.type, c.sp, 0);
+    out.unlisted.push({ type: c.type, sp: c.sp, issued: c.count, flagged: c.flagged });
   }
   res.json(out);
 });
@@ -1923,11 +1966,24 @@ app.post("/claim", async (req, res) => {
      · each main quest pays a FIXED amount, exactly ONCE, only IN ORDER
      · a minimum real-time gap between completions (anti-bot pacing)
      · a hard per-wallet ceiling = the sum of all quest rewards
-   Payout destination is ALWAYS the earning wallet (never client-chosen), the
-   amount is ALWAYS the server ledger (never client-sent), and every payout
-   passes per-claim / per-wallet-daily / pool-reserve caps AND a global hourly
-   circuit breaker that auto-halts if outflow spikes. Write-before-send + a
+   Payout destination is ALWAYS the earning wallet (never client-chosen) and the
+   amount is ALWAYS the server ledger (never client-sent). Write-before-send + a
    per-wallet lock make double-claims impossible.
+
+   WHAT GUARDS THE OUTFLOW, PRECISELY — this header used to claim "per-claim /
+   per-wallet-daily / pool-reserve caps AND a global hourly circuit breaker that
+   auto-halts if outflow spikes". NONE OF THAT EXISTS ON THE $CHIKI PATHS.
+   RESERVE / DAILY_FRAC / WALLET_DAILY are SOL constants belonging to the retired
+   /claim route (REWARDS_QUEST_ONLY makes it pay 0), there is no hourly
+   accumulator anywhere in this file, and neither _payoutQuestReward nor
+   _payoutOne reads one — both call sendChikiRaw directly. The REAL controls are:
+     · an ADMIN SIGNATURE on an action-bound, single-use, 5-minute nonce
+     · MANUAL REVIEW of the list before release (/quest/rewards)
+     · a batch size capped at 25 wallets per signed call
+     · the winner path's at-payout stake re-check (added 2026-07-31)
+     · and, ultimately, the treasury's own balance
+   So the operator must eyeball the totals: 25 x 112,030 = 2,800,750 $CHIKI can
+   leave in one signed call, and nothing here will stop it.
    ============================================================================ */
 const CHIKI_DECIMALS = Math.max(0, Number(process.env.CHIKI_DECIMALS || 6));   // pump.fun = 6
 // MUST stay in sync with the client's Econ story chain (ids + order).
@@ -2010,6 +2066,19 @@ const MAIN_QUESTS = [
 // Per-quest $CHIKI rewards accrue to a per-player pouch (admin-released, SEPARATE from the grand prize).
 const QUEST_REWARD_AMT   = new Map(MAIN_QUESTS.map(q => [q.id, q.chiki || 0]));
 const QUEST_BIT          = new Map(MAIN_QUESTS.map(q => [q.id, 1n << BigInt(q.bit)]));   // BigInt — bits reach 62
+// THE MASK SITS EXACTLY ON THE POSTGRES BIGINT CEILING. A wallet that has claimed all 63 chapters
+// holds 9223372036854775807 = 2^63-1, i.e. bits 0..62 are all consumed and bit 63 is the sign bit.
+// quest_rewards.done_mask is BIGINT and qrAccrue casts `$2::bigint`, so a 64th chapter would make
+// every completion of it throw — SILENTLY, because the call site swallows the error with a
+// console.error. Fail LOUDLY at boot instead: the migration (done_mask -> NUMERIC, or a second
+// done_mask_hi column read as a pair) has to land BEFORE the chapter, not after the reports start
+// vanishing.
+{
+  const _overflow = MAIN_QUESTS.filter(q => q.bit > 62).map(q => `${q.id}(bit ${q.bit})`);
+  if (_overflow.length) {
+    throw new Error(`quest done_mask exceeds a signed BIGINT: ${_overflow.join(", ")} — migrate quest_rewards.done_mask to NUMERIC before adding this chapter`);
+  }
+}
 const QUEST_REWARD_TOTAL = MAIN_QUESTS.reduce((a, q) => a + (q.chiki || 0), 0);   // 112030 per player when all done
 // mask may arrive as Number, numeric string (pg BIGINT), or BigInt — normalize to BigInt
 function questMask(mask) { try { return BigInt(mask || 0); } catch (e) { return 0n; } }
@@ -2027,6 +2096,28 @@ const QUEST_IDX     = new Map(MAIN_QUESTS.map((q, i) => [q.id, i]));
 // them as predecessors, or a skipped optional chapter permanently 409-stalls every later real
 // reward (Ch.42..63) and the 1,000,000 winner slot. Keep in sync with Econ.gd "optional": true.
 const QUEST_OPTIONAL = new Set(["s2_sold", "s2_buy", "s2_merchant"]);
+// ============ THE 21 CHAPTERS THAT WERE ALWAYS REAL (Profile.gd REAL21) ============
+// On 2026-07-24 06:00 UTC, 42 soft chapters were promoted to real payouts. Every player who had
+// already claimed any of them banked the SOFT reward, so Profile._migrate_promo63 marks those ids
+// `quest_soft_settled` and Chain.reconcile_quest_reports NEVER reports them again — that is what
+// stops the same chapter being paid twice. But the in-order gate below required them as
+// PREDECESSORS, and they are ids the server can therefore never receive from a grandfathered save.
+//
+// Measured (quests_grandfather_sim): a veteran replaying the real client's queue got 7 chapters
+// credited (17,000 $CHIKI) and then s_hunt -> 409 need=s2_flower, forever. 83,000 of the 100,000
+// they were owed blocked, s_ascend unreachable, and the client re-polls that 409 every 25 s for
+// the rest of time (Chain.gd dequeues only on a 400). So the ordering gate now binds on the LEGACY
+// 21 only: those still have to arrive in order, and a promoted chapter is never a required
+// predecessor. Nothing is paid twice — each chapter still pays exactly once, on its own bit — and
+// the blocked 83,000 needs no back-fill, because the client's own retry queue drains as soon as the
+// 409 stops.
+const QUEST_LEGACY21 = new Set(["s_meet", "s_kill", "s_gather", "s_stone", "s_craft", "s_forage", "s_fish",
+  "s_hunt", "s_shell", "s_gear", "s_meat", "s_stock", "s_chiki", "s_honey", "s_ore",
+  "s_angler", "s_slayer", "s_forge2", "s_crystal", "s_train", "s_ascend"]);
+// Flip to "1" only once a client that sends authMsg/authSig on /quest/complete has shipped — the
+// body is {wallet, questId} today (Chain.gd _drain_quests), so enforcing now refuses every honest
+// report. A credential that IS sent is checked either way, and a WRONG one is always refused.
+const QUEST_AUTH_REQUIRED = String(process.env.CHIK_QUEST_AUTH || "") === "1";
 const QUEST_MIN_GAP_MS = Math.max(0, Number(process.env.QUEST_MIN_GAP_SEC ?? 20)) * 1000;
 // Winner eligibility — FAIL-CLOSED (enforced on the reward path regardless of VERIFY_HOLDERS):
 const QUEST_MIN_HOLD = Math.max(0, Number(process.env.QUEST_MIN_HOLD || MIN));                       // must hold >= this $CHIKI
@@ -2111,23 +2202,51 @@ app.post("/quest/complete", async (req, res) => {
   if (!QUEST_IDX.has(questId)) return res.status(400).json({ error: "unknown quest" });
   if (isBanned(wallet)) return res.status(403).json({ error: "not eligible", banned: true });
   const isFinal = questId === FINAL_QUEST;
-  // AUTH MODEL: this game connects wallets by PUBLIC ADDRESS ONLY — it promises users it never asks for a
-  // signature. So quest completion CANNOT prove wallet ownership by signature. Reward integrity therefore
-  // rests on: the HOLDER GATE (>= QUEST_MIN_HOLD, re-checked at payout), the HOLD-TIME (aged wallet), and
-  // ADMIN REVIEW before any payout is released (a 3rd party can complete quests for any holder's address,
-  // so the admin must eyeball the winner/pouch lists before releasing). Admin PAYOUT endpoints ARE
-  // signature-gated (the operator signs with a tool, not the game). See REWARD_SECURITY.md.
+  // AUTH MODEL — CORRECTED 2026-07-31. This comment used to say the game "connects wallets by PUBLIC
+  // ADDRESS ONLY … it never asks for a signature", and that the holder gate is "re-checked at
+  // payout". BOTH ARE NOW FALSE. /verify performs a real Ed25519 sign-in and mints a market token,
+  // the shipped client refuses to poll without one, and the whole market rail is bound to it; and
+  // neither _payoutQuestReward nor _payoutOne re-reads a balance (see the note in _payoutOne).
+  //
+  // What is TRUE today: this route is unauthenticated, and 103,030 $CHIKI of pouch LIABILITY can be
+  // minted per arbitrary Solana address with curl (measured: 63 posts in 104 ms; 300 never-seen
+  // wallets enqueued in 77 ms). No $CHIKI moves without an admin-signed batch, so this is a review
+  // list, not a payout — but the list is the only control, so treat it as untrusted and cross-check
+  // against presence/world activity before signing.
+  //
+  // The credential the client already holds is honoured here now, and a WRONG one is refused, so the
+  // client half can ship and be verified before CHIK_QUEST_AUTH turns the gate on.
+  const _qTok = String(req.body?.mktToken || "");
+  if (_qTok && marketTokens[wallet] !== _qTok) return res.status(401).json({ error: "sign in again — that market token is stale" });
+  const _qProven = (_qTok && marketTokens[wallet] === _qTok)
+    || verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig);
+  if (QUEST_AUTH_REQUIRED && !_qProven) return res.status(401).json({ error: "sign-in required to report a chapter" });
   try {
     const led = await _questLoad(wallet);
     const idx = QUEST_IDX.get(questId);
     if (led.done[questId]) {
       // SELF-HEAL: completions recorded before the per-quest pouch shipped (or whose accrual
       // write failed) have a done entry but no pouch bit — back-fill it here, idempotently.
-      try { await store.qrAccrue(wallet, QUEST_BIT.get(questId) || 0); } catch (e) { console.error("qrAccrue(already) failed", wallet, questId, String(e.message || e)); }
+      // A PURE READ IN THE COMMON CASE. This branch sits ABOVE the pacing gate, so it used to run an
+      // INSERT..ON CONFLICT DO UPDATE on every repeat post of an already-done chapter, at whatever
+      // rate the caller chose (12 repeats returned 200/already in 25 ms). The heal is only needed
+      // when the bit is genuinely missing, so ask first and write only then.
+      const _qb = QUEST_BIT.get(questId) || 0n;
+      try {
+        const _qr = await store.qrGet(wallet);
+        if (_qb && !(questMask(_qr && _qr.done_mask) & _qb)) await store.qrAccrue(wallet, _qb);
+      } catch (e) { console.error("qrAccrue(already) failed", wallet, questId, String(e.message || e)); }
       const wrow = isFinal ? await store.winnerGet(wallet) : null;
       return res.json({ ok: true, already: true, questId, finished: isFinal, won: !!wrow, rank: wrow ? wrow.rank : 0, done: Object.keys(led.done) });
     }
-    for (let i = 0; i < idx; i++) { const pid = MAIN_QUESTS[i].id; if (QUEST_OPTIONAL.has(pid)) continue; if (!led.done[pid]) return res.status(409).json({ error: "complete earlier chapters first", need: pid }); }
+    // IN-ORDER, ON THE LEGACY 21 ONLY — see QUEST_LEGACY21 for why a promoted chapter can never be a
+    // required predecessor (a grandfathered veteran never reports one, and the 409 jammed them at
+    // Ch.15 with 83,000 $CHIKI unreachable).
+    for (let i = 0; i < idx; i++) {
+      const pid = MAIN_QUESTS[i].id;
+      if (QUEST_OPTIONAL.has(pid) || !QUEST_LEGACY21.has(pid)) continue;
+      if (!led.done[pid]) return res.status(409).json({ error: "complete earlier chapters first", need: pid });
+    }
     const now = Date.now();
     if (now - led.lastAt < QUEST_MIN_GAP_MS) return res.status(429).json({ error: "too fast — pace yourself", retryInMs: QUEST_MIN_GAP_MS - (now - led.lastAt) });
 
@@ -2386,6 +2505,26 @@ async function _payoutOne(wallet) {
   // Anti-sybil: the winner must STILL hold the stake at payout time (defeats flash/cycled-stake capture of all slots).
   if (wallet === "11111111111111111111111111111111") { await store.payoutClear(wallet).catch(() => {}); return { skipped: "system/burn address — unpayable" }; }
 
+  // ...AND NOW IT ACTUALLY DOES. The line above described a check that did not exist: there was no
+  // chikiBalance call anywhere between payoutBegin and sendChikiRaw, and balance_at_win was recorded
+  // at reserveWinner and never compared to anything. So one actor with 500,000 $CHIKI of working
+  // capital — not 5,000,000 — could hold it in wallet 1, run the 63 chapters (the route is
+  // unauthenticated), move the stake to wallet 2, and repeat, capturing all ten slots and the entire
+  // 10,000,000 $CHIKI prize pool, then sell the stake before the admin batch ran.
+  //
+  // SKIPPED, NEVER CLEARED. A wallet that fails this is left on the list exactly as it was, so a
+  // genuine winner who happened to be mid-transfer (or an RPC that could not answer) is paid on the
+  // next run rather than losing a prize they earned. This is the WINNER path only — the 2026-07-22
+  // owner policy of no at-payout re-check for the per-chapter POUCH is unchanged.
+  try {
+    const _bal = await chikiBalance(wallet, true);
+    if (_bal < QUEST_MIN_HOLD) {
+      return { skipped: `stake no longer held (${Math.floor(_bal)} < ${QUEST_MIN_HOLD}) — left on the list, retry when it is restored`, balance: _bal };
+    }
+  } catch (e) {
+    return { skipped: "eligibility check unavailable — left on the list, retry shortly" };
+  }
+
   const now = Date.now();
   let out;
   try { out = await sendChikiRaw(wallet, WINNER_REWARD); }
@@ -2421,6 +2560,33 @@ app.get("/cup/status", async (req, res) => {
 app.post("/cup/register", async (req, res) => {
   const wallet = req.body?.wallet;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  // ============ YOU MAY NOT SEAT SOMEONE ELSE ============
+  // This route read req.body.wallet and never proved it — no signature, no market token, no
+  // presence. Measured: a caller with no credential of any kind seated 7 strangers, filled an 8-seat
+  // lobby, and burned 100 Glory from each. Every one of those players will no-show, forfeit round 1,
+  // and hand the attacker's own entry a clean run at a 1.00 SOL prize — while real entrants are
+  // locked out of a tournament with a real SOL pool.
+  //
+  // THE CLIENT DOES NOT SEND A CREDENTIAL YET (Chikiseum.gd _cup_register posts {wallet, snap}), so
+  // a hard gate here would 401 every honest entry — this is a both-sides fix and the client half
+  // must deploy first. Two things land now that do not need it:
+  //   1. A LIVE WORLD PRESENCE. The Chikiseum is in the world and Net.gd POSTs /world/move every
+  //      frame while the game is up (only the boot wallet-gate holds it), so an honest entrant
+  //      always has a row. It cuts the victim pool from "any wallet on the roster, the market board
+  //      or the chat log" to "someone playing right now", and it kills the sybil variant outright.
+  //   2. A CREDENTIAL IS HONOURED IF SENT, AND A BAD ONE IS REFUSED — so the client half can ship
+  //      and be verified before CHIK_CUP_AUTH is flipped.
+  const _cupTok = String(req.body?.mktToken || "");
+  const _cupProven = (_cupTok && marketTokens[wallet] === _cupTok)
+    || verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig);
+  if (_cupTok && marketTokens[wallet] !== _cupTok) return res.status(401).json({ error: "sign in again — that market token is stale" });
+  if (CUP_AUTH_REQUIRED && !_cupProven) return res.status(401).json({ error: "sign-in required to enter the Cup" });
+  if (!_cupProven) {
+    const pres = worldPlayers.get(wallet);
+    if (!pres || Date.now() - pres.ts > WORLD_TTL_MS) {
+      return res.status(403).json({ error: "enter the Cup from inside Chikoria — no live presence for that trainer" });
+    }
+  }
   if (!liveCup || liveCup.state.status !== "registration") return res.status(409).json({ error: "registration is not open" });
   if (!cupPublic && !isAdminWallet(wallet)) return res.status(403).json({ error: "the Cup isn't open to the public yet" });
   if (liveCup.state.entrants.find(e => e.wallet === wallet)) return res.status(409).json({ error: "already registered" });
@@ -2448,6 +2614,17 @@ app.post("/cup/ready", async (req, res) => {
   const wallet = req.body?.wallet;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
   if (!liveCup || liveCup.state.status !== "live") return res.status(409).json({ error: "no live round" });
+  // same rule as /cup/register: readying a stranger starts a round they are not sitting at, which
+  // costs them the match. Credential honoured if sent, wrong one refused, otherwise a live presence.
+  const _rTok = String(req.body?.mktToken || "");
+  if (_rTok && marketTokens[wallet] !== _rTok) return res.status(401).json({ error: "sign in again — that market token is stale" });
+  const _rProven = (_rTok && marketTokens[wallet] === _rTok)
+    || verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig);
+  if (CUP_AUTH_REQUIRED && !_rProven) return res.status(401).json({ error: "sign-in required" });
+  if (!_rProven) {
+    const pres = worldPlayers.get(wallet);
+    if (!pres || Date.now() - pres.ts > WORLD_TTL_MS) return res.status(403).json({ error: "ready up from inside Chikoria" });
+  }
   try { const ok = liveCup.ready(wallet); if (!ok) return res.status(404).json({ error: "you're not in this cup" }); await persistCup(); res.json({ ok: true, ...cupSnapshot(wallet) }); }
   catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
@@ -2514,6 +2691,21 @@ app.post("/cup/chat", (req, res) => {
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
   const text = cleanChat(req.body?.text).slice(0, 240);
   if (!text) return res.status(400).json({ error: "empty message" });
+  // IMPERSONATION. Same hole as /cup/register: `wallet` and `name` were taken verbatim, so a stranger
+  // posted {wallet:<victim>, name:"Victim", text:"I concede"} and got a 200 with the victim's wallet
+  // stamped on it. The credential the client will send is honoured here too, and a WRONG one is
+  // refused; without one the speaker must at least be a live trainer OR seated in this cup, which is
+  // who the cup room is for.
+  const _chTok = String(req.body?.mktToken || "");
+  if (_chTok && marketTokens[wallet] !== _chTok) return res.status(401).json({ error: "sign in again — that market token is stale" });
+  const _chProven = (_chTok && marketTokens[wallet] === _chTok)
+    || verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig);
+  if (!_chProven) {
+    const seated = !!(liveCup && Array.isArray(liveCup.state.entrants) && liveCup.state.entrants.some(e => e && e.wallet === wallet));
+    const pres = worldPlayers.get(wallet);
+    const live = pres && Date.now() - pres.ts <= WORLD_TTL_MS;
+    if (!seated && !live) return res.status(403).json({ error: "speak from inside Chikoria" });
+  }
   const now = Date.now(), last = cupChatRate.get(wallet) || 0;
   if (now - last < 1200) return res.status(429).json({ error: "slow down a sec" });
   cupChatRate.set(wallet, now);
@@ -2727,8 +2919,10 @@ app.post("/meme/hatched", async (req, res) => {
       const c = pickMeme();
       if (!c) return res.status(409).json({ error: "the dynasty is fully hatched" });
       h.char = c.key; h.name = c.name; h.edition = (memeMinted[c.key] || 0) + 1; memeMinted[c.key] = h.edition; h.undetermined = false;
+      censusInvalidate();      // a sale just determined its species — the world census changed
     }
     h.status = "pending"; h.hatchedAt = Date.now(); await saveMeme();
+    censusInvalidate();        // status incubating -> pending is what makes this sale countable
   }
   res.json({ ok: true, status: h.status, char: h.char, name: h.name, edition: h.edition, cap: capOf(h.char), rarity: rarityOf(h.char) });
 });
@@ -2926,6 +3120,38 @@ function pvpStartMatch(a, b, opts) {  // a,b = snapshots with .wallet
   pvpMatches.set(m.id, m); pvpPlayerMatch.set(m.walletA, m.id); pvpPlayerMatch.set(m.walletB, m.id);
   return m;
 }
+// ============ A WORLD DUEL'S FIGHTER IS NOT THE CALLER'S TO WRITE ============
+// The Cup builds its entrants server-side (cupSnapFromBody), but the world-duel routes stored the
+// caller's `snap` VERBATIM and pvp-engine read `br`, `arenaSkills` and `cardTier` straight off it.
+// Measured against the strongest thing a legitimate client can send (Net.gd's PvpNet snap — companion level,
+// cap 50, cardTier 1, arenaSkills []): forged br 100000 gave maxhp 1,200,240 against the honest 840,
+// a hand of six tier-5 cards against six tier-1, and the forged side finished on 1,200,099 HP. One
+// edited JSON body won any duel with certainty.
+//
+// THIS IS A SANITISER, NOT A REBUILD, deliberately. Routing world duels through cupSnapFromBody
+// would ALSO require every duellist to own a Legendary and to have a stored profile — a gameplay
+// change nobody asked for, since net_id and pre-save players can duel today. So instead the fields
+// that decide combat are taken away from the wire:
+//   * br  -> clamped to 1..50, exactly the range the shipped client sends (and the same clamp
+//            /world/move already applies to the presence row's br).
+//   * arenaSkills / cardTier -> DROPPED, not clamped. No shipped client writes either one (every
+//            occurrence in the client is a hardcoded cardTier:1 / arenaSkills:[]), so the engine's
+//            own defaults — deck [0,1,2], every card tier 1 — ARE the honest experience, byte for
+//            byte. Clamping to 5 would have left the forger their tier-5 hand.
+// When a client one day carries a real deck, it comes from the stored profile the way the Cup's
+// does, never from this body.
+const DUEL_MAX_BR = 50;
+function duelSnap(wallet, snap) {
+  const s = (snap && typeof snap === "object") ? snap : {};
+  return {
+    wallet,
+    name: stripTags(String(s.name || "Trainer")).slice(0, 20),
+    element: CUP_ELEMS.includes(s.element) ? s.element : "Fire",
+    br: Math.max(1, Math.min(DUEL_MAX_BR, Math.floor(Number(s.br) || 1))),
+    arenaSkills: [],        // engine default [0,1,2] — what every shipped client already plays
+    cardTier: 1,            // engine default tier 1 for every slot
+  };
+}
 
 // Admin/Cup: create a live PvP match from two player snapshots {wallet, name, element, br, arenaSkills, cardTier}.
 app.post("/pvp/create", async (req, res) => {
@@ -2994,14 +3220,16 @@ function availableJoin(body) {
     if (proven) out.matched.sec = (sd === "a" ? curM.secA : curM.secB);
     return out;
   }
-  if (snap && snap.element) pvpAvail.set(wallet, { name: String(name || "Trainer").slice(0, 20), snap, ts: Date.now(), searching: !!searching });
+  // SANITISED ON THE WAY IN, so nothing downstream ever sees the caller's numbers (see duelSnap)
+  const _mySnap = (snap && snap.element) ? duelSnap(wallet, snap) : null;
+  if (_mySnap) pvpAvail.set(wallet, { name: String(name || "Trainer").slice(0, 20), snap: _mySnap, ts: Date.now(), searching: !!searching });
   else pvpAvail.delete(wallet);
   // auto-match: if I'm actively searching, pair me with ANY other searching Trainer not already in a battle
-  if (searching && snap && snap.element) {
+  if (searching && _mySnap) {
     for (const [w, v] of pvpAvail) {
       if (w === wallet || !v.searching) continue;
       const m = pvpPlayerMatch.get(w); if (m && pvpMatches.get(m) && pvpMatches.get(m).status === "active") continue;
-      const me = { ...snap, wallet }, op = { ...v.snap, wallet: w };
+      const me = { ..._mySnap, wallet }, op = { ...duelSnap(w, v.snap), wallet: w };
       const match = pvpStartMatch(op, me, { turnMs: 30000 });   // earlier searcher = side a
       pvpAvail.delete(w); pvpAvail.delete(wallet);
       pvpChallenges = pvpChallenges.filter(c => c.from !== w && c.to !== w && c.from !== wallet && c.to !== wallet);
@@ -3023,9 +3251,23 @@ app.post("/pvp/challenge", (req, res) => {
   if (!isPubkey(from) || !isPubkey(to)) return res.status(400).json({ error: "valid wallets required" });
   if (from === to) return res.status(400).json({ error: "you can't challenge yourself" });
   if (!snap || !snap.element) return res.status(400).json({ error: "legendary snap required" });
+  // PROVE `from`. It was never checked, so a challenge could be posted AS a stranger: accept it and
+  // the victim's pvpPlayerMatch slot holds a duel they never entered, which is what /pvp/available
+  // and /pvp/queue then return them into instead of matchmaking — measured, with an honest searcher
+  // waiting, the victim's own /pvp/available came back matched to the attacker's forged match and
+  // players:0. The attacker also authored the victim's fighter. mktWallet reads b.wallet, and this
+  // body's field is `from`, so the token is checked against `from` explicitly.
+  //
+  // A CLAIMED-SLOT RULE, not a flat gate — the same shape /world/move uses. An unproven caller may
+  // still challenge from an id nobody has proven (a net_id-era client, or the beat between sign-in
+  // and /verify returning a token); what it may never do is speak for a wallet that IS proven.
+  const _fromProven = isPubkey(from) && String(req.body?.mktToken || "").length >= 16 && marketTokens[from] === String(req.body?.mktToken || "");
+  if (!_fromProven && marketTokens[from]) {
+    return res.status(403).json({ error: "that Trainer is signed in — prove this wallet first" });
+  }
   cleanAvail();
   if (pvpChallenges.some(c => c.from === from && c.to === to)) return res.json({ ok: true });   // dedupe
-  pvpChallenges.push({ id: "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), from, fromName: String(fromName || "Trainer").slice(0, 20), to, snap, ts: Date.now() });
+  pvpChallenges.push({ id: "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), from, fromName: String(fromName || "Trainer").slice(0, 20), to, snap: duelSnap(from, snap), ts: Date.now() });
   res.json({ ok: true });
 });
 // Accept a challenge -> starts the live match; both sides learn via /pvp/available (matched) or this response.
@@ -3037,8 +3279,8 @@ app.post("/pvp/challenge/accept", (req, res) => {
   const ch = pvpChallenges.splice(i, 1)[0];
   // guard: neither player may already be in a live battle (prevents double-matches)
   for (const w of [ch.from, wallet]) { const mm = pvpPlayerMatch.get(w); if (mm && pvpMatches.get(mm) && pvpMatches.get(mm).status === "active") { pvpChallenges = pvpChallenges.filter(c => c.from !== ch.from && c.to !== ch.from && c.from !== wallet && c.to !== wallet); return res.status(409).json({ error: "that Trainer is already in a battle" }); } }
-  snap.wallet = wallet; ch.snap.wallet = ch.from;
-  const m = pvpStartMatch(ch.snap, snap, { turnMs: 30000 });   // challenger = side a, accepter = side b
+  // both fighters sanitised (see duelSnap) — the accepter's body is as untrusted as the challenger's
+  const m = pvpStartMatch(duelSnap(ch.from, ch.snap), duelSnap(wallet, snap), { turnMs: 30000 });   // challenger = side a, accepter = side b
   pvpAvail.delete(ch.from); pvpAvail.delete(wallet);
   pvpChallenges = pvpChallenges.filter(c => c.from !== ch.from && c.to !== ch.from && c.from !== wallet && c.to !== wallet);
   { const side = pvpSideOf(m, wallet);
@@ -3118,6 +3360,13 @@ app.get("/fund", async (req, res) => {
 // nearby online players to render them live. In-memory + TTL-pruned (mirrors the PvP lobby). No DB, no rewards.
 const worldPlayers = new Map();   // wallet -> { x, z, dir, handle, leg, el, br, ts }
 const WORLD_TTL_MS = 12000;       // drop a trainer who hasn't pinged in 12s
+// The movement plausibility bound (see the long note in /world/move). Not a refusal — a stamp that
+// makes the two value-bearing reach checks stand down for a moment.
+const WARP_MAX_UPS = 110;         // units/second; the boat (70) is the fastest legitimate thing
+const WARP_SLACK = 60;            // units of free jump per ping, for latency and dropped packets
+const WARP_HOLD_MS = 3000;        // how long a node claim / monster kill stands down after a warp
+let _warpPings = 0;               // observability: how often this fires at all
+export function _warpStatsForTest() { return { warps: _warpPings }; }
 const WORLD_RADIUS = 4000;        // only return players within this distance (interest management)
 const WORLD_MAX_PEERS = 60;       // hard cap on peers per snapshot — applied to the NEAREST, see worldSnapshot()
 const clampF = (v, lo, hi, d) => { v = Number(v); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d; };
@@ -3250,7 +3499,26 @@ const CLAIM_RADIUS_KIND = Object.freeze(Object.assign(Object.create(null), { pig
 const NODE_CD_DEFAULT_S = 60;
 const CLAIM_RADIUS = 14;          // world units; in-game gather reach is ~7, doubled for latency
 const CLAIM_MIN_MS = 1800;        // the client's own anti-macro floor is 2s
-// WHAT A NODE DROPS, decided here rather than by the client. Transcribed from Gather.gd:694-729,
+// THE ISLAND'S GATHERABLE EXTENT (Gather.gd CX/CZ + the 240..640 placement ring, mines included).
+// A wide margin on purpose: this is a plausibility bound, not a manifest.
+const ISLAND_CX = 2, ISLAND_CZ = -204, ISLAND_NODE_R = 900;
+// WHAT IS STILL MISSING, STATED PLAINLY: there is no NODE MANIFEST. The gates below check that a
+// claimed id is well-formed, of a real kind, on the island, within reach of a live presence and not
+// faster than a human — but NOT that the node exists. Measured: a wallet standing on empty ground
+// had 14/14 fabricated ids accepted, and one spot offers ~613 integer positions inside CLAIM_RADIUS.
+// The remaining bound is the pace floor, which caps a fabricator at the same ~33 claims/minute an
+// honest gatherer has; what it does not do is make them walk to a real node.
+//
+// The manifest is the real fix and it CANNOT be baked from source alone, which is why it is not here:
+//   * stone/crystal/berries/seashell/honey/flower placement runs Godot's seeded RNG (seed 7711)
+//     against the island heightmap, so reproducing it means porting `_surf` AND Godot's PCG stream;
+//   * pig and cow are LIVESTOCK — they wander, so their ids change while the world runs and no
+//     static set can ever contain them;
+//   * only wood (trees_meta.json) and the three mines are exactly derivable today.
+// The workable route is to DUMP the id set from a real client build and ship it as data, with the
+// livestock kinds left position-checked rather than manifest-checked.
+const NODE_MANIFEST = null;       // when this exists: refuse any id it does not contain
+// WHAT A NODE DROPS, decided here rather than by the client. Transcribed from Gather.gd's _grant table,
 // which is the behaviour players have today — this names the drop, it does not rebalance it.
 //
 // An ALLOWLIST, never a default: a node id is "kind:ix:iz" and the handler accepts any kind string
@@ -3267,13 +3535,22 @@ const nodeDrop = (kind) => (Object.hasOwn(NODE_DROP, kind) ? NODE_DROP[kind] : [
 // how many claims arrive with a provable identity — read from /assets/summary, so the decision to
 // start refusing unproven ones is made on a real number rather than a guess
 let _provenClaims = 0, _unprovenClaims = 0;
+// The kill-switch for the gate above. OFF by default and it must stay off until a client that sends
+// mktToken on /world/node/claim has shipped — see the note at the gate.
+const CLAIM_TOKEN_REQUIRED = String(process.env.CHIK_CLAIM_TOKEN || "") === "1";
+// CURRENTLY UNREACHABLE, and that is worth knowing rather than deleting. CLAIM_MIN_MS (1800 ms) caps
+// one wallet at 60000/1800 = 33.3 claims/minute, below this 40 — measured over a 60 s maximum-rate
+// run: 32 claims landed, "too fast" refused 412, burst refused 0. If the pace floor is ever lowered
+// for a faster tool tier, THIS becomes the real ceiling; do not assume the floor is still doing the
+// work. Left at 40 deliberately: the honest gloves-Lv10 berry ceiling is ~22/min and moving a gate
+// to within 8% of real play is how honest players start getting refused.
 const CLAIM_BURST = 40;           // per wallet per minute, a generous ceiling on honest play
 const claimRate = new Map();      // wallet -> {last, count, windowStart}
 
 app.post("/world/node/claim", (req, res) => {
   const b = req.body || {};
   if (!isPresenceId(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
-  const id = nodeId(b.id);
+  let id = nodeId(b.id);
   if (!id) return res.status(400).json({ error: "id required" });
   const now = Date.now();
   nodeSweep(now);
@@ -3282,6 +3559,12 @@ app.post("/world/node/claim", (req, res) => {
   const me = worldPlayers.get(b.wallet);
   if (!me || now - me.ts > WORLD_TTL_MS) {
     return res.status(403).json({ ok: false, error: "no live presence" });
+  }
+  // ...and you have to have GOT there. A presence row stamped by an impossible jump cannot turn into
+  // material for WARP_HOLD_MS (see /world/move). Honest travel points and the drowning rescue also
+  // land here, which costs a real player three seconds and nothing else.
+  if (me.warp && now - me.warp < WARP_HOLD_MS) {
+    return res.status(403).json({ ok: false, error: "catch your breath", retryInMs: WARP_HOLD_MS - (now - me.warp) });
   }
 
   // 2. the node has to be within reach of where you said you were. Ids are "kind:x:z", which is
@@ -3292,6 +3575,32 @@ app.post("/world/node/claim", (req, res) => {
   if (!Number.isFinite(nx) || !Number.isFinite(nz)) {
     return res.status(400).json({ ok: false, error: "malformed id" });
   }
+  // 2a. A KIND THAT DROPS NOTHING IS NOT A NODE. nodeDrop() is an allowlist and answers [] for
+  //     anything unknown, but the id was still keyed into worldNodes and still reached recordGather.
+  //     Refusing here keeps the shared node map free of kinds the world does not contain, and it is
+  //     the first half of the "the id is not the evidence" problem (the second half is a real node
+  //     manifest — see the note below).
+  if (!Object.hasOwn(NODE_DROP, kind)) {
+    return res.status(400).json({ ok: false, error: "no such node kind" });
+  }
+  // 2b. AND IT HAS TO BE ON THE ISLAND. Everything gatherable is placed inside a 240..640 ring
+  //     around (CX,CZ)=(2,-204) (Gather.gd's placement plan), the three mines sit on the mountain
+  //     inside it, and livestock wander only a few units from where they spawned. 900 is a wide
+  //     margin over all of that; /world/move alone clamps a position to +/-100000, so without this a
+  //     claim could be made at any coordinate in the world and stored forever in the node map.
+  if (Math.hypot(nx - ISLAND_CX, nz - ISLAND_CZ) > ISLAND_NODE_R) {
+    return res.status(400).json({ ok: false, error: "no such node" });
+  }
+  // 2c. CANONICALISE BEFORE THE ID IS USED AS A KEY. nodeId() sanitises CHARACTERS but never the
+  //     numeric form, and the reach check parses with Number() — so "stone:120:-260",
+  //     "stone:0120:-260", "stone:00000120:-260" and "stone:1.2e2:-260" all passed the position gate
+  //     and each got its OWN worldNodes key and its own cooldown. One physical rock produced 17
+  //     independent drops from 24 spellings of its id, and a cheater re-mined a rock other players
+  //     still saw standing. The honest client always sends the canonical form
+  //     (Gather.gd node_id: "%s:%d:%d" with int(round(...))), so rebuilding the key from the numbers
+  //     the reach check already parsed changes nothing for it — and it is what makes a future node
+  //     manifest lookup sound, because a manifest consulted with a non-canonical key is no manifest.
+  id = `${kind}:${Math.round(nx)}:${Math.round(nz)}`;
   const dist = Math.hypot(nx - (me.x || 0), nz - (me.z || 0));
   const claimRadius = Object.hasOwn(CLAIM_RADIUS_KIND, kind) ? CLAIM_RADIUS_KIND[kind] : CLAIM_RADIUS;
   if (dist > claimRadius) {
@@ -3308,9 +3617,23 @@ app.post("/world/node/claim", (req, res) => {
   // carry no token — their nodes would stay standing for everyone else, which is the very desync
   // this is meant to fix. So it is recorded and reported, and the gate comes after the roster shows
   // the tokened client is in the wild.
+  //
+  // MEASURED COST OF LEAVING IT OPEN: an attacker POSTs {wallet:<victim>, id:"stone:900:-500"} with
+  // no token, gets 200, and the victim's own next claim is refused 429 — 12 s of contention gave the
+  // attacker 6 claims and the victim 0. The attacker GAINS nothing (recordGather credits b.wallet,
+  // i.e. the victim), so this is pure denial-of-gathering, and the victim's live position comes free
+  // from the public world snapshot.
+  //
+  // THE FLIP IS NOW ONE ENV VAR, not a code change — but it MUST NOT be turned on before a client
+  // that sends mktToken on this route is in the wild (Gather.gd's claim body is {wallet, id, cd}
+  // today), or it refuses 100% of honest wallet gathering. `nodeClaims` in /assets/summary is the
+  // gauge: flip when unproven claims from wallet ids have fallen to noise.
   const claimProven = presenceOk(String(b.wallet), b);
   if (!claimProven) _unprovenClaims++;
   else _provenClaims++;
+  if (CLAIM_TOKEN_REQUIRED && !claimProven) {
+    return res.status(403).json({ ok: false, error: "prove this wallet first" });
+  }
 
   const r = claimRate.get(b.wallet) || { last: 0, count: 0, windowStart: now };
   if (now - r.windowStart > 60000) { r.count = 0; r.windowStart = now; }
@@ -3388,6 +3711,13 @@ app.post("/world/node/claim", (req, res) => {
 // to bound — the cap under-counts nothing an honest angler could actually do (the reel minigame is
 // slower than this), it only refuses a tight machine-gun loop.
 const FISH_REC_MIN_MS = 800;         // cap the COUNTED rate to human scale; honest play never beats it
+// per wallet per UTC day, scaled by any live festival multiplier — see the note at the roll
+const FFISH_DAILY_MAX = Math.max(1, Number(process.env.FFISH_DAILY_MAX || 60));
+const _ffishDay = new Map();         // wallet -> { day, n }
+let _ffishCapped = 0;                // observability: legends dropped by the daily ceiling
+export function _ffishDayStatsForTest(w) { return { capped: _ffishCapped, row: _ffishDay.get(String(w)) || null }; }
+// sim seam: seed a wallet's day counter so the ceiling can be exercised without a real day of casts
+export function _setFfishDayForTest(w, n) { _ffishDay.set(String(w), { day: Math.floor(Date.now() / 86400000), n: Math.max(0, n | 0) }); return n; }
 // ============ THE SERVER ROLLS THE CATCH — fantasy fish become witnessed, like eggs ============
 // Fantasy fish are the PRIMARY ingredient of every egg (Econ.EGG_RECIPE), and an egg hatches into a
 // tradeable chikimon. So a fantasy fish is the most valuable thing in the game that the server had
@@ -3408,7 +3738,7 @@ const FISH_REC_MIN_MS = 800;         // cap the COUNTED rate to human scale; hon
 // Closing it fully needs the spot table and gear server-side; this is the increment that makes the
 // species real.
 // ENFORCEMENT IS OFF UNTIL THE CLIENT ADOPTS THE SERVER'S ROLL, and this is not caution for its own
-// sake — shipping it early would break honest players. Player.gd:1917 _roll_catch still rolls locally,
+// sake — shipping it early would break honest players. Player.gd _roll_catch still rolls locally,
 // so the client and the server now roll INDEPENDENTLY: a player sees "you caught a Golden Chikifish",
 // their save holds it, and the server never witnessed it. Enforcing the sale bind or Mithra's fish
 // price in that state refuses goods the player watched themselves catch — the exact class of harm the
@@ -3419,10 +3749,10 @@ const FFISH_AUTHORITY = String(process.env.FFISH_AUTHORITY || "") === "1";
 let _ffishAuth = FFISH_AUTHORITY;   // test-overridable mirror; every gate below reads this
 const FFISH_ORDER = Object.freeze(["rainbow_fish", "mystic_eel", "crystal_koi", "golden_chikifish"]);
 const FFISH_SET = new Set(FFISH_ORDER);
-const FFISH_CATCH_BASE = Object.freeze(Object.assign(Object.create(null), {   // mirrors Econ.gd:675
+const FFISH_CATCH_BASE = Object.freeze(Object.assign(Object.create(null), {   // mirrors Econ.gd FFISH_CATCH_BASE
   golden_chikifish: 0.0060, crystal_koi: 0.0020, mystic_eel: 0.0007, rainbow_fish: 0.0002,
 }));
-const FFISH_ROD_REQ = Object.freeze(Object.assign(Object.create(null), {      // mirrors Econ.gd:684
+const FFISH_ROD_REQ = Object.freeze(Object.assign(Object.create(null), {      // mirrors Econ.gd FFISH_ROD_REQ
   golden_chikifish: 2, crystal_koi: 4, mystic_eel: 6, rainbow_fish: 8,
 }));
 const FFISH_ROD_FLOOR = 0.30;
@@ -3501,7 +3831,26 @@ app.post("/world/fish/report", (req, res) => {
   // FFISH_ORDER) — but the ROLL is ours, so a client can no longer simply declare a Rainbow Fish.
   const _tier = Math.min(3, Math.max(1, Math.floor(Number(b.tier)) || 1));
   const _rod = Math.min(10, Math.max(0, Math.floor(Number(b.rod)) || 0));
-  const _legend = rollFantasyCatch(_tier, _rod);
+  let _legend = rollFantasyCatch(_tier, _rod);
+  // A DAY'S FISHING IS A DAY'S FISHING. tier and rod are asserted by the caller and only clamped, so
+  // a keypair that has never played can post {tier:3, rod:10} at the 800 ms floor and win the lottery
+  // 4,500 times an hour — measured 157.84 legends per 4,500 reports, i.e. ~3,780 witnessed fantasy
+  // fish a day on a wallet with no gear and no game client. That is the exact credit FFISH_AUTHORITY
+  // is supposed to make trustworthy, so the flip would arm a poisoned book.
+  //
+  // A CEILING, NOT A REFUSAL, and pitched far above real play: a hard session is a few hundred casts,
+  // and at the very best odds that is on the order of ten legends. The base is 60, and it SCALES WITH
+  // THE FESTIVAL MULTIPLIER because that multiplier is exactly what makes an honest angler's day
+  // unusual. Over the cap the cast still counts as an ordinary fish — only the legend is dropped.
+  if (_legend) {
+    const _day = Math.floor(now / 86400000);
+    const _fr = _ffishDay.get(String(b.wallet));
+    const _row = (_fr && _fr.day === _day) ? _fr : { day: _day, n: 0 };
+    const _cap = FFISH_DAILY_MAX * Math.max(1, Math.floor(fishEventActive() ? _fishEvent.mult : 1));
+    if (_row.n >= _cap) { _legend = ""; _ffishCapped++; }
+    else { _row.n++; _ffishDay.set(String(b.wallet), _row); }
+    if (_ffishDay.size > 20000) { for (const [k, v] of _ffishDay) { if (v.day !== _day) _ffishDay.delete(k); } }
+  }
   if (_legend) ownCredit(String(b.wallet), "ffish", _legend, 1);
   if (_legend) worldFeedPush("ffish", b.wallet, _legend);   // a witnessed catch: the world hears about it
   // The client renders what the SERVER says was caught. An older client ignores `legend` and keeps
@@ -3543,13 +3892,25 @@ app.post("/world/kill/report", (req, res) => {
   // at KILL_REC_MIN_MS 500 the ceiling would have been 43,200 essence/hour of sellable credit on a
   // wallet that never fought anything, because this route verifies no combat whatsoever.
   recordGather(String(b.wallet), "essence", new Array(ESSENCE_PER_KILL).fill("essence"), false);
-  // ...but NOT if the server just watched this wallet kill something itself. The world tick credits on
-  // its own observation of a health pool it owns reaching zero; this route credits on the client's word.
-  // Both fired for the same fight, so one monster paid twice. The witnessed kill wins and this stands
-  // down — the telemetry tally above still records the report either way.
+  // THIS ROUTE NO LONGER CREDITS ANYTHING. It used to credit 1 essence per counted report whenever
+  // the server had NOT witnessed a kill — i.e. precisely when it had no evidence — which measured
+  // 7,194 units/hour of real, market-sellable acquisition entitlement on a wallet that did nothing
+  // but /verify and one /world/move (12 counted reports in 6.0 s, book 1500 -> 1512). Essence gates
+  // every craft recipe and is one of the 14 listable MAT_IDS, so that was laundering capacity at
+  // zero cost, sybil-multiplied per keypair.
+  //
+  // The shared mob pool exists now and /world/mob/hit credits on the server's OWN observation of a
+  // health pool it owns reaching zero, so there is a witnessed path for every one of the 24 world
+  // monsters. The shipped client already fires both (Net.gd posts /world/mob/hit {finish:true} and
+  // Profile.on_kill calls report_kill), and the dedupe below already stood this credit down whenever
+  // the server saw the kill — so honest players lose nothing: the credit they were getting from here
+  // was, by construction, only the credit the server could not see.
+  //
+  // The telemetry tally above is unchanged (creditOwn=false), so the observe-only oversold signal
+  // still reads exactly what it read before.
   const _wk = lastWitnessedKill.get(String(b.wallet)) || 0;
-  if (Date.now() - _wk > KILL_DEDUPE_MS) ownCredit(String(b.wallet), "mat", "essence", 1);
-  res.json({ ok: true, counted: true });
+  const _witnessed = Date.now() - _wk <= KILL_DEDUPE_MS;
+  res.json({ ok: true, counted: true, credited: false, witnessed: _witnessed });
 });
 
 // ============ THE WEEKLY RAID PRIZE IS THE SERVER'S TO GIVE ============
@@ -3568,6 +3929,10 @@ app.post("/world/kill/report", (req, res) => {
 // is a SIG_VER bump, batched with every other unsigned value gate rather than done piecemeal.
 const raidClaim = new Map();         // wallet -> ISO week index already claimed
 const RAID_WEEK = () => Math.floor(Date.now() / 604800000);
+// The dark arena, mirrored from RaidBoss.gd BOSS_X/BOSS_Z; ENGAGE_R there is 78, so 110 is a wide
+// margin around the whole platform. RAID_PRIZE_* mirror _pay_raid (RaidBoss.gd).
+const RAID_BOSS_X = 359, RAID_BOSS_Z = 259, RAID_CLAIM_R = 110;
+const RAID_PRIZE_CHIKI = 500, RAID_PRIZE_CRYSTAL = 25;
 const RAID_CLAIM_MAX = 20000;
 // EVICT ONLY SPENT WEEKS. Dropping the oldest rows blindly handed the evicted wallet its prize again
 // in the SAME week — the eviction itself became the re-claim. A row for a PAST week protects nothing
@@ -3601,12 +3966,28 @@ app.post("/world/raid/claim", (req, res) => {
   const week = RAID_WEEK();
   const w = String(b.wallet);
   if (raidClaim.get(w) === week) return res.json({ ok: true, granted: false, week });
+  // WERE YOU EVEN AT THE ARENA? The gate was a permission slip with no evidence behind it: nothing
+  // checked MALGROTH's HP, the player's position, or that a raid happened at all. Presence at the
+  // arena is the one thing the server can check, and now that /world/move stamps implausible jumps
+  // it means something — you cannot teleport in, claim, and teleport out. RAID_CLAIM_R is generous
+  // (the client shows the boss HUD at 78 units) so a player fighting from the edge still claims.
+  const _dR = Math.hypot((me.x || 0) - RAID_BOSS_X, (me.z || 0) - RAID_BOSS_Z);
+  if (_dR > RAID_CLAIM_R || (me.warp && now - me.warp < WARP_HOLD_MS)) {
+    return res.json({ ok: true, granted: false, week, tooFar: Math.round(_dR) });
+  }
   // CLAIM BEFORE ANSWERING — the same rule the egg restitution and meme-egg guards follow, so two
   // requests racing the same kill cannot both be told "granted"
   raidClaim.set(w, week);
   evictRaidClaims();
   _assetsDirty = true;
-  res.json({ ok: true, granted: true, week });
+  // THE PRIZE IS THE SERVER'S TO PAY, not just to permit. The 25 crystal has always been granted by
+  // the client (RaidBoss.gd _pay_raid) and never recorded here, so a legitimately earned raid crystal
+  // was spent out of UNWITNESSED_ALLOWANCE — an honest player's own forgiveness budget — instead of
+  // raising their bound. Crediting it here is the accounting the payout always deserved, and the
+  // amounts are now in the reply so a future client can apply what the SERVER says rather than a
+  // local constant.
+  ownCredit(w, "mat", "crystal", RAID_PRIZE_CRYSTAL);
+  res.json({ ok: true, granted: true, week, prize: { chiki: RAID_PRIZE_CHIKI, mat: "crystal", qty: RAID_PRIZE_CRYSTAL } });
 });
 
 // ============ STEP 6: the FULL material flow becomes observable (observe-only) ============
@@ -3676,7 +4057,7 @@ export function _flowFor(wallet) { return { spent: matSpent.get(wallet) || null,
 //
 // SO WHAT ABOUT REAL UNWITNESSED MATERIAL? It exists and it is SMALL, measured from the real tables:
 // all 12 TASKS together grant 9, level milestones about 45 across a whole lifetime, a treasure chest
-// 4–8 of one material (Profile.gd:2526) or 6 crystal, plus craft refunds bounded by what was spent.
+// 4–8 of one material (Profile.gd's chest grant) or 6 crystal, plus craft refunds bounded by what was spent.
 // UNWITNESSED_ALLOWANCE covers all of it with a wide margin instead of refusing an honest player,
 // and it is per (wallet, item) so it cannot be pooled into one big sale.
 const OWN_KINDS = new Set(FFISH_AUTHORITY ? ["mat", "ffish"] : ["mat"]);   // mutated by _setFfishAuthorityForTest
@@ -3760,9 +4141,21 @@ function ownEscrowed(wallet, kind, item) {
     if (String(row.kind || "mat") !== kind || String(row.item || "") !== item) continue;
     n += Math.max(0, Number(row.qty) || 0);
   }
+  // A PENDING CRAFT-ORDER DELIVERY IS ESCROW TOO. The filler's goods have left their bag and the
+  // poster has 48 hours to pay, so those units are committed exactly as a listing's are. Without
+  // this the deliver-side bound was a no-op against repetition: `sold` only moves at PAY time, so
+  // 30 consecutive 99-gold deliveries each measured themselves against the same untouched 1500 and
+  // all 30 were accepted (measured). Counting them here is what makes the 48h window stop being a
+  // bound-evasion race.
+  for (const row of marketOrders) {
+    if (row.state !== "delivered") continue;
+    if (String(row.fillerWallet || "") !== wallet) continue;
+    if (String(row.kind || "mat") !== kind || String(row.item || "") !== item) continue;
+    n += Math.max(0, Number(row.qty) || 0);
+  }
   return n;
 }
-function ownAvailable(wallet, kind, item) {
+function ownAvailable(wallet, kind, item, allowOverride) {
   const r = ownBook.get(wallet);
   const k = ownKey(kind, item);
   const open = r ? (r.open[k] || 0) : 0;
@@ -3773,9 +4166,23 @@ function ownAvailable(wallet, kind, item) {
   // tasks and milestones the server never sees. A fantasy fish has exactly one source — a cast, which
   // the server now rolls itself — so there is no unwitnessed channel to forgive, and forgiving 1500 of
   // a 1-in-5000 fish would have been the whole exploit wearing a different hat.
-  const allow = kind === "ffish" ? 0 : UNWITNESSED_ALLOWANCE;
+  const allow = kind === "ffish" ? 0
+    : (Number.isFinite(allowOverride) ? Math.max(0, allowOverride) : UNWITNESSED_ALLOWANCE);
   return (open + cred + allow) - sold - used - ownEscrowed(wallet, kind, item);
 }
+// THE ALLOWANCE IS NOT SPENDABLE ON ASSET ISSUANCE.
+// 1500 per (wallet, item) is right for the MARKET — it forgives chests, tasks and milestones the
+// server never witnessed, and the worst case there is a bounded sale. It is wrong for minting,
+// because it also paid for eggs and scrolls: measured on a wallet that had done nothing but /verify,
+// ownAvailable was 1500 for all six egg materials, i.e. 37 free legendary eggs and 37 free mount
+// eggs — the fuel behind the /consume species drain. Issuance therefore reads a much smaller
+// forgiveness, and the number is chosen against the recipes rather than by feel: the CHEAPEST egg
+// still needs 30 wood, the dearest 50 crystal, and Azulon's scroll 50 wood, so 25 cannot fund any
+// single recipe on its own while it still forgives a player whose last few gathers went unwitnessed
+// (a backgrounded phone, a cold backend — /world/node/claim answers 403 and the client keeps the
+// item). Grandfathering is untouched: this refuses a NEW claim, it never touches anything held.
+const ISSUE_UNWITNESSED_ALLOWANCE = 25;
+const ownAvailableForIssue = (wallet, kind, item) => ownAvailable(wallet, kind, item, ISSUE_UNWITNESSED_ALLOWANCE);
 // ONE-TIME OPENING BALANCE. prev._serverSavedAt is the only clock the server writes itself
 // (safe._serverSavedAt = now, unconditional), so a client cannot forge its way into this branch —
 // unlike store.firstSeen, which /verify INSERTs for an unsigned address-only POST and which returns 0
@@ -4047,7 +4454,8 @@ app.get("/assets/summary", (req, res) => {
              mountsAdopted: _mountsAdopted, chikisAdopted: _chikisAdopted,
              matFlow: { spendingWallets: matSpent.size, gainingWallets: matGained.size },
              nodeClaims: { proven: _provenClaims, unproven: _unprovenClaims,
-                           provenPct: (_provenClaims + _unprovenClaims) ? Math.round(100 * _provenClaims / (_provenClaims + _unprovenClaims)) : 0 },
+                           provenPct: (_provenClaims + _unprovenClaims) ? Math.round(100 * _provenClaims / (_provenClaims + _unprovenClaims)) : 0,
+                           enforcing: CLAIM_TOKEN_REQUIRED },
              // Refused for an impossible quantity (LIST_QTY_MAX). Unlike oversoldMaterials — which is
              // a soft signal, since materials also arrive from crafting/quests/chests/trades — every
              // row here is a listing the game could not have produced, so it names an actual attempt.
@@ -4227,6 +4635,14 @@ app.post("/world/mob/hit", (req, res) => {
   // 2. you have to actually be in the world
   const me = worldPlayers.get(b.wallet);
   if (!me || now - me.ts > WORLD_TTL_MS) { _mobHitsRefused++; return res.status(403).json({ ok: false, error: "no live presence" }); }
+  // ...and you have to have GOT there. The reach check below is measured against this row, so a row
+  // written by a teleport makes it meaningless: one wallet swept all 24 spawns in 10 s and claimed
+  // every kill on the island. See the note in /world/move — the move itself is allowed, the reward
+  // is not, for WARP_HOLD_MS.
+  if (me.warp && now - me.warp < WARP_HOLD_MS) {
+    _mobHitsRefused++;
+    return res.status(403).json({ ok: false, error: "catch your breath", retryInMs: WARP_HOLD_MS - (now - me.warp) });
+  }
 
   const spec = MOB_SPAWNS[idx];
 
@@ -4433,7 +4849,7 @@ function bumpStaticSeq(prev, next) {
   return Number(prev.sq) || 1;
 }
 // ---- INTEREST RADIUS (with hysteresis) ----
-// The client hides every remote past RENDER_DIST 240 (Net.gd:64) and skips all their per-frame
+// The client hides every remote past RENDER_DIST 240 (Net.gd RENDER_DIST) and skips all their per-frame
 // work — yet the snapshot shipped every peer within WORLD_RADIUS 4000, i.e. the whole island. At
 // 60 peers most of every snapshot was players the receiver could not see. So /world/move replies
 // now ship only peers the receiver can actually render: ENTER at 260 (20 units beyond the render
@@ -4572,7 +4988,7 @@ function presenceOk(id, body) {
 // WORLD_TICK=0) forces the shared world off; WORLD_TICK=1, which every existing sim sets, still
 // means on.
 const WORLD_TICK_ON = String(process.env.CHIK_WORLD_TICK ?? process.env.WORLD_TICK ?? "") !== "0";
-// Mirrors Econ.MOBS (Econ.gd:220) and Econ.RESPAWN_S (231). If these drift from the client the shared
+// Mirrors Econ.gd MOBS and Econ.gd RESPAWN_S. If these drift from the client the shared
 // HP bar lies, so they are asserted equal by world_tick_sim rather than trusted.
 const MOB_STATS = Object.freeze(Object.assign(Object.create(null), {
   darkeet:   { hp: 170, essence: 1 },
@@ -4580,7 +4996,7 @@ const MOB_STATS = Object.freeze(Object.assign(Object.create(null), {
   hogwert:   { hp: 260, essence: 2 },
   darkeon:   { hp: 400, essence: 3 },
 }));
-// The 24 spawns, in the SAME ORDER Monsters.gd:111 walks monsters_meta.json — so the array index IS
+// The 24 spawns, in the SAME ORDER Monsters.gd's spawn walk reads monsters_meta.json — so the array index IS
 // the shared mob id on every client, with no negotiation and nothing to broadcast. This is the one
 // piece of luck in the whole problem and the reason it is tractable.
 const MOB_SPAWNS = Object.freeze([
@@ -4811,9 +5227,19 @@ function recordGather(wallet, kind, drop, creditOwn = true) {
   if (!isPubkey(String(wallet || "")) || !kind) return;
   // Count the MATERIALS, not the node kind. The oversold check compares this against what a wallet
   // lists for sale, and nobody sells a "cow" — they sell beef and hide.
-  const mats = Array.isArray(drop) && drop.length ? drop : [kind];
+  // NO FALLBACK TO THE NODE KIND. NODE_DROP is written as "an ALLOWLIST, never a default — unknown
+  // -> nothing", and nodeDrop() honours it by returning []. This line used to turn that empty drop
+  // straight back into the raw kind string, so a claim of a node kind that does not exist
+  // ("essence:800:-400") credited the acquisition book anyway if the string happened to be in
+  // MAT_IDS — measured 1500 -> 1501 on a drop of []. The two real callers (fish, kill) already pass
+  // a filled array, so nothing legitimate depended on the fallback.
+  const mats = Array.isArray(drop) ? drop : [];
+  if (!mats.length) return;
   const g = _tallyRow(gatherCount, wallet);
-  for (const m of mats) g[m] = (g[m] || 0) + 1;
+  // MATERIALS ONLY as tally keys. The restore path truncates a gather row to its first 40 keys, so
+  // junk keys written here could push a wallet's REAL counts out of the row the oversold signal
+  // reads. The flow tallies already enforce exactly this rule on restore.
+  for (const m of mats) { if (!MAT_IDS.has(m)) continue; g[m] = (g[m] || 0) + 1; }
   _assetsDirty = true;
   // THE ACQUISITION BOUND'S ONLY BULK CREDIT. A node claim is position-authorised against the
   // server's own record of where this wallet is, and one gather is exactly one item, so each entry
@@ -4922,12 +5348,163 @@ const ASSET_SUPPLY = Object.freeze({
                           chemist: 50, electro: 300, fire: 300, night: 100, sailor: 200 }),
   mount:  Object.freeze({ chicken: 15, boar: 20, gator: 15, horse: 10, wolf: 10, griffin: 5 }),
 });
-// live issuance for one species, counted from the registry itself (the record IS the count)
-function issuedCount(type, sp) {
-  let k = 0;
-  for (const r of assetReg.values()) if (r && r.type === type && r.sp === sp && r.state !== "void") k++;
-  return k;
+// ============ ONE CENSUS, THREE RECORD SOURCES ============
+// A cap is only as true as its DENOMINATOR, and the denominator used to be the registry alone —
+// which is the newest and smallest of three places a living creature can be recorded:
+//
+//   1. assetReg      the server-minted registry (id/type/sp/owner/origin/state/parent/chain)
+//   2. assetLedger   the LEGACY per-wallet ledger — rec.units / rec.mounts / rec.avatars. This is
+//                    where every old-game creature lives, and there are worlds where it holds far
+//                    more of a species than the registry does. Counting only (1) let a
+//                    legacy-heavy species issue right past its advertised supply.
+//   3. memeMinted    the PAID Meme Dynasty sale counter (kv "meme_minted", backed by memeHatches).
+//
+// THE DEDUP TRAP. These sources overlap, and a naive union double-counts:
+//   - /assets/mounts/sync and /assets/chikimon/sync ADOPT ledger entries by minting a registry row
+//     for them, so one creature sits in BOTH (1) and (2);
+//   - anything the server itself hatched appears in (1) and then, on the player's next save, in (2);
+//   - a paid-sale meme is counted in (3), is granted in-game (so it reaches (2)), and is then
+//     adopted into (1) — one creature, counted three times.
+// Double-counting is not a harmless overestimate: it refuses honest players at a ceiling the world
+// has not actually reached. So the union is reconciled PER WALLET PER SPECIES, registry-first.
+//
+// THE DEDUP KEY. Adoption used to carry no link back to the ledger entry it adopted (only sp/owner
+// /origin), so `luid` — the ledger's own key for that entry (the unit uid for chikimon, the species
+// key for mounts, which is what rec.mounts is keyed by) — is written on every adopted row from
+// here on. Rows adopted BEFORE this existed have no luid, so the reconciliation also absorbs one
+// unmatched ledger entry per unmatched registry row of the same wallet+species: species-level
+// adoption is one row per species per wallet, which makes that absorption exact for those rows.
+//
+// EXCLUSIONS: a ledger entry with held === false was sold or given away; a registry row in state
+// consumed/void (a hatched egg, above all) is not a living creature. Neither counts.
+// A species named by no supply table is still counted and still reported — never a crash.
+//
+// UNVERIFIED ASSETS ARE REPORTED, NOT COUNTED. A flagged asset is one the record says appeared from
+// nowhere. If it consumed a cap slot, then conjuring five griffins into a save would permanently
+// deny the last five griffins to every honest player — forgery as a denial-of-service on scarcity,
+// paid for by the innocent. Nothing is deleted or taken (that is not what flags are for): they ride
+// in the published `flagged` line, visible and auditable, and simply do not bind the cap.
+const CENSUS_TTL_MS = 30000;            // backstop only; every mutation invalidates explicitly
+let _census = null, _censusAt = 0, _censusBuilds = 0;
+function censusInvalidate() { _census = null; }
+// the asset TYPE is a closed set that never contains ":", so type+sp is unambiguous as one key
+function _censusKey(type, sp) { return String(type) + ":" + String(sp); }
+
+function buildCensus() {
+  const byKey = new Map();
+  const slotOf = (type, sp) => {
+    const k = _censusKey(type, sp);
+    let s = byKey.get(k);
+    if (!s) { s = { type, sp, registry: 0, ledger: 0, sales: 0, deduped: 0, count: 0, flagged: 0, orphanSales: 0, w: new Map() }; byKey.set(k, s); }
+    return s;
+  };
+  // Each wallet keeps two parallel tallies of the same shape: `c` (clean — what binds the cap) and
+  // `f` (flagged — reported only). Both are reconciled by the identical rule, so a forged asset is
+  // deduped as carefully as an honest one; it is simply counted somewhere that costs nobody.
+  const grp = () => ({ R: 0, L: 0, luids: null, uids: null });
+  const wOf = (slot, wallet) => {
+    let w = slot.w.get(wallet);
+    if (!w) { w = { c: grp(), f: grp(), S: 0 }; slot.w.set(wallet, w); }
+    return w;
+  };
+  const addReg = (g, luid) => { g.R++; if (luid) (g.luids || (g.luids = new Set())).add(String(luid)); };
+  const addLed = (g, uid) => { g.L++; (g.uids || (g.uids = [])).push(String(uid)); };
+  const distinctOf = (g) => {
+    let matched = 0;
+    if (g.luids && g.uids) for (const uid of g.uids) if (g.luids.has(uid)) matched++;
+    if (matched > g.R) matched = g.R;
+    const unmatchedL = g.L - matched, freeR = g.R - matched;
+    const absorbed = Math.min(unmatchedL, Math.max(0, freeR));      // pre-luid adoptions & own hatches
+    return g.R + (unmatchedL - absorbed);
+  };
+
+  // ---- 1. the registry: what the server itself minted --------------------------------------
+  for (const r of assetReg.values()) {
+    if (!r || r.state !== "active") continue;         // consumed / void are not living creatures
+    const type = String(r.type || ""), sp = String(r.sp || "");
+    if (!type || !sp) continue;
+    const slot = slotOf(type, sp), w = wOf(slot, String(r.owner || "?"));
+    const bad = r.origin === "unverified";
+    addReg(bad ? w.f : w.c, r.luid);
+    if (!bad) slot.registry++;                     // `flagged` is filled in by the reconcile below
+  }
+  // ---- 2. the legacy ledger: what predates the registry -------------------------------------
+  for (const [wallet, rec] of assetLedger) {
+    if (!rec || typeof rec !== "object") continue;
+    if (rec.units) for (const uid of Object.keys(rec.units)) {
+      const u = rec.units[uid];
+      if (!u || u.held === false) continue;           // sold / no longer in the roster
+      const sp = String(u.sp || "");
+      if (!sp || sp === "?") continue;
+      const slot = slotOf("chikimon", sp), w = wOf(slot, wallet), bad = u.origin === "unverified";
+      addLed(bad ? w.f : w.c, uid);
+      if (!bad) slot.ledger++;
+    }
+    if (rec.mounts) for (const sp of Object.keys(rec.mounts)) {
+      const m = rec.mounts[sp];
+      if (!m || m.held === false) continue;
+      if (!sp || sp === "?") continue;
+      const slot = slotOf("mount", sp), w = wOf(slot, wallet), bad = m.origin === "unverified";
+      addLed(bad ? w.f : w.c, sp);                    // rec.mounts IS keyed by species
+      if (!bad) slot.ledger++;
+    }
+    // avatars are census-only in the ledger — never graded, so there is no flagged case here
+    if (rec.avatars) for (const sp of Object.keys(rec.avatars)) {
+      const a = rec.avatars[sp];
+      if (!a || a.held === false) continue;
+      if (!sp || sp === "?") continue;
+      const slot = slotOf("avatar", sp), w = wOf(slot, wallet);
+      addLed(w.c, sp); slot.ledger++;
+    }
+  }
+  // ---- 3. the paid Meme Dynasty sale ---------------------------------------------------------
+  for (const h of memeHatches) {
+    if (!h || !h.char) continue;
+    if (h.status !== "pending" && h.status !== "minted") continue;   // a mystery egg has no species yet
+    const slot = slotOf("chikimon", String(h.char)), w = wOf(slot, String(h.wallet || "?"));
+    w.S++; slot.sales++;
+  }
+  // a persisted memeMinted tally with no hatch row behind it (an older kv blob) still counts — it
+  // just cannot be attributed to a wallet, so it can never be deduped against one either
+  for (const key of Object.keys(memeMinted)) {
+    const n = Math.max(0, Number(memeMinted[key]) || 0);
+    if (!n) continue;
+    const slot = slotOf("chikimon", key);
+    const extra = Math.max(0, n - slot.sales);
+    if (extra > 0) { slot.sales += extra; slot.orphanSales += extra; }
+  }
+
+  // ---- reconcile: registry first, then whatever the registry does not already stand for -------
+  for (const slot of byKey.values()) {
+    let total = slot.orphanSales, flagged = 0;
+    for (const w of slot.w.values()) {
+      const base = distinctOf(w.c);
+      total += base + Math.max(0, w.S - base);       // a sale already standing in (1)/(2) adds nothing
+      flagged += distinctOf(w.f);
+    }
+    slot.count = total;
+    slot.flagged = flagged;
+    slot.deduped = Math.max(0, slot.registry + slot.ledger + slot.sales - slot.count);
+    slot.w = null;                                    // working state, not a published record
+  }
+  _censusBuilds++;
+  return byKey;
 }
+function censusAll() {
+  if (!_census || Date.now() - _censusAt > CENSUS_TTL_MS) { _census = buildCensus(); _censusAt = Date.now(); }
+  return _census;
+}
+// THE one counter. Everything that asks "how many of these exist" asks this, so there is a single
+// number to be right about rather than two that drift apart.
+const _CENSUS_ZERO = Object.freeze({ count: 0, registry: 0, ledger: 0, sales: 0, deduped: 0, flagged: 0 });
+function trueIssued(type, sp) {
+  const c = censusAll().get(_censusKey(type, sp));
+  if (!c) return _CENSUS_ZERO;
+  return { count: c.count, registry: c.registry, ledger: c.ledger, sales: c.sales,
+           deduped: c.deduped, flagged: c.flagged };
+}
+// live issuance for one species — the DEDUPED union of every record source, not the registry alone
+function issuedCount(type, sp) { return trueIssued(type, sp).count; }
 function supplyOf(type, sp) {
   const t = ASSET_SUPPLY[type];
   if (t && Object.hasOwn(t, sp)) return t[sp];
@@ -4951,8 +5528,17 @@ function mintAsset(type, wallet, fields, origin, parent) {
   // the advertised rarity true. Restores/adoptions of assets that ALREADY EXIST are not issuance —
   // they carry origin "legacy"/"unverified"/"restitution" and are exempt, or the registry would
   // refuse to record history it is supposed to preserve.
+  //
+  // ADOPTION IS NOT ISSUANCE, WHATEVER THE LEDGER GRADED IT. `luid` is only ever set by the two
+  // sync routes, and it names the ledger entry the row adopts — a creature the census ALREADY
+  // counts from the ledger, so the cap must not be re-applied to it. Reading the exemption off the
+  // ORIGIN alone was wrong: the ledger's verdict is "legacy" for a pre-epoch roster but "hatched",
+  // "purchased", "issued" or "traded" for everyone else, and those graded rows were refused
+  // SUPPLY_EXHAUSTED on any full species — a player denied the registration of a creature they
+  // already own (and, through the sync loop's `break`, denied it for their whole stable).
   const _sp = String((fields && fields.sp) || "");
-  const _issuing = !["legacy", "unverified", "restitution"].includes(String(origin || ""));
+  const _adopting = !!(fields && fields.luid);
+  const _issuing = !_adopting && !["legacy", "unverified", "restitution"].includes(String(origin || ""));
   if (_issuing && _sp && atSupplyCap(type, _sp)) {
     const e = new Error(`every ${_sp} that will ever exist has been claimed`);
     e.code = "SUPPLY_EXHAUSTED";
@@ -4972,6 +5558,7 @@ function mintAsset(type, wallet, fields, origin, parent) {
   assetReg.set(id, row);
   ownerSet(wallet).add(id);
   _assetsDirty = true;
+  censusInvalidate();      // the count this row belongs to is now stale — the cap must never read it stale
   return row;
 }
 
@@ -4989,6 +5576,7 @@ function transferAsset(id, from, to, why, extra) {
   ownerSet(to).add(id);
   regEvent(row, "transferred", Object.assign({ from, to, why }, extra || {}));
   _assetsDirty = true;
+  censusInvalidate();      // the census reconciles PER WALLET, so a change of owner re-groups it
   return row;
 }
 
@@ -5089,9 +5677,10 @@ app.post("/assets/egg/claim", (req, res) => {
       });
     }
   }
+  let _charge = false;
   if (_ownEnforce && _ownReady && _recipe) {
     for (const m of Object.keys(_recipe)) {
-      const have = ownAvailable(wallet, "mat", m);
+      const have = ownAvailableForIssue(wallet, "mat", m);   // issuance reads the strict allowance
       if (have < _recipe[m]) {
         _ownRefusals++;
         return res.status(409).json({
@@ -5100,16 +5689,27 @@ app.post("/assets/egg/claim", (req, res) => {
         });
       }
     }
-    // Charged only once every material AND the legend cleared, so a partial payment is never taken.
-    for (const m of Object.keys(_recipe)) ownDebit(wallet, "mat", m, _recipe[m]);
-    if (_ffishAuth && _fishReq) ownDebit(wallet, "ffish", _fishReq.sp, _fishReq.n);
+    _charge = true;   // every ingredient cleared — but nothing is taken until the egg EXISTS
   } else if (_ownEnforce && !_ownReady) {
     _ownSkipped++;
   }
   _lastEggClaim.set(wallet, now);
+  // the only per-wallet map in this region without a bound; same sweep the neighbours use
+  if (_lastEggClaim.size > 5000) {
+    let _d = 250;
+    for (const k of _lastEggClaim.keys()) { if (_d-- <= 0) break; _lastEggClaim.delete(k); }
+  }
   let row;
   try { row = mintAsset("egg", wallet, { kind, sp: kind }, "issued"); }
   catch (e) { return res.status(503).json({ error: "the asset registry is at capacity — this is a server fault, not yours; nothing was consumed" }); }
+  // CHARGED AFTER THE MINT, AND THAT ORDER IS THE POINT. The debit used to run before mintAsset, so
+  // a registry-capacity throw took 40 crystal + 30 gold + 26 essence and answered "nothing was
+  // consumed" — a false sentence over a real loss (measured: crystal 1500 -> 1460 on a 503).
+  // Charged only once every material AND the legend cleared, so a partial payment is never taken.
+  if (_charge) {
+    for (const m of Object.keys(_recipe)) ownDebit(wallet, "mat", m, _recipe[m]);
+    if (_ffishAuth && _fishReq) ownDebit(wallet, "ffish", _fishReq.sp, _fishReq.n);
+  }
   res.json({ ok: true, egg: { id: row.id, kind, born: row.born, readyAt: eggReadyAt(row) } });
 });
 
@@ -5154,12 +5754,17 @@ app.post("/assets/egg/hatch", (req, res) => {
   }
   } catch (e) {
     // the egg is NOT consumed on failure — a capacity fault must never destroy what a player paid for
+    // ...and a species that has genuinely run out is NOT a capacity fault. Telling a player to "try
+    // again later" for a cap that will never move sends them into an endless retry and misdirects
+    // support, so the two are answered separately.
+    if (e && e.code === "SUPPLY_EXHAUSTED") return res.status(409).json({ error: `${e.message} — your egg is safe, hatch it again` });
     return res.status(503).json({ error: "the asset registry is at capacity — your egg is safe, try again later" });
   }
   // CONSUMED, NOT DELETED. The egg keeps its row and points at what came out of it, so the
   // creature's lineage is readable forever — and the egg can never vouch a second hatch.
   row.state = "consumed";
   row.hatchedTo = born.id;
+  censusInvalidate();      // a consumed egg leaves the live count; the creature it became joins it
   regEvent(row, "hatched", { into: born.id, sp: born.sp });
   // the world feed carries ONLY server-rolled hatches (the /assets/egg/consume halfway house is a
   // client-chosen species — an honest lineage, but not a witnessed roll, so it stays out)
@@ -5194,20 +5799,46 @@ app.post("/assets/egg/consume", (req, res) => {
 
   const sp = String(req.body?.sp || "").slice(0, 24);
   const isMount = row.kind === "mount";
-  const pool = isMount ? MOUNT_SUPPLY.map(m => m[0]) : (EGG_KIND_POOL[row.kind] || SPECIES_NORMAL);
-  if (!pool.includes(sp)) return res.status(400).json({ error: "that is not something this egg can produce" });
+  // THE POOL IS THE ONE /assets/egg/hatch ROLLS FROM, NOT THE WHOLE CATALOG.
+  // This used to be `MOUNT_SUPPLY.map(m => m[0])` / the raw species list, i.e. the client NAMED the
+  // prize and the only test was "is that a thing this egg can produce". Two consequences, both
+  // measured (hatching_consume_sim.mjs): five brand-new wallets took all five griffins — a 5/75
+  // weighted Mythic roll turned into a deterministic pick — and one wallet consumed three legendary
+  // eggs as dragonos and listed all three duplicates on the Trading Post. The dedup and the cap
+  // filter below are exactly what /hatch already applies before it rolls; this route now offers the
+  // same set, so the only thing it still concedes is WHICH of the legal outcomes was drawn.
+  const owned = isMount ? ownedMounts(wallet) : ownedSpecies(wallet);
+  const catalog = isMount ? MOUNT_SUPPLY.map(m => m[0]) : (EGG_KIND_POOL[row.kind] || SPECIES_NORMAL);
+  if (!catalog.includes(sp)) return res.status(400).json({ error: "that is not something this egg can produce" });
+  // ONE OF EACH SPECIES. /hatch filters the roll by ownedSpecies/ownedMounts; without the same
+  // filter here a wallet mints the same legendary as often as it can find eggs.
+  if (owned.has(sp)) {
+    return res.status(409).json({ error: isMount
+      ? "that steed already waits in your stable — your egg is safe, hatch it again"
+      : "you already carry that one — your egg is safe, hatch it again" });
+  }
   // the client picked this species itself, so the cap has to be checked rather than assumed
   if (row.kind === "meme" && memeAtCap(sp)) {
     return res.status(409).json({ error: "that Meme Dynasty edition is fully claimed — your egg is safe, hatch it again" });
+  }
+  if (atSupplyCap(isMount ? "mount" : "chikimon", sp)) {
+    return res.status(409).json({ error: `every ${sp} that will ever exist has been claimed — your egg is safe, hatch it again` });
   }
 
   let born;
   try {
     born = mintAsset(isMount ? "mount" : "chikimon", wallet,
       { sp, kind: isMount ? "mount" : (row.kind === "normal" ? "normal" : row.kind), lvl: 1 }, "hatched", row.id);
-  } catch (e) { return res.status(503).json({ error: "the asset registry is at capacity — your egg is safe, try again later" }); }
+  } catch (e) {
+    // A CAP IS NOT A CAPACITY FAULT. One catch used to answer both, so a player whose species had
+    // genuinely run out was told to "try again later" and would retry forever. The egg survives
+    // either way (nothing above this line mutates it) — only the sentence changes.
+    if (e && e.code === "SUPPLY_EXHAUSTED") return res.status(409).json({ error: `${e.message} — your egg is safe, hatch it again` });
+    return res.status(503).json({ error: "the asset registry is at capacity — your egg is safe, try again later" });
+  }
   row.state = "consumed";
   row.hatchedTo = born.id;
+  censusInvalidate();      // same as the server-rolled hatch: the egg leaves the live count
   regEvent(row, "hatched", { into: born.id, sp });
   _assetsDirty = true;
   res.json({ ok: true, hatched: { id: born.id, type: born.type, sp: born.sp, from: row.id } });
@@ -5251,9 +5882,18 @@ app.post("/assets/mounts/sync", (req, res) => {
       const lo = lrec.mounts[sp] && lrec.mounts[sp].origin;
       const origin = ORIGINS.has(lo) ? lo : "unverified";   // the ledger's verdict rides along, never upgraded
       try {
-        mintAsset("mount", wallet, { sp, kind: "mount" }, origin);
+        // `luid` is the DEDUP KEY: rec.mounts is keyed by species, so the species IS the ledger's
+        // name for this steed. Without it the world census counts the adopted row and the ledger
+        // entry it came from as two mounts, and the cap refuses honest players early.
+        mintAsset("mount", wallet, { sp, kind: "mount", luid: sp }, origin);
         ownedSp.add(sp); adopted.push(sp); _mountsAdopted++;
-      } catch (e) { break; }   // capacity: adopt what fits — the rest stays ledger-known and retries next sync
+      } catch (e) {
+        // A PER-SPECIES refusal must not end the loop. `break` was written for the one failure that
+        // existed (registry capacity — "adopt what fits"), and a species-scoped throw arriving at
+        // the same catch silently cost the wallet every OTHER steed it owns.
+        if (e && e.code === "SUPPLY_EXHAUSTED") continue;
+        break;   // capacity: adopt what fits — the rest stays ledger-known and retries next sync
+      }
     }
   }
 
@@ -5307,9 +5947,15 @@ app.post("/assets/chikimon/sync", (req, res) => {
       if (ownedSp.has(sp)) continue;              // already property; one row per species per wallet
       const origin = ORIGINS.has(u.origin) ? u.origin : "unverified";   // the ledger's verdict rides along, never upgraded
       try {
-        mintAsset("chikimon", wallet, { sp, kind: String(u.kind || "normal").slice(0, 12), lvl: 1 }, origin);
+        // `luid` is the DEDUP KEY: the ledger's own uid for the creature this row adopts, so the
+        // world census counts one creature rather than one per record source.
+        mintAsset("chikimon", wallet, { sp, kind: String(u.kind || "normal").slice(0, 12), lvl: 1, luid: uid }, origin);
         ownedSp.add(sp); adopted.push(sp); _chikisAdopted++;
-      } catch (e) { break; }   // capacity: adopt what fits — the rest stays ledger-known and retries next sync
+      } catch (e) {
+        // per-species refusal skips that creature only; capacity ends the pass (see mounts/sync)
+        if (e && e.code === "SUPPLY_EXHAUSTED") continue;
+        break;   // capacity: adopt what fits — the rest stays ledger-known and retries next sync
+      }
     }
   }
 
@@ -5351,6 +5997,24 @@ app.post("/assets/chikimon/sync", (req, res) => {
 const EGG_RESTITUTION_UNTIL = Date.UTC(2026, 7, 4);   // 7 days, closes 2026-08-04 00:00 UTC
 const eggRestitutionDone = new Map();                 // wallet -> { at, granted:[kind] }
 const RESTITUTION_KINDS = Object.freeze(["normal", "legendary", "meme", "mount"]);
+// ONLY AN ACCOUNT THAT EXISTED WHEN THE WIPE HAPPENED CAN HAVE BEEN WIPED.
+// `prog` rides in the client-authored save, so the arithmetic above reads numbers the player writes:
+// a crafted push of eggmake_*=9 / hatch_*=0 answered `owed:["normal","legendary","meme","mount"]`
+// and minted four registry eggs — one of them a CAPPED Meme Dynasty edition and one a CAPPED mount —
+// on a wallet created seconds earlier (measured, hatching_consume_sim.mjs R5). The one-shot is per
+// wallet, so it was unlimited across wallets.
+//
+// The discriminator is a clock the SERVER wrote and a new wallet cannot have: players.first_seen,
+// INSERTed the first time an address reaches /verify. The seal-floor wipe ran 2026-07-27 18:41 UTC
+// to 2026-07-28 00:10 UTC, so every genuine victim's account already existed by the END of that
+// window; anyone first seen after it cannot have lost an egg to it. Every real victim is still paid
+// in full — this refuses the throwaway wallet, not the make-good.
+const EGG_WIPE_END_MS = Date.UTC(2026, 6, 28, 0, 10);   // 2026-07-28 00:10 UTC — grace restored
+async function restitutionEligibleFirstSeen(wallet) {
+  let fs = _testFirstSeen.get(wallet) || 0;
+  if (!fs) { try { fs = Number(await store.firstSeen(wallet)) || 0; } catch (e) { fs = 0; } }
+  return fs;
+}
 
 function owedEggs(mmo) {
   const prog = (mmo && mmo.prog && typeof mmo.prog === "object") ? mmo.prog : {};
@@ -5399,6 +6063,9 @@ app.get("/assets/egg/restitution", async (req, res) => {
     const p = await store.getProfile(w);
     if (p && p.mmo) owed = owedEggs(p.mmo);
   } catch (e) { return res.status(503).json({ error: "could not read your save — try again shortly" }); }
+  // the same account-age gate the claim enforces, so nobody is shown a number they cannot collect
+  const fsG = await restitutionEligibleFirstSeen(w);
+  if (!fsG || fsG >= EGG_WIPE_END_MS) owed = [];
   res.json({ open, closesAt: EGG_RESTITUTION_UNTIL, alreadyClaimed: !!prior,
              claimedAt: prior?.at || null, owed: prior ? [] : owed });
 });
@@ -5412,6 +6079,13 @@ app.post("/assets/egg/restitution", async (req, res) => {
   if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
   if (Date.now() >= EGG_RESTITUTION_UNTIL) return res.status(410).json({ error: "the egg restitution window has closed" });
   if (eggRestitutionDone.has(wallet)) return res.status(409).json({ error: "you have already claimed your eggs" });
+  // AN ACCOUNT THE SERVER FIRST SAW AFTER THE WIPE CANNOT HAVE BEEN WIPED (see EGG_WIPE_END_MS).
+  // A DB that cannot answer is retryable rather than refused-forever, and the one-shot is untouched.
+  const fs = await restitutionEligibleFirstSeen(wallet);
+  if (!fs) return res.status(503).json({ error: "could not confirm when this account was first seen — try again shortly" });
+  if (fs >= EGG_WIPE_END_MS) {
+    return res.status(403).json({ error: "this account was first seen after the 2026-07-27 incident, so nothing was lost from it", firstSeen: fs });
+  }
 
   let mmo = null;
   try { const p = await store.getProfile(wallet); mmo = p && p.mmo; }
@@ -5436,21 +6110,81 @@ app.post("/assets/egg/restitution", async (req, res) => {
   res.json({ ok: true, granted, note: "these are fresh eggs on a new incubation clock" });
 });
 
+// AZULON'S PRICE, MIRRORED SERVER-SIDE (Econ.gd SCROLL_TRADE — one of every catchable fantasy fish
+// plus 230 units of gathered material). It had NO server mirror at all: the route checked
+// AVATARS_MAX and atSupplyCap and nothing else, so 40 throwaway keypairs holding nothing minted 80
+// supply-capped avatars in 111 ms, and ~875 signed-in wallets could permanently exhaust the entire
+// 1750-slot scroll-reachable avatar supply. mintAsset never deletes and grandfathering is absolute,
+// so every slot taken that way is denied to an honest player forever.
+//
+// The MATERIAL half is enforceable today and is enforced. THE FANTASY FISH HALF IS NOT, for exactly
+// the reason the egg route gives: the shipped client's cast report carries no rod or spot tier, so
+// the witnessed ffish book is empty for honest players. It therefore sits behind the same _ffishAuth
+// flag, and turning that flag on is one decision for both routes.
+const SCROLL_RECIPE_FISH = Object.freeze({ rainbow_fish: 1, mystic_eel: 1, crystal_koi: 1, golden_chikifish: 1 });
+const SCROLL_RECIPE_MATS = Object.freeze({ gold: 12, iron: 18, crystal: 20, wood: 50, stone: 40,
+                                           berries: 30, honey: 12, seashell: 20, hide: 10, essence: 18 });
+const SCROLL_REDEEM_MIN_MS = 5000;      // the egg route's floor; a human bartering cannot beat it
+const _lastScrollRedeem = new Map();
 app.post("/assets/scroll/redeem", (req, res) => {
   if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
   const wallet = regWallet(req);
   if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
   const held = regOwned(wallet, "avatar");
   if (held.length >= AVATARS_MAX) return res.status(409).json({ error: "you already carry two looks" });
+  const nowS = Date.now();
+  if (nowS - (_lastScrollRedeem.get(wallet) || 0) < SCROLL_REDEEM_MIN_MS) return res.status(429).json({ error: "too fast" });
   const have = new Set(held.map(a => a.sp));
   // the ceremony look every player is awarded is theirs whether or not it was ever registered
   const pool = AVATAR_IDS.filter(a => !have.has(a) && a !== "classic");
   if (!pool.length) return res.status(409).json({ error: "no looks left" });
+  // CAN THIS WALLET AFFORD AZULON'S PRICE? Same fail-open policy as the egg claim: while the book is
+  // still loading the barter is allowed through, because refusing on missing data strands a real
+  // player. Nothing is taken until the avatar exists.
+  if (_ffishAuth && _ownEnforce && _ownReady) {
+    for (const f of Object.keys(SCROLL_RECIPE_FISH)) {
+      const haveF = ownAvailable(wallet, "ffish", f);
+      if (haveF < SCROLL_RECIPE_FISH[f]) {
+        _ownRefusals++;
+        return res.status(409).json({
+          error: `Azulon asks for the four sparks — ${SCROLL_RECIPE_FISH[f]} ${f.replace(/_/g, " ")}, and Chikoria has recorded you catching ${Math.max(0, haveF)}.`,
+          need: SCROLL_RECIPE_FISH[f], have: Math.max(0, haveF), fish: f,
+        });
+      }
+    }
+  }
+  let _chargeS = false;
+  if (_ownEnforce && _ownReady) {
+    for (const m of Object.keys(SCROLL_RECIPE_MATS)) {
+      const haveM = ownAvailableForIssue(wallet, "mat", m);   // issuance reads the strict allowance
+      if (haveM < SCROLL_RECIPE_MATS[m]) {
+        _ownRefusals++;
+        return res.status(409).json({
+          error: `Azulon weighs your offering and the mist stays shut — you need ${SCROLL_RECIPE_MATS[m]} ${m}, and Chikoria has recorded you acquiring ${Math.max(0, haveM)}.`,
+          need: SCROLL_RECIPE_MATS[m], have: Math.max(0, haveM), mat: m,
+        });
+      }
+    }
+    _chargeS = true;   // every ingredient cleared — nothing is taken until the avatar EXISTS
+  } else if (_ownEnforce && !_ownReady) {
+    _ownSkipped++;
+  }
+  _lastScrollRedeem.set(wallet, nowS);
+  if (_lastScrollRedeem.size > 5000) {
+    let _d = 250;
+    for (const k of _lastScrollRedeem.keys()) { if (_d-- <= 0) break; _lastScrollRedeem.delete(k); }
+  }
   let row;
   const availA = pool.filter((a) => !atSupplyCap("avatar", a));
   if (!availA.length) return res.status(409).json({ error: "every avatar of the looks you lack has been claimed" });
   try { row = mintAsset("avatar", wallet, { sp: availA[crypto.randomInt(availA.length)], kind: "avatar" }, "scroll"); }
   catch (e) { return res.status(503).json({ error: "the asset registry is at capacity — this is a server fault, not yours; nothing was consumed" }); }
+  // charged after the mint, for the same reason the egg claim is: a capacity fault must never take
+  // material and then answer "nothing was consumed"
+  if (_chargeS) {
+    for (const m of Object.keys(SCROLL_RECIPE_MATS)) ownDebit(wallet, "mat", m, SCROLL_RECIPE_MATS[m]);
+    if (_ffishAuth) for (const f of Object.keys(SCROLL_RECIPE_FISH)) ownDebit(wallet, "ffish", f, SCROLL_RECIPE_FISH[f]);
+  }
   res.json({ ok: true, avatar: { id: row.id, sp: row.sp, born: row.born } });
 });
 
@@ -5526,24 +6260,35 @@ export function restoreAssetReg(v) {
                   born: Number(src.born) || Date.now(), origin: String(src.origin || "issued").slice(0, 16),
                   state: (src.state === "consumed" || spent) ? "consumed" : "active",
                   parent: src.parent ? String(src.parent).slice(0, 64) : null,
-                  hatchedTo, lvl: Number(src.lvl) || undefined, chain };
+                  hatchedTo, lvl: Number(src.lvl) || undefined, chain,
+                  // the census dedup key, re-typed like everything else — a row that adopted a
+                  // ledger entry must keep saying so, or the restart double-counts that creature
+                  luid: src.luid ? String(src.luid).slice(0, 32) : undefined };
     assetReg.set(id, row); ownerSet(owner).add(id); n++;
   }
+  censusInvalidate();
   return n;
 }
 // test seams for the meme cap sim: mint a creature exactly as an in-game egg hatch does, and set
 // the paid-sale tally, so the two routes can be exercised independently
 export function _mintAssetForTest(type, wallet, fields, origin) { return mintAsset(type, wallet, fields, origin); }
-export function _setMemeMintedForTest(key, n) { memeMinted[key] = n; }
-export function _clearAssetReg() { assetReg.clear(); assetsByOwner.clear(); eggRestitutionDone.clear(); }
+export function _setMemeMintedForTest(key, n) { memeMinted[key] = n; censusInvalidate(); }
+export function _clearAssetReg() { assetReg.clear(); assetsByOwner.clear(); eggRestitutionDone.clear(); censusInvalidate(); }
+// the WHOLE truth about one species: the consolidated count and where every number came from
+export function _trueIssued(type, sp) { return trueIssued(type, sp); }
+export function _censusStats() { return { builds: _censusBuilds, keys: censusAll().size }; }
 // test seam: age an egg past its incubation window without waiting real hours
 export function _ageAsset(id, ms) { const r = assetReg.get(id); if (r) { r.born -= ms; return true; } return false; }
 export function _transferAssetForTest(id, from, to, why) { return transferAsset(id, from, to, why); }
+// test seam: the two per-wallet rate maps in this region, so a sim can prove they are BOUNDED
+// without minting five thousand real wallets
+export function _issueRateMapsForTest() { return { egg: _lastEggClaim, scroll: _lastScrollRedeem }; }
 // test seams: fill the registry to its cap, force an auction to end, and backdate a wallet's
 // first-seen — all three model conditions a sim cannot otherwise reach (capacity, a 12h auction
 // clock, and a player who predates this system).
 export function _fillAssetRegForTest() {
   while (assetReg.size < ASSET_REG_MAX) assetReg.set("pad" + assetReg.size, { id: "pad", type: "chikimon", state: "consumed", chain: [] });
+  censusInvalidate();
   return assetReg.size;
 }
 export function _endAuctionForTest(id) {
@@ -5829,6 +6574,7 @@ function auditAssets(wallet, mmo, walletFirstSeen = 0) {
     _assetsDirty = true;
   }
   rec.seen = now;
+  censusInvalidate();   // this save may have added, or released (held=false), a creature the world census counts
   return { firstEver, newUnits, newMounts, eggsHatchable, eggGlut, flagged, unverified: rec.unverified };
 }
 
@@ -5909,8 +6655,12 @@ export function restoreAssetLedger(v) {
   for (const e of (Array.isArray(v.gather) ? v.gather : [])) {
     if (!Array.isArray(e) || !e[1] || typeof e[1] !== "object") continue;
     const g = Object.create(null);
+    // MATERIALS ONLY, the same rule the flow tallies below already enforce and the same rule
+    // recordGather now enforces on the way in. Without it a blob carrying junk keys came back and
+    // the 40-key truncation could evict a wallet's real counts.
     for (const k of Object.keys(e[1]).filter(k => has(e[1], k)).slice(0, 40)) {
-      const n = Number(e[1][k]); if (n > 0) g[String(k).slice(0, 24)] = n;
+      if (!MAT_IDS.has(k)) continue;
+      const n = Number(e[1][k]); if (Number.isFinite(n) && n > 0) g[String(k).slice(0, 24)] = n;
     }
     gatherCount.set(String(e[0] || "").slice(0, 64), g);
   }
@@ -5946,6 +6696,7 @@ export function restoreAssetLedger(v) {
       sp: String((b || {}).sp || "").slice(0, 24), lvl: Number((b || {}).lvl) || 1,
       ts: Number((b || {}).ts) || 0, used: !!(b || {}).used })));
   }
+  censusInvalidate();   // a restored ledger is a different world than the empty one that preceded it
   return n;
 }
 const ORIGINS = new Set(["legacy", "hatched", "purchased", "issued", "traded", "restitution", "unverified"]);
@@ -5954,7 +6705,7 @@ const ORIGINS = new Set(["legacy", "hatched", "purchased", "issued", "traded", "
 // both directions without waiting 12 real hours for a legendary.
 // clears EVERY per-wallet tally this module owns — a seam that misses one leaves a sim with dirty
 // state that silently invalidates its assertions, so new tallies must be added here too
-export function _clearAssetLedger() { assetLedger.clear(); assetBuys.clear(); gatherCount.clear(); matSpent.clear(); matGained.clear(); raidClaim.clear(); _assetsReady = true; }
+export function _clearAssetLedger() { assetLedger.clear(); assetBuys.clear(); gatherCount.clear(); matSpent.clear(); matGained.clear(); raidClaim.clear(); _assetsReady = true; censusInvalidate(); }
 export function _raidWeekFor(wallet) { return raidClaim.has(wallet) ? raidClaim.get(wallet) : null; }
 export function _setRaidWeekForTest(wallet, week) { raidClaim.set(wallet, week); }
 export function _ageAssetEggs(wallet, ms) {
@@ -6012,9 +6763,17 @@ Promise.all([store.kvGet("asset_registry"), store.kvGet("asset_ledger")]).then((
   console.error("asset restore FAILED — issuing and auditing are suspended until a restart reads it:", e && e.message);
 });
 
-app.post("/world/move", (req, res) => {
-  const b = req.body || {}, wallet = b.wallet;
-  if (!isPresenceId(wallet)) return res.status(400).json({ error: "valid wallet required" });
+// ============ ONE MOVE HANDLER, TWO TRANSPORTS ============
+// The body of /world/move lives here as a plain function because a WebSocket now carries the same
+// contract (see attachWorldSocket at the bottom of the file). It is a FUNCTION, not a second copy:
+// the warp/speed stamp, the seq ordering rule, the presence claim, the coordinate rounding and the
+// reply assembly all have exactly one implementation, so the two transports cannot drift apart —
+// and drift here would be invisible, because both would keep "working" while disagreeing about the
+// world. Returns {code, body, wallet, proven} instead of touching res, so it has no idea which
+// transport called it.
+function worldMoveApply(b) {
+  const wallet = b.wallet;
+  if (!isPresenceId(wallet)) return { code: 400, body: { error: "valid wallet required" }, wallet: "", proven: false };
   // PUPPETEERING: anyone can read a wallet off /world/roster, so a bare wallet cannot own a
   // presence slot. But a hard gate here is wrong: a real player has a wallet id the moment they
   // sign in, a beat BEFORE /verify returns their token, and freezing them in place for that window
@@ -6024,7 +6783,7 @@ app.post("/world/move", (req, res) => {
   const held = worldPlayers.get(wallet);
   const iAmProven = presenceOk(wallet, b);
   if (held && held.proven && !iAmProven) {
-    return res.status(403).json({ error: "that trainer is signed in — prove this wallet first" });
+    return { code: 403, body: { error: "that trainer is signed in — prove this wallet first" }, wallet, proven: false };
   }
   // PIPELINED MOVES: the client may now keep two requests in flight, and TCP does not promise the
   // second POST arrives second. A monotonically increasing per-session `seq` decides which body is
@@ -6033,12 +6792,8 @@ app.post("/world/move", (req, res) => {
   // client sends none and behaves exactly as before.
   const seq = Number.isFinite(+b.seq) ? Math.max(0, Math.floor(+b.seq)) : null;
   if (seq !== null && held && Number.isFinite(held.seq) && seq <= held.seq) {
-    return res.json({ ok: true, stale: true, seq,
-                      players: worldSnapshot(wallet, held.x, held.z, !!b.dl, true), online: worldPlayers.size,
-                      mobs: _worldTickOn ? mobSnapshot(Date.now()) : undefined,
-                      event: fishEventActive() ? { mult: _fishEvent.mult, ends: _fishEvent.ends, label: _fishEvent.label } : undefined,
-                      party: partyWire(wallet),
-                      feed: worldFeedSince(b.fs) });
+    return { code: 200, wallet, proven: iAmProven,
+             body: worldMoveReply({ ok: true, stale: true, seq }, wallet, held.x, held.z, b.dl, b.fs, iAmProven) };
   }
   // Presence coords are rounded AT STORE TIME: they arrive as float32 noise (15 significant digits
   // for a 1-unit-per-voxel world) and every extra digit is paid for on EVERY snapshot to every peer.
@@ -6052,8 +6807,34 @@ app.post("/world/move", (req, res) => {
   // copy — an earlier draft rebuilt the static fields separately with subtly different clamps, which
   // would have made every ping look like a change and silently turned the delta back into a full send.
   const _prev = worldPlayers.get(wallet);
+  // ============ IS THAT A PLACE YOU COULD HAVE GOT TO? ============
+  // /world/move clamped x/z to +/-100000 and rounded to 2dp and did NOTHING else — no previous
+  // position, no dt, no speed term anywhere in the handler. So a wallet teleported between all 24
+  // monster spawns in 10.2 s (largest accepted single jump: 913.9 units) and claimed 24/24 kills
+  // with zero refusals, taking the whole island's kill reward and denying it to everyone actually
+  // standing there. Every reach check in the file — node claims, mob strikes, the raid gate — is
+  // measured against this row, so a row that can be anywhere makes all of them decorative.
+  //
+  // IT DOES NOT REFUSE THE MOVE, AND THAT IS DELIBERATE. Chikoria teleports honest players: the
+  // drowning rescue drops you at the Healing Center and travel points warp you (Player.gd's drown
+  // rescue and _travel), both with a client-side _tp_grace. Refusing or snapping would rubber-band a
+  // real player at exactly those moments. Instead the row is STAMPED, and the two routes that turn
+  // presence into value — the node claim and the monster kill — stand down for WARP_HOLD_MS. You may
+  // teleport; you may not bank a gather or a kill you teleported into.
+  //
+  // The ceiling is generous on purpose: the fastest thing in the game is the boat at 70 u/s
+  // (Player.gd boat_speed), against run_speed 18 and the griffin's ride multiplier, so 110 u/s plus
+  // 60 units of slack absorbs latency, a lag spike and a dropped ping without ever touching honest
+  // movement. dt is clamped to a 10 s ceiling so a long gap does not hand out an unlimited budget.
+  let _warp = _prev ? _prev.warp : 0;
+  if (_prev && Number.isFinite(_prev.x)) {
+    const _dt = Math.min(10, Math.max(0.05, (Date.now() - (_prev.ts || 0)) / 1000));
+    const _jump = Math.hypot(x - _prev.x, z - _prev.z);
+    if (_jump > WARP_MAX_UPS * _dt + WARP_SLACK) { _warp = Date.now(); _warpPings++; }
+  }
   const _row = {
     proven: iAmProven,
+    warp: _warp,                          // last implausible jump — read by the two value routes
     seen: _prev ? _prev.seen : undefined,
     vis: _prev ? _prev.vis : undefined,   // interest-radius hysteresis memory — must survive the row replace
 
@@ -6081,13 +6862,266 @@ app.post("/world/move", (req, res) => {
   worldPlayers.set(wallet, _row);
   // The shared world rides the reply the client is ALREADY making, so co-op costs zero extra requests
   // and zero extra round trips. An older client ignores the field; a pristine island makes it empty.
-  res.json({ ok: true, seq: seq !== null ? seq : undefined,
-             players: worldSnapshot(wallet, x, z, !!b.dl, true), online: worldPlayers.size,
-             mobs: _worldTickOn ? mobSnapshot(Date.now()) : undefined,
-             event: fishEventActive() ? { mult: _fishEvent.mult, ends: _fishEvent.ends, label: _fishEvent.label } : undefined,
-             party: partyWire(wallet),   // members only, max 4 rows, island-wide — the ONE interest bypass
-             feed: worldFeedSince(b.fs) });
+  return { code: 200, wallet, proven: iAmProven,
+           body: worldMoveReply({ ok: true, seq: seq !== null ? seq : undefined }, wallet, x, z, b.dl, b.fs, iAmProven) };
+}
+// THE reply builder — used by the POST, by the socket's move ack, and by the socket tick. One copy,
+// so "what a client is told about the world" has a single definition. `base` carries the
+// transport/ordering fields (ok/seq/stale, or the socket's frame tag) and is mutated in place so the
+// JSON key order stays exactly what /world/move has always emitted.
+function worldMoveReply(base, wallet, x, z, dl, fs, iAmProven) {
+  base.players = worldSnapshot(wallet, x, z, !!dl, true);
+  base.online = worldPlayers.size;
+  base.mobs = _worldTickOn ? mobSnapshot(Date.now()) : undefined;
+  base.event = fishEventActive() ? { mult: _fishEvent.mult, ends: _fishEvent.ends, label: _fishEvent.label } : undefined;
+  // PROVEN CALLERS ONLY. The presence slot is CLAIMED, not owned (see the puppeteering
+  // note above): an unproven caller may still take an UNCLAIMED slot — which is what a
+  // wallet's row becomes ~12 s after they close the tab. That is tolerable for a
+  // position, but the party field is a ROSTER: it names who a trainer is grouped with,
+  // their leader, and every member's island-wide coordinates. Anyone can read a wallet
+  // off /world/roster, so without this gate a stranger POSTs the lapsed slot and is
+  // handed the group. presenceOk is the same rule the party routes use — a net_id
+  // stands alone, a public wallet must present its /verify token, which the shipped
+  // client sends on EVERY move (Net.gd's move POST), so no honest player loses the field.
+  base.party = iAmProven ? partyWire(wallet) : undefined;   // members only, max 4 rows, island-wide — the ONE interest bypass
+  base.feed = worldFeedSince(fs);
+  return base;
+}
+app.post("/world/move", (req, res) => {
+  const r = worldMoveApply(req.body || {});
+  res.status(r.code).json(r.body);
 });
+
+// ============ THE WEBSOCKET WORLD TRANSPORT — ADDITIVE, NEVER A REPLACEMENT ============
+// Every client in the wild right now speaks HTTP: POST /world/move every 280 ms on two pipelined
+// lanes, snapshot rides the reply. That keeps working EXACTLY as it does today — this block adds a
+// second door onto the same room. Nothing above this line changed behaviour; worldMoveApply and
+// worldMoveReply are the same functions the POST runs.
+//
+// WHAT IT BUYS: on HTTP a change waits for the next poll, so propagation is measured at p50 143 ms /
+// p95 275 ms — most of which is poll wait, not network. A push tick removes the wait term.
+// WHAT IT COSTS: a tick is unconditional, so a socket receives ~5.6x more snapshots per second than
+// a poller. That is the trade, and it is measured in ws_transport_sim.mjs rather than assumed.
+//
+// If the upgrade fails, the socket drops, or CHIK_WS=0 refuses it, the client simply keeps polling.
+// No route, no field and no timing above depends on a socket existing.
+const WS_ON = String(process.env.CHIK_WS ?? "") !== "0";
+const WS_PATH = "/ws/world";
+// 20 Hz = 50 ms. WHY 20: the client interpolates remotes 0.45 s in the past (Net.gd INTERP_DELAY),
+// so anything that lands inside that buffer is invisible as lag; 50 ms is a fifth of the 280 ms poll
+// period it replaces, which turns the dominant term in the measured p95 (poll wait) into noise.
+// Going faster spends bandwidth on samples the interpolator will never show — the wire cost is
+// linear in the rate and the snapshot is ~300 bytes PER PEER ROW, so 60 Hz in a crowded square is
+// three times the bytes for zero visible difference. Going slower re-introduces the wait it exists
+// to delete. Tunable for load testing via CHIK_WS_HZ, clamped to something sane.
+const WS_TICK_HZ = Math.min(60, Math.max(1, Number(process.env.CHIK_WS_HZ) || 20));
+const WS_TICK_MS = Math.max(1, Math.round(1000 / WS_TICK_HZ));
+const WS_MAX_PAYLOAD = 16 * 1024;   // an inbound move is ~300 bytes; anything near this is not a client
+const WS_MSG_BURST = 40;            // inbound messages/second per socket — the HTTP client makes ~7
+const WS_BACKPRESSURE = 256 * 1024; // skip a tick for a socket this far behind rather than grow the heap
+// ============ THE THREE BOUNDS THAT MAKE A PUSH TRANSPORT SAFE TO EXPOSE ============
+// A POST is self-limiting: one request buys one snapshot, so an attacker's egress is capped by
+// their own upload. A TICK is not. Measured (`_av_ws_load_sim.mjs`, out-of-process server and
+// out-of-process attacker, against the rows-only control): 200 anonymous sockets, each sending ONE
+// ~300-byte move every 10 s to stay inside WORLD_TTL_MS, pulled **27.4 MiB/s of egress from 6 KB/s
+// of upload** — x89 what the identical 200 clients got over HTTP — and dragged an honest HTTP
+// poller's p95 from 3.3 ms to 12.8 ms. 400 sockets: 54.7 MiB/s and 14.0 ms. The control (the same
+// 200 presence rows made over HTTP, no sockets) measured 3.3 ms, i.e. presence-map growth costs
+// nothing and every byte of that is the socket. None of it needs a wallet, a token or a signature.
+//
+//  1. WS_MAX_SOCKETS — an absolute ceiling. Over it the upgrade is refused exactly the way the
+//     CHIK_WS=0 kill switch refuses it, and the client falls back to polling. This can only deny
+//     an OPTIMISATION, never the game: a refused player plays on HTTP, which is what 100% of the
+//     fleet does today. Deliberately NOT a per-IP cap — Render terminates TLS and proxies, so
+//     remoteAddress is the proxy for everyone (a per-IP cap would break honest play) and
+//     x-forwarded-for is client-writable (a cap keyed on a rotatable identity is not a cap).
+//  2. WS_AUTH_GRACE_MS — a socket that never gets a move ACCEPTED is closed. Connecting is free
+//     and was otherwise permanent: an idle socket also pinned the 20 Hz timer forever, which is
+//     precisely what the "the tick only exists while someone is listening" note exists to avoid.
+//  3. WS_MOVE_IDLE_MS — the stream follows the client's own cadence. Net.gd sends every 280 ms and
+//     drops its socket after 600 ms of silence (WS_SILENCE), so 4 s is 14x the honest cadence and
+//     strictly more permissive than the client's own watchdog: no honest player can reach it. It
+//     turns "one message buys WORLD_TTL_MS x 20 Hz = 240 snapshots" into "buys 80", and makes the
+//     attacker's egress proportional to their upload instead of free.
+const WS_MAX_SOCKETS = Math.max(0, Math.min(20000, Number(process.env.CHIK_WS_MAX ?? 250)));   // 0 = unlimited (load tests only)
+// > Render's measured 4.9-5.1 s cold start AND the client's own 8 s WS_CONNECT_TIMEOUT, so a socket
+// that is merely slow to get going is never inside this. Swept every 5 s, so the real close lands
+// between GRACE and GRACE+5 s. Env-tunable so a sim can prove the sweep without waiting 30 s.
+const WS_AUTH_GRACE_MS = Math.max(1000, Number(process.env.CHIK_WS_GRACE_MS) || 30000);
+const WS_MOVE_IDLE_MS = Math.max(1000, Number(process.env.CHIK_WS_IDLE_MS) || 4000);   // stop PUSHING to a socket this quiet; never closes it, the next move re-arms it
+const wsClients = new Set();
+let _wsFrames = 0, _wsBytes = 0, _wsTicks = 0, _wsCpuUs = 0, _wsJitMax = 0, _wsJitSum = 0, _wsJitN = 0, _wsLastTick = 0, _wsIv = null;
+let _wsRefused = 0, _wsIdleSkips = 0, _wsGraceClosed = 0;
+// Observability + the sim's measuring stick. Never returns anything a client sent.
+export function _wsStatsForTest() {
+  return { on: WS_ON, path: WS_PATH, hz: WS_TICK_HZ, tickMs: WS_TICK_MS, max: WS_MAX_SOCKETS,
+           sockets: wsClients.size, authed: [...wsClients].filter(w => w._chik && w._chik.wallet).length, ticking: !!_wsIv,
+           frames: _wsFrames, bytes: _wsBytes, ticks: _wsTicks, cpuUs: _wsCpuUs,
+           refused: _wsRefused, idleSkips: _wsIdleSkips, graceClosed: _wsGraceClosed,
+           jitterMaxMs: _wsJitMax, jitterAvgMs: _wsJitN ? _wsJitSum / _wsJitN : 0 };
+}
+export function _wsResetStatsForTest() {
+  _wsFrames = 0; _wsBytes = 0; _wsTicks = 0; _wsCpuUs = 0; _wsJitMax = 0; _wsJitSum = 0; _wsJitN = 0; _wsLastTick = 0;
+  _wsRefused = 0; _wsIdleSkips = 0; _wsGraceClosed = 0;
+}
+function wsSend(ws, obj) {
+  if (ws.readyState !== 1) return 0;
+  const s = JSON.stringify(obj);
+  ws.send(s);
+  _wsFrames++; _wsBytes += s.length;
+  return s.length;
+}
+// THE TICK. Per socket it produces the SAME object /world/move would have returned to that receiver
+// right now — same worldSnapshot (so the same interest radius, the same nearest-60 cap and the same
+// per-receiver sq/dl delta memory, which lives on the receiver's presence row and is therefore
+// SHARED with its HTTP polls), the same mobSnapshot, the same party gate, the same feed cursor.
+function wsTick() {
+  const now = Date.now();
+  // jitter = how far this tick landed from WS_TICK_MS after the last one. Measured on the tick
+  // itself, not on a parallel timer, so it includes the cost of the tick's own work.
+  if (_wsLastTick) { const d = Math.abs(now - _wsLastTick - WS_TICK_MS); _wsJitSum += d; _wsJitN++; if (d > _wsJitMax) _wsJitMax = d; }
+  _wsLastTick = now;
+  const cpu0 = process.cpuUsage();
+  for (const ws of wsClients) {
+    const st = ws._chik;
+    // AN UNAUTHENTICATED SOCKET RECEIVES NOTHING. `wallet` is set only by an accepted move, i.e. by
+    // exactly the checks the POST runs (isPresenceId + the proven-slot claim). There is no weaker
+    // socket-only path: a hijacked socket can do precisely what a forged POST can do, no more.
+    if (!st || !st.wallet || ws.readyState !== 1) continue;
+    if (ws.bufferedAmount > WS_BACKPRESSURE) continue;
+    // THE STREAM FOLLOWS THE CLIENT'S CADENCE. Presence alone (WORLD_TTL_MS, 12 s) is far too loose
+    // a licence to push at 20 Hz: it let one ~300-byte message buy 240 snapshots, which is the whole
+    // of the measured x89 egress amplification. Net.gd sends every 280 ms and kills its own socket
+    // after 600 ms of silence, so a real player is never within an order of magnitude of this bound.
+    // It does not close the socket and does not clear the wallet — the next accepted move re-arms it,
+    // so a client that stalls and recovers simply resumes.
+    if (now - (st.lastMove || 0) > WS_MOVE_IDLE_MS) { _wsIdleSkips++; continue; }
+    const p = worldPlayers.get(st.wallet);
+    // Presence lapsed (they stopped sending moves, or the TTL sweep took the row) — a socket does not
+    // keep a trainer alive that a poller would have let expire.
+    if (!p || now - p.ts > WORLD_TTL_MS) { st.wallet = ""; continue; }
+    // Re-derive proof EVERY tick from the stored credential rather than caching a bool: a market
+    // token can rotate under us (a re-/verify), and the party roster must stop the moment it does.
+    const proven = presenceOk(st.wallet, st.auth);
+    if (p.proven && !proven) {   // someone proven now owns the slot — the same 403 the POST gives
+      st.wallet = ""; wsSend(ws, { t: "err", code: 403, error: "that trainer is signed in — prove this wallet first" });
+      continue;
+    }
+    const body = worldMoveReply({ t: "world" }, st.wallet, p.x, p.z, st.dl, st.fs, proven);
+    // Advance the feed cursor by what we actually pushed, so the next tick does not repeat a headline.
+    // The client's own `fs` still governs its move acks, exactly as it does over HTTP.
+    if (body.feed) for (const r of body.feed) if (r.t > st.fs) st.fs = r.t;
+    wsSend(ws, body);
+  }
+  const cpu = process.cpuUsage(cpu0);
+  _wsCpuUs += cpu.user + cpu.system;
+  _wsTicks++;
+}
+function attachWorldSocket(server) {
+  // The upgrade is handled explicitly (noServer) for two reasons: a path that is not ours must be
+  // closed rather than left hanging (once ANY upgrade listener exists, Node stops auto-destroying),
+  // and CHIK_WS=0 must answer with a real refusal instead of a reset.
+  const wss = WS_ON ? new WS.Server({ noServer: true, maxPayload: WS_MAX_PAYLOAD, clientTracking: false }) : null;
+  server.on("upgrade", (req, socket, head) => {
+    const path = String(req.url || "").split("?")[0];
+    if (path !== WS_PATH) { socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"); socket.destroy(); return; }
+    if (!WS_ON) {   // the kill switch: the endpoint does not exist, and the client falls back to polling
+      socket.write("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\nX-Chik-Ws: off\r\n\r\n");
+      socket.destroy(); return;
+    }
+    // THE CEILING. Refused in exactly the shape the kill switch uses, because that shape is the one
+    // the client is already proven to survive: connect_to_url succeeds, the handshake does not, the
+    // peer leaves STATE_CONNECTING without reaching STATE_OPEN and _ws_fail() hands the world back
+    // to polling on the next frame. Refusing here can therefore only cost a player the OPTIMISATION.
+    if (WS_MAX_SOCKETS > 0 && wsClients.size >= WS_MAX_SOCKETS) {
+      _wsRefused++;
+      socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nX-Chik-Ws: full\r\nRetry-After: 30\r\n\r\n");
+      socket.destroy(); return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => wsOpen(ws));
+  });
+  if (WS_ON) {
+    // A half-open TCP connection (laptop lid, dead wifi) never fires 'close'. Ping; a socket that
+    // misses two rounds is terminated. Presence is unaffected either way — the TTL owns that.
+    const hv = setInterval(() => {
+      for (const ws of wsClients) {
+        const st = ws._chik;
+        if (st && st.dead) { try { ws.terminate(); } catch {} continue; }
+        if (st) st.dead = true;
+        try { ws.ping(); } catch {}
+      }
+    }, 30000); hv.unref?.();
+    // The grace sweep gets its OWN timer rather than riding the heartbeat: the heartbeat's 30 s
+    // cadence IS the liveness rule (two missed pongs = dead), and shortening it to make the grace
+    // tighter would quietly halve how long a lossy link is tolerated. Two cheap unref'd timers.
+    // NEVER AUTHENTICATED = closed. Opening a socket costs an attacker one TCP connection and
+    // nothing else; without this a socket that says nothing lives forever, occupies a
+    // WS_MAX_SOCKETS slot, and (through wsLoopSync) pins the 20 Hz timer that is supposed to exist
+    // only while someone is listening. `authed` is stamped by the first ACCEPTED move, so this
+    // closes only sockets that never presented anything the POST would have accepted either.
+    const gv = setInterval(() => {
+      const now = Date.now();
+      for (const ws of wsClients) {
+        const st = ws._chik;
+        if (st && !st.authed && now - (st.born || 0) > WS_AUTH_GRACE_MS) { _wsGraceClosed++; try { ws.terminate(); } catch {} }
+      }
+    }, 5000); gv.unref?.();
+    console.log(`world socket on ${WS_PATH} · ${WS_TICK_HZ}Hz · max ${WS_MAX_SOCKETS || "unlimited"}`);
+  } else {
+    console.log(`world socket DISABLED (CHIK_WS=0) — clients fall back to /world/move polling`);
+  }
+}
+// THE TICK ONLY EXISTS WHILE SOMEONE IS LISTENING. No shipped client speaks WebSocket yet, so an
+// always-on 20Hz timer would be pure waste on a free-tier dyno that is otherwise idle between polls
+// — and a permanently busy event loop is exactly what stops Render spinning a service down.
+// Started by the first socket, stopped by the last. The loop still spins for a connected-but-silent
+// socket (measured: ONE such socket produced 29 ticks in 1.5 s and zero frames) — that is why the
+// grace sweep closes an unauthenticated socket rather than leaving it to sit there.
+function wsLoopSync() {
+  if (WS_ON && wsClients.size > 0 && !_wsIv) { _wsIv = setInterval(wsTick, WS_TICK_MS); _wsIv.unref?.(); _wsLastTick = 0; }
+  else if (wsClients.size === 0 && _wsIv) { clearInterval(_wsIv); _wsIv = null; _wsLastTick = 0; }
+}
+function wsOpen(ws) {
+  ws._chik = { wallet: "", auth: null, dl: 0, fs: 0, dead: false, msgs: 0, win: 0,
+               born: Date.now(), authed: false, lastMove: 0 };
+  wsClients.add(ws);
+  wsLoopSync();
+  ws.on("pong", () => { if (ws._chik) ws._chik.dead = false; });
+  ws.on("error", () => { try { ws.terminate(); } catch {} });
+  // A DROPPED SOCKET CLEARS PRESENCE THE WAY A STOPPED POLL DOES: it stops refreshing `ts`, and
+  // WORLD_TTL_MS (12 s) sweeps the row. Deleting it here instead would make a transport switch
+  // (socket → poll, or a reconnect) visibly pop the trainer out of everyone's world for a frame.
+  ws.on("close", () => { wsClients.delete(ws); wsLoopSync(); });
+  ws.on("message", (raw) => {
+    const st = ws._chik; if (!st) return;
+    const now = Date.now();
+    if (now - st.win > 1000) { st.win = now; st.msgs = 0; }
+    if (++st.msgs > WS_MSG_BURST) return;   // drop, don't close — a lagging client bursting is not an attack
+    let m; try { m = JSON.parse(String(raw)); } catch { wsSend(ws, { t: "err", error: "bad json" }); return; }
+    if (!m || typeof m !== "object") { wsSend(ws, { t: "err", error: "bad frame" }); return; }
+    const kind = String(m.t || "move");
+    if (kind === "ping") { wsSend(ws, { t: "pong", ts: now }); return; }
+    if (kind !== "move") { wsSend(ws, { t: "err", error: "unknown frame" }); return; }
+    // SAME VALIDATION AS THE POST — literally the same function. Warp stamp, seq ordering, presence
+    // claim, coordinate rounding, delta memory: one implementation, so the transports cannot disagree.
+    const r = worldMoveApply(m);
+    if (r.code !== 200) {
+      st.wallet = ""; st.auth = null;                        // a refused move de-authenticates the socket
+      wsSend(ws, { t: "err", code: r.code, error: r.body && r.body.error });
+      return;
+    }
+    st.wallet = r.wallet;
+    st.auth = { wallet: r.wallet, mktToken: String(m.mktToken || "") };   // re-checked every tick
+    st.authed = true;              // survived the grace sweep: this socket presented an accepted move
+    st.lastMove = now;             // arms WS_MOVE_IDLE_MS — the push follows the client's own cadence
+    st.dl = m.dl ? 1 : 0;
+    const fs = Number(m.fs) || 0; if (fs > st.fs) st.fs = fs;
+    if (r.body.feed) for (const row of r.body.feed) if (row.t > st.fs) st.fs = row.t;   // don't re-push what the ack carried
+    // The ack IS the HTTP reply. Byte-for-byte the same object the POST would have returned for this
+    // body, plus the frame tag — ws_transport_sim.mjs asserts that field by field against a live POST.
+    wsSend(ws, Object.assign({ t: "move" }, r.body));
+  });
+}
 // Read-only: nearby online trainers (for spectators / light polling). Deliberately WIDE
 // (WORLD_RADIUS, no interest filter): a spectator wants the island view, not a render bubble.
 app.get("/world/players", (req, res) => {
@@ -6228,6 +7262,32 @@ app.get("/world/dm", (req, res) => {
 // market token, because wallets are published in /world/roster and cannot be their own credential.
 const PARTY_MAX = 4;
 const PARTY_INVITE_MIN_MS = 2000;             // per-inviter rate cap (the chat-cap shape, line ~1745)
+// A PER-INVITER cap is not a spam bound, because the inviter is a self-asserted net_id: an attacker
+// rotates `wallet` and pays nothing. Measured (_av_party_attack_sim.mjs A9): 260 invites from 260
+// fresh ids in 419 ms, zero refused, and because an invite is delivered as a DM into the victim's
+// 200-row inbox ring it EVICTED ALL FIVE of their real whispers. So the real bound is on the
+// RECIPIENT: at most this many unanswered invites may be sitting in one trainer's inbox at a time.
+// Past that the route refuses BEFORE writing anything, so an invite flood can never cost a player
+// their whisper history. (The same flood through /world/dm still can — that route is older than
+// this feature and takes no invite path; see the audit note.)
+// The window is DELIBERATELY much shorter than PARTY_INVITE_TTL_MS. Declining is purely local (the
+// client collapses the line; there is no /party/decline), so counting across the full 10-minute TTL
+// would let a griefer spend five requests to lock a trainer out of every legitimate invite for ten
+// minutes — trading a flood for a targeted denial. One minute bounds the flood just as well and an
+// honest inviter is never refused for long.
+const PARTY_INVITE_MAX_PENDING = 5;
+const PARTY_INVITE_PEND_MS = 60000;
+const PARTY_INVITE_MAX = 20000;               // the invite map itself must not be an unbounded write
+// Second half of the same guarantee: even at the capped rate, invites accumulate, and the inbox is a
+// 200-row ring. Shifting the head to make room spends a REAL WHISPER on an invite nobody asked for,
+// so an invite evicts the oldest INVITE instead, and falls back to the head only when it is the
+// only row there is. Whisper history can therefore never be destroyed through this route.
+function pushInvite(inbox, msg) {
+  inbox.push(msg);
+  if (inbox.length <= 200) return;
+  const k = inbox.findIndex(m => m && m.kind === "pinv" && m !== msg);
+  inbox.splice(k >= 0 ? k : 0, 1);
+}
 const PARTY_INVITE_TTL_MS = 10 * 60 * 1000;   // an unanswered invite dies after 10 minutes
 const PARTY_DEAD_MS = 5 * WORLD_TTL_MS;       // every member's presence expired for this long → disband
 const parties = new Map();      // id -> { members: [presenceId..PARTY_MAX], leader, created, deadSince? }
@@ -6238,12 +7298,28 @@ function newPartyId() { return "pty_" + crypto.randomBytes(12).toString("hex"); 
 // ONE kv blob. partyOf is reconstructed from it on restore, so the two maps can never disagree
 // after a restart — same reasoning as sidOwner/walletSid being persisted as a pair.
 function serializeParties() { return [...parties.entries()].map(([id, p]) => ({ id, members: p.members, leader: p.leader, created: p.created })); }
+// A restored blob is an UNTRUSTED INPUT — it comes back from a database a future bug or an admin
+// could have corrupted, so every invariant the live routes enforce is re-enforced here, on the way
+// IN (the restoreWorldNodes rule). The one that matters is ONE PARTY PER ID: partyOf can only hold
+// a single pid, so an id listed by two parties becomes a GHOST MEMBER of the party partyOf does not
+// point at — it keeps receiving that party's private chat and /party/leave (which works through
+// partyOf) can never get it out. Duplicate ids inside one row are the same bug in miniature: they
+// eat a slot and deliver every party message twice.
+const PARTY_MAX_ROWS = 20000;   // a corrupt blob must not be an unbounded allocation
 function restoreParties(v) {
   parties.clear(); partyOf.clear();
   if (!Array.isArray(v)) return;
   for (const e of v) {
-    if (!e || typeof e.id !== "string" || !Array.isArray(e.members)) continue;
-    const members = e.members.filter(isPresenceId).slice(0, PARTY_MAX);
+    if (!e || typeof e.id !== "string" || !e.id || !Array.isArray(e.members)) continue;
+    if (parties.size >= PARTY_MAX_ROWS) break;
+    if (parties.has(e.id)) continue;                         // duplicate id — first row wins
+    const members = [];
+    for (const w of e.members) {
+      if (!isPresenceId(w)) continue;
+      if (members.includes(w) || partyOf.has(w)) continue;   // dup inside the row / already claimed
+      members.push(w);
+      if (members.length >= PARTY_MAX) break;
+    }
     if (members.length < 2) continue;                        // a party is at least two people
     const leader = members.includes(e.leader) ? e.leader : members[0];
     parties.set(e.id, { members, leader, created: Number(e.created) || Date.now() });
@@ -6315,18 +7391,37 @@ app.post("/party/invite", (req, res) => {
     if (!p) partyOf.delete(from);
     else if (p.members.length >= PARTY_MAX) return res.status(409).json({ error: "party is full" });
   }
+  // RECIPIENT-SIDE BOUND — the one an id-rotating flood cannot walk around. Counted off the
+  // recipient's own inbox (their SENT echoes carry self:true and are skipped, or a trainer who
+  // invites five friends could not be invited back), newest-first with an early exit, so it is a
+  // handful of array reads on a ring that is already capped at 200.
+  const nowBox = worldDM.get(to) || [];
+  let pend = 0;
+  for (let i = nowBox.length - 1; i >= 0 && pend < PARTY_INVITE_MAX_PENDING; i--) {
+    const m = nowBox[i];
+    if (m && m.kind === "pinv" && !m.self && now - (Number(m.ts) || 0) <= PARTY_INVITE_PEND_MS) pend++;
+  }
+  if (pend >= PARTY_INVITE_MAX_PENDING)
+    return res.status(429).json({ error: "that trainer already has invites waiting" });
   _lastInvite.set(from, now);
   if (_lastInvite.size > 5000) { for (const k of [..._lastInvite.keys()].slice(0, _lastInvite.size - 5000)) _lastInvite.delete(k); }
   // The invite names a MOMENT: the inviter's party as it stands right now. Accept re-checks this,
   // which is what makes an invite issued before a disband stale instead of a ghost door.
   partyInvites.set(from + "|" + to, { pid: partyOf.get(from) || null, ts: now });
+  // invites to FABRICATED recipients cost the attacker nothing and never reach a real inbox, so the
+  // map needs its own ceiling; Map iterates in insertion order, so this drops the oldest first
+  if (partyInvites.size > PARTY_INVITE_MAX) {
+    for (const k of [...partyInvites.keys()].slice(0, partyInvites.size - PARTY_INVITE_MAX)) partyInvites.delete(k);
+  }
   // Delivered AS A TYPED DM — the whisper store wholesale (sanitising, caps, 30d retention, kv
   // persistence, the token-gated GET) so an invite inherits every hardening whispers already have.
   // kind:"pinv" is what tells the client to render accept/decline buttons instead of a text row.
   const fromHandle = stripTags(String(b.handle || "Trainer")).slice(0, 20);
   const msg = { from, fromHandle, to, text: fromHandle + " invites you to a party", kind: "pinv", ts: now };
-  const inbox = dmInbox(to); inbox.push(msg); if (inbox.length > 200) inbox.shift();
-  const sent = dmInbox(from); sent.push({ ...msg, self: true }); if (sent.length > 200) sent.shift();
+  pushInvite(dmInbox(to), msg);
+  // the sender's own echo goes through the same rule: a harvested net_id (they are published in
+  // /world/roster) lets a stranger POST invites AS a victim, and that echo lands in the VICTIM's inbox
+  pushInvite(dmInbox(from), { ...msg, self: true });
   if (worldDM.size > 5000) { const oldest = [...worldDM.keys()].slice(0, worldDM.size - 5000); oldest.forEach(k => worldDM.delete(k)); }
   saveWorldDM();
   res.json({ ok: true });
@@ -6341,11 +7436,18 @@ app.post("/party/accept", (req, res) => {
   if (!inv || now - inv.ts > PARTY_INVITE_TTL_MS) { partyInvites.delete(key); return res.status(403).json({ error: "no open invite from that trainer" }); }
   if (partyOf.has(me)) return res.status(409).json({ error: "leave your current party first" });
   const curPid = partyOf.get(from) || null;
-  // STALE: an invite issued FOR a specific party dies with it — disband (or the inviter changing
-  // groups) must not teleport the accepter into whatever the inviter is in now. But an invite with
-  // pid null was "party WITH me" before any party existed: if the inviter has since formed one
-  // (their other invitee accepted first), joining it is exactly what both sides meant.
-  if (inv.pid !== null && inv.pid !== curPid) { partyInvites.delete(key); return res.status(409).json({ error: "that invite is stale — the party has changed" }); }
+  // STALE: an invite names a party, and it dies with that party. Disband — or the inviter changing
+  // groups — must not teleport the accepter into whatever the inviter happens to be in now.
+  //
+  // A null pid means "party with me, whatever that becomes", and it must mean ONLY the party the
+  // inviter goes on to FOUND. An earlier draft let a null-pid invite open whatever party the
+  // inviter had since joined, which is a consent bypass with a name: a mole issues an invite to
+  // their own alt while partyless, gets themselves invited into someone else's group, and the alt
+  // then walks in on the OLD invite — into a party nobody there ever offered it. Measured
+  // (_av_party_attack_sim.mjs A7): the alt landed in the victim party and read its private chat.
+  // The honest flow that null exists for — invite two friends at once, before any party exists —
+  // is preserved by RETARGETING at the moment of founding (below), so this test is now exact.
+  if (inv.pid !== curPid) { partyInvites.delete(key); return res.status(409).json({ error: "that invite is stale — the party has changed" }); }
   let pid = curPid, p = pid ? parties.get(pid) : null;
   if (pid && !p) { partyInvites.delete(key); return res.status(409).json({ error: "that party is gone" }); }
   if (p && p.members.length >= PARTY_MAX) return res.status(409).json({ error: "party is full" });
@@ -6353,6 +7455,11 @@ app.post("/party/accept", (req, res) => {
     pid = newPartyId();
     p = { members: [from], leader: from, created: now };
     parties.set(pid, p); partyOf.set(from, pid);
+    // RETARGET: this accept is the moment the inviter's party comes into being, so every other
+    // invite they issued while partyless now names it. Doing it here — rather than treating null
+    // as a wildcard at redemption time — is what keeps "A invites B and C at once" working while
+    // an invite can still only ever open the party its own issuer founded.
+    for (const [k, iv] of partyInvites) if (iv.pid === null && k.startsWith(from + "|")) iv.pid = pid;
   }
   p.members.push(me); partyOf.set(me, pid);
   delete p.deadSince;
@@ -6381,6 +7488,16 @@ app.post("/party/kick", (req, res) => {
   if (who === me) return res.status(400).json({ error: "leave, don't kick yourself" });
   if (!p.members.includes(who)) return res.status(404).json({ error: "not a member of your party" });
   partyRemove(pid, who);
+  // A kick that any open invite can undo is not a kick. Every member may invite (that is the
+  // design), so the removed trainer walked straight back in on an invite ANOTHER member had issued
+  // before the kick — no new decision by anyone, the leader's action simply reversed itself
+  // (measured, _av_party_attack_sim.mjs A8). Only invites belonging to THIS party are dropped, so
+  // an unrelated group's open invite to the same trainer is untouched, and any member who genuinely
+  // wants them back can still issue a fresh one.
+  for (const [k, iv] of partyInvites) {
+    if (!k.endsWith("|" + who)) continue;
+    if (iv.pid === pid || partyOf.get(k.slice(0, k.length - who.length - 1)) === pid) partyInvites.delete(k);
+  }
   res.json({ ok: true });
 });
 // test seam (the node_persist_sim pattern): round-trip the REAL serialize/restore in one process.
@@ -6389,8 +7506,11 @@ export const _partySeam = {
   restore: restoreParties,
   clear() { parties.clear(); partyOf.clear(); partyInvites.clear(); _lastInvite.clear(); },
   clearInviteCap() { _lastInvite.clear(); },
-  size() { return { parties: parties.size, partyOf: partyOf.size }; },
+  size() { return { parties: parties.size, partyOf: partyOf.size, invites: partyInvites.size }; },
   pidOf(id) { return partyOf.get(id); },
+  // the WHOLE inbox ring — GET /world/dm serves only the last 40 rows, which cannot show a sim
+  // whether an invite flood destroyed the older whispers underneath it
+  dmRing(id) { return (worldDM.get(id) || []).slice(); },
 };
 
 // ---- ON-CHAIN Trading Post settlement (OPT-IN, off by default) ------------------------------
@@ -6561,7 +7681,21 @@ app.post("/market/order-pay", async (req, res) => {
   // re-fetch: the reservation blocks decline/expiry, but never trust a 20s-old reference
   const fresh = marketOrders.find(x => x.id === id) || row;
   marketOrders = marketOrders.filter(x => x.id !== id);
+  _consumeOrder(fresh.id);   // this id has now settled: it can never be posted again (see _soldOrders)
+  // ---- THE OWNERSHIP BOOKKEEPING THE LISTING RAIL ALREADY DOES ----
+  // /market/buy-onchain debits the seller and credits the buyer (ownSold + ownCredit, one line each).
+  // This route did neither, in both directions. Seller half: a filler could stake the same fabricated
+  // stockpile forever because `sold` never moved. Buyer half: a poster who paid real $CHIKI for 1,980
+  // iron got no entitlement for it, so order-bought goods were unsellable beyond the allowance and
+  // would be clamped out of the save the moment the v>=2 client ships.
+  ownSold(String(fresh.fillerWallet || ""), String(fresh.kind || "mat"), String(fresh.item || ""), Number(fresh.qty) || 0);
+  ownCredit(payer, String(fresh.kind || "mat"), String(fresh.item || ""), Number(fresh.qty) || 0);
   // goods to the POSTER (their client grants via the fills poll). Value-bearing: never cap-drop.
+  // BOTH QUEUES STILL KEY ON THE ORDER ID, and they must: the filler's client matches this id
+  // against its own my_deliveries record (Market.gd _deliv_done) and the poster's against its
+  // orders_credited set, so a synthetic per-settlement id would leave an honest filler's delivery
+  // showing "awaiting payment" forever. What made the shared key dangerous was that a settled id
+  // could be POSTED AGAIN — that is what _consumeOrder above closes, at the source.
   const farr = marketFills[fresh.sid] || (marketFills[fresh.sid] = []);
   if (!farr.some(f => f.id === fresh.id))
     farr.push({ id: fresh.id, item: fresh.item, kind: fresh.kind, qty: fresh.qty, price: fresh.price, fillerName: fresh.fillerName || "a trainer", ts: Date.now() });
@@ -6592,9 +7726,9 @@ const MARKET_TTL_MS = 24 * 60 * 60 * 1000;   // listings expire after a day
 // verbatim, and nothing clamps it) could ask a real buyer to pay for a million of something.
 //
 // These ceilings come from what the game can REPRESENT, measured, not guessed:
-//   BAG_CAP tops out at 1100 per material (Econ.gd:246), and every over-cap source is small and
+//   BAG_CAP tops out at 1100 per material (Econ.gd BAG_CAP), and every over-cap source is small and
 //   slow — all 12 TASKS together grant 9 crystal, level milestones ~45 lifetime, and the weekly
-//   raid 25 (RaidBoss.gd:203). Even a 200-week raider tops out near 6,150 of a single material.
+//   raid 25 (RaidBoss.gd _pay_raid). Even a 200-week raider tops out near 6,150 of a single material.
 //   Fantasy fish are 1-in-42 per cast at the very best (tier-3 spot, Lv10 rod), so 2000 is on the
 //   order of 200 hours of ideal fishing. Potions are crafted, bounded by the mats they consume.
 //
@@ -6607,6 +7741,26 @@ const MARKET_TTL_MS = 24 * 60 * 60 * 1000;   // listings expire after a day
 // REFUSE, don't clamp: clamping would silently turn an absurd listing into a plausible one and
 // destroy the signal. A refusal is visible to the seller and counted for the operator below.
 // chikimon is absent on purpose — one creature is one row, and chikimonSaleBlocked already gates it.
+// EVERY LISTABLE ITEM NAME IS A CATALOG ENTRY. `kind` was coerced to a known value but `item` was
+// stored verbatim (`stripTags(String(l.item || "wood")).slice(0,24)`) on both op:list and
+// op:order_post — auction_post has had a catalog check all along, which is what makes the omission
+// visible. Measured: a listing of kind "mat" item "not_a_material" was accepted and served on the
+// board, and on the LISTING rail that string settles through /market/buy-onchain into `released`,
+// which the BUYER's client feeds to credit_mat — attacker-chosen data written into a stranger's
+// save. Inert today (matSaveEnforce and ownItemOk both skip non-MAT_IDS keys), but it is unvalidated
+// input crossing between players and it costs one Set lookup to close.
+// POT_IDS mirrors Econ.gd POTIONS (22 rows) — the only crafted things that are listable.
+const POT_IDS = new Set(["healing_draught", "greater_healing_draught", "phoenix_tonic", "feast_of_the_fallen",
+  "second_wind", "wakeful_elixir", "scholars_tonic", "rage_brew", "ironhide_tonic", "streak_sigil",
+  "ember_vial", "tide_vial", "gale_vial", "wild_vial", "lucky_lure", "swiftfoot_serum",
+  "berry_mash", "hearty_broth", "grand_banquet", "trail_fodder", "golden_oats", "beast_ration"]);
+function listItemOk(kind, item) {
+  if (kind === "mat") return MAT_IDS.has(item);
+  if (kind === "ffish") return FFISH_SET.has(item);
+  if (kind === "pot") return POT_IDS.has(item);
+  if (kind === "chikimon") return CHIKIMON_IDS.has(item);
+  return false;
+}
 const LIST_QTY_MAX = Object.freeze(Object.assign(Object.create(null), {
   mat: 20000,      // ~3.3x the ceiling a four-year raider could reach on one material
   ffish: 2000,     // ~200h of best-case fantasy fishing
@@ -6668,6 +7822,27 @@ function _consumeListing(id) {
   if (_soldListings.size > 50000) {
     let drop = _soldListings.size - 50000;
     for (const k of _soldListings.keys()) { if (drop-- <= 0) break; _soldListings.delete(k); }
+  }
+}
+// THE SAME RESURRECTION GUARD, FOR ORDERS — orders had none (13 mentions of _soldListings, 0 of an
+// order equivalent). An order id is client-chosen, and order_post only checked for a clash against
+// the LIVE board — a settled order has already been spliced out, so re-posting its id was a plain
+// 200. That id is still sitting in the filler's fills queue as an acked receipt (rows are marked
+// granted, not deleted, and live KEEP_CREDITED_MS = 2 days), so returnOrderGoods' `if (!arr.some(f
+// => f.id === row.id))` suppressed the SECOND return: measured end to end, cycle 2's 50 iron left
+// the filler's bag and never came back, with no error shown to either side. Uncapped repetitions,
+// pure destruction of another player's goods.
+const _soldOrders = new Map();     // order id -> ts consumed (settled / declined / cancelled / expired)
+store.kvGet("market_sold_orders").then(v => { if (Array.isArray(v)) for (const e of v) { if (e && e.id) _soldOrders.set(String(e.id), Number(e.ts) || Date.now()); } }).catch(() => {});
+export function _soldOrderIdsForTest() { return _soldOrders; }
+function _consumeOrder(id) {
+  if (!id) return;
+  _soldOrders.set(String(id), Date.now());
+  // bounded by COUNT, oldest-first — never by age, for the same reason listings are not: the fills
+  // queue that would swallow a re-used id outlives any age window worth choosing.
+  if (_soldOrders.size > 50000) {
+    let drop = _soldOrders.size - 50000;
+    for (const k of _soldOrders.keys()) { if (drop-- <= 0) break; _soldOrders.delete(k); }
   }
 }
 store.kvGet("auction_refunds").then(v => { if (v && typeof v === "object") auctionRefunds = v; }).catch(() => {});
@@ -6773,6 +7948,7 @@ async function saveMarket() {
       store.kvSet("market_auctions", _capAuctions()),
       store.kvSet("auction_refunds", auctionRefunds),
       store.kvSet("market_sold_ids", [..._soldListings].slice(-25000).map(([id, ts]) => ({ id, ts }))),
+      store.kvSet("market_sold_orders", [..._soldOrders].slice(-25000).map(([id, ts]) => ({ id, ts }))),
       // THE BOOK RIDES WITH THE BOARD. Escrow is derived from marketListings, so a book persisted on a
       // different schedule than the listings it is read against would restore inconsistent. /market/op
       // awaits this on every op, including list.
@@ -6997,9 +8173,11 @@ function pruneMarket() {
       if (o.paying && now - o.paying < 90000) return true;   // a payment is being verified — hold
       if (now - (o.deliveredTs || 0) < ORDER_PAY_WINDOW_MS) return true;
       returnOrderGoods(o, "expired");
+      _consumeOrder(o.id);                                   // spent id — never postable again
       return false;
     }
-    return now - (o.ts || 0) < MARKET_TTL_MS;
+    if (now - (o.ts || 0) >= MARKET_TTL_MS) { _consumeOrder(o.id); return false; }
+    return true;
   });
   _pruneValueMap(marketFills, "granted", now);    // owed goods survive 60d, not 7
   // SECURITY backstop: cap distinct buckets so a flood of fake sids can't grow memory unbounded —
@@ -7055,6 +8233,11 @@ app.post("/market/op", async (req, res) => {
       // board and never becomes something a real buyer can pay for on-chain. See LIST_QTY_MAX.
       const _lk = (["chikimon", "ffish", "pot"].includes(String(l.kind)) ? String(l.kind) : "mat");
       const _lq = clampF(l.qty, 1, 999999, 1) | 0;
+      // the item has to be a thing that exists (see listItemOk) — checked before the row is built,
+      // so a made-up name never reaches the board and never reaches a buyer's client
+      if (!listItemOk(_lk, stripTags(String(l.item || "")).slice(0, 24))) {
+        return res.status(400).json({ error: "Chikoria has no such item. Cancel the listing to put your goods back in your bag." });
+      }
       if (Object.hasOwn(LIST_QTY_MAX, _lk) && _lq > LIST_QTY_MAX[_lk]) {
         _overQtyListings++;
         // Bound this map like every other per-wallet map here, and keep the WORST attempt per seller
@@ -7065,7 +8248,7 @@ app.post("/market/op", async (req, res) => {
         if (_lq > _row.worst) { _row.worst = _lq; _row.item = stripTags(String(l.item || "")).slice(0, 24); _row.kind = _lk; }
         _overQtyBy.set(_who, _row);
         if (_overQtyBy.size > 5000) { let drop = 250; for (const k of _overQtyBy.keys()) { if (drop-- <= 0) break; _overQtyBy.delete(k); } }
-        // The client shows this string to the seller verbatim (Market.gd:836), and by now it has
+        // The client shows this string to the seller verbatim (Market.gd's list-error toast), and by now it has
         // already taken the goods out of their bag locally — so say how to get them back.
         return res.status(409).json({ error: `A ${_lk} listing cannot exceed ${LIST_QTY_MAX[_lk]}. Cancel the listing to put your goods back in your bag, then list a smaller amount.`, max: LIST_QTY_MAX[_lk] });
       }
@@ -7087,7 +8270,7 @@ app.post("/market/op", async (req, res) => {
             if (_lq - _avail > _row.asked - _row.had) { _row.item = _item; _row.asked = _lq; _row.had = Math.max(0, _avail); }
             _ownWorst.set(_ow, _row);
             if (_ownWorst.size > 5000) { let d = 250; for (const k of _ownWorst.keys()) { if (d-- <= 0) break; _ownWorst.delete(k); } }
-            // The client shows this verbatim (Market.gd:836) and has already taken the goods out of
+            // The client shows this verbatim (Market.gd's list-error toast) and has already taken the goods out of
             // the bag, so it must say how to get them back — cancel can now actually do that.
             return res.status(409).json({
               error: `Chikoria has only recorded you acquiring ${Math.max(0, _avail)} of that. Cancel the listing to put your goods back in your bag.`,
@@ -7165,8 +8348,8 @@ app.post("/market/op", async (req, res) => {
     cancelled = marketListings.length < before;   // true ONLY if a still-live listing was removed (else it already sold)
     // A ROW THE SERVER NEVER HAD IS NOT A SALE. `cancelled:false` was doing double duty — it meant
     // both "this sold" and "I have no record of it" — and the client only reclaims on `true`
-    // (Market.gd:519). So any listing the server refused or dropped left the seller's goods deducted
-    // (Market.gd:405) with no way back: cancel answered false, the client kept the row and re-pushed
+    // (Market.gd's mine-reconcile). So any listing the server refused or dropped left the seller's goods deducted
+    // (Market.gd's list submit) with no way back: cancel answered false, the client kept the row and re-pushed
     // it forever. The LIST_QTY_MAX refusal above walks straight into that, and its message tells the
     // seller to cancel — advice that could not work until this branch existed.
     //
@@ -7197,6 +8380,11 @@ app.post("/market/op", async (req, res) => {
     const ow = stripTags(String(l.wallet || "")).slice(0, 44);
     if (!isPubkey(ow)) return res.status(400).json({ error: "orders pay real $CHIKI — connect your Phantom wallet to post one" });
     const oid = stripTags(String(l.id || ("O" + Date.now() + Math.floor(Math.random() * 1e4)))).slice(0, 40);
+    // A SETTLED OR CLOSED ORDER ID IS SPENT FOREVER — the same rule op:list has had since the
+    // double-sale bug. Re-posting one is how a poster destroyed a filler's staked goods.
+    if (_soldOrders.has(oid)) {
+      return res.status(409).json({ error: "That order id was already used. Post a new order with a fresh id." });
+    }
     const price = clampF(l.price, 1, 50000, 1) | 0;
     try {
       const bal = await chikiBalance(ow, true);
@@ -7206,11 +8394,15 @@ app.post("/market/op", async (req, res) => {
     if (clash && clash.sid !== sid) return res.status(409).json({ error: "order id collision — repost" });
     if (!clash) {
       if (marketOrders.filter(x => x.sid === sid).length >= 3) return res.status(429).json({ error: "3 open orders max" });
+      const _ok = (["ffish", "pot"].includes(String(l.kind)) ? String(l.kind) : "mat");
+      const _oi = stripTags(String(l.item || "wood")).slice(0, 24);
+      // same catalog rule as op:list — an order names a real item or it is not posted
+      if (!listItemOk(_ok, _oi)) return res.status(400).json({ error: "Chikoria has no such item to order." });
       marketOrders.push({
         id: oid,
         buyer: stripTags(String(l.seller || "Trainer")).slice(0, 20), sid, wallet: ow,
-        kind: (["ffish", "pot"].includes(String(l.kind)) ? String(l.kind) : "mat"),
-        item: stripTags(String(l.item || "wood")).slice(0, 24),
+        kind: _ok,
+        item: _oi,
         qty: clampF(l.qty, 1, 99, 1) | 0, price, ts: Date.now(),
       });
       // cap eviction must NEVER destroy a delivered row (a filler's staked goods live on it)
@@ -7238,6 +8430,29 @@ app.post("/market/op", async (req, res) => {
     // goods never staked. The filler is a distinct party from the poster, so gate on fw ownership, not sid.
     if (mktWallet(b) !== fw) return res.status(401).json({ error: "sign in with the wallet you're delivering from" });
     if (fw === row.wallet) return res.status(409).json({ error: "you can't deliver to your own wallet" });
+    // ---- THE ACQUISITION BOUND APPLIES HERE TOO ----
+    // op:list refuses the 1501st unit a wallet was never seen acquiring; this rail accepted an
+    // unbounded amount of the same material from the same wallet. Measured: a filler whose book had
+    // no row at all (ownAvailable 1500, the bare allowance) had 30 consecutive deliveries of 99 gold
+    // accepted, 2,970 units staked against orders worth up to 1,500,000 real $CHIKI, and its
+    // available count was still 1500 afterwards because nothing was ever debited. A craft order is a
+    // real-$CHIKI exit; it gets the same gate, the same fail-open-while-loading policy and the same
+    // sentence as the listing rail.
+    const _dw = fw, _dk = String(row.kind || "mat"), _di = String(row.item || ""), _dq = Number(row.qty) || 0;
+    if (_ownEnforce && OWN_KINDS.has(_dk) && isPubkey(_dw)) {
+      if (!_ownReady) {
+        _ownSkipped++;
+      } else {
+        const _davail = ownAvailable(_dw, _dk, _di);
+        if (_dq > _davail) {
+          _ownRefusals++;
+          return res.status(409).json({
+            error: `Chikoria has only recorded you acquiring ${Math.max(0, _davail)} of that. Deliver what you have gathered.`,
+            available: Math.max(0, _davail),
+          });
+        }
+      }
+    }
     row.state = "delivered";
     row.fillerSid = sid;
     row.fillerWallet = fw;
@@ -7264,17 +8479,32 @@ app.post("/market/op", async (req, res) => {
     const row = marketOrders.find(x => x.id === oid && x.sid === sid);
     if (row && row.paying && Date.now() - row.paying < 90000) return res.status(409).json({ error: "your payment for this delivery is being verified — it can't be declined now" });
     if (row && row.state === "delivered") returnOrderGoods(row, "declined");
-    if (row) marketOrders = marketOrders.filter(x => x.id !== oid);
+    if (row) { marketOrders = marketOrders.filter(x => x.id !== oid); _consumeOrder(oid); }
     cancelled = !!row;
   } else if (op === "order_cancel") {
     const oid = stripTags(String(l.id || "")).slice(0, 40);
     const row = marketOrders.find(x => x.id === oid && x.sid === sid);
     if (row && row.state === "delivered") return res.status(409).json({ error: "a delivery is awaiting your payment — pay it or decline it first" });
     marketOrders = marketOrders.filter(x => !(x.id === oid && x.sid === sid));
+    if (row) _consumeOrder(oid);                // a closed id is spent — it can never be posted again
     cancelled = !!row;                          // nothing to refund — real orders hold no escrow
   } else if (op === "auction_post") {
     // 🔨 a chikimon goes under the hammer: 12h, highest bid wins. The seller's client already
     // took custody of the unit (it restores intact on cancel / no-bid return).
+    // THE SAME INTERLOCK op:buy HAS. When the on-chain rail is live every LISTING must settle
+    // through the verified 75/20/5 split — the unauthenticated soft op:buy is refused precisely so a
+    // client cannot pay for a real asset with currency the server never verified. The auction house
+    // was left on the soft rail: auction_bid took a 50,000 bid from a wallet whose measured balance
+    // was 0, the hammer handed the creature over through the fills queue with recordAssetBuy
+    // stamping it "purchased", and the winner then listed it on the REAL rail for 40,000. That is a
+    // forged-currency-to-real-asset converter, and the honest seller is paid in nothing.
+    //
+    // TO BRING AUCTIONS BACK: give the hammer a buy-onchain-shaped settle (the winning bid signed as
+    // a real transfer and verified by txMarketSplit), then delete this gate. Until then the house is
+    // shut while the real rail is on, rather than open and unbacked.
+    if (MARKET_ONCHAIN) {
+      return res.status(409).json({ error: "the auction house is closed while trading settles on-chain — list it on the Trading Post instead" });
+    }
     const aid = stripTags(String(l.id || "")).slice(0, 40);
     if (!aid) return res.status(400).json({ error: "auction id required" });
     if (!marketAuctions.some(x => x.id === aid)) {
@@ -7302,6 +8532,11 @@ app.post("/market/op", async (req, res) => {
   } else if (op === "auction_bid") {
     // AUTHORITATIVE: exactly one bidder can hold the top spot; the displaced bidder's escrow
     // goes home through the refunds queue. accepted:false = the bidder's client deducts NOTHING.
+    // the other half of the interlock above — a bid is the payment, and it is soft $CHIKI the server
+    // never verified. accepted:false is the shape the client already handles (it deducts nothing).
+    if (MARKET_ONCHAIN) {
+      return res.json({ ok: true, accepted: false, reason: "the auction house is closed while trading settles on-chain" });
+    }
     const aid = stripTags(String(l.id || "")).slice(0, 40);
     const amt = clampF(l.amount, 1, 50000, 1) | 0;
     const row = marketAuctions.find(x => x.id === aid);
@@ -7348,9 +8583,10 @@ app.post("/market/op", async (req, res) => {
 
 // Open the port FIRST so Render detects it immediately (no "No open ports" timeout on a cold DB),
 // then initialize the DB in the background (errors logged, not fatal — the server stays up and recovers).
-app.listen(Number(PORT), () => {
+const httpServer = app.listen(Number(PORT), () => {
   console.log(`Chiki backend v2 on :${PORT} · ${NETWORK} · store=${store.kind} · treasury ${treasury.publicKey.toBase58()}`);
   console.log(`verifyHolders=${verifyOn} · holdMin=${MIN_HOLD_MINUTES} · dailyCap=${DAILY_FRAC>=1?"none":Math.round(DAILY_FRAC*100)+"% pool/day"} · perWallet=${WALLET_DAILY} SOL`);
 });
+attachWorldSocket(httpServer);   // the SECOND transport — see the block above /world/move's neighbours
 store.init().then(()=>{ console.log("store ready"); return loadCupState(); }).then(()=>console.log(`cup state loaded (public=${cupPublic}, owed prizes=${cupPrizes.size})`)).catch(e=>console.error("store.init failed:", e?.message||e));
 chat.init().then(()=>console.log("chat ready")).catch(e=>console.error("chat.init failed:", e?.message||e));

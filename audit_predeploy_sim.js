@@ -34,7 +34,8 @@ async function mkWallet() {
   const v = await post("/verify", { wallet, netId, authMsg, authSig });
   return { wallet, sid: netId, mktToken: v.body.mktToken };
 }
-const move = (id, tok) => post("/world/move", { wallet: id, mktToken: tok || "", x: 5, z: 5, dir: 0, handle: "Aud" });
+// at the arena: the raid claim is position-gated now (RaidBoss.gd BOSS_X/BOSS_Z = 359/259)
+const move = (id, tok) => post("/world/move", { wallet: id, mktToken: tok || "", x: 359, z: 259, dir: 0, handle: "Aud" });
 
 // ===========================================================================
 sec("A. /world/raid/claim — the net_id branch is an UNGATED weekly prize");

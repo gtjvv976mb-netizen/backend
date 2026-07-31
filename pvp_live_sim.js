@@ -39,7 +39,11 @@ const snapA = { element: "Fire",  name: "Alice", br: 8, cardTier: 1, arenaSkills
 const snapB = { element: "Water", name: "Bob",   br: 8, cardTier: 1, arenaSkills: [] };
 
 console.log("— matchmaking —");
-const ch = await post("/pvp/challenge", { from: A, fromName: "Alice", to: B, snap: snapA });
+// PROVE `from` (2026-07-31): /pvp/challenge trusted the caller's `from` outright, so a duel
+// could be forged between a stranger and yourself and it occupied their match slot. It is now a
+// claimed-slot rule — an id nobody has proven may still challenge, one that IS proven must show
+// its /verify token, which the client already holds.
+const ch = await post("/pvp/challenge", { from: A, fromName: "Alice", to: B, snap: snapA, mktToken: PA.tok });
 chk(ch.ok === true, "Alice challenges Bob");
 const inbox = await post("/pvp/available", { wallet: B, name: "Bob", snap: snapB, mktToken: PB.tok });
 const mine = (inbox.challenges || []).find(c => c.from === A);
@@ -119,7 +123,7 @@ console.log("— walking out is an instant loss, not a hang —");
 {
   const PC = await proven(), PD = await proven();
   const C = PC.w, D = PD.w;
-  await post("/pvp/challenge", { from: C, fromName: "Cara", to: D, snap: { ...snapA, name: "Cara" } });
+  await post("/pvp/challenge", { from: C, fromName: "Cara", to: D, snap: { ...snapA, name: "Cara" }, mktToken: PC.tok });
   const inb = await post("/pvp/available", { wallet: D, name: "Dev", snap: { ...snapB, name: "Dev" }, mktToken: PD.tok });
   const c2 = (inb.challenges || []).find(x => x.from === C);
   const a2 = await post("/pvp/challenge/accept", { wallet: D, challengeId: c2 && c2.id, snap: { ...snapB, name: "Dev" }, mktToken: PD.tok });

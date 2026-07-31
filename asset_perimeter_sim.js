@@ -91,7 +91,7 @@ sec("HOLE H: padding a save to the cap hid a forged mount and legendary from the
 {
   const W = await mkWallet();
   const many = {};
-  for (let i = 0; i < 400; i++) many["u" + i] = unit("leafcub", "normal", 1);
+  for (let i = 0; i < 400; i++) many["u" + i] = unit("jellox", "normal", 1);
   const mounts40 = Array.from({ length: 40 }, (_, i) => "m" + i);
   await save(W, { eggs: [], units: many, mounts: mounts40 });
   const padded = Object.assign({}, many); padded["u999"] = unit("dragonos", "legendary", 50);
@@ -223,8 +223,8 @@ sec("a level rewrite is RECORDED — and deliberately blocks nothing");
   // ordinary progress must NOT register as a jump worth reporting
   const W2 = await mkWallet();
   SRV._setWalletFirstSeenForTest(W2.wallet, Date.UTC(2025, 0, 1));
-  await save(W2, { eggs: [], units: { u1: unit("leafcub", "normal", 7) }, mounts: [] });
-  await save(W2, { eggs: [], units: { u1: unit("leafcub", "normal", 8) }, mounts: [] });
+  await save(W2, { eggs: [], units: { u1: unit("jellox", "normal", 7) }, mounts: [] });
+  await save(W2, { eggs: [], units: { u1: unit("jellox", "normal", 8) }, mounts: [] });
   const a2 = await audit(W2);
   chk((a2.units.u1.jump || 0) <= 1, `(control) a normal level-up is a jump of 1 (${a2.units.u1.jump || 0})`);
   const sum2 = (await get("/assets/summary?key=test-admin-key")).body;
@@ -243,14 +243,14 @@ sec("ONE creature, ONE live sale — species matching let a single unit back 12 
 {
   const W = await mkWallet();
   SRV._setWalletFirstSeenForTest(W.wallet, Date.UTC(2025, 0, 1));
-  await save(W, { eggs: [], units: { u1: unit("firix", "normal", 2), u2: unit("leafcub", "normal", 3) }, mounts: [] });
+  await save(W, { eggs: [], units: { u1: unit("firix", "normal", 2), u2: unit("jellox", "normal", 3) }, mounts: [] });
   const listUid = (id, uid, sp) => post("/market/op", { op: "list", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,
     listing: { id, kind: "chikimon", item: sp, uid, lvl: 2, xp: 0, price: 500, qty: 1 } });
   const a = await listUid("U-1", "u1", "firix");
   chk(a.status === 200, `the creature lists once (${a.status})`);
   const b2 = await listUid("U-2", "u1", "firix");
   chk(b2.status === 409, `the SAME creature cannot back a second row (${b2.status})`);
-  const other = await listUid("U-3", "u2", "leafcub");
+  const other = await listUid("U-3", "u2", "jellox");
   chk(other.status === 200, `(control) a different creature still lists (${other.status})`);
   // an auction is the same sale, so it must see the same reservation
   const auc = await post("/market/op", { op: "auction_post", sid: W.sid, wallet: W.wallet, mktToken: W.mktToken,

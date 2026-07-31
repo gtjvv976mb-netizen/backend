@@ -69,6 +69,8 @@ sec("THE CAP NOW BINDS on the in-game route — the promise is enforced");
 
   // a server-rolled meme egg must now never produce an alon
   const C = await mkWallet();
+  // issuance no longer spends the 1500 market allowance (see fix_hatching_sim H1) — pay Mithra
+  for (const [m, n] of Object.entries({ crystal: 50, honey: 34, berries: 40, essence: 34 })) SRV._grantOwnForTest(C.wallet, m, n);
   const ce = await post("/assets/egg/claim", { wallet: C.wallet, mktToken: C.mktToken, kind: "meme" });
   chk(ce.status === 200, `a meme egg is claimed (${ce.status})`);
   SRV._ageAsset(ce.body.egg.id, 25 * HOUR);                  // meme eggs are 24h
@@ -79,6 +81,7 @@ sec("THE CAP NOW BINDS on the in-game route — the promise is enforced");
   // and a client REPORTING an alon must be refused outright
   const D = await mkWallet();
   await wait(5100);
+  for (const [m, n] of Object.entries({ crystal: 50, honey: 34, berries: 40, essence: 34 })) SRV._grantOwnForTest(D.wallet, m, n);
   const de = await post("/assets/egg/claim", { wallet: D.wallet, mktToken: D.mktToken, kind: "meme" });
   SRV._ageAsset(de.body.egg.id, 25 * HOUR);
   const con = await post("/assets/egg/consume", { wallet: D.wallet, mktToken: D.mktToken, id: de.body.egg.id, sp: "alon" });

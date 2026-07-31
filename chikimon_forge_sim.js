@@ -56,7 +56,15 @@ const sync = (w, extra) => post("/assets/chikimon/sync", Object.assign({ wallet:
 const mine = (w) => get(`/assets/mine?wallet=${w.wallet}&mktToken=${encodeURIComponent(w.mktToken)}`);
 const audit = (w) => get(`/assets/audit?wallet=${w.wallet}&mktToken=${encodeURIComponent(w.mktToken)}`);
 const summary = () => get(`/assets/summary?key=test-admin-key`);
-const claim = (w, kind) => post("/assets/egg/claim", { wallet: w.wallet, mktToken: w.mktToken, kind });
+// MITHRA'S PRICE IS REAL NOW. Asset issuance stopped spending the 1500 unwitnessed market allowance
+// on 2026-07-31 (it measured out at 37 free legendary eggs per never-played wallet, which is what
+// funded the /assets/egg/consume species drains) and reads ISSUE_UNWITNESSED_ALLOWANCE (25) instead.
+// So a claim now needs witnessed gathering — which is exactly what _grantOwnForTest records, the same
+// ownCredit a real /world/node/claim performs.
+const EGG_RECIPE_MATS = { normal: { wood: 30, berries: 24, essence: 8 }, mount: { seashell: 40, hide: 30, iron: 22, essence: 16 },
+                          legendary: { crystal: 40, gold: 30, essence: 26 }, meme: { crystal: 50, honey: 34, berries: 40, essence: 34 } };
+const _payFor = (w, kind) => { for (const [m, n] of Object.entries(EGG_RECIPE_MATS[kind] || {})) SRV._grantOwnForTest(w.wallet, m, n); };
+const claim = (w, kind) => { _payFor(w, kind); return post("/assets/egg/claim", { wallet: w.wallet, mktToken: w.mktToken, kind }); };
 const consume = (w, id, sp) => post("/assets/egg/consume", { wallet: w.wallet, mktToken: w.mktToken, id, sp });
 // live ledger record for a wallet (serializeAssetLedger returns the LIVE rec objects)
 const ledgerRec = (w) => { const e = SRV.serializeAssetLedger().w.find(x => x[0] === w.wallet); return e ? e[1] : null; };
@@ -282,17 +290,26 @@ sec("PROPERTY 5 — NO DOUBLE-MINT / CLONE (concurrent + repeat syncs; dedup eve
   chk(healixRows.length === 1, `the registry holds exactly ONE healix row, not a clone (${healixRows.length})`);
   if (healixRows.length > 1) hole(`P5: concurrent syncs cloned the healix into ${healixRows.length} rows`);
 
-  // (b) canonical answer must be dup-free even if egg/consume earlier minted TWO rows of one species.
+  // (b) canonical answer must be dup-free even if the registry holds TWO rows of one species.
+  // 2026-07-31: /assets/egg/consume can no longer BUILD that state — it used to accept any species
+  // the client named, and a wallet minted three dragonos from three legendary eggs and listed all
+  // three; it now applies the same ownedSpecies/atSupplyCap filter /assets/egg/hatch rolls from
+  // (proven: the second jellox consume answers 409 "you already carry that one"). The duplicate is
+  // therefore constructed through the mint seam instead, because what this case is really about is
+  // the SYNC answer collapsing a duplicate however it got there — historic rows still exist.
   const G = await mkWallet(PRE);
   await save(G, { onboarded: true, mounts: [], eggs: [], units: { u1: { species: "forestle", kind: "normal", level: 4 } } });
-  for (let i = 0; i < 2; i++) {
+  const dupSecond = await (async () => {
     const ce = await claim(G, "normal");
-    if (ce.status !== 200) { console.log("    (claim retry — rate limit)", ce.status); await wait(5200); i--; continue; }
+    if (ce.status !== 200) return null;
     SRV._ageAsset(ce.body.egg.id, 7 * HOUR);
     const cr = await consume(G, ce.body.egg.id, "jellox");
-    chk(cr.status === 200, `consume #${i + 1} minted a jellox row (${cr.status})`);
-    await wait(5200);   // egg-claim rate limit is 5s
-  }
+    chk(cr.status === 200, `consume #1 minted a jellox row (${cr.status})`);
+    // the route now refuses the second — mint it directly, as a pre-fix registry would hold it
+    SRV._mintAssetForTest("chikimon", G.wallet, { sp: "jellox", kind: "normal", lvl: 1 }, "hatched");
+    return true;
+  })();
+  chk(dupSecond === true, `a historic duplicate jellox row was constructed (${dupSecond})`);
   const dupBefore = ((await mine(G)).body.chikimon || []).filter(x => x.sp === "jellox").length;
   console.log("    registry jellox rows before sync:", dupBefore);
   chk(dupBefore === 2, `two real duplicate jellox rows exist pre-sync (${dupBefore})`);

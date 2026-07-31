@@ -172,16 +172,21 @@ sec("ATTACK 5: honest Trading Post buyers were condemned ('purchased' was doc-on
 sec("ATTACK 6: list a forged legendary on the real-$CHIKI rail (the money path)");
 {
   const W = await mkWallet();
-  await saveAs(W, { eggs: [], units: { u1: unit("pipmoth", "normal", 2) }, mounts: [] });
+  await saveAs(W, { eggs: [], units: { u1: unit("firix", "normal", 2) }, mounts: [] });
   const sid = W.sid, v = { mktToken: W.mktToken };
+  // REAL SPECIES NAMES ON THE MARKET LEG. "pipmoth" and "azulon" are not in the catalog (azulon is
+  // the scroll NPC), and op:list now catalog-checks `item` the way auction_post always has — so both
+  // came back 400 "no such item", which tests the catalog rather than the provenance gate this case
+  // is about. The ledger legs above keep the invented names on purpose: the point THERE is that the
+  // audit records whatever a save presents.
   const listForged = await raw("/market/op", { op: "list", sid, wallet: W.wallet, mktToken: v.mktToken,
-    listing: { id: "L-forged-1", kind: "chikimon", item: "azulon", lvl: 50, xp: 999999, price: 9999999, qty: 1 } });
+    listing: { id: "L-forged-1", kind: "chikimon", item: "dragonos", lvl: 50, xp: 999999, price: 9999999, qty: 1 } });
   chk(listForged.status === 409, `listing a chikimon absent from the record is refused (${listForged.status})`);
   const board = await get("/market/list");
   chk(!board.listings.some(l => l.id === "L-forged-1"), `it never reached the board`);
   // the unit the wallet REALLY owns must still be listable — a false refusal strands a real player
   const listReal = await raw("/market/op", { op: "list", sid, wallet: W.wallet, mktToken: v.mktToken,
-    listing: { id: "L-real-1", kind: "chikimon", item: "pipmoth", lvl: 2, xp: 10, price: 100, qty: 1 } });
+    listing: { id: "L-real-1", kind: "chikimon", item: "firix", lvl: 2, xp: 10, price: 100, qty: 1 } });
   chk(listReal.status !== 409, `the wallet's genuine chikimon still lists fine (${listReal.status})`);
   const board2 = await get("/market/list");
   chk(board2.listings.some(l => l.id === "L-real-1"), `and it is on the board`);

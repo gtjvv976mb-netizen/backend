@@ -50,44 +50,51 @@ sec("the server names the same drop the shipped client already grants");
 
 sec("the cow's TWO items survive — that is deliberate, not a bug to tidy");
 {
+  // ON THE ISLAND: a claim is now bounded to the gatherable extent around (2,-204), so (900,900) —
+  // 1423 units out, in open ocean — is "no such node". The cow's two-item drop is unchanged.
   const W = await mkWallet();
-  await place(W, 900, 900);
-  const r = await claim(W, "cow:900:900", 900, 900);
-  chk(r.body.drop.length === 2, `a cow yields two items (${JSON.stringify(r.body.drop)})`);
+  await place(W, 300, 200);
+  const r = await claim(W, "cow:300:200", 300, 200);
+  chk(Array.isArray(r.body.drop) && r.body.drop.length === 2, `a cow yields two items (${JSON.stringify(r.body.drop)})`);
   const others = Object.entries(EXPECT).filter(([k]) => k !== "cow");
   chk(others.every(([, v]) => v.length === 1), `every other node yields exactly one`);
 }
 
-sec("an unknown node kind yields NOTHING — an allowlist, never a default");
+sec("an unknown node kind is REFUSED — an allowlist, never a default");
 {
+  // 2026-07-31: it used to be accepted and simply drop nothing, but the id was still keyed into the
+  // shared node map and still reached recordGather — where a `|| [kind]` fallback turned the empty
+  // drop back into the raw kind string and credited it if that string happened to be in MAT_IDS
+  // (measured: "essence:800:-400" moved the book 1500 -> 1501). Both halves are closed; the kind is
+  // now refused outright.
   const W = await mkWallet();
-  await place(W, 500, 500);
-  const r = await claim(W, "unobtanium:500:500", 500, 500);
-  chk(Array.isArray(r.body.drop) && r.body.drop.length === 0,
-      `a made-up kind drops nothing (${JSON.stringify(r.body.drop)})`);
+  await place(W, 300, 200);
+  const r = await claim(W, "unobtanium:300:200", 300, 200);
+  chk(r.status === 400 && !r.body.drop,
+      `a made-up kind is refused (${r.status} ${JSON.stringify(r.body)})`);
 }
 
 sec("a rate-limited claim now says when to come back, instead of vanishing");
 {
   const W = await mkWallet();
-  await place(W, 700, 700);
-  const a = await claim(W, "wood:700:700", 700, 700);
+  await place(W, 400, 100);   // on-island: the claim bound is a disc around (2,-204)
+  const a = await claim(W, "wood:400:100", 400, 100);
   chk(a.body.ok === true, `the first claim lands (${a.status})`);
-  const b = await claim(W, "wood:701:700", 700, 700);
+  const b = await claim(W, "wood:401:100", 400, 100);
   chk(b.status === 429, `an immediate second is refused (${b.status})`);
   chk(typeof b.body.retryInMs === "number" && b.body.retryInMs > 0 && b.body.retryInMs <= 1800,
       `and says how long to wait (${b.body.retryInMs}ms)`);
   // the refusal must NOT extend the window, or a polite client could never get through
   await wait(b.body.retryInMs + 120);
-  const c = await claim(W, "wood:701:700", 700, 700);
+  const c = await claim(W, "wood:401:100", 400, 100);
   chk(c.body.ok === true, `waiting exactly that long then succeeds (${c.status}) — the refusal did not push the window back`);
 }
 
 sec("the gather counter now counts MATERIALS, not node kinds");
 {
   const W = await mkWallet();
-  await place(W, 300, 300);
-  await claim(W, "cow:300:300", 300, 300);
+  await place(W, 300, 100);
+  await claim(W, "cow:300:100", 300, 100);
   await wait(1900);
   const g = SRV._gatheredFor(W.wallet) || {};
   chk(g.beef === 1 && g.hide === 1, `a cow claim counts beef and hide (${JSON.stringify(g)})`);

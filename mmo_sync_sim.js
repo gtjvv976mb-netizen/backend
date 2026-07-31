@@ -67,7 +67,11 @@ console.log("— ONE WORLD: a node taken by one player is gone for everyone —"
 {
   const id = "stone:120:-340";
   // both trainers WALK to the rock first - claims are position-authorised now, so a real client
-  // is always standing next to what it takes
+  // is always standing next to what it takes.
+  // 2026-07-31: /world/move stamps an implausible jump and a node claim stands down for 3 s after
+  // one (a wallet teleported between all 24 monster spawns in 10 s and claimed every kill). These
+  // two were last seen at (10,10), so the sim gives them travel time instead of blinking 380 units.
+  await new Promise(r => setTimeout(r, 3600));
   await post("/world/move", { wallet: alice, x: 120, z: -340, dir: 0, handle: "Alice" });
   await post("/world/move", { wallet: bob, x: 122, z: -338, dir: 0, handle: "Bob" });
   const c1 = await post("/world/node/claim", { wallet: alice, id, cd: 60 });
@@ -77,19 +81,20 @@ console.log("— ONE WORLD: a node taken by one player is gone for everyone —"
   const list = await (await fetch(BASE + "/world/nodes")).json();
   chk(!!list.nodes[id], "the world reports it spent, so every client hides it");
   chk(list.nodes[id] > 0 && list.nodes[id] <= 60000, "with a sane respawn countdown");
-  await post("/world/move", { wallet: bob, x: 999, z: 999, dir: 0, handle: "Bob" });
+  // a second rock, on the island (the claim bound is a disc around (2,-204)) and a short walk away
+  await post("/world/move", { wallet: bob, x: 140, z: -330, dir: 0, handle: "Bob" });
   await new Promise(r => setTimeout(r, 1900));      // respect the per-wallet claim interval
-  const other = await post("/world/node/claim", { wallet: bob, id: "stone:999:999", cd: 60 });
+  const other = await post("/world/node/claim", { wallet: bob, id: "stone:140:-330", cd: 60 });
   chk(other.ok === true, "a DIFFERENT rock is still free (claims are per-node)");
-  await post("/world/move", { wallet: alice, x: 1, z: 1, dir: 0, handle: "Alice" });
+  await post("/world/move", { wallet: alice, x: 118, z: -338, dir: 0, handle: "Alice" });
   await new Promise(r => setTimeout(r, 1900));
-  const quick = await post("/world/node/claim", { wallet: alice, id: "berries:1:1", cd: 1 });
+  const quick = await post("/world/node/claim", { wallet: alice, id: "berries:118:-338", cd: 1 });
   chk(quick.ok === true, "a normal node claims");
   // The respawn window belongs to the SERVER now — `cd` from the request body used to be honoured
   // up to a full hour, so a griefer could lock a node for everyone. Asking for 1s (as this sim used
   // to, and as a griefer would ask for 3600) no longer changes anything.
   const back = await (await fetch(BASE + "/world/nodes")).json();
-  const left = Math.round((back.nodes["berries:1:1"] || 0) / 1000);
+  const left = Math.round((back.nodes["berries:118:-338"] || 0) / 1000);
   chk(left > 1 && left <= 60, `the server picked the window, not the caller (${left}s, asked for 1s)`);
   const bad = await post("/world/node/claim", { wallet: alice, id: "../../etc/passwd<script>" });
   chk(bad.ok !== true, "hostile node id is refused, not fatal");
@@ -115,7 +120,9 @@ console.log("— node claims are AUTHORISED against where you actually are —")
 
   // present, but claiming a node on the far side of the island
   await post("/world/move", { wallet: cheat, x: 0, z: 0, dir: 0, handle: "Cheat" });
-  const far = await post("/world/node/claim", { wallet: cheat, id: "stone:900:-900", cd: 60 });
+  // 300,-500 is on the island but far from (0,0) — the REACH gate. (900,-900) is open sea and is now
+  // refused one step earlier, by the island-extent bound.
+  const far = await post("/world/node/claim", { wallet: cheat, id: "stone:300:-500", cd: 60 });
   chk(far.ok === false && far.error === "out of reach",
       `remote claim refused (${far.error}, ${far.dist} away) - cannot strip-mine the island from spawn`);
 

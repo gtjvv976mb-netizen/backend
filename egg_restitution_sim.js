@@ -17,13 +17,19 @@ const chk = (c, m) => { c ? (pass++, console.log("  ok:", m)) : (fail++, console
 const sec = (s) => console.log(`\n— ${s} —`);
 const wait = (ms) => new Promise(r => setTimeout(r, ms));
 let _n = 0;
-async function mkWallet() {
+async function mkWallet(firstSeen = Date.UTC(2026, 6, 20)) {
   const kp = nacl.sign.keyPair();
   const wallet = bs58.encode(kp.publicKey);
   const authMsg = `Chikoria sign-in\nwallet:${wallet}\nts:${Date.now()}`;
   const authSig = Buffer.from(nacl.sign.detached(Buffer.from(authMsg, "utf8"), kp.secretKey)).toString("base64");
   const netId = "n" + Date.now() + "_" + (++_n);
   const v = await post("/verify", { wallet, netId, authMsg, authSig });
+  // AN ACCOUNT THE SERVER FIRST SAW AFTER THE WIPE CANNOT HAVE BEEN WIPED (2026-07-31).
+  // `prog` rides in the client-authored save, so a crafted push on a wallet created seconds ago used
+  // to be answered owed:["normal","legendary","meme","mount"] and minted four registry eggs — one a
+  // capped Meme edition, one a capped mount. The claim is now gated on players.first_seen, a clock
+  // the server writes at /verify. Every wallet here is a GENUINE pre-wipe victim, so it is backdated.
+  if (firstSeen) SRV._setWalletFirstSeenForTest(wallet, firstSeen);
   return { wallet, authMsg, authSig, sid: netId, mktToken: v.body.mktToken };
 }
 const save = async (w, mmo) => { await wait(700); return post("/profile", { wallet: w.wallet, authMsg: w.authMsg, authSig: w.authSig, profile: { mmo } }); };
@@ -177,6 +183,19 @@ sec("the counter-less STARTER egg is covered too");
   const v = await claim(veteran);
   chk(!v.body.granted.some(g => g.kind === "normal"),
       `a veteran who has hatched before is not handed a second starter (${JSON.stringify(v.body.granted.map(g=>g.kind))})`);
+}
+
+sec("a wallet the server first saw AFTER the wipe is refused — the counters are client-authored");
+{
+  const N = await mkWallet(0);                       // no backdate: first_seen is right now
+  await save(N, { onboarded: true, eggs: [], units: {}, mounts: [],
+                  prog: { eggmake_normal: 9, eggmake_legendary: 9, eggmake_meme: 9, eggmake_mount: 9 } });
+  const q = await owedOf(N);
+  chk(Array.isArray(q.body.owed) && q.body.owed.length === 0, `it is not even shown a debt (${JSON.stringify(q.body.owed)})`);
+  const c = await claim(N);
+  chk(c.status === 403, `the claim is refused (${c.status} ${JSON.stringify(c.body.error || "").slice(0, 80)})`);
+  const held = await mine(N);
+  chk((held.eggs || []).length === 0, `and nothing was minted to it (${(held.eggs || []).length})`);
 }
 
 console.log(`\nEGGRESTITUTION_DONE pass=${pass} fail=${fail}`);

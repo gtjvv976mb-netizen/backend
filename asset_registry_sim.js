@@ -30,7 +30,15 @@ async function mkWallet() {
   return { wallet, authMsg, authSig, sid: netId, mktToken: v.body.mktToken };
 }
 const wait = (ms) => new Promise(r => setTimeout(r, ms));
-const claim = (w, kind) => post("/assets/egg/claim", { wallet: w.wallet, mktToken: w.mktToken, kind });
+// MITHRA'S PRICE IS REAL NOW. Asset issuance stopped spending the 1500 unwitnessed market allowance
+// on 2026-07-31 (it measured out at 37 free legendary eggs per never-played wallet, which is what
+// funded the /assets/egg/consume species drains) and reads ISSUE_UNWITNESSED_ALLOWANCE (25) instead.
+// So a claim now needs witnessed gathering — which is exactly what _grantOwnForTest records, the same
+// ownCredit a real /world/node/claim performs.
+const EGG_RECIPE_MATS = { normal: { wood: 30, berries: 24, essence: 8 }, mount: { seashell: 40, hide: 30, iron: 22, essence: 16 },
+                          legendary: { crystal: 40, gold: 30, essence: 26 }, meme: { crystal: 50, honey: 34, berries: 40, essence: 34 } };
+const _payFor = (w, kind) => { for (const [m, n] of Object.entries(EGG_RECIPE_MATS[kind] || {})) SRV._grantOwnForTest(w.wallet, m, n); };
+const claim = (w, kind) => { _payFor(w, kind); return post("/assets/egg/claim", { wallet: w.wallet, mktToken: w.mktToken, kind }); };
 const hatch = (w, id) => post("/assets/egg/hatch", { wallet: w.wallet, mktToken: w.mktToken, id });
 const mine = (w) => get(`/assets/mine?wallet=${w.wallet}&mktToken=${encodeURIComponent(w.mktToken)}`);
 
@@ -148,12 +156,25 @@ sec("mounts are ROLLED by the server, so a cheater cannot simply name the griffi
 
 sec("avatars finally have a server record (they had none at all)");
 {
+  // AZULON'S PRICE IS ENFORCED NOW (2026-07-31): the route used to check only AVATARS_MAX and the
+  // supply cap, so 40 empty keypairs minted 80 supply-capped avatars in 111 ms. It mirrors
+  // Econ.gd SCROLL_TRADE's 230 materials, so the sim pays them — and SCROLL_REDEEM_MIN_MS (5 s)
+  // now paces the route the way EGG_CLAIM_MIN_MS paces Mithra.
+  const SCROLL_MATS = { gold: 12, iron: 18, crystal: 20, wood: 50, stone: 40, berries: 30, honey: 12, seashell: 20, hide: 10, essence: 18 };
+  const payScroll = (w) => { for (const [m, n] of Object.entries(SCROLL_MATS)) SRV._grantOwnForTest(w.wallet, m, n); };
   const W = await mkWallet();
+  const broke = await post("/assets/scroll/redeem", { wallet: W.wallet, mktToken: W.mktToken });
+  chk(broke.status === 409, `a wallet that gathered nothing is refused (${broke.status})`);
+  payScroll(W);
   const r1 = await post("/assets/scroll/redeem", { wallet: W.wallet, mktToken: W.mktToken });
   chk(r1.status === 200 && !!r1.body.avatar?.id, `a scroll mints a look (${r1.body.avatar?.sp})`);
   chk(r1.body.avatar.sp !== "classic", `never the ceremony look everyone already has`);
+  await wait(5200);
+  payScroll(W);
   const r2 = await post("/assets/scroll/redeem", { wallet: W.wallet, mktToken: W.mktToken });
   chk(r2.status === 200, `a second look is allowed`);
+  await wait(5200);
+  payScroll(W);
   const r3 = await post("/assets/scroll/redeem", { wallet: W.wallet, mktToken: W.mktToken });
   chk(r3.status === 409, `a third is refused — the client's own 2-look cap (${r3.status})`);
   chk((await mine(W)).body.avatars.length === 2, `and the registry holds exactly two`);

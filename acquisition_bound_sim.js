@@ -91,14 +91,18 @@ async function main() {
   const bk = srv._ownFor(digger.wallet);
   ok("...into cred, not open", bk && bk.cred["mat:wood"] === 3, JSON.stringify(bk && bk.cred));
 
-  // ---------- 4. a kill credits 1 essence, NOT the 6-unit telemetry ceiling ----------
+  // ---------- 4. a kill REPORT credits nothing at all (2026-07-31) ----------
+  // It used to credit 1 essence whenever the server had NOT witnessed the kill — i.e. exactly when it
+  // had no evidence — which measured 7,194 sellable units/hour on a wallet that never fought. The
+  // shared mob pool is the witnessed path now (/world/mob/hit credits on the server's own view of a
+  // health pool reaching zero) and the shipped client fires both, so nothing honest is lost.
   const fighter = await mk();
   await post("/world/move", { wallet: fighter.wallet, mktToken: fighter.tok, x: 10, z: 10, y: 6, dir: 0, handle: "F", leg: 1, el: "Fire", br: 1 });
   const k1 = await post("/world/kill/report", { wallet: fighter.wallet, mktToken: fighter.tok });
   ok("a kill report is counted", k1.status === 200, `status ${k1.status}`);
   const eb = srv._ownFor(fighter.wallet);
-  ok("...crediting exactly 1 essence, not ESSENCE_PER_KILL (6)",
-     eb && eb.cred["mat:essence"] === 1, `cred=${JSON.stringify(eb && eb.cred)}`);
+  ok("...crediting NO sellable essence on the client's word",
+     !eb || !eb.cred["mat:essence"], `cred=${JSON.stringify(eb && eb.cred)}`);
   const gc = srv._gatheredFor(fighter.wallet);
   ok("...while the observe-only tally KEEPS its over-generous 6", gc && gc.essence === 6,
      `gatherCount=${JSON.stringify(gc)}`);
@@ -237,10 +241,16 @@ async function main() {
      (rE2.json.fish === "mystic_eel" || rE2.json.mat === "crystal") && Number.isFinite(Number(rE2.json.have)),
      JSON.stringify({ fish: rE2.json.fish, mat: rE2.json.mat, need: rE2.json.need, have: rE2.json.have }));
 
-  // a player inside the unwitnessed allowance CAN still claim — the allowance protects honest players
+  // A PLAYER WHOSE GATHERING THE SERVER WITNESSED CAN STILL CLAIM.
+  // 2026-07-31: asset ISSUANCE no longer spends the 1500 market allowance — it reads
+  // ISSUE_UNWITNESSED_ALLOWANCE (25), which is below every recipe's largest ingredient, because the
+  // full allowance measured out at 37 free legendary eggs and 37 free mount eggs on a wallet that had
+  // done nothing but /verify (the fuel behind the /assets/egg/consume species drains). So this case
+  // now grants the materials the way a real gather does, which is what it was always describing.
   const payer = await mk();
   srv._setFfishAuthorityForTest(true);
   srv._grantOwnForTest(payer.wallet, "golden_chikifish", 3, "ffish");   // the 3 legends the recipe demands
+  for (const [m, n] of Object.entries({ wood: 30, berries: 24, essence: 8 })) srv._grantOwnForTest(payer.wallet, m, n);
   const rP = await post("/assets/egg/claim", { wallet: payer.wallet, mktToken: payer.tok, kind: "normal" });
   ok("a player who caught the legend AND has the materials gets their egg",
      rP.status === 200, `status ${rP.status} ${JSON.stringify(rP.json.error || "").slice(0, 90)}`);
@@ -250,7 +260,7 @@ async function main() {
      `used=${JSON.stringify(pb && pb.used)}`);
   const availWood = srv._ownAvailFor(payer.wallet, "mat", "wood");
   ok("...so the material they spent is no longer sellable",
-     availWood === ALLOW - 30, `wood available=${availWood} expected=${ALLOW - 30}`);
+     availWood === ALLOW + 30 - 30, `wood available=${availWood} expected=${ALLOW}`);
 
   // and the charge is atomic: a wallet short on ONE material pays nothing
   const short = await mk();
@@ -302,13 +312,19 @@ async function main() {
   ok("rod 0 can never hook a legend, however the client asks (FFISH_ROD_REQ)", legends === 0, `legends=${legends}`);
 
   // and Mithra now demands the legend she was always supposed to
+  // MATERIALS GRANTED THE WAY A GATHER GRANTS THEM — issuance reads the strict allowance now
+  // (ISSUE_UNWITNESSED_ALLOWANCE 25, below the meme egg's 50 crystal), so the fish half is what these
+  // two cases are actually about and the material half has to be paid for like a real player's.
+  const MEME_MATS = { crystal: 50, honey: 34, berries: 40, essence: 34 };
   const eggless = await mk();
+  for (const [m, n] of Object.entries(MEME_MATS)) srv._grantOwnForTest(eggless.wallet, m, n);
   srv._setFfishAuthorityForTest(false);
   const rMemeOff = await post("/assets/egg/claim", { wallet: eggless.wallet, mktToken: eggless.tok, kind: "meme" });
   ok("with the flag off Mithra still trades without the legend (today's behaviour, unbroken)",
      rMemeOff.status === 200, `status ${rMemeOff.status}`);
   srv._setFfishAuthorityForTest(true);
   const eggless2 = await mk();
+  for (const [m, n] of Object.entries(MEME_MATS)) srv._grantOwnForTest(eggless2.wallet, m, n);
   const rMeme = await post("/assets/egg/claim", { wallet: eggless2.wallet, mktToken: eggless2.tok, kind: "meme" });
   ok("a meme egg is refused without the Rainbow Fish the recipe demands",
      rMeme.status === 409 && rMeme.json.fish === "rainbow_fish",

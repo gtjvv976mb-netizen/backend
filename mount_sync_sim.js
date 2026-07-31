@@ -45,7 +45,15 @@ const wait = (ms) => new Promise(r => setTimeout(r, ms));
 const save = (w, mmo) => { return wait(700).then(() => post("/profile", { wallet: w.wallet, authMsg: w.authMsg, authSig: w.authSig, profile: { mmo } })); };
 const sync = (w) => post("/assets/mounts/sync", { wallet: w.wallet, mktToken: w.mktToken });
 const mine = (w) => get(`/assets/mine?wallet=${w.wallet}&mktToken=${encodeURIComponent(w.mktToken)}`);
-const claim = (w, kind) => post("/assets/egg/claim", { wallet: w.wallet, mktToken: w.mktToken, kind });
+// MITHRA'S PRICE IS REAL NOW (2026-07-31): asset issuance reads ISSUE_UNWITNESSED_ALLOWANCE (25)
+// instead of the 1500 market allowance, because the market allowance measured out at 37 free eggs
+// per never-played wallet — the fuel behind the /assets/egg/consume species drains. A claim now needs
+// witnessed gathering, which is exactly what _grantOwnForTest records (the same ownCredit a real
+// /world/node/claim performs).
+const EGG_RECIPE_MATS = { normal: { wood: 30, berries: 24, essence: 8 }, mount: { seashell: 40, hide: 30, iron: 22, essence: 16 },
+                          legendary: { crystal: 40, gold: 30, essence: 26 }, meme: { crystal: 50, honey: 34, berries: 40, essence: 34 } };
+const _payFor = (w, kind) => { for (const [m, n] of Object.entries(EGG_RECIPE_MATS[kind] || {})) SRV._grantOwnForTest(w.wallet, m, n); };
+const claim = (w, kind) => { _payFor(w, kind); return post("/assets/egg/claim", { wallet: w.wallet, mktToken: w.mktToken, kind }); };
 const hatch = (w, id) => post("/assets/egg/hatch", { wallet: w.wallet, mktToken: w.mktToken, id });
 
 // ---------------------------------------------------------------------------

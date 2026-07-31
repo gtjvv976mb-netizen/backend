@@ -54,7 +54,15 @@ const saveRaw = (w, mmoText) => wait(700).then(() => postRaw("/profile",
 const sync = (w, extra) => post("/assets/mounts/sync", Object.assign({ wallet: w.wallet, mktToken: w.mktToken }, extra || {}));
 const mine = (w) => get(`/assets/mine?wallet=${w.wallet}&mktToken=${encodeURIComponent(w.mktToken)}`);
 const summary = () => get(`/assets/summary?key=test-admin-key`);
-const claim = (w, kind) => post("/assets/egg/claim", { wallet: w.wallet, mktToken: w.mktToken, kind });
+// MITHRA'S PRICE IS REAL NOW (2026-07-31): asset issuance reads ISSUE_UNWITNESSED_ALLOWANCE (25)
+// instead of the 1500 market allowance, because the market allowance measured out at 37 free eggs
+// per never-played wallet — the fuel behind the /assets/egg/consume species drains. A claim now needs
+// witnessed gathering, which is exactly what _grantOwnForTest records (the same ownCredit a real
+// /world/node/claim performs).
+const EGG_RECIPE_MATS = { normal: { wood: 30, berries: 24, essence: 8 }, mount: { seashell: 40, hide: 30, iron: 22, essence: 16 },
+                          legendary: { crystal: 40, gold: 30, essence: 26 }, meme: { crystal: 50, honey: 34, berries: 40, essence: 34 } };
+const _payFor = (w, kind) => { for (const [m, n] of Object.entries(EGG_RECIPE_MATS[kind] || {})) SRV._grantOwnForTest(w.wallet, m, n); };
+const claim = (w, kind) => { _payFor(w, kind); return post("/assets/egg/claim", { wallet: w.wallet, mktToken: w.mktToken, kind }); };
 const hatch = (w, id) => post("/assets/egg/hatch", { wallet: w.wallet, mktToken: w.mktToken, id });
 const consume = (w, id, sp) => post("/assets/egg/consume", { wallet: w.wallet, mktToken: w.mktToken, id, sp });
 // live ledger record for a wallet (serializeAssetLedger returns the LIVE rec objects)
@@ -158,16 +166,20 @@ sec("ATTACK 4 — NO DOUBLE-MINT / CLONE (concurrent + repeat syncs; dedup even 
   if (wolfRows.length > 1) hole(`ATTACK 4: concurrent syncs cloned the wolf into ${wolfRows.length} rows`);
 
   // (b) canonical answer must be dup-free even if an OLDER path minted two rows of one species.
-  //     /assets/egg/consume mints a mount from a client-chosen species WITHOUT an ownedMounts check,
-  //     so it can legitimately produce two 'griffin' rows — a real duplicate the answer must swallow.
+  //     THAT PATH IS CLOSED as of 2026-07-31: /assets/egg/consume used to mint a mount from a
+  //     client-chosen species with NO ownedMounts and NO atSupplyCap check, so five fresh wallets
+  //     took all five griffins deterministically and one wallet could hold two. It now offers exactly
+  //     the pool /assets/egg/hatch rolls from (measured: the second griffin consume answers 409
+  //     "that steed already waits in your stable"). Historic duplicates still exist in the registry,
+  //     and swallowing them is what this case is about — so the second row is minted through the seam.
   const G = await mkWallet(Date.UTC(2025, 0, 1));
-  for (let i = 0; i < 2; i++) {
+  {
     const ce = await claim(G, "mount");
-    if (ce.status !== 200) { console.log("    (claim retry — rate limit)", ce.status); await wait(5200); i--; continue; }
+    chk(ce.status === 200, `a mount egg is claimed (${ce.status})`);
     SRV._ageAsset(ce.body.egg.id, 7 * HOUR);
     const cr = await consume(G, ce.body.egg.id, "griffin");
-    chk(cr.status === 200, `consume #${i + 1} minted a griffin row (${cr.status})`);
-    await wait(5200);   // egg-claim rate limit is 5s
+    chk(cr.status === 200, `consume #1 minted a griffin row (${cr.status})`);
+    SRV._mintAssetForTest("mount", G.wallet, { sp: "griffin", kind: "mount" }, "hatched");   // a pre-fix duplicate
   }
   const dupBefore = ((await mine(G)).body.mounts || []).filter(m => m.sp === "griffin").length;
   console.log("    registry griffin rows before sync:", dupBefore);

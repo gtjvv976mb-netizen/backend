@@ -98,9 +98,13 @@ sec("origins are broken out, so legacy and unverified are distinguishable");
 }
 
 // ---------------------------------------------------------------------------
+let hatchedSp = null;              // the species the server ROLLED below — the next section pins it
 sec("EGGS: claimed vs hatched vs still nesting");
 {
   const D = await mkWallet(PRE);
+  // Mithra now charges (EGG_RECIPE_MATS) and issuance reads the STRICT unwitnessed allowance (25),
+  // so a wallet has to be RECORDED acquiring the ingredients before it can claim an egg at all.
+  for (const m of ["wood", "berries", "essence", "seashell", "hide", "iron"]) SRV._grantOwnForTest(D.wallet, m, 400, "mat");
   const e1 = await post("/assets/egg/claim", { wallet: D.wallet, mktToken: D.mktToken, kind: "mount" });
   chk(e1.status === 200, `a mount egg is claimed (${e1.status})`);
   await wait(5100);
@@ -125,6 +129,7 @@ sec("EGGS: claimed vs hatched vs still nesting");
 
   // the hatched mount is MINTED even though no cloud save has reported it yet
   const sp = h.body.hatched.sp;
+  hatchedSp = sp;
   chk(find(c.mounts, sp).minted === 1, `the hatched ${sp} is counted as minted (${find(c.mounts, sp).minted})`);
 }
 
@@ -132,8 +137,16 @@ sec("EGGS: claimed vs hatched vs still nesting");
 sec("minted and holders are reported separately, not blended");
 {
   const c = await census();
-  const anyMintedNotHeld = c.mounts.some(m => m.minted > 0 && m.holders === 0);
-  chk(anyMintedNotHeld, "a freshly minted mount shows minted>0 with holders=0 until its owner saves");
+  // WAS FLAKY, NOW EXACT. This used to be `c.mounts.some(m => m.minted > 0 && m.holders === 0)`,
+  // which depended on the RANDOM roll above: this sim pre-seeds horse (2 savers) and griffin (1) as
+  // ledger holders, so whenever the roll landed on either of those, no mount in the whole census had
+  // minted>0 with holders===0 and the assertion failed for a reason that had nothing to do with the
+  // server. Pin the species that was actually rolled and its exact expected holders instead — the
+  // property under test is that D's fresh mint does NOT appear in `holders` (D has never saved).
+  const preSeeded = { horse: 2, griffin: 1 }[hatchedSp] || 0;
+  const row = c.mounts.find(m => m.sp === hatchedSp) || {};
+  chk(row.minted === 1 && row.holders === preSeeded,
+    `the freshly minted ${hatchedSp} shows minted=${row.minted} and holders=${row.holders} — its owner has never saved, so it is counted as minted only (pre-seeded savers of ${hatchedSp}: ${preSeeded})`);
   const heldNotMinted = c.chikimon.some(m => m.holders > 0 && m.minted === 0);
   chk(heldNotMinted, "and a legacy creature shows holders>0 with minted=0 — the two never merge");
   chk(typeof c.note === "string" && c.note.includes("fill in"), "the payload states the freshness caveat itself");
