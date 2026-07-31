@@ -4183,7 +4183,10 @@ function worldSnapshot(wallet, x, z, delta = false) {
     const d = Math.hypot((p.x || 0) - x, (p.z || 0) - z);
     if (d > WORLD_RADIUS) continue;
     // volatile half: always sent, because it is what actually moves
-    const row = { d, wallet: w, x: p.x, y: p.y || 0, z: p.z, dir: p.dir, mount: p.mount || "", act: p.act || "", spr: !!p.spr };
+    // `a` = the sample's AGE in ms (now - when the mover reported it). An age, not a clock, so no
+    // client/server clock sync is needed; the client stamps arrival-minus-age and gets a timeline in
+    // its OWN clock that is jitter-free. Old clients ignore the field.
+    const row = { d, wallet: w, x: p.x, y: p.y || 0, z: p.z, dir: p.dir, mount: p.mount || "", act: p.act || "", spr: !!p.spr, a: now - p.ts };
     const sq = Number(p.sq) || 1;
     if (seen && seen.get(w) === sq) {
       row.dl = 1;                       // "static half omitted — reuse what I already told you"
@@ -5599,8 +5602,24 @@ app.post("/world/move", (req, res) => {
   if (held && held.proven && !iAmProven) {
     return res.status(403).json({ error: "that trainer is signed in — prove this wallet first" });
   }
-  const x = clampF(b.x, -100000, 100000, 0), z = clampF(b.z, -100000, 100000, 0);
-  const y = clampF(b.y, -1000, 100000, 0);   // height: without it every remote was ground-snapped and nobody could be seen jumping
+  // PIPELINED MOVES: the client may now keep two requests in flight, and TCP does not promise the
+  // second POST arrives second. A monotonically increasing per-session `seq` decides which body is
+  // newest; a stale one must NOT overwrite the row (position would step backwards for every peer),
+  // but its reply is still useful — the snapshot is read fresh either way. seq is optional: an older
+  // client sends none and behaves exactly as before.
+  const seq = Number.isFinite(+b.seq) ? Math.max(0, Math.floor(+b.seq)) : null;
+  if (seq !== null && held && Number.isFinite(held.seq) && seq <= held.seq) {
+    return res.json({ ok: true, stale: true, seq,
+                      players: worldSnapshot(wallet, held.x, held.z, !!b.dl), online: worldPlayers.size,
+                      mobs: _worldTickOn ? mobSnapshot(Date.now()) : undefined });
+  }
+  // Presence coords are rounded AT STORE TIME: they arrive as float32 noise (15 significant digits
+  // for a 1-unit-per-voxel world) and every extra digit is paid for on EVERY snapshot to every peer.
+  // 2dp on x/y/z is sub-visible; dir stays at 3dp because Net.gd lerp_angles it and coarser steps
+  // are visible on slow turns. This touches the wire/presence row ONLY — never the save or economy.
+  const x = Math.round(clampF(b.x, -100000, 100000, 0) * 100) / 100;   // 2dp
+  const z = Math.round(clampF(b.z, -100000, 100000, 0) * 100) / 100;   // 2dp
+  const y = Math.round(clampF(b.y, -1000, 100000, 0) * 100) / 100;     // 2dp — height: without it every remote was ground-snapped and nobody could be seen jumping
   // The row is REPLACED wholesale every ping, so anything that must survive has to be carried over:
   // `seen` is this caller's delta memory. `sq` is derived from the FINISHED row rather than a parallel
   // copy — an earlier draft rebuilt the static fields separately with subtly different clamps, which
@@ -5609,7 +5628,7 @@ app.post("/world/move", (req, res) => {
   const _row = {
     proven: iAmProven,
     seen: _prev ? _prev.seen : undefined,
-    x, y, z, dir: clampF(b.dir, -7, 7, 0),
+    x, y, z, dir: Math.round(clampF(b.dir, -7, 7, 0) * 1000) / 1000,   // 3dp — do NOT round coarser (yaw stepping)
     handle: stripTags(String(b.handle || "Trainer")).slice(0, 20),
     leg: clampF(b.leg, 0, 20, 14) | 0,                 // companion species index
     el: stripTags(String(b.el || "Fire")).slice(0, 10),
@@ -5626,13 +5645,15 @@ app.post("/world/move", (req, res) => {
       .filter((k) => ["normal", "legendary", "meme", "mount"].includes(k)).join(","),
     spr: !!b.spr,                                          // actually sprinting, vs inferred from speed
     br: clampF(b.br, 1, 50, 1) | 0,   // companion LEVEL (cap 50) — not the Cup 1..30 BR
+    seq: seq !== null ? seq : (_prev && Number.isFinite(_prev.seq) ? _prev.seq : undefined),
     ts: Date.now(),
   };
   _row.sq = bumpStaticSeq(_prev, _row);   // advances ONLY when a static field really changed
   worldPlayers.set(wallet, _row);
   // The shared world rides the reply the client is ALREADY making, so co-op costs zero extra requests
   // and zero extra round trips. An older client ignores the field; a pristine island makes it empty.
-  res.json({ ok: true, players: worldSnapshot(wallet, x, z, !!b.dl), online: worldPlayers.size,
+  res.json({ ok: true, seq: seq !== null ? seq : undefined,
+             players: worldSnapshot(wallet, x, z, !!b.dl), online: worldPlayers.size,
              mobs: _worldTickOn ? mobSnapshot(Date.now()) : undefined });
 });
 // Read-only: nearby online trainers (for spectators / light polling).
