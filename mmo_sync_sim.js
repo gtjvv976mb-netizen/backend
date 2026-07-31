@@ -71,7 +71,16 @@ console.log("— ONE WORLD: a node taken by one player is gone for everyone —"
   // 2026-07-31: /world/move stamps an implausible jump and a node claim stands down for 3 s after
   // one (a wallet teleported between all 24 monster spawns in 10 s and claimed every kill). These
   // two were last seen at (10,10), so the sim gives them travel time instead of blinking 380 units.
-  await new Promise(r => setTimeout(r, 3600));
+  // 2026-08-01: WAITING IS NO LONGER ENOUGH, and that is the point of the change. The allowance used
+  // to be `110 * gap + 60`, so a long enough pause bought an arbitrarily large single jump (at a
+  // 10 s gap, 1160 units) — which is why 19 hops of 65 u could carry a wallet 1200 units and bank a
+  // gather at the far end with zero warps stamped. It is now a BANK capped at 2.5 s of travel, so a
+  // client has to actually cover the ground. WALK there, which is what a real client does anyway.
+  for (let i = 1; i <= 10; i++) {
+    await new Promise(r => setTimeout(r, 300));
+    await post("/world/move", { wallet: alice, x: 10 + (110 * i) / 10, z: 10 + (-350 * i) / 10, dir: 0, handle: "Alice" });
+    await post("/world/move", { wallet: bob, x: 12 + (110 * i) / 10, z: 12 + (-350 * i) / 10, dir: 0, handle: "Bob" });
+  }
   await post("/world/move", { wallet: alice, x: 120, z: -340, dir: 0, handle: "Alice" });
   await post("/world/move", { wallet: bob, x: 122, z: -338, dir: 0, handle: "Bob" });
   const c1 = await post("/world/node/claim", { wallet: alice, id, cd: 60 });

@@ -13,6 +13,8 @@ import {
 import { createCup } from "./cup-live.js";   // Chikoria Cup live orchestrator (double-elim, deterministic resolver)
 import { createMatch as pvpCreate, submit as pvpSubmit, tick as pvpTick, viewFor as pvpView, forfeit as pvpForfeit, spectatorView as pvpSpectate } from "./pvp-engine.js";   // live PvP battles
 import { getAssociatedTokenAddressSync, createTransferCheckedInstruction, createAssociatedTokenAccountIdempotentInstruction, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";   // $CHIKI quest-reward payouts ($CHIKI is TOKEN-2022 — the legacy program rejects its accounts with InvalidAccountData)
+import { loadTerrain, terrainInfo } from "./world_terrain.js";     // the island heightfield — the server's copy of the floor
+import * as PhysMod from "./world_physics.js";                     // server-side movement simulation (CHIK_PHYS=1; OFF by default)
 
 dotenv.config();
 const {
@@ -3364,6 +3366,9 @@ const WORLD_TTL_MS = 12000;       // drop a trainer who hasn't pinged in 12s
 // makes the two value-bearing reach checks stand down for a moment.
 const WARP_MAX_UPS = 110;         // units/second; the boat (70) is the fastest legitimate thing
 const WARP_SLACK = 60;            // units of free jump per ping, for latency and dropped packets
+// Seconds of WARP_MAX_UPS travel a presence row may bank. Replaces WARP_SLACK's per-ping grant —
+// see the long note at the stamp in worldMoveApply for the measurement that forced it.
+const WARP_BANK_S = 2.5;
 const WARP_HOLD_MS = 3000;        // how long a node claim / monster kill stands down after a warp
 let _warpPings = 0;               // observability: how often this fires at all
 export function _warpStatsForTest() { return { warps: _warpPings }; }
@@ -3499,9 +3504,18 @@ const CLAIM_RADIUS_KIND = Object.freeze(Object.assign(Object.create(null), { pig
 const NODE_CD_DEFAULT_S = 60;
 const CLAIM_RADIUS = 14;          // world units; in-game gather reach is ~7, doubled for latency
 const CLAIM_MIN_MS = 1800;        // the client's own anti-macro floor is 2s
-// THE ISLAND'S GATHERABLE EXTENT (Gather.gd CX/CZ + the 240..640 placement ring, mines included).
-// A wide margin on purpose: this is a plausibility bound, not a manifest.
-const ISLAND_CX = 2, ISLAND_CZ = -204, ISLAND_NODE_R = 900;
+// THE ISLAND'S GATHERABLE EXTENT (Gather.gd CX/CZ). A plausibility bound, not a manifest.
+// SIZED FROM THE REAL NODES, NOT FROM THE PLACEMENT RING, because the ring is not the widest thing
+// out there. Measured against the shipped client data on 2026-08-01:
+//   * stone/crystal/berries/seashell/honey/flower: Gather.gd's ring, rad <= 640
+//   * pig/cow: same ring, then wander <= 13 units from home            -> <= 653
+//   * the three mines (gold -232,360 · iron -388,340 · crystal_mine -332,224) -> max 669.4 (iron)
+//   * TREES (trees_meta.json "instances", 240 of them) are AUTHORED, not ring-placed, and reach
+//     927.8 at (178,707). At R=900 four real trees — wood:-192:675, wood:-162:701, wood:178:707,
+//     wood:398:618 — answered 400 "no such node", i.e. an honest player chopped for 16 s and had
+//     the wood revoked. R=1000 clears the measured maximum by 72 units and still refuses the
+//     20000-unit fabrications this gate exists for. Re-measure if trees_meta.json is ever re-baked.
+const ISLAND_CX = 2, ISLAND_CZ = -204, ISLAND_NODE_R = 1000;
 // WHAT IS STILL MISSING, STATED PLAINLY: there is no NODE MANIFEST. The gates below check that a
 // claimed id is well-formed, of a real kind, on the island, within reach of a live presence and not
 // faster than a human — but NOT that the node exists. Measured: a wallet standing on empty ground
@@ -6763,6 +6777,129 @@ Promise.all([store.kvGet("asset_registry"), store.kvGet("asset_ledger")]).then((
   console.error("asset restore FAILED — issuing and auditing are suspended until a restart reads it:", e && e.message);
 });
 
+// ============ SERVER-SIMULATED MOVEMENT — CHIK_PHYS, OFF BY DEFAULT ============
+// The whole of world_physics.js hangs off this flag. With CHIK_PHYS unset (the default, and what is
+// deployed) NOTHING below runs: no terrain is loaded, no state is kept, no field is added to any
+// reply, and /world/move relays the client's position exactly as it always has. That is not a
+// courtesy — the deployed fleet is thousands of clients that send positions and no inputs, and they
+// must keep working forever.
+// NO TERRAIN, NO PHYSICS. world_terrain fails PERMISSIVE by design (surfaceHeight returns sea level
+// when the file is absent, so it can never refuse a player), which is right for a lookup and
+// catastrophic for an authority: every ground test would put the island's floor at 6.0, lifting
+// anyone in a valley and blocking nothing. island_data.bin is 7 MB and lives in the CLIENT project,
+// so a deploy that sets CHIK_PHYS=1 without vendoring it is a plausible accident. Make it a no-op
+// instead of a wrong answer.
+const _physWanted = String(process.env.CHIK_PHYS ?? "") === "1";
+const _physTerrain = _physWanted ? loadTerrain() : null;
+const PHYS_ON = _physWanted && !!(_physTerrain && _physTerrain.ok);
+const physStates = new Map();      // wallet -> world_physics state (only while PHYS_ON)
+let _physCorrections = 0, _physDrops = 0, _physTeleports = 0, _physResyncs = 0;
+if (_physWanted) {
+  console.log(PHYS_ON
+    ? `server physics ON (CHIK_PHYS=1) — terrain ${terrainInfo().w}x${terrainInfo().h} from ${terrainInfo().source}`
+    : `server physics REFUSED TO START: CHIK_PHYS=1 but island_data.bin was not found, so movement stays a pure relay. Tried ${JSON.stringify(_physTerrain && _physTerrain.tried)}`);
+}
+export function _physStatsForTest() {
+  return { on: PHYS_ON, states: physStates.size, corrections: _physCorrections, drops: _physDrops, teleports: _physTeleports, resyncs: _physResyncs };
+}
+export function _physStateForTest(wallet) { return physStates.get(wallet) || null; }
+export function _physGrantTeleportForTest(wallet, x, y, z, reason) {
+  const st = physStates.get(wallet); if (!st) return null;
+  return PhysMod.grantTeleport(st, x, y, z, Date.now(), reason || "test");
+}
+
+// A position-only client never says what it is doing, so the mode is INFERRED from the fields it
+// already broadcasts: `mount` is on the wire today (it has to be — remotes render the steed). There
+// is no sail flag anywhere in the wire, which is why a non-declaring client's hard ceiling is
+// floored at the boat's 70 u/s: mistaking a sailor for a walker would correct an honest player at
+// full speed, and that is the one failure this design must never have.
+function physModeOf(b, st) {
+  const m = String(b.mount || "");
+  if (m === "griffin") return "fly";
+  if (m) return "mount";
+  return st && st.driven ? st.mode : "foot";
+}
+// "spec" is the CREATOR free-fly: 420 u/s and no collision at all (Player.gd:466-481). The client
+// gates it on d["creator"], which is a client-side flag on a hostile client, so the ceiling has to be
+// re-earned here. isAdminWallet is the same rule /world/roster and the toolbox routes use.
+const physSpecOk = (wallet) => { try { return isAdminWallet(wallet); } catch (e) { return false; } };
+function physStateFor(wallet, x, y, z, dir, nowMs) {
+  let st = physStates.get(wallet);
+  if (!st) { st = PhysMod.newState(x, y, z, dir, nowMs); physStates.set(wallet, st); }
+  return st;
+}
+// Runs INSIDE worldMoveApply, after the coordinates are clamped and rounded and before the row is
+// built. Returns the position the row should actually store.
+function physApply(wallet, b, x, y, z, dir) {
+  const now = Date.now();
+  const st = physStateFor(wallet, x, y, z, dir, now);
+  st.mode = physModeOf(b, st);
+  if (Number.isFinite(+dir)) st.dir = +dir;
+  // ---- 1. INPUTS. One frame or a batch; a malformed frame is dropped, never fatal. ----
+  const raw = Array.isArray(b.inputs) ? b.inputs.slice(0, 16) : (b.input ? [b.input] : []);
+  const allowSpec = physSpecOk(wallet);
+  if (st.mode === "spec" && !allowSpec) st.mode = "foot";   // a sticky mode from before the gate
+  for (const f of raw) {
+    const inp = PhysMod.sanitizeInput(f, st, { allowSpec });
+    if (!inp) { st.drops = (st.drops || 0) + 1; _physDrops++; continue; }
+    st.mode = inp.mode;
+    Object.assign(st, PhysMod.advance(st, inp, inp.dt, now).state);
+    st.input = inp; st.inputMs = now; st.driven = true;
+  }
+  // ---- 2. THE CLAIM. Old clients send only this; new ones send it as well, and it is what the
+  //         simulation is resynced to whenever it is plausible.
+  //         A body with NO coordinates at all is a pure-input client and must not be reconciled:
+  //         clampF turns a missing x into 0, and "reconciling" against the origin would correct
+  //         every one of them, every ping, into the middle of the sea. ----
+  const claims = b.x !== undefined || b.z !== undefined;
+  const r = claims ? PhysMod.reconcile(st, { x, y, z }, now, {
+    soft: !!st.driven,                                   // no inputs => no model => nothing to compare
+    minSpeed: st.driven ? 0 : PhysMod.PHYS.BOAT,         // see physModeOf
+  }) : { action: "derived" };
+  st.lastAction = r.action;
+  if (r.action === "correct") _physCorrections++;
+  else if (r.action === "teleport") _physTeleports++;
+  else if (r.action === "resync") _physResyncs++;
+  // A RESYNC hands back the POSITION and withholds the PAYOUT. It fires only after STUCK_MS of
+  // unbroken refusals, i.e. exactly when the alternative is leaving an honest player's presence row
+  // stranded where every value route can see it (measured: 12 consecutive corrections left a row
+  // 235 u behind, permanently). The stand-down is longer than world_physics' own resync cooldown, so
+  // a client that forces resyncs deliberately never gets a window in which a gather would settle.
+  return { x: Math.round(st.x * 100) / 100, y: Math.round(st.y * 100) / 100, z: Math.round(st.z * 100) / 100,
+           action: r.action, holdMs: r.action === "resync" ? PhysMod.TUNE.RESYNC_HOLD_MS : 0 };
+}
+// What the mover is told about itself. `undefined` when the flag is off, so JSON.stringify omits the
+// key entirely and the reply is byte-identical to today's.
+function physWire(wallet) {
+  if (!PHYS_ON) return undefined;
+  const st = physStates.get(wallet);
+  if (!st) return undefined;
+  const w = PhysMod.snapshotOf(st);
+  if (st.lastAction === "correct") w.corr = 1;      // snap to this; the model refused your claim
+  return w;
+}
+// THE 20 Hz ADVANCE. Everyone the server is simulating moves whether or not they just spoke, so
+// peers see continuous motion between a mover's 280 ms reports instead of a stair-step. A player who
+// stops sending stops steering (world_physics INPUT_TTL) but keeps falling, so nobody hangs in
+// mid-air. Time-based, so calling it twice in the same millisecond grants no extra distance.
+function physTickAll(now = Date.now()) {
+  if (!PHYS_ON) return 0;
+  let n = 0;
+  for (const [w, st] of physStates) {
+    const p = worldPlayers.get(w);
+    if (!p || now - p.ts > WORLD_TTL_MS) { physStates.delete(w); continue; }
+    if (!st.driven) continue;                       // a position-relay client is not simulated
+    Object.assign(st, PhysMod.tickPlayer(st, now));
+    p.x = Math.round(st.x * 100) / 100;
+    p.y = Math.round(st.y * 100) / 100;
+    p.z = Math.round(st.z * 100) / 100;
+    p.dir = Math.round(st.dir * 1000) / 1000;
+    n++;
+  }
+  return n;
+}
+if (PHYS_ON) setInterval(() => { try { physTickAll(); } catch (e) {} }, 50).unref?.();
+
 // ============ ONE MOVE HANDLER, TWO TRANSPORTS ============
 // The body of /world/move lives here as a plain function because a WebSocket now carries the same
 // contract (see attachWorldSocket at the bottom of the file). It is a FUNCTION, not a second copy:
@@ -6826,19 +6963,54 @@ function worldMoveApply(b) {
   // (Player.gd boat_speed), against run_speed 18 and the griffin's ride multiplier, so 110 u/s plus
   // 60 units of slack absorbs latency, a lag spike and a dropped ping without ever touching honest
   // movement. dt is clamped to a 10 s ceiling so a long gap does not hand out an unlimited budget.
+  //
+  // THE ALLOWANCE IS A BANK, NOT A PER-PING CONSTANT — and this is the correction of a LIVE hole,
+  // not a refinement. `WARP_MAX_UPS * dt + WARP_SLACK` grants a fresh 60 units of free jump to every
+  // MESSAGE, and nothing rate-limits POST /world/move, so the whole stamp was bypassed simply by
+  // sending more of them: measured on the deployed build (`_av_phys_preexist_sim.mjs`), 19 hops of
+  // 65 u carried a wallet 1200 units in 0.04 s with ZERO warps stamped, and the node claim at the far
+  // end answered `200 ["wood"]`. Sustained: 37,143 u/s. The stand-down that node claims, monster
+  // kills and the raid gate all depend on simply never armed.
+  // The bank fills at exactly WARP_MAX_UPS per second of wall clock and is spent by the distance
+  // moved, so an honest player never notices it (a boat at 70 u/s spends 0.18 s of bank per 0.28 s
+  // report and sits at the cap forever; ten coalesced reports cost 0.7 s of a 2.5 s bank) while an
+  // attacker is held to WARP_MAX_UPS whatever their message rate. The one-shot allowance is
+  // 110 * 2.5 = 275 u — TIGHTER than the old rule already gave for any gap over 2 s (at dt 10 s the
+  // old rule allowed 1160 u in a single ping).
   let _warp = _prev ? _prev.warp : 0;
+  let _wbank = WARP_BANK_S;
   if (_prev && Number.isFinite(_prev.x)) {
-    const _dt = Math.min(10, Math.max(0.05, (Date.now() - (_prev.ts || 0)) / 1000));
+    const _el = Math.max(0, (Date.now() - (_prev.ts || Date.now())) / 1000);
+    _wbank = Math.min(WARP_BANK_S, (Number.isFinite(_prev.wbank) ? _prev.wbank : WARP_BANK_S) + _el);
     const _jump = Math.hypot(x - _prev.x, z - _prev.z);
-    if (_jump > WARP_MAX_UPS * _dt + WARP_SLACK) { _warp = Date.now(); _warpPings++; }
+    if (_jump > WARP_MAX_UPS * _wbank) { _warp = Date.now(); _warpPings++; _wbank = 0; }
+    else _wbank = Math.max(0, _wbank - _jump / WARP_MAX_UPS);
+  }
+  // ============ THE SERVER'S OWN ANSWER (CHIK_PHYS) ============
+  // With the flag off these three are the client's numbers, unchanged, and physApply is never
+  // called — so the row, the reply and the wire are byte-identical to what ships today.
+  let px = x, py = y, pz = z;
+  if (PHYS_ON) {
+    const _pr = physApply(wallet, b, x, y, z, Math.round(clampF(b.dir, -7, 7, 0) * 1000) / 1000);
+    px = _pr.x; py = _pr.y; pz = _pr.z;
+    // A corrected claim is also an implausible one: stand the value routes down exactly as a warp
+    // does, so nobody banks a gather or a kill on a position the server just refused.
+    if (_pr.action === "correct" || _pr.action === "teleport") _warp = Date.now();
+    // A RESYNC gives the position back after STUCK_MS of refusals, so it must withhold value for
+    // longer than a client can force another one. The value routes compare `now - warp < WARP_HOLD_MS`,
+    // so a warp stamped in the FUTURE is simply a longer stand-down — 16 s here against
+    // world_physics' 15 s resync cooldown, i.e. an attacker who resyncs on a timer never owns a
+    // moment in which a gather, a kill or a raid claim would settle.
+    else if (_pr.action === "resync") _warp = Date.now() + Math.max(0, (_pr.holdMs || 0) - WARP_HOLD_MS);
   }
   const _row = {
     proven: iAmProven,
     warp: _warp,                          // last implausible jump — read by the two value routes
+    wbank: _wbank,                        // unspent reach budget in seconds — internal, never on the wire
     seen: _prev ? _prev.seen : undefined,
     vis: _prev ? _prev.vis : undefined,   // interest-radius hysteresis memory — must survive the row replace
 
-    x, y, z, dir: Math.round(clampF(b.dir, -7, 7, 0) * 1000) / 1000,   // 3dp — do NOT round coarser (yaw stepping)
+    x: px, y: py, z: pz, dir: Math.round(clampF(b.dir, -7, 7, 0) * 1000) / 1000,   // 3dp — do NOT round coarser (yaw stepping)
     handle: stripTags(String(b.handle || "Trainer")).slice(0, 20),
     leg: clampF(b.leg, 0, 20, 14) | 0,                 // companion species index
     el: stripTags(String(b.el || "Fire")).slice(0, 10),
@@ -6863,7 +7035,7 @@ function worldMoveApply(b) {
   // The shared world rides the reply the client is ALREADY making, so co-op costs zero extra requests
   // and zero extra round trips. An older client ignores the field; a pristine island makes it empty.
   return { code: 200, wallet, proven: iAmProven,
-           body: worldMoveReply({ ok: true, seq: seq !== null ? seq : undefined }, wallet, x, z, b.dl, b.fs, iAmProven) };
+           body: worldMoveReply({ ok: true, seq: seq !== null ? seq : undefined }, wallet, px, pz, b.dl, b.fs, iAmProven) };
 }
 // THE reply builder — used by the POST, by the socket's move ack, and by the socket tick. One copy,
 // so "what a client is told about the world" has a single definition. `base` carries the
@@ -6885,6 +7057,9 @@ function worldMoveReply(base, wallet, x, z, dl, fs, iAmProven) {
   // client sends on EVERY move (Net.gd's move POST), so no honest player loses the field.
   base.party = iAmProven ? partyWire(wallet) : undefined;   // members only, max 4 rows, island-wide — the ONE interest bypass
   base.feed = worldFeedSince(fs);
+  // WHERE THE SERVER THINKS *YOU* ARE, plus the last input sequence it has consumed. undefined while
+  // CHIK_PHYS is off, and JSON.stringify drops undefined keys, so the reply keeps its exact shape.
+  base.phys = physWire(wallet);
   return base;
 }
 app.post("/world/move", (req, res) => {
@@ -6981,6 +7156,10 @@ function wsTick() {
   // itself, not on a parallel timer, so it includes the cost of the tick's own work.
   if (_wsLastTick) { const d = Math.abs(now - _wsLastTick - WS_TICK_MS); _wsJitSum += d; _wsJitN++; if (d > _wsJitMax) _wsJitMax = d; }
   _wsLastTick = now;
+  // Advance the simulation before sampling it, so a socket frame carries this tick's position rather
+  // than the last one's. No-op unless CHIK_PHYS=1, and time-based, so the standalone 20 Hz interval
+  // doing the same thing costs nothing here.
+  physTickAll(now);
   const cpu0 = process.cpuUsage();
   for (const ws of wsClients) {
     const st = ws._chik;

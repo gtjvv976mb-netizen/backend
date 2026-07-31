@@ -611,3 +611,84 @@ twice over plain HTTP already gets **20 of 20 rows abbreviated** on the second c
 reproduce it identically (21/21). The socket changes only the PRICE — a squatter on a net_id
 (net_ids are published verbatim by `GET /world/roster`) got **18 unrequested frames from one inbound
 message**, where over HTTP each consumed static half costs one request.
+
+## 11. Movement authority, attacked (2026-08-01)
+
+Sims (all boot the real `server.js` in-process — throwaway keypair, dummy RPC, memory store, unique
+port, never the live backend): `_av_phys_attack_sim.mjs` **26/26**, `_av_phys_honest_sim.mjs`
+**17/17**, `_av_phys_preexist_sim.mjs` **6/6** (two child servers: the pre-change build and the
+current one), `physics_authority_sim.mjs` **67/67**.
+
+### 11.1 A per-MESSAGE allowance is not a speed limit — and it was LIVE
+
+`/world/move` stamped a warp when `jump > WARP_MAX_UPS(110) * max(0.05, dt) + WARP_SLACK(60)`. The
+`+60` is granted to every **message**, and nothing rate-limits `POST /world/move`, so the entire
+stamp was bypassed by sending more of them. Hops of ≤65 u never stamp, at any rate.
+
+Measured against the **pre-change build** (`_av_phys_preexist_sim.mjs` case 1): 19 hops of 65 u
+carried a wallet **1200 units in 0.04 s** — 34,286 u/s against a fastest-legitimate-thing of 70 u/s —
+with **zero warps stamped**, and `POST /world/node/claim` at the far end answered **`200 ["wood"]`**.
+Sustained: 37,500 u/s over 120 hops. The stand-down that `/world/node/claim`, `/world/mob/hit` and
+the raid gate all depend on simply never armed. **This predates CHIK_PHYS and shipped.**
+
+**Fix**: the allowance is now a bank (`WARP_BANK_S = 2.5`), filled at `WARP_MAX_UPS` per second of
+wall clock and spent by distance moved, carried on the presence row as `wbank` (internal — the row is
+never spread onto the wire, and `STATIC_KEYS` is an explicit list so `sq` is unaffected). Same attack
+on the current build: **403 "catch your breath"**. The honest control ran on **both** builds: a boat
+at 70 u/s, 0 of 18 reports stood down on either.
+
+The one-shot allowance is 275 u, **tighter** than the old rule for any gap over ~2 s (at a 10 s gap
+the old rule allowed a single 1160 u jump). Stated cost: a client that loses the network for >2 s and
+returns having genuinely moved >275 u has a warp stamped and loses 3 s of gathering.
+
+### 11.2 The same mistake inside `world_physics.reconcile`, in both directions at once
+
+`REACH_SLACK = 6.0` per claim was simultaneously too loose and too tight, and only measurement
+separates the two:
+
+* **too loose** — 120 claims of 5.5 u posted as fast as HTTP accepts them: **3203 u/s**, uncorrected.
+* **too tight** — 6.0 u is *smaller than one honest report interval*. The recorded client sprints at
+  30.24 u/s = 8.47 u per `MOVE_DT`, and `Net.gd` deliberately keeps two requests in flight, so a
+  coalesced pair gives the second claim `dtWall ≈ 0.001` and a ceiling of 6.07 against a move of
+  8.47: **18 corrections in 24 reports for a player running in a straight line**.
+
+**Fix**: `TUNE.REACH_BANK_S = 2.5`, held in *seconds* so a mode change rescales it. After: sustained
+200 u/s is held at **32.7 u/s** and 900 claims at 586 msg/s buy **0.00 u**; honest burst arrival is
+**0/24**, and a 2.8 s stall flushed as ten back-to-back reports is **0/10**.
+
+### 11.3 Four more confirmed defects
+
+| # | Defect | Proof | Fix |
+|---|---|---|---|
+| 1 | `mode:"spec"` — the CREATOR free-fly (420 u/s, no collision) is admin-gated **in the client only**. A bare `godot-…` net_id put `mode:"spec"` in one input frame; `physModeOf` made it sticky and a 110 u jump in 0.3 s was accepted (366 u/s). | attack A9 | `sanitizeInput(raw, state, {allowSpec})`; `server.js` passes `isAdminWallet(wallet)` and clears a sticky `spec` on any non-admin ping. Now `action=correct`, `st.mode=foot`. |
+| 2 | A granted teleport window **never lapses** — rule 1 re-armed `acceptUntil` on every claim that merely landed *inside* it. One drown rescue answered `"teleport"` on 30 of 30 honest reports over 8.5 s and accepted a **1900 u jump** nine seconds later. The same re-arm promoted `grantModeSwitch`'s deliberate 400 ms boarding window to a rolling 3 s one on its first claim. | attack A11 / A11b | Extend only on the claim that was actually *granted*. Now 10/30 inside the window, the 1900 u jump is refused, and the mode-switch window still reads 276 ms after a claim. |
+| 3 | `segmentPenetration` returned 0 for any segment ≤1 u (`if (!(d > 1))`) **and never sampled its own endpoint** (`i < n`). A claim landing inside a column is *lifted* onto it by the terrain floor, so 1-unit hops walked a client up the steepest face on the island for free. | attack A12 | Sample `i <= n`, skip only `d === 0`. On the steepest 2 u rise on the island (53→60 at −294,186): **7 refusals, climbed 2.00 u of 7.00**. Costs honest play nothing — worst penetration on all 8 recorded client runs is still **0.000**. |
+| 4 | A correction **freezes the base every check measures from**, so `moved` only grows and a player refused once for a reason that persists can never be accepted again — 12 consecutive corrections left a presence row stranded **235 u behind, permanently**. Every value route reads that row, so a false correction does not rubber-band a player, it takes their gathering away until they relog. | honest B9 | `TUNE.STUCK_MS 4000` → a `resync` that hands back the POSITION and withholds the PAYOUT. The move is **bounded** by `ceilSpeed × stuckSeconds` (an unbounded one measured 187 u/s sustained — the escape hatch became the exploit), gated by `RESYNC_COOLDOWN_MS 15000`, and `server.js` stamps a warp `RESYNC_HOLD_MS 16000` into the future, i.e. **longer than the cooldown**, so a client forcing resyncs on a timer never owns a moment in which a gather would settle. Verified: `403 "catch your breath"` immediately after. |
+
+### 11.4 Honest play, measured (`_av_phys_honest_sim.mjs`, `CHIK_PHYS=1`)
+
+**0 corrections in 200+ honest reports.** Every recorded `dev_physdump` run replayed through the real
+`/world/move` at the real 280 ms cadence, as the shipped position-only fleet (**0/70**) and as a
+prediction client (**0/65**): flat walk, flat sprint, hill, wall, jump, sea, mount ride, mount dash.
+Plus 10% input-frame loss **0/7**, +300 ms latency **0/7**, burst arrival **0/24**, a 2.8 s stall
+flushed as ten reports **0/10**, the steepest sustained climb on the island (48 u of altitude over
+205 u of ground) **0/28**, the boat at 70 u/s as a relay client **0/20** and as a declaring client
+**0/20**, a 30 fps phone **0/20**, a dashing Direwolf at the theoretical maximum 95.76 u/s **0/20**,
+and the real 548 u drown rescue accepted with **0/15** corrections afterwards.
+
+### 11.5 Stated residuals
+
+* **A 175 u one-off displacement is allowed and cannot be removed.** It is exactly what a coalesced
+  pair of honest reports after a network stall looks like. Measured: a wallet claiming 240 u/s and
+  gathering as it goes settled **1 of 40** claims — the first — and **0** after the bank was spent.
+* **A resync is one bounded reposition per 15 s with a 16 s value blackout** — movement only, zero
+  economic throughput, and other players see a short teleport.
+* **Vertical is not authoritative, deliberately.** A claim 900 u in the air is accepted; the server
+  enforces only the floor. Value is settled by horizontal proximity, and the horizontal position
+  still has to be reachable.
+* **A wallet can brick its OWN input lane** by sending one frame with `seq = MAX_SAFE_INTEGER`
+  (`advance` takes `Math.max`). Self-inflicted only — inputs for a proven wallet with no token are
+  403 and never reach `lastInputSeq`.
+* **The three mine mouths are the only place a heightfield can be wrong**, and they were measured:
+  the worst 24 u traverse at any of the twelve entrance directions is **2.40 u** (crystal_mine +z)
+  against `PEN_TOL 3.0` — a 0.60 u margin. Re-measure if the island is ever re-baked.
