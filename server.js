@@ -1550,6 +1550,13 @@ async function adminGiftChiki(req, res) {
     res.json({ ok: true, pending: false, granted: { sp: si, level: lv, isLegend, nick: gift.nick } });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 }
+// Read-only, public: is a festival on? The operator's answer to "did my curl land?", the website's
+// banner source, and the only status check that needs no login and writes nothing.
+app.get("/world/event", (_req, res) => {
+  if (!fishEventActive()) return res.json({ active: false });
+  res.json({ active: true, mult: _fishEvent.mult, ends: _fishEvent.ends, label: _fishEvent.label,
+             remainingMs: Math.max(0, Number(_fishEvent.ends) - Date.now()) });
+});
 // Admin: schedule (or cancel) the fishing festival. Auth: ?key= or body key must equal ADMIN_KEY
 // (which never leaves the env). mult clamps to 1..10, duration to 168h; mult<=1 or hours<=0 cancels.
 app.post("/admin/fishing-event", async (req, res) => {
