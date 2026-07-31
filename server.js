@@ -1550,6 +1550,33 @@ async function adminGiftChiki(req, res) {
     res.json({ ok: true, pending: false, granted: { sp: si, level: lv, isLegend, nick: gift.nick } });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 }
+// Read-only, public: THE RARITY BOARD — every capped species, its supply, how many exist, what is
+// left, and the LIVE rarity that scarcity earns it. Rarity rises as the world claims more: the
+// tier is read off what REMAINS, so the last few of anything are the rarest things in Chikoria.
+function liveRarity(remaining, cap) {
+  if (cap <= 0) return "Common";
+  if (remaining <= 0) return "Extinct";
+  if (remaining <= Math.max(1, Math.round(cap * 0.02))) return "Immortal";
+  if (remaining <= Math.max(2, Math.round(cap * 0.08))) return "Mythic";
+  if (remaining <= Math.max(4, Math.round(cap * 0.20))) return "Legendary";
+  if (remaining <= Math.max(8, Math.round(cap * 0.40))) return "Epic";
+  if (remaining <= Math.max(16, Math.round(cap * 0.70))) return "Rare";
+  return "Uncommon";
+}
+app.get("/world/rarity", (_req, res) => {
+  const out = { avatar: {}, mount: {}, chikimon: {} };
+  for (const [type, tbl] of Object.entries(ASSET_SUPPLY)) {
+    for (const sp of Object.keys(tbl)) {
+      const cap = tbl[sp], made = issuedCount(type, sp), left = Math.max(0, cap - made);
+      out[type][sp] = { cap, issued: made, remaining: left, rarity: liveRarity(left, cap) };
+    }
+  }
+  for (const c of MEME_CHARS) {
+    const cap = c.cap || MEME_CAP, made = memeIssued(c.key), left = Math.max(0, cap - made);
+    out.chikimon[c.key] = { cap, issued: made, remaining: left, rarity: liveRarity(left, cap) };
+  }
+  res.json(out);
+});
 // Read-only, public: the island's chronicle — the same last-8 ring every client renders under its
 // minimap. For the operator ("did any events happen?"), the website, and diagnosis. Writes nothing.
 app.get("/world/feed", (_req, res) => {
@@ -4878,9 +4905,59 @@ function regOwned(wallet, type, state = "active") {
 // the provenance, and a mutable provenance is not one.
 function regEvent(row, what, extra) { row.chain.push(Object.assign({ at: Date.now(), what }, extra || {})); }
 
+// ============ RARITY IS A LAW, NOT A LABEL ============
+// Advertised scarcity used to be enforced NOWHERE for avatars, and for mounts the "supply" numbers
+// were only pickWeighted WEIGHTS — rarer to roll, unlimited to own. Only Meme Dynasty had real
+// caps, and even those were enforced at the ROUTE, not here: nine call sites reach mintAsset, so
+// every new path was a silent bypass (measured: 400 mint attempts produced 40 of a 5-supply avatar
+// and 66 griffins against a supply of 5). The cap now lives at the CHOKEPOINT every issuance must
+// pass through, so nothing can route around it — including future code.
+//
+// Avatar caps are the client's Econ.AVATAR_SUPPLY x10 (the owner's decision after the Mad
+// Alchemist was over-issued: raising the ceiling rather than confiscating anyone's avatar).
+// GRANDFATHERING: a species already past its cap simply stops issuing — nothing is ever deleted or
+// taken back. Over-issued holders keep what they have; the cap binds from here on.
+const ASSET_SUPPLY = Object.freeze({
+  avatar: Object.freeze({ classic: 500, Knight: 200, Mystic: 100, Navigator: 300, Star: 200,
+                          chemist: 50, electro: 300, fire: 300, night: 100, sailor: 200 }),
+  mount:  Object.freeze({ chicken: 15, boar: 20, gator: 15, horse: 10, wolf: 10, griffin: 5 }),
+});
+// live issuance for one species, counted from the registry itself (the record IS the count)
+function issuedCount(type, sp) {
+  let k = 0;
+  for (const r of assetReg.values()) if (r && r.type === type && r.sp === sp && r.state !== "void") k++;
+  return k;
+}
+function supplyOf(type, sp) {
+  const t = ASSET_SUPPLY[type];
+  if (t && Object.hasOwn(t, sp)) return t[sp];
+  if (type === "chikimon") { const c = MEME_CHARS.find(x => x.key === sp); if (c) return c.cap || MEME_CAP; }
+  return 0;                       // 0 = uncapped class (normal/legendary chikimon, eggs)
+}
+function atSupplyCap(type, sp) {
+  const cap = supplyOf(type, sp);
+  return cap > 0 && issuedCount(type, sp) >= cap;
+}
+// how many are LEFT — the number the world's rarity is derived from
+function remainingOf(type, sp) {
+  const cap = supplyOf(type, sp);
+  return cap > 0 ? Math.max(0, cap - issuedCount(type, sp)) : -1;   // -1 = uncapped
+}
+
 let _regWarnAt = 0;
 function mintAsset(type, wallet, fields, origin, parent) {
   if (assetReg.size >= ASSET_REG_MAX) throw new Error("asset registry is full");
+  // THE CHOKEPOINT. Every path that issues anything comes through here; refusing here is what makes
+  // the advertised rarity true. Restores/adoptions of assets that ALREADY EXIST are not issuance —
+  // they carry origin "legacy"/"unverified"/"restitution" and are exempt, or the registry would
+  // refuse to record history it is supposed to preserve.
+  const _sp = String((fields && fields.sp) || "");
+  const _issuing = !["legacy", "unverified", "restitution"].includes(String(origin || ""));
+  if (_issuing && _sp && atSupplyCap(type, _sp)) {
+    const e = new Error(`every ${_sp} that will ever exist has been claimed`);
+    e.code = "SUPPLY_EXHAUSTED";
+    throw e;
+  }
   // the cap is a cliff for EVERY player at once, so it must never arrive unannounced
   if (assetReg.size > ASSET_REG_MAX * 0.8 && Date.now() - _regWarnAt > 300000) {
     _regWarnAt = Date.now();
@@ -5053,8 +5130,12 @@ app.post("/assets/egg/hatch", (req, res) => {
   try {
   if (row.kind === "mount") {
     const have = ownedMounts(wallet);
-    const pool = MOUNT_SUPPLY.filter(([mid]) => !have.has(mid));
-    if (!pool.length) return res.status(409).json({ error: "your stable is already full" });
+    // the supply cap binds the ROLL too, exactly as it does for memes: a steed whose last piece is
+    // claimed can no longer be rolled. The egg is NOT consumed when nothing is left (409 before any
+    // state change) — a player must never lose an egg to the world running out.
+    const pool = MOUNT_SUPPLY.filter(([mid]) => !have.has(mid) && !atSupplyCap("mount", mid));
+    if (!pool.length) return res.status(409).json({ error: ownedMounts(wallet).size >= MOUNT_SUPPLY.length
+      ? "your stable is already full" : "every remaining steed has been claimed — the stable is legendary now" });
     born = mintAsset("mount", wallet, { sp: pickWeighted(pool), kind: "mount" }, "hatched", row.id);
   } else {
     const have = ownedSpecies(wallet);
@@ -5366,7 +5447,9 @@ app.post("/assets/scroll/redeem", (req, res) => {
   const pool = AVATAR_IDS.filter(a => !have.has(a) && a !== "classic");
   if (!pool.length) return res.status(409).json({ error: "no looks left" });
   let row;
-  try { row = mintAsset("avatar", wallet, { sp: pool[crypto.randomInt(pool.length)], kind: "avatar" }, "scroll"); }
+  const availA = pool.filter((a) => !atSupplyCap("avatar", a));
+  if (!availA.length) return res.status(409).json({ error: "every avatar of the looks you lack has been claimed" });
+  try { row = mintAsset("avatar", wallet, { sp: availA[crypto.randomInt(availA.length)], kind: "avatar" }, "scroll"); }
   catch (e) { return res.status(503).json({ error: "the asset registry is at capacity — this is a server fault, not yours; nothing was consumed" }); }
   res.json({ ok: true, avatar: { id: row.id, sp: row.sp, born: row.born } });
 });
@@ -5954,6 +6037,7 @@ app.post("/world/move", (req, res) => {
                       players: worldSnapshot(wallet, held.x, held.z, !!b.dl, true), online: worldPlayers.size,
                       mobs: _worldTickOn ? mobSnapshot(Date.now()) : undefined,
                       event: fishEventActive() ? { mult: _fishEvent.mult, ends: _fishEvent.ends, label: _fishEvent.label } : undefined,
+                      party: partyWire(wallet),
                       feed: worldFeedSince(b.fs) });
   }
   // Presence coords are rounded AT STORE TIME: they arrive as float32 noise (15 significant digits
@@ -6001,6 +6085,7 @@ app.post("/world/move", (req, res) => {
              players: worldSnapshot(wallet, x, z, !!b.dl, true), online: worldPlayers.size,
              mobs: _worldTickOn ? mobSnapshot(Date.now()) : undefined,
              event: fishEventActive() ? { mult: _fishEvent.mult, ends: _fishEvent.ends, label: _fishEvent.label } : undefined,
+             party: partyWire(wallet),   // members only, max 4 rows, island-wide — the ONE interest bypass
              feed: worldFeedSince(b.fs) });
 });
 // Read-only: nearby online trainers (for spectators / light polling). Deliberately WIDE
@@ -6090,6 +6175,24 @@ app.post("/world/dm", (req, res) => {
   // impersonation: sending AS a public wallet you do not own
   if (!presenceOk(String(b.wallet), b)) return res.status(403).json({ error: "prove this wallet first" });
   const to = String(b.to || "");
+  // PARTY CHAT: to:"party" fans the message out to every member's whisper inbox — one store, one
+  // delivery loop, all the DM hardening for free. "party" can never collide with a real recipient:
+  // it is 5 chars and isPresenceId requires 6+.
+  if (to === "party") {
+    const pid = partyOf.get(String(b.wallet)), p = pid ? parties.get(pid) : null;
+    if (!p) return res.status(409).json({ error: "you are not in a party" });
+    const ptext = stripTags(String(b.text || "")).slice(0, 200).trim();
+    if (!ptext) return res.json({ ok: true });
+    const pfrom = String(b.wallet), pHandle = stripTags(String(b.handle || "Trainer")).slice(0, 20);
+    const pmsg = { from: pfrom, fromHandle: pHandle, to: "party", pid, text: ptext, ts: Date.now() };
+    for (const w of p.members) {
+      const inbox = dmInbox(w);
+      inbox.push(w === pfrom ? { ...pmsg, self: true } : pmsg);
+      if (inbox.length > 200) inbox.shift();
+    }
+    saveWorldDM();
+    return res.json({ ok: true });
+  }
   if (!isPresenceId(to)) return res.status(400).json({ error: "valid recipient required" });
   const text = stripTags(String(b.text || "")).slice(0, 200).trim();
   if (!text) return res.json({ ok: true });
@@ -6114,6 +6217,181 @@ app.get("/world/dm", (req, res) => {
   const since = Number(req.query?.since) || 0;
   res.json({ messages: (worldDM.get(sid) || []).filter(m => m.ts > since).slice(-40) });
 });
+
+// ============ PARTY REGISTRY ============
+// Small opt-in co-op groups, max 4 trainers. The server owns the roster; the client only renders
+// it. NOTHING ECONOMIC moves through a party — no shared loot, no shared XP, no gather changes.
+// It is a social contract plus exactly ONE wire privilege: members see each other's coordinates
+// island-wide in the /world/move reply (the single deliberate interest-radius bypass, members
+// only, capped at PARTY_MAX rows). Auth is presenceOk, exactly like /world/dm: a net_id stands
+// alone (so demo players may party — no value moves), a public wallet must present the /verify
+// market token, because wallets are published in /world/roster and cannot be their own credential.
+const PARTY_MAX = 4;
+const PARTY_INVITE_MIN_MS = 2000;             // per-inviter rate cap (the chat-cap shape, line ~1745)
+const PARTY_INVITE_TTL_MS = 10 * 60 * 1000;   // an unanswered invite dies after 10 minutes
+const PARTY_DEAD_MS = 5 * WORLD_TTL_MS;       // every member's presence expired for this long → disband
+const parties = new Map();      // id -> { members: [presenceId..PARTY_MAX], leader, created, deadSince? }
+const partyOf = new Map();      // presenceId -> party id (reverse index — DERIVED, never persisted alone)
+const partyInvites = new Map(); // "from|to" -> { pid, ts }  pid = inviter's party AT ISSUE TIME (null = none yet)
+const _lastInvite = new Map();  // inviter -> ts of last accepted invite POST (rate cap)
+function newPartyId() { return "pty_" + crypto.randomBytes(12).toString("hex"); }   // server-minted, unguessable
+// ONE kv blob. partyOf is reconstructed from it on restore, so the two maps can never disagree
+// after a restart — same reasoning as sidOwner/walletSid being persisted as a pair.
+function serializeParties() { return [...parties.entries()].map(([id, p]) => ({ id, members: p.members, leader: p.leader, created: p.created })); }
+function restoreParties(v) {
+  parties.clear(); partyOf.clear();
+  if (!Array.isArray(v)) return;
+  for (const e of v) {
+    if (!e || typeof e.id !== "string" || !Array.isArray(e.members)) continue;
+    const members = e.members.filter(isPresenceId).slice(0, PARTY_MAX);
+    if (members.length < 2) continue;                        // a party is at least two people
+    const leader = members.includes(e.leader) ? e.leader : members[0];
+    parties.set(e.id, { members, leader, created: Number(e.created) || Date.now() });
+    for (const w of members) partyOf.set(w, e.id);
+  }
+}
+store.kvGet("world_parties").then(v => { if (!parties.size) restoreParties(v); }).catch(() => {});
+function saveParties() { store.kvSet("world_parties", serializeParties()).catch(() => {}); }
+function disbandParty(pid) {
+  const p = parties.get(pid); if (!p) return;
+  for (const w of p.members) if (partyOf.get(w) === pid) partyOf.delete(w);
+  parties.delete(pid);
+}
+function partyRemove(pid, who) {
+  const p = parties.get(pid); if (!p) return;
+  p.members = p.members.filter(w => w !== who);
+  if (partyOf.get(who) === pid) partyOf.delete(who);
+  if (p.members.length < 2) disbandParty(pid);        // auto-disband — a solo "party" is nobody's group
+  else if (p.leader === who) p.leader = p.members[0]; // leadership passes to the longest-standing member
+  saveParties();
+}
+// TTL sweep, the WORLD_TTL_MS pattern: a party whose EVERY member has lost presence is dead — but
+// only after the whole group has been gone PARTY_DEAD_MS, so a page reload (12 s presence TTL)
+// doesn't nuke the group. deadSince is in-memory only: a restart restarts the clock, which is the
+// point — persisted parties must survive a deploy, when nobody has presence yet.
+setInterval(() => {
+  const now = Date.now();
+  let dirty = false;
+  for (const [pid, p] of parties) {
+    const anyLive = p.members.some(w => { const pr = worldPlayers.get(w); return pr && now - pr.ts <= WORLD_TTL_MS; });
+    if (anyLive) { if (p.deadSince) delete p.deadSince; continue; }
+    if (!p.deadSince) { p.deadSince = now; continue; }
+    if (now - p.deadSince > PARTY_DEAD_MS) { disbandParty(pid); dirty = true; }
+  }
+  if (dirty) saveParties();
+  for (const [k, inv] of partyInvites) if (now - inv.ts > PARTY_INVITE_TTL_MS) partyInvites.delete(k);
+}, 10000).unref?.();
+// The ONE deliberate interest-radius bypass: "where is my group" is the whole point of a party, so
+// members get each other's coordinates island-wide, riding the /world/move reply they already make.
+// Members only, max PARTY_MAX rows, coordinates + handle only — never inventory, never the static
+// half. Absent entirely for partyless players (undefined → dropped by JSON), and it is a TOP-LEVEL
+// reply field, never part of STATIC_KEYS (the peer-row "party" static is the chikimon party string
+// — an unrelated field that happens to share the word).
+function partyWire(id) {
+  const pid = partyOf.get(id);
+  if (!pid) return undefined;
+  const p = parties.get(pid);
+  if (!p) { partyOf.delete(id); return undefined; }
+  const now = Date.now(), m = [];
+  for (const w of p.members) {
+    const pr = worldPlayers.get(w);
+    if (!pr || now - pr.ts > WORLD_TTL_MS) continue;   // offline member — no coordinates to share
+    m.push({ w, h: pr.handle || "Trainer", x: pr.x, z: pr.z });
+  }
+  return { id: pid, leader: p.leader, m };
+}
+app.post("/party/invite", (req, res) => {
+  const b = req.body || {}, from = String(b.wallet || "");
+  if (!isPresenceId(from)) return res.status(400).json({ error: "valid wallet required" });
+  if (!presenceOk(from, b)) return res.status(403).json({ error: "prove this wallet first" });
+  const to = String(b.to || "");
+  if (!isPresenceId(to)) return res.status(400).json({ error: "valid recipient required" });
+  if (to === from) return res.status(400).json({ error: "you cannot invite yourself" });
+  const now = Date.now();
+  if (now - (_lastInvite.get(from) || 0) < PARTY_INVITE_MIN_MS) return res.status(429).json({ error: "slow down — invites are rate-limited" });
+  const pid = partyOf.get(from) || null;
+  if (pid) {
+    const p = parties.get(pid);
+    if (!p) partyOf.delete(from);
+    else if (p.members.length >= PARTY_MAX) return res.status(409).json({ error: "party is full" });
+  }
+  _lastInvite.set(from, now);
+  if (_lastInvite.size > 5000) { for (const k of [..._lastInvite.keys()].slice(0, _lastInvite.size - 5000)) _lastInvite.delete(k); }
+  // The invite names a MOMENT: the inviter's party as it stands right now. Accept re-checks this,
+  // which is what makes an invite issued before a disband stale instead of a ghost door.
+  partyInvites.set(from + "|" + to, { pid: partyOf.get(from) || null, ts: now });
+  // Delivered AS A TYPED DM — the whisper store wholesale (sanitising, caps, 30d retention, kv
+  // persistence, the token-gated GET) so an invite inherits every hardening whispers already have.
+  // kind:"pinv" is what tells the client to render accept/decline buttons instead of a text row.
+  const fromHandle = stripTags(String(b.handle || "Trainer")).slice(0, 20);
+  const msg = { from, fromHandle, to, text: fromHandle + " invites you to a party", kind: "pinv", ts: now };
+  const inbox = dmInbox(to); inbox.push(msg); if (inbox.length > 200) inbox.shift();
+  const sent = dmInbox(from); sent.push({ ...msg, self: true }); if (sent.length > 200) sent.shift();
+  if (worldDM.size > 5000) { const oldest = [...worldDM.keys()].slice(0, worldDM.size - 5000); oldest.forEach(k => worldDM.delete(k)); }
+  saveWorldDM();
+  res.json({ ok: true });
+});
+app.post("/party/accept", (req, res) => {
+  const b = req.body || {}, me = String(b.wallet || "");
+  if (!isPresenceId(me)) return res.status(400).json({ error: "valid wallet required" });
+  if (!presenceOk(me, b)) return res.status(403).json({ error: "prove this wallet first" });
+  const from = String(b.from || "");
+  if (!isPresenceId(from)) return res.status(400).json({ error: "valid inviter required" });
+  const key = from + "|" + me, inv = partyInvites.get(key), now = Date.now();
+  if (!inv || now - inv.ts > PARTY_INVITE_TTL_MS) { partyInvites.delete(key); return res.status(403).json({ error: "no open invite from that trainer" }); }
+  if (partyOf.has(me)) return res.status(409).json({ error: "leave your current party first" });
+  const curPid = partyOf.get(from) || null;
+  // STALE: an invite issued FOR a specific party dies with it — disband (or the inviter changing
+  // groups) must not teleport the accepter into whatever the inviter is in now. But an invite with
+  // pid null was "party WITH me" before any party existed: if the inviter has since formed one
+  // (their other invitee accepted first), joining it is exactly what both sides meant.
+  if (inv.pid !== null && inv.pid !== curPid) { partyInvites.delete(key); return res.status(409).json({ error: "that invite is stale — the party has changed" }); }
+  let pid = curPid, p = pid ? parties.get(pid) : null;
+  if (pid && !p) { partyInvites.delete(key); return res.status(409).json({ error: "that party is gone" }); }
+  if (p && p.members.length >= PARTY_MAX) return res.status(409).json({ error: "party is full" });
+  if (!p) {
+    pid = newPartyId();
+    p = { members: [from], leader: from, created: now };
+    parties.set(pid, p); partyOf.set(from, pid);
+  }
+  p.members.push(me); partyOf.set(me, pid);
+  delete p.deadSince;
+  partyInvites.delete(key);
+  saveParties();
+  res.json({ ok: true, party: partyWire(me) });
+});
+app.post("/party/leave", (req, res) => {
+  const b = req.body || {}, me = String(b.wallet || "");
+  if (!isPresenceId(me)) return res.status(400).json({ error: "valid wallet required" });
+  if (!presenceOk(me, b)) return res.status(403).json({ error: "prove this wallet first" });
+  const pid = partyOf.get(me);
+  if (!pid || !parties.get(pid)) return res.status(409).json({ error: "you are not in a party" });
+  partyRemove(pid, me);
+  res.json({ ok: true });
+});
+app.post("/party/kick", (req, res) => {
+  const b = req.body || {}, me = String(b.wallet || "");
+  if (!isPresenceId(me)) return res.status(400).json({ error: "valid wallet required" });
+  if (!presenceOk(me, b)) return res.status(403).json({ error: "prove this wallet first" });
+  const who = String(b.who || "");
+  if (!isPresenceId(who)) return res.status(400).json({ error: "valid member required" });
+  const pid = partyOf.get(me), p = pid ? parties.get(pid) : null;
+  if (!p) return res.status(409).json({ error: "you are not in a party" });
+  if (p.leader !== me) return res.status(403).json({ error: "only the leader may kick" });
+  if (who === me) return res.status(400).json({ error: "leave, don't kick yourself" });
+  if (!p.members.includes(who)) return res.status(404).json({ error: "not a member of your party" });
+  partyRemove(pid, who);
+  res.json({ ok: true });
+});
+// test seam (the node_persist_sim pattern): round-trip the REAL serialize/restore in one process.
+export const _partySeam = {
+  serialize: serializeParties,
+  restore: restoreParties,
+  clear() { parties.clear(); partyOf.clear(); partyInvites.clear(); _lastInvite.clear(); },
+  clearInviteCap() { _lastInvite.clear(); },
+  size() { return { parties: parties.size, partyOf: partyOf.size }; },
+  pidOf(id) { return partyOf.get(id); },
+};
 
 // ---- ON-CHAIN Trading Post settlement (OPT-IN, off by default) ------------------------------
 // When MARKET_ONCHAIN=1 the buyer signs a REAL $CHIKI SPL transfer straight to the seller's
