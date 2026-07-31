@@ -172,3 +172,40 @@ quietly leaking the treasury's RPC credentials. Fail closed, not fail leaky.
 **Rule for any new field on a public route:** if its value comes from `process.env`, it is a
 credential until proven otherwise. Never `||`-chain a public field onto a private one — the
 fallback is invisible in review and only shows up in production.
+
+## 6. Snapshot delta memory must be written AFTER the cap (2026-07-31)
+
+`worldSnapshot()` decides, per peer, whether to ship the full static half (handle/avatar/party/…) or
+an abbreviated `dl: 1` row meaning *"reuse what I already told you"*. The decision is recorded in a
+per-receiver `seen` map. Two ordering bugs made the server claim it had sent rows it never sent.
+
+**(a) The 60-peer cap.** `seen[w] = sq` was written inside the scan loop, i.e. *before*
+`out.slice(0, WORLD_MAX_PEERS)` threw the farthest rows away. Any peer beyond the cap was marked
+sent without being sent; the moment it drifted into the 60 nearest — a crowd shifting, one player
+walking off — it was shipped `dl: 1` for a wallet the client had never heard of, and Net.gd answered
+with a `_dl_resync`, a whole extra full-snapshot round. Measured at **10 of 10** promoted peers.
+This is **pre-existing**, not a cost of interest management: the same 10/10 reproduces on git HEAD
+(`7d0673a`), before the interest radius existed. Proof: `av_capseen_prechange_sim.mjs`, run against
+both builds. **Fixed** by moving the whole static-half decision into a post-cap pass; wire shape is
+byte-identical (`av_wireshape_sim.mjs` diffs key order and byte count old vs new).
+
+**(b) The wide-radius skip ran before the interest eviction.** Interest eviction deliberately clears
+the receiver's `seen` entry so re-entry ships a FULL row. But `if (d > WORLD_RADIUS) continue` sat
+*above* that branch, so a client that POSTs itself past 4000 units left the bubble without ever
+running the eviction and kept its `vis`/`seen` entries — on the way back it was shipped an
+unrenderable `dl: 1` for a rig every observer's client had already freed. One forced resync round per
+observer, per teleport, **at an attacker's choosing**. **Fixed** by testing interest first
+(`INTEREST_LEAVE` 320 is far inside `WORLD_RADIUS` 4000, so it subsumes the wide check when interest
+is on; the wide check still guards the spectate path).
+
+**The rule**: if a response is filtered, sorted or capped *after* a row is built, any bookkeeping
+that records "I sent this" must move after the filter too. A `seen` map written optimistically is a
+lie the client pays for.
+
+Interest management itself verified adversarially (`av_interest_attack_sim.mjs`, 29/29): a peer
+parked at exactly d=260 with float jitter over 1200 polls (~10 min) flaps **0** times where a plain
+260 radius would flap 1200; a fast observer crosses out at x=328 and back in at x=256, exactly one
+transition each, and 200 polls anywhere inside the 260–320 dead band never flap; two players in
+opposite corners (d=3394) do not see each other yet both count in `online` and in `/world/roster`,
+and the wide spectate route still shows them; after a dropped poll, re-entry ships a full row and the
+poll after it goes abbreviated again.

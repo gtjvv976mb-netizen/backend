@@ -937,6 +937,7 @@ async function loadCupState() {
   try { const ta = await store.kvGet("cup_total_awarded"); if (ta != null) cupTotalAwarded = Number(ta) || 0; } catch (e) {}
   try { const ch = await store.kvGet("cup_champion"); if (ch != null) cupChampion = ch; } catch (e) {}
   try { const bw = await store.kvGet("banned_wallets"); if (Array.isArray(bw)) for (const w of bw) if (isPubkey(w)) bannedWallets.add(w); } catch (e) {}   // reward-pool bans persist across restarts
+  try { const fe = await store.kvGet("fish_event"); if (fe && Number(fe.mult) > 1 && Number(fe.ends) > Date.now()) _fishEvent = { mult: Math.min(10, Math.max(1, Number(fe.mult))), ends: Number(fe.ends), label: String(fe.label || "Fishing Festival").slice(0, 40) }; } catch (e) {}   // a mid-festival restart must not end the party
   try { const wins = await store.kvGet("battle_wins"); if (wins && typeof wins === "object") battleWins = wins; } catch (e) {}   // server-authoritative BR win ledger
   try { const mm = await store.kvGet("meme_minted"); if (mm && typeof mm === "object") memeMinted = mm; } catch (e) {}
   try { const mh = await store.kvGet("meme_hatches"); if (Array.isArray(mh)) memeHatches = mh; } catch (e) {}
@@ -1375,6 +1376,15 @@ app.post("/profile", async (req, res) => {
     // itself — BEFORE this save overwrites it, so a pre-existing player's real hoard becomes sellable
     // entitlement instead of being refused on cutover day.
     if (hasMmo) ownSnapshotOpening(wallet, profile.mmo, prev && prev._serverSavedAt);
+    // STEP 7 — THE ECONOMY FLIP. Baseline first (one-time grandfather), then the invariant. The blob
+    // is still stored VERBATIM below — the client's own signature must survive — so enforcement is
+    // corrections in the RESPONSE (`matClamps`), which a >= MAT_SAVE_MIN_V client applies and
+    // re-signs. Admin saves are trusted, same as the sanitizer above. Never fatal to a save.
+    let matClamps = null;
+    if (hasMmo && !isAdminWallet(wallet)) {
+      try { matSaveBaseline(wallet, profile.mmo); matClamps = matSaveEnforce(wallet, profile.mmo); }
+      catch (e) { console.error("mat save flip threw for", String(wallet).slice(0, 8), e && e.message); }
+    }
     if (hasMmo) safe.mmo = profile.mmo;                // the signed MMO cloud-save rides through verbatim
     else if (prev && prev.mmo) safe.mmo = prev.mmo;    // SECURITY: legacy (unsigned) writes must NOT wipe it
 
@@ -1390,7 +1400,11 @@ app.post("/profile", async (req, res) => {
     }
     safe._serverSavedAt = now;   // authoritative "last seen" for offline progression
     await store.setProfile(wallet, safe);
-    res.json({ ok: true, serverSavedAt: safe._serverSavedAt });
+    // matClamps: { material: bound } — the wallet exceeded the acquisition invariant; the client sets
+    // each local count to min(current, bound) and re-signs. Old clients ignore unknown keys (Chain.gd
+    // reads only serverSavedAt), so this is additive and non-destructive.
+    if (matClamps) res.json({ ok: true, serverSavedAt: safe._serverSavedAt, matClamps, matFlagged: true });
+    else res.json({ ok: true, serverSavedAt: safe._serverSavedAt });
   } catch (e) { res.status(500).json({ error: "save failed: " + String(e.message || e) }); }
 });
 
@@ -1536,6 +1550,23 @@ async function adminGiftChiki(req, res) {
     res.json({ ok: true, pending: false, granted: { sp: si, level: lv, isLegend, nick: gift.nick } });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 }
+// Admin: schedule (or cancel) the fishing festival. Auth: ?key= or body key must equal ADMIN_KEY
+// (which never leaves the env). mult clamps to 1..10, duration to 168h; mult<=1 or hours<=0 cancels.
+app.post("/admin/fishing-event", async (req, res) => {
+  const key = String(req.body?.key ?? req.query?.key ?? "");
+  if (!process.env.ADMIN_KEY || key !== process.env.ADMIN_KEY) return res.status(403).json({ error: "admin key required" });
+  const mult = Math.min(10, Math.max(1, Number(req.body?.mult) || 1));
+  const hours = Math.min(168, Math.max(0, Number(req.body?.hours) || 0));
+  const label = stripTags(String(req.body?.label || "Fishing Festival")).slice(0, 40);
+  if (mult <= 1 || hours <= 0) {
+    _fishEvent = { mult: 1, ends: 0, label: "" };
+    await saveFishEvent();
+    return res.json({ ok: true, active: false });
+  }
+  _fishEvent = { mult, ends: Date.now() + hours * 3600000, label };
+  await saveFishEvent();
+  res.json({ ok: true, active: true, mult, hours, label, ends: _fishEvent.ends });
+});
 app.post("/admin/gift-chiki", adminGiftChiki);
 app.post("/admin/gift-legendary", adminGiftChiki);   // back-compat alias
 
@@ -3126,11 +3157,17 @@ export function _clearWorldNodes() { worldNodes.clear(); worldNodeUses.clear(); 
 // have their assertions quietly rewritten to match it. Never reachable from a request.
 export function _setOwnEnforceForTest(on) { _ownEnforce = !!on; return _ownEnforce; }
 // Lets the sim prove both sides of the flag without two server boots. Production reads the env var.
+export function _rollFantasyCatchForTest(tier, rod) { return rollFantasyCatch(tier, rod); }
+export function _worldFeedPushForTest(k, w, d) { worldFeedPush(k, w, d); }
 export function _setFfishAuthorityForTest(on) { _ffishAuth = !!on; if (_ffishAuth) OWN_KINDS.add("ffish"); else OWN_KINDS.delete("ffish"); return _ffishAuth; }
 export function _grantOwnForTest(w, item, n, kind = "mat") { ownCredit(String(w), kind, item, n); return n; }
-export function _clearOwnBook() { ownBook.clear(); _ownWorst.clear(); _ownRefusals = 0; _ownSkipped = 0; _ownSnapshots = 0; _ownReady = true; _ownEnforce = true; }
-export function _ownFor(w) { const r = ownBook.get(String(w)); return r ? { open: r.open, cred: r.cred, sold: r.sold, used: r.used, openSrc: r.openSrc } : null; }
+export function _clearOwnBook() { ownBook.clear(); _ownWorst.clear(); _ownRefusals = 0; _ownSkipped = 0; _ownSnapshots = 0; _ownReady = true; _ownEnforce = true;
+                                  _matFlags.clear(); _matSaveClamps = 0; _matSaveObserved = 0; _matSaveSkipped = 0; _matBaselines = 0; }
+export function _ownFor(w) { const r = ownBook.get(String(w)); return r ? { open: r.open, cred: r.cred, sold: r.sold, used: r.used, openSrc: r.openSrc, base: r.base, baseSrc: r.baseSrc } : null; }
 export function _ownAvailFor(w, kind, item) { return ownAvailable(String(w), kind, item); }
+// Step 7 seams: read-only views so the flip sim can print the actual bound and counters.
+export function _matFlipStateForTest() { return { clamps: _matSaveClamps, observedOnly: _matSaveObserved, skipped: _matSaveSkipped, baselines: _matBaselines, flagged: _matFlags.size }; }
+export function _matSaveBoundForTest(w, m) { const r = ownBook.get(String(w)); return r ? matSaveBound(r, m) : UNWITNESSED_ALLOWANCE; }
 
 async function saveWorldNodes() {
   if (!_nodesDirty) return;
@@ -3302,8 +3339,9 @@ app.post("/world/node/claim", (req, res) => {
 // reports each catch, the server records ONE fish per catch into the same gatherCount tally.
 //
 // OBSERVE-ONLY, and deliberately not enforcement. The client still credits the fish locally (fishing
-// stays client-authoritative until the whole material count is enforced — that flip waits for live
-// data, like every gate in this migration). This only lets the server learn the plausible ceiling of
+// stays client-authoritative until the whole material count is enforced — that flip now EXISTS: see
+// STEP 7 / matSaveEnforce, staged behind the mmo.v floor and CHIK_MAT_ENFORCE, gathering its own live
+// data through matSaveFlip.observedOnly). This only lets the server learn the plausible ceiling of
 // fish a wallet has caught, so `caught >= held + sold` becomes a real invariant for fish. recordGather
 // already counts pubkey wallets only, so an unsigned net_id catch is harmlessly ignored (they cannot
 // sell on the market either). A live world presence is required (same gate as a node claim), and the
@@ -3358,12 +3396,44 @@ function ffishCatchChance(sp, tier, rod) {
   const t = Math.min(1, Math.max(0, (rod - req) / span));
   const rodFactor = FFISH_ROD_FLOOR + (1 - FFISH_ROD_FLOOR) * t;
   const mult = FISH_TIER_MULT[Math.min(3, Math.max(1, tier))] || 1.0;
-  return FFISH_CATCH_BASE[sp] * mult * rodFactor;
+  const ev = fishEventActive() ? Math.min(10, Math.max(1, Number(_fishEvent.mult))) : 1;
+  return Math.min(FFISH_CATCH_BASE[sp] * mult * rodFactor * ev, EVENT_CAST_CAP);
 }
 // Rarest first, so a Rainbow is never masked by a Golden — same order as the client had.
 function rollFantasyCatch(tier, rod) {
   for (const sp of FFISH_ORDER) if (Math.random() < ffishCatchChance(sp, tier, rod)) return sp;
   return "";
+}
+
+// ============ LIVE EVENT: the fishing festival (admin-scheduled, e.g. 24h of 4x legends) ============
+// One multiplier, applied inside ffishCatchChance — the SAME chokepoint the client mirrors — so the
+// authoritative roll and every displayed odd agree to the digit. Persisted in the kv store: a mid-
+// festival restart must not end the party. EVENT_CAST_CAP mirrors Econ.gd: whatever the multiplier,
+// no single cast may beat 1-in-4 for any legend.
+const EVENT_CAST_CAP = 0.25;
+let _fishEvent = { mult: 1, ends: 0, label: "" };
+function fishEventActive(now = Date.now()) {
+  return _fishEvent.mult > 1 && now < Number(_fishEvent.ends);
+}
+async function saveFishEvent() { try { await store.kvSet("fish_event", _fishEvent); } catch (e) {} }
+
+// ============ THE WORLD FEED: server-witnessed rare moments, shown under every minimap ============
+// Only events THIS server rolled may enter (fantasy catches, server-rolled legendary/meme hatches),
+// so every headline is a fact. Ephemeral by design — a restart forgets old headlines, it cannot
+// forge new ones. The move reply ships only rows newer than the client's fs cursor.
+const WORLD_FEED_MAX = 8;
+let worldFeed = [];
+function worldFeedPush(k, wallet, d) {
+  const me = worldPlayers.get(String(wallet));
+  const h = stripTags(String((me && me.handle) || "A trainer")).slice(0, 20);
+  worldFeed.push({ k, h, d: String(d).slice(0, 32), t: Date.now() });
+  if (worldFeed.length > WORLD_FEED_MAX) worldFeed = worldFeed.slice(-WORLD_FEED_MAX);
+}
+function worldFeedSince(fs) {
+  if (!worldFeed.length) return undefined;
+  const cut = Number(fs) || 0;
+  const rows = worldFeed.filter((r) => r.t > cut);
+  return rows.length ? rows : undefined;
 }
 const _lastFishRec = new Map();      // wallet -> last COUNTED catch ms (anti-inflation, not a refusal)
 app.post("/world/fish/report", (req, res) => {
@@ -3394,6 +3464,7 @@ app.post("/world/fish/report", (req, res) => {
   const _rod = Math.min(10, Math.max(0, Math.floor(Number(b.rod)) || 0));
   const _legend = rollFantasyCatch(_tier, _rod);
   if (_legend) ownCredit(String(b.wallet), "ffish", _legend, 1);
+  if (_legend) worldFeedPush("ffish", b.wallet, _legend);   // a witnessed catch: the world hears about it
   // The client renders what the SERVER says was caught. An older client ignores `legend` and keeps
   // rolling its own for display only — it just gains no sellable entitlement from it, which is the
   // point. `counted` keeps its old meaning so nothing existing changes shape.
@@ -3594,7 +3665,8 @@ function _ownRow(w) {
     let drop = Math.max(1, Math.floor(GATHER_WALLETS_MAX * 0.05));
     for (const k of ownBook.keys()) { if (drop-- <= 0) break; ownBook.delete(k); }
   }
-  r = { open: Object.create(null), cred: Object.create(null), sold: Object.create(null), used: Object.create(null), openSrc: 0 };
+  r = { open: Object.create(null), cred: Object.create(null), sold: Object.create(null), used: Object.create(null), openSrc: 0,
+        base: Object.create(null), baseSrc: 0 };   // Step 7: the save-path grandfather baseline (see matSaveBaseline)
   ownBook.set(w, r);
   return r;
 }
@@ -3701,6 +3773,116 @@ function ownSnapshotOpening(wallet, mmo, prevSavedAt) {
   }
   _ownSnapshots++; _ownDirty = true;
 }
+
+// ============ STEP 7 OF SERVER AUTHORITY: THE ECONOMY FLIP (save-path material bound) ============
+// Until now the bound above only guarded the MARKET exit: a save could still assert any hoard and the
+// server stored it verbatim (safe.mmo = profile.mmo). This extends the SAME book — same credits, same
+// sinks, same allowance — to the save push itself. Nothing here rewrites the signed blob (the mmo
+// save is client-signed; a server edit would trip the client's own tamper check and zero the player's
+// currencies, which is exactly the destructive failure the audit passes banned). Instead the /profile
+// response carries `matClamps`, corrections the client applies locally and re-signs — the same
+// non-destructive direction as every ack in this codebase.
+//
+// THE INVARIANT, per material m, per pubkey wallet:
+//     claimed[m]  <=  base[m] + cred[m] + UNWITNESSED_ALLOWANCE − sold[m] − used[m]     (floored at 0)
+// where base[m] is a ONE-TIME grandfather snapshot taken on the wallet's first save-accept after the
+// flip, stored as the NET offset  min(claimed_then, OWN_OPEN_CAP) − cred_then + sold_then + used_then,
+// so that the formula above — evaluated with LIFETIME counters — measures sources and sinks SINCE the
+// snapshot. Without the offset, a pre-flip sale would be double-counted against the player (sold
+// already reflected in the smaller snapshot AND subtracted again) and could falsely clamp an honest
+// wallet's remaining stock; the offset may therefore legitimately be NEGATIVE.
+//
+// ESCROW IS DELIBERATELY NOT SUBTRACTED here (unlike ownAvailable): the client removes listed goods
+// from the bag at list time, so the bag count already excludes them, and any divergence in that dance
+// must only ever LOOSEN the save bound — a false clamp costs a real player real property.
+//
+// STAGING, stated plainly:
+//   * The FIRST save after the flip IS grandfathered — that is the accepted cost — but capped at
+//     OWN_OPEN_CAP per material, so a hoard fabricated for cutover buys a bounded amount, and the
+//     SECOND inflated push clamps.
+//   * VERSION FLOOR: corrections only go to saves whose mmo.v >= MAT_SAVE_MIN_V (export_server stamps
+//     v; today's shipped client sends 1). A stale client cannot reconcile corrections it never learned
+//     to read, so it keeps observe-only behaviour: exceedance is counted and flagged server-side but
+//     nothing is returned. A cheater declaring v=1 forever dodges only the correction — the excess is
+//     already unsellable (market bound) and unspendable (egg barter), i.e. inert.
+//   * KILL-SWITCH: CHIK_MAT_ENFORCE=0 reverts the whole flip (baselines and clamps) to observe-only.
+//     Read per-request so no code change is needed to flip it.
+//   * Non-pubkey net_ids: unchanged — /profile already requires a pubkey wallet, and the book ignores
+//     anything else.
+//   * Fails OPEN while the book restores (_ownReady), counted, same policy as the market gate. The
+//     baseline is also NOT taken before restore completes — snapshotting against a half-restored book
+//     would burn the one-time grandfather on wrong marks.
+const MAT_SAVE_MIN_V = 2;   // mmo.v floor — bump export_server's v only WITH the client that applies matClamps
+const matEnforceOn = () => String(process.env.CHIK_MAT_ENFORCE ?? "1") !== "0";
+let _matSaveClamps = 0, _matSaveObserved = 0, _matSaveSkipped = 0, _matBaselines = 0;
+const _matFlags = new Map();   // wallet -> { short, n, ts, mat, claimed, bound } — worst exceedance kept
+function matSaveBaseline(wallet, mmo) {
+  if (!matEnforceOn() || !_ownReady) return;
+  const w = String(wallet || "");
+  if (!isPubkey(w)) return;
+  const prior = ownBook.get(w);
+  if (prior && prior.baseSrc) return;             // written ONCE — a later save can never rewrite it
+  const r = _ownRow(w);
+  if (!r.base) r.base = Object.create(null);      // rows restored from a pre-flip blob lack the field
+  r.baseSrc = Date.now();
+  const mats = (mmo && typeof mmo.mats === "object" && mmo.mats) || {};
+  const keys = new Set();
+  for (const m of Object.keys(mats)) if (MAT_IDS.has(m)) keys.add(m);
+  // ALSO mark every material the book already has activity for: a wallet that sold its whole legacy
+  // stock before the flip holds 0 now, and without a mark its pre-flip `sold` would be subtracted
+  // from nothing and falsely clamp its first post-flip gathers.
+  for (const bucket of ["cred", "sold", "used"]) {
+    for (const k of Object.keys(r[bucket])) if (k.startsWith("mat:")) keys.add(k.slice(4));
+  }
+  for (const m of keys) {
+    const k = ownKey("mat", m);
+    const q = Math.floor(safeNum(mats[m]));
+    const claimed = Number.isFinite(q) && q > 0 ? Math.min(q, OWN_OPEN_CAP) : 0;
+    r.base[k] = claimed - (r.cred[k] || 0) + (r.sold[k] || 0) + (r.used[k] || 0);
+  }
+  _matBaselines++; _ownDirty = true;
+}
+function matSaveBound(r, m) {
+  const k = ownKey("mat", m);
+  const base = (r.base && Number.isFinite(r.base[k])) ? r.base[k] : 0;
+  return Math.max(0, base + (r.cred[k] || 0) + UNWITNESSED_ALLOWANCE - (r.sold[k] || 0) - (r.used[k] || 0));
+}
+// Inspect a pushed save against the invariant. Returns null (in bounds / not participating) or a
+// { mat: bound } map of corrections. Never throws into the save path — the caller wraps it.
+function matSaveEnforce(wallet, mmo) {
+  if (!matEnforceOn()) return null;               // kill-switch: observe-only, instantly
+  const w = String(wallet || "");
+  if (!isPubkey(w)) return null;
+  if (!_ownReady) { _matSaveSkipped++; return null; }
+  const r = ownBook.get(w);
+  if (!r || !r.baseSrc) return null;              // no baseline yet (it is written earlier this same save)
+  const mats = (mmo && typeof mmo.mats === "object" && mmo.mats) || null;
+  if (!mats) return null;
+  const clamps = {};
+  let worst = null;
+  for (const m of Object.keys(mats)) {
+    if (!MAT_IDS.has(m)) continue;
+    const q = Math.floor(safeNum(mats[m]));
+    if (!Number.isFinite(q) || q <= 0) continue;
+    const bound = matSaveBound(r, m);
+    if (q > bound) {
+      clamps[m] = bound;
+      if (!worst || q - bound > worst.claimed - worst.bound) worst = { mat: m, claimed: q, bound };
+    }
+  }
+  if (!worst) return null;
+  // FLAG regardless of client version — observability is the point of the observe tier.
+  const f = _matFlags.get(w) || { short: w.slice(0, 8), n: 0, ts: 0, mat: "", claimed: 0, bound: 0 };
+  f.n++; f.ts = Date.now();
+  if (worst.claimed - worst.bound > f.claimed - f.bound) { f.mat = worst.mat; f.claimed = worst.claimed; f.bound = worst.bound; }
+  _matFlags.set(w, f);
+  if (_matFlags.size > 5000) { let d = 250; for (const k of _matFlags.keys()) { if (d-- <= 0) break; _matFlags.delete(k); } }
+  const v = Math.floor(safeNum(mmo.v));
+  if (!(Number.isFinite(v) && v >= MAT_SAVE_MIN_V)) { _matSaveObserved++; return null; }   // stale client: observe-only
+  _matSaveClamps++;
+  return clamps;
+}
+
 // A value the client sent may be a hostile OBJECT, and both String(x) and Number(x) invoke its
 // toString/valueOf — so `{"toString":1,"valueOf":1}` throws a TypeError inside the handler. That
 // answered 500, aborted the batch mid-loop (dropping the honest events after the poison), and burnt
@@ -3838,6 +4020,13 @@ app.get("/assets/summary", (req, res) => {
              acquisitionBound: { enforcing: _ownReady, refused: _ownRefusals, skipped: _ownSkipped,
                                  openings: _ownSnapshots, wallets: ownBook.size,
                                  worst: [..._ownWorst.values()].sort((a, b) => (b.asked - b.had) - (a.asked - a.had)).slice(0, 20) },
+             // Step 7, the save-path flip. `observedOnly` is the pre-flight gauge: exceedances seen on
+             // stale (< MAT_SAVE_MIN_V) clients, flagged but not corrected. Do not bump the client's
+             // export version until this stays near zero for honest-shaped wallets on the live fleet.
+             matSaveFlip: { on: matEnforceOn(), bookReady: _ownReady, minClientV: MAT_SAVE_MIN_V,
+                            baselines: _matBaselines, clamps: _matSaveClamps, observedOnly: _matSaveObserved,
+                            skipped: _matSaveSkipped, flagged: _matFlags.size,
+                            worst: [..._matFlags.values()].sort((a, b) => (b.claimed - b.bound) - (a.claimed - a.bound)).slice(0, 20) },
              impossibleListings: { refused: _overQtyListings, sellers: _overQtyBy.size,
                                    worst: [..._overQtyBy].sort((a, b) => b[1].worst - a[1].worst).slice(0, 20)
                                      .map(([w, r]) => ({ w: String(w).slice(0, 8), tried: r.worst, item: r.item, kind: r.kind, attempts: r.n })) },
@@ -3972,7 +4161,14 @@ app.post("/world/mob/hit", (req, res) => {
   const b = req.body || {};
   if (!_worldTickOn) return res.status(503).json({ ok: false, error: "the shared world is not live yet", tick: false });
   if (!isPresenceId(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
-  const idx = Math.floor(Number(b.idx));
+  // COERCE NOTHING INTO A REAL MONSTER. Number() is far too willing here: Number(null), Number(""),
+  // Number(false) and Number([]) are all 0 — a REAL spawn — and Number("0x7") is 7. So a request with a
+  // missing or junk idx used to answer 200 for a monster it never named (measured: {idx:null} struck
+  // spawn 0). Only a real number, or a plain decimal string, may name a monster.
+  const rawIdx = typeof b.idx === "number" ? b.idx
+    : (typeof b.idx === "string" && /^-?\d+(\.\d+)?$/.test(b.idx.trim())) ? Number(b.idx.trim())
+    : NaN;
+  const idx = Math.floor(rawIdx);
   if (!Number.isInteger(idx) || idx < 0 || idx >= MOB_SPAWNS.length) return res.status(400).json({ error: "unknown monster" });
   const now = Date.now();
 
@@ -4015,25 +4211,49 @@ app.post("/world/mob/hit", (req, res) => {
   }
   _mobHits++;
 
-  // 3. THE ANCHOR. The first strike of this life records where the fight is, from the striker's own
-  //    presence row — never from a position they sent us. Anyone joining must be standing near it.
+  // 3. REACH. Two independent ways to be in this fight, and the anchor may only ever ADD one.
+  //
+  //    THE MONSTER. Since MOB_SYNC_IDLE the idle path is a pure function of (ordinal, unix seconds) —
+  //    ported above — so evaluate it and require the striker to be near where the monster ACTUALLY IS.
+  //    MOB_ANCHOR_MAX survives only as a sanity backstop.
+  //
+  //    THE ANCHOR. A fight can be dragged off the idle path (an aggro chase, or a card battle that
+  //    holds the monster still while the path point orbits on), so the first strike of a life also
+  //    records where the fight is happening, from the striker's own presence row — never a position
+  //    they sent us — and everyone already standing there keeps their reach.
+  //
+  //    THE ANCHOR IS PERMISSIVE, NOT RESTRICTIVE, and that is a FIX not a preference. It used to be
+  //    the only test once set, which handed anyone a free island-wide denial of service: an opener may
+  //    legitimately stand up to MOB_IDLE_GATE (220) from the monster, MOB_ANCHOR_R is 40, and nothing
+  //    cleared a live mob's anchor — so one 1-damage request from an UNPROVEN net_id pinned the fight
+  //    200 units off the monster and every honest trainer standing ON it was refused "too far from the
+  //    fight" forever after. Measured (_skeptic_mobpool_sim): honest finisher 0 units from the mob,
+  //    refused at dist=200, still refused after ten minutes of world ticks, mob stuck alive at 169/170
+  //    in the shared snapshot. Twenty-four free requests locked the whole island. Anyone who could
+  //    legitimately OPEN a fight here can therefore JOIN one here, and the anchor only ever widens that.
+  //
+  //    The anchor is also CARRIED BY THE MONSTER'S OWN MOTION (stored as an offset from the idle point
+  //    at anchor time) and EXPIRES after MOB_ANCHOR_TTL of no accepted strike, so a stale fight releases
+  //    rather than pinning a live monster to a spot it walked away from minutes ago.
   const px = me.x || 0, pz = me.z || 0;
-  if (m.ax === undefined) {
-    // Refuse to anchor absurdly far from the spawn: a mob cannot have walked to the far side of the
-    // island, so an anchor out there is a claim about geography, not a fight.
-    const fromHome = Math.hypot(spec[1] - px, spec[2] - pz);
-    if (fromHome > MOB_ANCHOR_MAX) {
-      _mobHitsRefused++;
-      return res.status(403).json({ ok: false, error: "that monster is nowhere near there", dist: Math.round(fromHome) });
-    }
-    m.ax = px; m.az = pz;
-  } else {
-    const off = Math.hypot(m.ax - px, m.az - pz);
-    if (off > MOB_ANCHOR_R) {
-      _mobHitsRefused++;
-      return res.status(403).json({ ok: false, error: "too far from the fight", dist: Math.round(off) });
-    }
+  const ip = mobIdlePos(idx, now / 1000);
+  const fromIdle = Math.hypot(ip.x - px, ip.z - pz);
+  const fromHome = Math.hypot(spec[1] - px, spec[2] - pz);
+  const nearMob = fromIdle <= MOB_IDLE_GATE && fromHome <= MOB_ANCHOR_MAX;
+  const anchorLive = m.ax !== undefined && (now - (m.aT || 0)) <= MOB_ANCHOR_TTL;
+  let fromAnchor = null;
+  if (anchorLive) {
+    // where the anchor has drifted to, dragged along by the monster's own path since it was set
+    fromAnchor = Math.hypot((m.ax + (ip.x - m.aix)) - px, (m.az + (ip.z - m.aiz)) - pz);
   }
+  if (!nearMob && !(fromAnchor !== null && fromAnchor <= MOB_ANCHOR_R)) {
+    _mobHitsRefused++;
+    return res.status(403).json(anchorLive
+      ? { ok: false, error: "too far from the fight", dist: Math.round(Math.min(fromIdle, fromAnchor)) }
+      : { ok: false, error: "that monster is nowhere near there", dist: Math.round(fromIdle) });
+  }
+  if (!anchorLive) { m.ax = px; m.az = pz; m.aix = ip.x; m.aiz = ip.z; }   // (re)open the fight here
+  m.aT = now;                                                             // a live fight keeps its anchor
 
   // THE FINISHING BLOW. Chikoria has NO world-space chip damage: HIT_R is only a HUD hint, and a
   // monster is engaged into a private 1v1 card battle and killed outright on a win (Battle.gd:1281 ->
@@ -4173,35 +4393,59 @@ function bumpStaticSeq(prev, next) {
   }
   return Number(prev.sq) || 1;
 }
-function worldSnapshot(wallet, x, z, delta = false) {
+// ---- INTEREST RADIUS (with hysteresis) ----
+// The client hides every remote past RENDER_DIST 240 (Net.gd:64) and skips all their per-frame
+// work — yet the snapshot shipped every peer within WORLD_RADIUS 4000, i.e. the whole island. At
+// 60 peers most of every snapshot was players the receiver could not see. So /world/move replies
+// now ship only peers the receiver can actually render: ENTER at 260 (20 units beyond the render
+// wall, so an approaching peer's rig + interp buffer exist BEFORE they become visible) and LEAVE
+// at 320 (a 60-unit hysteresis band, ~4× the largest per-snapshot step of the fastest mount, so a
+// peer dancing on the boundary flaps exactly once per real crossing, never per tick). Eviction
+// also forgets the receiver's delta memory of that peer, so re-entry ships a FULL row — the
+// client frees the rig after its 10 s grace and an abbreviated row would force a resync round.
+// GET /world/players and /world/roster keep the wide view on purpose (spectate / the online pill).
+const INTEREST_ENTER = 260;
+const INTEREST_LEAVE = 320;
+function worldSnapshot(wallet, x, z, delta = false, interest = false) {
   const now = Date.now(), out = [];
-  const me = delta ? worldPlayers.get(wallet) : null;
-  const seen = me ? (me.seen || (me.seen = new Map())) : null;
+  const me = (delta || interest) ? worldPlayers.get(wallet) : null;
+  const seen = (delta && me) ? (me.seen || (me.seen = new Map())) : null;
+  // hysteresis memory: the peers this receiver is currently being shipped. Lives on the caller's
+  // own row (like `seen`), so the TTL sweep that evicts them evicts it — nothing to prune later.
+  const vis = (interest && me) ? (me.vis || (me.vis = new Set())) : null;
   for (const [w, p] of worldPlayers) {
     if (now - p.ts > WORLD_TTL_MS) { worldPlayers.delete(w); continue; }
     if (w === wallet) continue;
     const d = Math.hypot((p.x || 0) - x, (p.z || 0) - z);
+    // INTEREST IS TESTED BEFORE THE WIDE RADIUS, and the order is load-bearing. A hostile client can
+    // POST itself past WORLD_RADIUS; with the wide skip first, that peer left the receiver's bubble
+    // WITHOUT running the eviction below, so it kept its `vis`/`seen` entries. On its way back it was
+    // then shipped an abbreviated `dl:1` row for a rig the receiver's client had already freed —
+    // one forced _dl_resync round per observer, per teleport, at the attacker's choosing.
+    // INTEREST_LEAVE (320) is far inside WORLD_RADIUS (4000), so with interest on this branch already
+    // catches everything the wide check would have; the wide check still guards the spectate path.
+    if (interest) {
+      const lim = (vis && vis.has(w)) ? INTEREST_LEAVE : INTEREST_ENTER;
+      if (d > lim) {
+        if (vis && vis.delete(w) && me.seen) me.seen.delete(w);   // evicted → next entry is a FULL row
+        continue;
+      }
+      if (vis) vis.add(w);
+    }
     if (d > WORLD_RADIUS) continue;
     // volatile half: always sent, because it is what actually moves
     // `a` = the sample's AGE in ms (now - when the mover reported it). An age, not a clock, so no
     // client/server clock sync is needed; the client stamps arrival-minus-age and gets a timeline in
     // its OWN clock that is jitter-free. Old clients ignore the field.
+    // The STATIC half is decided further down, AFTER the cap — see there for why.
     const row = { d, wallet: w, x: p.x, y: p.y || 0, z: p.z, dir: p.dir, mount: p.mount || "", act: p.act || "", spr: !!p.spr, a: now - p.ts };
-    const sq = Number(p.sq) || 1;
-    if (seen && seen.get(w) === sq) {
-      row.dl = 1;                       // "static half omitted — reuse what I already told you"
-    } else {
-      row.handle = p.handle; row.leg = p.leg; row.el = p.el; row.br = p.br;
-      row.avatar = p.avatar; row.comp = p.comp; row.party = p.party; row.eggs = p.eggs || "";
-      row.sq = sq;
-      if (seen) seen.set(w, sq);
-    }
+    row._p = p;                         // carried to the post-cap pass, deleted before it goes out
     out.push(row);
   }
-  if (seen && seen.size > WORLD_MAX_PEERS * 3) {
-    // bounded by the peer cap it serves; drop the oldest rather than let a long session accumulate
-    let drop = seen.size - WORLD_MAX_PEERS * 2;
-    for (const k of seen.keys()) { if (drop-- <= 0) break; seen.delete(k); }
+  if (vis) {
+    // a peer who TTL'd out (or signed out) without ever crossing the boundary would otherwise sit
+    // in vis/seen forever; forgetting them here also makes their eventual REJOIN ship a full row.
+    for (const w of vis) if (!worldPlayers.has(w)) { vis.delete(w); if (me.seen) me.seen.delete(w); }
   }
   // NEAREST FIRST, then cap. This used to `slice(0, 60)` straight off Map iteration order — which
   // is INSERTION order, i.e. oldest sessions first. With more than 60 trainers in range, #61
@@ -4212,7 +4456,32 @@ function worldSnapshot(wallet, x, z, delta = false) {
   // today, and narrowing it would change who you can see — a gameplay change, not a fix.
   out.sort((a, b) => a.d - b.d);
   const near = out.slice(0, WORLD_MAX_PEERS);
-  for (const e of near) delete e.d;   // `d` is a sort key, never part of the wire contract
+  // THE DELTA MEMORY IS WRITTEN AFTER THE CAP, and that ordering is the whole point. Recording
+  // `seen[w] = sq` inside the loop above marked peers the cap then THREW AWAY — so the server
+  // believed it had sent a static half it never sent. The moment such a peer drifted into the 60
+  // nearest (someone walks off, a crowd shifts) it was shipped `dl:1`: a row with no handle, no
+  // avatar, no party, for a wallet the client has never heard of. Net.gd answers that with
+  // `_dl_resync`, a whole extra full-snapshot round — and in a 60+ crowd, which is exactly when a
+  // town square is at its heaviest, that fires on every poll. Measured at 10 of 10 promoted peers,
+  // on this build AND on git HEAD before interest management existed (av_capseen_prechange_sim.mjs),
+  // so this is an old bug the cap has always had, not a cost of the interest radius.
+  for (const e of near) {
+    const p = e._p, sq = Number(p.sq) || 1;
+    if (seen && seen.get(e.wallet) === sq) {
+      e.dl = 1;                       // "static half omitted — reuse what I already told you"
+    } else {
+      e.handle = p.handle; e.leg = p.leg; e.el = p.el; e.br = p.br;
+      e.avatar = p.avatar; e.comp = p.comp; e.party = p.party; e.eggs = p.eggs || "";
+      e.sq = sq;
+      if (seen) seen.set(e.wallet, sq);
+    }
+    delete e.d; delete e._p;   // sort key and row back-pointer — never part of the wire contract
+  }
+  if (seen && seen.size > WORLD_MAX_PEERS * 3) {
+    // bounded by the peer cap it serves; drop the oldest rather than let a long session accumulate
+    let drop = seen.size - WORLD_MAX_PEERS * 2;
+    for (const k of seen.keys()) { if (drop-- <= 0) break; seen.delete(k); }
+  }
   return near;
 }
 // Broadcast my position (and get nearby players back in one round-trip).
@@ -4258,9 +4527,12 @@ function presenceOk(id, body) {
 //   * a hit is POSITION-AUTHORISED against the server's own presence record, exactly like
 //     /world/node/claim (server.js:3180) — reach is derived from the spawn index, never from a
 //     position the caller sends.
-// Off by default (WORLD_TICK). The tick and the state exist and can be observed before anything is
-// enforced, which is the same staged shape mounts, eggs and chikimon each moved in.
-const WORLD_TICK_ON = String(process.env.WORLD_TICK || "") === "1";
+// ON BY DEFAULT since 2026-07-31: the client consumes the mobs field now (Net.gd applies it after
+// its seq gate and hands the dead-set to Monsters.apply_shared), so the reason it shipped dark —
+// "no client reads it yet" — no longer holds. Kill-switch: CHIK_WORLD_TICK=0 (or the legacy
+// WORLD_TICK=0) forces the shared world off; WORLD_TICK=1, which every existing sim sets, still
+// means on.
+const WORLD_TICK_ON = String(process.env.CHIK_WORLD_TICK ?? process.env.WORLD_TICK ?? "") !== "0";
 // Mirrors Econ.MOBS (Econ.gd:220) and Econ.RESPAWN_S (231). If these drift from the client the shared
 // HP bar lies, so they are asserted equal by world_tick_sim rather than trusted.
 const MOB_STATS = Object.freeze(Object.assign(Object.create(null), {
@@ -4300,8 +4572,55 @@ const MOB_DMG_MAX = 120;               // per hit; the strongest real loadout is
 // were standing together", the one positional property that survives /world/move having no speed
 // check. Be clear about the limit: a lone bot sets its own anchor, so this bounds co-op credit, not
 // solo farming. Solo farming is bounded by the respawn clock instead.
-const MOB_ANCHOR_R = 40;        // co-fighters must be within this of where the fight started
-const MOB_ANCHOR_MAX = 780;     // an anchor may not sit further from home than a mob could have walked
+const MOB_ANCHOR_R = 40;        // extra reach granted to whoever is already standing at the fight
+const MOB_ANCHOR_MAX = 780;     // sanity backstop: further from home than a mob could EVER be
+// A fight with no accepted strike for this long is over: release the anchor so a live monster is never
+// pinned to a spot it walked away from. Comfortably longer than one card battle, far shorter than the
+// forever an unreleased anchor used to last.
+const MOB_ANCHOR_TTL = 45000;
+// ---- THE SHARED IDLE PATH — PORTED EXACTLY from Monsters.gd (MOB_SYNC_IDLE block, _mob_hash /
+// _mob_wander_r / _mob_idle_pos). Since the client made idle motion a pure function of
+// (spawn ordinal, unix seconds), every client agrees where mob idx N is — and so can the server.
+// That retires the 780-unit "somewhere in the annulus" first-strike gate: the opener must now be
+// near where the monster actually IS. Do not edit these constants or the arithmetic without
+// changing Monsters.gd in the same commit — world_share_v2_sim asserts convergence within 1 unit
+// against values printed by the real GDScript functions, so a drift fails the sim rather than
+// silently refusing honest fighters.
+const MOB_ISLE_CX = 2.0, MOB_ISLE_CZ = -204.0;          // Monsters.gd ISLE_CX / ISLE_CZ
+const MOB_ANNULUS_IN = 250.0, MOB_ANNULUS_OUT = 620.0;  // Monsters.gd ANNULUS_IN / ANNULUS_OUT
+const MOB_WANDER_R = 60.0;                              // Monsters.gd MOB_WANDER_R
+// How far from the evaluated idle point an honest opener can be: an aggro chase drags a mob up to
+// DEAGGRO_R 70 off its path, a card battle holds it in place while the path point orbits up to a
+// full wander diameter (2 x 60) away, plus strike reach and a few units of client clock skew
+// (1 s of skew is a few units of path). 220 covers that sum; a claim from across the map (600+) is
+// refused, against the 780 the home-based gate accepted.
+const MOB_IDLE_GATE = 220;
+function mobHash(i, salt) {
+  // Monsters.gd _mob_hash runs in 64-bit signed ints and the product reaches ~2.7e18 — past
+  // Number's 2^53 — so BigInt is REQUIRED for the port to be exact. It never exceeds 2^63, so
+  // neither side wraps and no masking is needed.
+  let h = BigInt(i * 73856093) ^ BigInt(salt * 19349663);
+  h = (h ^ (h >> 13n)) * 1274126177n;
+  if (h < 0n) h = -h;                                   // absi — defensive on both sides
+  return Number(h % 100000n) / 100000;
+}
+function mobWanderR(hx, hz) {
+  const hr = Math.hypot(hx - MOB_ISLE_CX, hz - MOB_ISLE_CZ);
+  return Math.max(8.0, Math.min(MOB_WANDER_R, Math.min(hr - MOB_ANNULUS_IN - 5.0, MOB_ANNULUS_OUT - hr - 5.0)));
+}
+function mobIdlePos(idx, tSec) {
+  const sp = MOB_SPAWNS[idx];
+  const hx = sp[1], hz = sp[2];
+  const rMax = mobWanderR(hx, hz);
+  const w1 = 0.045 + mobHash(idx, 1) * 0.055;
+  const w2 = 0.017 + mobHash(idx, 2) * 0.031;
+  const p1 = mobHash(idx, 3) * Math.PI * 2;
+  const p2 = mobHash(idx, 4) * Math.PI * 2;
+  const ang = tSec * w1 + p1;
+  const rad = rMax * (0.45 + 0.40 * Math.sin(tSec * w2 + p2) + 0.15 * Math.sin(tSec * w1 * 0.37 + p2 * 1.7));
+  return { x: hx + Math.sin(ang) * rad, z: hz + Math.cos(ang) * rad };
+}
+export function _mobIdlePos(idx, tSec) { return mobIdlePos(idx, tSec); }   // sim seam: convergence proof
 // Who gets paid for a kill. MOB_PAYEES caps the reward multiplier at four no matter how many wallets
 // touched the monster; MOB_SHARE_MIN is only a tourist floor, deliberately low enough that an honest
 // 30-of-170 contribution still counts.
@@ -4324,7 +4643,8 @@ function mobRow(idx) {
   const spec = MOB_SPAWNS[idx];
   if (!spec) return null;
   const st = MOB_STATS[spec[0]];
-  m = { hp: st ? st.hp : 60, gen: 1, deadAt: 0, hitters: new Map(), ax: undefined, az: undefined };
+  m = { hp: st ? st.hp : 60, gen: 1, deadAt: 0, hitters: new Map(),
+        ax: undefined, az: undefined, aix: 0, aiz: 0, aT: 0 };
   worldMobs.set(idx, m);
   return m;
 }
@@ -4343,12 +4663,16 @@ function worldMobTick(now) {
     m.hp = mobMaxHp(idx);
     m.gen++;                           // a new life: credit for the old one can never be claimed again
     m.hitters.clear();
-    m.ax = undefined; m.az = undefined; // and a new life anchors wherever it is next found
+    m.ax = undefined; m.az = undefined; m.aT = 0; // and a new life anchors wherever it is next found
   }
 }
 // What every client is told about the shared world. Only mobs that are NOT at full health or are dead
 // are worth sending — a pristine island is an empty object, so the common case costs ~2 bytes.
 function mobSnapshot(now) {
+  // EXPIRE ON EVERY READ. The /world/move reply is the main consumer now, and it did not tick —
+  // so a mob whose respawn came due stayed {dead, back:0} in every move snapshot until someone
+  // happened to hit something or GET /world/mobs. O(dead), so it costs nothing when quiet.
+  worldMobTick(now);
   const out = {};
   for (const [idx, m] of worldMobs) {
     if (!m.deadAt && m.hp >= mobMaxHp(idx)) continue;
@@ -4388,7 +4712,7 @@ export function restoreWorldMobs(v, now = Date.now()) {
     const gen = Math.max(1, Math.floor(Number(e[1].gen)) || 1);
     const m = mobRow(idx);
     m.deadAt = deadAt; m.gen = gen; m.hp = 0;
-    m.hitters.clear(); m.ax = undefined; m.az = undefined;   // credit for that life is closed
+    m.hitters.clear(); m.ax = undefined; m.az = undefined; m.aT = 0;   // credit for that life is closed
     n++;
   }
   return n;
@@ -4744,6 +5068,11 @@ app.post("/assets/egg/hatch", (req, res) => {
   row.state = "consumed";
   row.hatchedTo = born.id;
   regEvent(row, "hatched", { into: born.id, sp: born.sp });
+  // the world feed carries ONLY server-rolled hatches (the /assets/egg/consume halfway house is a
+  // client-chosen species — an honest lineage, but not a witnessed roll, so it stays out)
+  if (row.kind === "legendary" || row.kind === "meme" || row.kind === "mount") {
+    worldFeedPush(row.kind === "meme" ? "meme" : (row.kind === "mount" ? "mount" : "legend"), wallet, born.sp);
+  }
   _assetsDirty = true;
   res.json({ ok: true, hatched: { id: born.id, type: born.type, sp: born.sp, kind: born.kind, born: born.born, from: row.id } });
 });
@@ -5610,8 +5939,10 @@ app.post("/world/move", (req, res) => {
   const seq = Number.isFinite(+b.seq) ? Math.max(0, Math.floor(+b.seq)) : null;
   if (seq !== null && held && Number.isFinite(held.seq) && seq <= held.seq) {
     return res.json({ ok: true, stale: true, seq,
-                      players: worldSnapshot(wallet, held.x, held.z, !!b.dl), online: worldPlayers.size,
-                      mobs: _worldTickOn ? mobSnapshot(Date.now()) : undefined });
+                      players: worldSnapshot(wallet, held.x, held.z, !!b.dl, true), online: worldPlayers.size,
+                      mobs: _worldTickOn ? mobSnapshot(Date.now()) : undefined,
+                      event: fishEventActive() ? { mult: _fishEvent.mult, ends: _fishEvent.ends, label: _fishEvent.label } : undefined,
+                      feed: worldFeedSince(b.fs) });
   }
   // Presence coords are rounded AT STORE TIME: they arrive as float32 noise (15 significant digits
   // for a 1-unit-per-voxel world) and every extra digit is paid for on EVERY snapshot to every peer.
@@ -5628,6 +5959,8 @@ app.post("/world/move", (req, res) => {
   const _row = {
     proven: iAmProven,
     seen: _prev ? _prev.seen : undefined,
+    vis: _prev ? _prev.vis : undefined,   // interest-radius hysteresis memory — must survive the row replace
+
     x, y, z, dir: Math.round(clampF(b.dir, -7, 7, 0) * 1000) / 1000,   // 3dp — do NOT round coarser (yaw stepping)
     handle: stripTags(String(b.handle || "Trainer")).slice(0, 20),
     leg: clampF(b.leg, 0, 20, 14) | 0,                 // companion species index
@@ -5653,10 +5986,13 @@ app.post("/world/move", (req, res) => {
   // The shared world rides the reply the client is ALREADY making, so co-op costs zero extra requests
   // and zero extra round trips. An older client ignores the field; a pristine island makes it empty.
   res.json({ ok: true, seq: seq !== null ? seq : undefined,
-             players: worldSnapshot(wallet, x, z, !!b.dl), online: worldPlayers.size,
-             mobs: _worldTickOn ? mobSnapshot(Date.now()) : undefined });
+             players: worldSnapshot(wallet, x, z, !!b.dl, true), online: worldPlayers.size,
+             mobs: _worldTickOn ? mobSnapshot(Date.now()) : undefined,
+             event: fishEventActive() ? { mult: _fishEvent.mult, ends: _fishEvent.ends, label: _fishEvent.label } : undefined,
+             feed: worldFeedSince(b.fs) });
 });
-// Read-only: nearby online trainers (for spectators / light polling).
+// Read-only: nearby online trainers (for spectators / light polling). Deliberately WIDE
+// (WORLD_RADIUS, no interest filter): a spectator wants the island view, not a render bubble.
 app.get("/world/players", (req, res) => {
   const wallet = req.query?.wallet || "", x = clampF(req.query?.x, -100000, 100000, 0), z = clampF(req.query?.z, -100000, 100000, 0);
   res.json({ players: worldSnapshot(wallet, x, z), online: worldPlayers.size });
@@ -6058,7 +6394,8 @@ function _capAuctions() {
 }
 function serializeOwnBook() {
   const out = [];
-  for (const [w, r] of ownBook) out.push([w, { open: r.open, cred: r.cred, sold: r.sold, used: r.used, openSrc: r.openSrc || 0 }]);
+  for (const [w, r] of ownBook) out.push([w, { open: r.open, cred: r.cred, sold: r.sold, used: r.used, openSrc: r.openSrc || 0,
+                                               base: r.base || {}, baseSrc: r.baseSrc || 0 }]);
   return out.slice(-GATHER_WALLETS_MAX);
 }
 // RESTORE TRUSTS NOTHING. This blob came out of a database a future bug could corrupt, and it now
@@ -6073,7 +6410,8 @@ export function restoreOwnBook(v) {
     if (!Array.isArray(e) || !e[1] || typeof e[1] !== "object") continue;
     const w = String(e[0] || "").slice(0, 64);
     if (!isPubkey(w)) continue;
-    const r = { open: Object.create(null), cred: Object.create(null), sold: Object.create(null), used: Object.create(null), openSrc: 0 };
+    const r = { open: Object.create(null), cred: Object.create(null), sold: Object.create(null), used: Object.create(null), openSrc: 0,
+                base: Object.create(null), baseSrc: 0 };
     for (const bucket of ["open", "cred", "sold", "used"]) {
       const src = e[1][bucket];
       if (!src || typeof src !== "object") continue;
@@ -6086,8 +6424,37 @@ export function restoreOwnBook(v) {
         if (Number.isFinite(q) && q > 0) r[bucket][`${kind}:${item}`] = Math.min(q, Number.MAX_SAFE_INTEGER);
       }
     }
+    // Step 7 baseline: mats only, and — unlike the buckets — a NEGATIVE value is legal here, because
+    // base is a NET OFFSET (min(claimed, OWN_OPEN_CAP) − cred + sold + used; see matSaveBaseline).
+    // THE CEILING MUST CARRY THE SINKS. An earlier version clamped base to OWN_OPEN_CAP flat, on the
+    // reasoning that "the positive side can never legitimately exceed the grandfather cap" — which is
+    // exactly the raw-snapshot assumption the offset exists to kill. `sold`/`used` are LIFETIME and
+    // unbounded, so a pre-cutover veteran's honest offset legitimately runs far above the cap: one
+    // with a 6200 opening balance who sold his whole 7700 entitlement baselines at base=13900, and
+    // the flat clamp cut him to 6200 — bound 7700 -> 0, turning his next honest save into
+    // matClamps:{wood:0}, a total wipe of that material, on nothing worse than a routine redeploy.
+    // Clamping to OWN_OPEN_CAP + sold + used keeps the anti-corruption ceiling identical (the bound
+    // is base + cred + allowance − sold − used, so it still cannot exceed OWN_OPEN_CAP + cred +
+    // allowance no matter what the blob claims) while never cutting a real offset. The buckets are
+    // restored ABOVE this block, so r.sold/r.used are already populated here — do not reorder.
+    const bsrc = e[1].base;
+    if (bsrc && typeof bsrc === "object") {
+      for (const k of Object.keys(bsrc).filter(k => Object.hasOwn(bsrc, k)).slice(0, 64)) {
+        const cut = String(k).indexOf(":");
+        if (cut < 1) continue;
+        const kind = k.slice(0, cut), item = k.slice(cut + 1);
+        if (kind !== "mat" || !ownItemOk(kind, item)) continue;
+        const q = Number(bsrc[k]);
+        if (!Number.isFinite(q)) continue;
+        const kk = `${kind}:${item}`;
+        const ceil = OWN_OPEN_CAP + (r.sold[kk] || 0) + (r.used[kk] || 0);
+        r.base[kk] = Math.max(-Number.MAX_SAFE_INTEGER, Math.min(q, ceil));
+      }
+    }
     const os = Number(e[1].openSrc);
     r.openSrc = Number.isFinite(os) && os > 0 ? os : 0;
+    const bs = Number(e[1].baseSrc);
+    r.baseSrc = Number.isFinite(bs) && bs > 0 ? bs : 0;
     ownBook.set(w, r); n++;
   }
   if (n !== v.length) console.error(`restoreOwnBook: kept ${n} of ${v.length} rows — the remainder failed validation`);

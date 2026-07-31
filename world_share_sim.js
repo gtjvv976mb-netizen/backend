@@ -26,8 +26,9 @@ await new Promise(r => setTimeout(r, 1400));
 
 console.log("— the peer cap keeps the NEAREST trainers, not the oldest sessions —");
 {
-  // 62 trainers far away, registered FIRST (so they are oldest in Map insertion order)
-  for (let i = 0; i < 62; i++) await move(wallet(), 1000 + i, 1000 + i);
+  // 62 trainers farther out — but INSIDE the interest radius (enter 260; interest_radius_sim owns
+  // the outside-the-bubble behaviour) — registered FIRST (so they are oldest in Map insertion order)
+  for (let i = 0; i < 62; i++) { const a = i * 0.101; const r = 100 + i * 2; await move(wallet(), r * Math.cos(a), r * Math.sin(a)); }
   // then 3 who walk right up to me — newest, and the ones I must be able to see
   const near = [wallet(), wallet(), wallet()];
   await move(near[0], 5, 0);
@@ -42,12 +43,11 @@ console.log("— the peer cap keeps the NEAREST trainers, not the oldest session
   chk(seen === 3, `all 3 trainers standing next to me are visible (${seen}/3) — insertion order would have dropped every one`);
 
   // and the cap really is nearest-first: EVERY trainer that got dropped must be further away than
-  // every trainer that was kept. (The far crowd sits on a diagonal, so their true distance is
-  // (1000+i)*sqrt(2) ~ 1414..1500 — assert the property, not a hand-computed number.)
+  // every trainer that was kept — assert the property, not a hand-computed number.
   const ds = (snap.players || []).map(p => Math.hypot(p.x, p.z)).sort((a, b) => a - b);
   const keptMax = ds[ds.length - 1];
   const allD = [...near.map((_, i) => Math.hypot([5, 0, 7][i], [0, 6, 7][i])),
-                ...Array.from({ length: 62 }, (_, i) => Math.hypot(1000 + i, 1000 + i))].sort((a, b) => a - b);
+                ...Array.from({ length: 62 }, (_, i) => 100 + i * 2)].sort((a, b) => a - b);
   const droppedMin = allD[60];      // the nearest trainer that did NOT make the cut
   chk(ds[0] < 10, `closest returned peer is ${ds[0].toFixed(1)} away`);
   chk(keptMax <= droppedMin,

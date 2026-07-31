@@ -169,17 +169,18 @@ async function main() {
   ok(`...so the absolute ceiling is ${worstEssencePerHour} essence/hour vs the 43,200 faucet — a ${(43200 / worstEssencePerHour).toFixed(0)}x cut`,
      worstEssencePerHour < 43200 / 10, `${worstEssencePerHour}`);
 
-  // ---------- 6b. THE ANCHOR, which replaced a reach gate that was a coin flip ----------
-  // Monsters.gd's only steering is an annulus around the island centre (447-451); there is NO leash to
-  // home, and all 24 of 24 homes sit inside the unsteered 250..620 band, so a mob random-walks a
-  // 370-unit ring and can sit hundreds of units from its spawn. A 90-unit gate around home would have
-  // refused the honest fighter most of the time and stopped no bot. The anchor records where the fight
-  // IS, taken from the first striker's own presence row.
+  // ---------- 6b. THE IDLE-PATH GATE (updated 2026-07-31; it replaced the anchor-from-home band) ----------
+  // Monsters.gd's idle motion is now MOB_SYNC_IDLE: a pure function of (ordinal, unix seconds),
+  // leashed to a <=60-unit wander disc around home — and the server ports the same function. So the
+  // opener must stand near where the monster actually IS (evaluated, gate 220), no longer merely
+  // somewhere in the 780-from-home band this block used to encode. world_share_v2_sim proves the
+  // port converges with the real GDScript functions to <1 unit; here we prove the honest/dishonest split.
   srv._clearWorldMobs();
-  const AX = DARKEON.x + 300, AZ = DARKEON.z + 300;    // far from home: a mob really can wander here
+  const ipD = srv._mobIdlePos(DARKEON.idx, Date.now() / 1000);
+  const AX = ipD.x + 5, AZ = ipD.z - 3;                // standing AT the mob's evaluated position
   const opener = await mk(AX, AZ);
   const o1 = await hit(opener, DARKEON.idx, 10);
-  ok("the trainer who OPENS a fight is never refused, wherever the monster wandered to",
+  ok("the trainer who OPENS a fight at the mob's evaluated position is never refused",
      o1.status === 200, `status ${o1.status} ${JSON.stringify(o1.json.error || "")}`);
   const buddy = await mk(AX + 20, AZ);
   await sleep(HIT_MIN_MS + 60);

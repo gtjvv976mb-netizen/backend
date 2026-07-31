@@ -115,12 +115,14 @@ async function main() {
 
   // ---------- 5. MOVING MUST NOT COUNT AS A CHANGE, or the delta never applies ----------
   const before = Number((await move(bob, true)).json.players.find((p) => p.wallet === crowd[1].wallet)?.sq || 0);
-  await move(crowd[1], false, { x: 999, z: -999, act: "chop:axe:5", mount: "wolf", spr: true });
+  // (150,150) — a real move that stays inside bob's interest radius; (999,-999) would now be a
+  // legitimate DESPAWN under the enter-260/leave-320 interest filter, which interest_radius_sim covers
+  await move(crowd[1], false, { x: 150, z: 150, act: "chop:axe:5", mount: "wolf", spr: true });
   const after = (await move(bob, true)).json.players.find((p) => p.wallet === crowd[1].wallet) || {};
   ok("walking, acting, mounting and sprinting do NOT re-send the static half",
      after.dl === 1, `dl=${after.dl} sq_before=${before}`);
   ok("...but the new position and action still arrive",
-     Number(after.x) === 999 && after.act === "chop:axe:5" && after.mount === "wolf" && after.spr === true,
+     Number(after.x) === 150 && after.act === "chop:axe:5" && after.mount === "wolf" && after.spr === true,
      `x=${after.x} act=${after.act} mount=${after.mount} spr=${after.spr}`);
 
   // ---------- 6. THE TWO MODES AGREE ON THE FACTS ----------
