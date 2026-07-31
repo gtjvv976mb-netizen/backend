@@ -692,3 +692,171 @@ and the real 548 u drown rescue accepted with **0/15** corrections afterwards.
 * **The three mine mouths are the only place a heightfield can be wrong**, and they were measured:
   the worst 24 u traverse at any of the twelve entrance directions is **2.40 u** (crystal_mine +z)
   against `PEN_TOL 3.0` — a 0.60 u margin. Re-measure if the island is ever re-baked.
+
+---
+
+## 12. Adversarial re-verification: the one-die fishing roll and STAGE 3 actions (2026-08-01)
+
+Everything in this section was re-run from scratch on fresh ports against the real `server.js`
+(throwaway keypair, memory store, dead RPC, no `DATABASE_URL`) and, where the claim is about what a
+player *sees*, against the real Godot client. Nothing touched the live backend or any chain.
+
+| Sim / probe | Result |
+|---|---|
+| `stage3_actions_sim.mjs` (ports 44131-44135) | 41 / 0 |
+| `fish_onedie_sim.js` (port 44317) | 17 / 0 |
+| `_rv_fish_attack_sim.mjs` (port 44401) | 17 / 0, 6 findings |
+| `_rv_actions_attack_sim.mjs` (port 44411) | 34 / 0, **honest refusals = 0**, 4 findings |
+| `_rv_physwarp_attack_sim.mjs` (ports 44421/44422) | 6 / 0 |
+| `_rv_secrets_probe.mjs` (port 44431) | 17 / 0 |
+| `dev_rvfishw.gd` — WINDOWED, real Player vs a local server on 44319 | 17 / 0 |
+| `dev_fishonedie.gd` (headless) / `dev_scriptcheck` | 21 / 0 · `bad=0 checked=389` |
+| Regression: gather_authority 24, fish_report 13, kill_report 12, skeptic_mobpool 28, mmo_sync 29, world_share 24 + v2 14, pvp_live 19, econ 16, delta_snapshot 15, presence_auth 8, interest_radius 16, party 40, physics_authority 67, av_phys_honest 17, av_phys_attack 26, market fuzzer 8, critical_econ 10, world_tick 66, mount_sync 26, terrain_parity 405/405 | all 0 fail |
+
+### 12.1 Confirmed defect and its fix — the trainer-level gate was the client's alone
+
+**The rod decides what is HOOKED; the trainer level decides what is LANDED.** `Player.gd`'s strike
+handler snaps the line the instant a legend above `Econ.FFISH_LEVEL` (golden 5, koi 10, eel 15,
+rainbow 20) is struck: the player is toasted *"the Golden Chikifish SNAPPED the line — reach Trainer
+Lv 5 to land it"*, banks nothing, and the fish is gone. The server knew nothing about it — it had
+already run `ownCredit(wallet, "ffish", legend, 1)` and `worldFeedPush("ffish", …)`.
+
+*Failure scenario, measured (`_rv_fish_attack_sim.mjs` case C2):* a wallet posting
+`{tier:3, rod:10, lvl:1}` was rolled `golden_chikifish`; the world chronicle published a row reading
+`golden_chikifish` for it, and the acquisition book gained a fantasy fish. On a real client that same
+cast shows the player the line snapping. **The chronicle announced a catch the player watched get
+away, and `FFISH_AUTHORITY` would one day have enforced an entitlement the player's save never had.**
+
+**Fix** (`server.js`, `FFISH_LEVEL` + the gate immediately after `rollFantasyCatch`): a rolled legend
+the caller's own asserted level cannot land is dropped before the daily ceiling, before `ownCredit`
+and before `worldFeedPush`. The cast still counts as an ordinary fish.
+
+`lvl` is client-asserted, and that is safe **because this gate can only ever subtract**. A caller who
+inflates it, or omits it, gets exactly the answer they got before — so it adds no attack surface and
+can refuse nothing a liar could not already have taken. An absent `lvl` means "no assertion", not
+"level 0", so no already-shipped client changes shape.
+
+*Proof after the fix:* server-side, a lvl-1 wallet took 60 tier-3/rod-10 casts under a ×10 festival
+for **0 legends and 0 chronicle rows**, with the new `outlevelled` counter reading **23** — the
+server did roll them and then withheld them, so the pass is not vacuous. A `lvl:20` angler is
+unaffected (legend on cast 1, chronicle row matching the reply), and a client sending **no** `lvl`
+key is ungated exactly as before. End to end (`dev_rvfishw.gd`, real Player, real local server): a
+Lv 1 trainer with a Lv 10 rod at a Legendary-Depths spot under a ×10 festival cast **16** times for
+**0 legend verdicts, 0 snaps and 0 new chronicle rows**, while the Lv 20 session in the same run
+landed 2 legends whose chronicle rows matched exactly what was displayed.
+
+### 12.2 Answers to the four fishing questions
+
+* **Can a client still show itself a legend the server did not roll?** Yes, and *today it does not
+  matter less than it sounds*. With `FFISH_AUTHORITY` off — the deployed state — `OWN_KINDS` is
+  `{mat}`, so the market listing bound skips `ffish` entirely: a wallet the server rolled **zero**
+  Rainbow Fish for listed 5 of them, `200`, on the board (`_rv_fish_attack_sim.mjs` D1). The one-die
+  change makes the *book* true; it does not yet make the book *binding*. What it does already bind is
+  the **chronicle**: declaring a fish on the market pushes no feed row, and only a server roll can.
+* **Can the bite-time report be spammed to buy extra rolls?** The 800 ms floor binds the ROLL, not
+  the request: 200 concurrent casts were all accepted HTTP-200 in 56 ms and exactly **1** counted.
+  Spaced casts buy **4,333 rolls/hour/wallet** at an asserted tier 3 / rod 10. The real bound is
+  `FFISH_DAILY_MAX` (60/day, scaled by the festival multiplier): over the cap, 12 casts minted
+  **0** legends and pushed **0** chronicle rows.
+* **Does a dropped reply lose a catch or award two?** Neither, but the two sides can disagree.
+  `ownCredit` and `worldFeedPush` both run *before* `res.json`, and there is no ack, no idempotency
+  key and no retraction route — so a lost reply is a **silent credit** (measured: `ownAvailable`
+  0 → 1 with the reply discarded). It cannot lose a catch (`Net.fish_verdict` answers `know=false`
+  and the client plays its local die — proven end to end: wire down, species `frostgill`, bank
+  8 → 9). It cannot award two, because one report is one roll. A *retried* body 810 ms later **is** a
+  whole new roll; the shipped client never retries.
+* **Is the chronicle row always the species the player was shown?** After 12.1, in every case except
+  one, yes. The remaining case is stated below.
+
+### 12.3 Stated residuals — fishing
+
+* **The chronicle is written at the BITE, not at the landing.** `Player.gd` reports on the
+  cast → bite transition so the verdict is back before the strike judges the species. Every way a
+  bite can still fail afterwards — the 1.8–2.8 s strike window expiring, the line snapping at
+  tension ≥ 99, six seconds of not reeling — leaves a chronicle row and an `ffish` credit for a fish
+  that got away. Closing it needs a client-sent *landed* confirmation (safe for the same reason
+  `lvl` is: it can only subtract), which is a client change and therefore a later release.
+* **The chronicle is floodable by unauthenticated net_ids, and this is PRE-EXISTING** (the same
+  `worldFeedPush` line is in the pre-STAGE-3 baseline). 24 fabricated `godot-…` ids — no wallet, no
+  signature, no token — wrote **8 of the 8** feed rows. `ownCredit` skips net_ids so there is no
+  economic gain; it is display griefing of an 8-row ring, and it lets an attacker put any handle
+  next to any legend.
+* **The live fleet cannot roll a legend at all, so `FFISH_AUTHORITY` must stay OFF until a client
+  ships.** Independently re-confirmed from the artifact: the shipped `Net.gdc`, extracted from a
+  byte-identical rebuild of `realm/index.pck.[0-8].bin` (Jul 31 18:45) and zstd-decompressed,
+  contains the literals `/world/fish/report`, `wallet` and `mktToken` but **no `tier`, no `lvl`, no
+  `legend`, no `counted`**. So every live report posts `{wallet, mktToken}`, `rod` clamps to 0 —
+  below golden's unlock of 2 — and nothing is ever rolled.
+
+### 12.4 STAGE 3 (`CHIK_ACTIONS`) attacked, and what the flag actually binds
+
+Refusals, all measured with the flag ON: out of reach `403` at 14.6 u against `CLAIM_RADIUS` 14
+(13.9 u still granted); no presence `403`; mid-teleport `403 "catch your breath"` with the identical
+claim landing after the hold; the five malformed ids `stone:abc:-260`, `../../etc/passwd`,
+`stone:9000:-260`, `unicorn:120:-260` and `""` all `400` with four *distinct* reasons; an 8-way race
+on one crystal `wins=1 taken=7`, **one item total**; an 8-way race on a 3-load tree `3` grants and
+**3** items — one per claim, never a bonus; a replay `taken=true drop=undefined`; a decimal id
+refused rather than re-keyed. Fishing and kill reports for a wallet you cannot prove are `403`, and
+a forged market token is `403`.
+
+**The tool gate is a consistency check, not an authorisation, and the code now says so.** Because a
+tool-less body must pass forever (every shipped client sends none), a cheater deletes one key:
+`tool:"axe"` on a rock is `403 needs="pickaxe"`, and the **identical claim with no `tool` field is
+`200` immediately after**. It also binds neither TIER nor OWNERSHIP — a wallet that has never
+crafted anything claims `tool:"pickaxe", toolLvl:10` and is granted, because gear lives in the
+client-authored save. Do not cite it as an anti-cheat control.
+
+**Claiming for another wallet is still open and `CHIK_ACTIONS` does not touch it** (pre-existing,
+gated behind `CHIK_CLAIM_TOKEN`, which is OFF because `Gather.gd` sends no token). Measured: a
+tokenless stranger claims in a victim's name → `200`, and the victim's very next honest claim →
+`429 "too fast"`. The attacker gains nothing (`recordGather` credits the victim); it is
+denial-of-gathering, not theft.
+
+**The new water bound is a small CPU amplifier, stated not fixed.** A *refused* cast costs 169
+`surfaceHeight` lookups (the lattice returns on the first hit, so a bone-dry inland stance is the
+worst case), the check sits BEFORE the 800 ms count floor, and `/world/fish/report` has no inbound
+rate cap. Measured: 300 concurrent dry casts refused in 131 ms, 0.033 ms of heightfield work each —
+the same order as parsing the request body.
+
+### 12.5 Honest play with `CHIK_ACTIONS=1`: the number is ZERO
+
+A 20-node gathering session across all nine node kinds at the client's own 2 s cadence, sending the
+tool field an honest client *would* send: **20/20 granted**. A 14-cast fishing session from a shore
+stance derived from the server's own heightfield: **14/14 counted, 0 refusals**. A mob fight standing
+on the monster: 6 strikes, **0 refused**, killed. Total honest refusals: **0**.
+
+The water bound was then swept exhaustively rather than sampled. Every point on the island with water
+within `FISH_SPOT_RANGE` (24, `Player.gd`) — i.e. every stance from which an honest angler could
+reach a school, since `Fish.gd` places all 44 schools in water — was tested against `waterNear`:
+**60,963 stances, 0 refused**. The bound is not vacuous: 958 of 958 deep-inland stances are refused.
+The direction is also safe by construction — the server calls anything below `SEA = 6.0` water while
+the client's own water surface is at `water_level = 4.0`, so the server's notion of water is strictly
+the more permissive of the two.
+
+### 12.6 Both flags OFF is byte-identical to today, re-proven
+
+`server_stage3_baseline.mjs` was regenerated from the deploy mirror's `HEAD:server.js` (the last
+committed server = everything except this pass) and diffed: the working tree differs by exactly
+**4 replaced lines and 111 insertions**, and nothing else. Three child servers — baseline,
+flag-unset and `CHIK_ACTIONS=0` — driven through the same 20-step transcript are **byte-identical**
+at 1,914 bytes after normalising only wall-clock keys. The equivalence is not vacuous: the baseline's
+own transcript shows the tool field ignored and a teleported cast not held.
+
+The one change that ships **outside** the flag is the warp-bank guard
+`(_claims || !PHYS_ON)`, and it was attacked on its own terms
+(`_rv_physwarp_attack_sim.mjs`). A coordinate-less ping does reset `_wbank` to the full
+`WARP_BANK_S`, so 40 alternating rounds of "claim +270 u, then refill for free" claimed
+x = 10,921 — but `physApply`'s reconcile is the stricter gate and the server's answer stayed
+**x = 121.0**, a 10,800 u gap, with a correction on all 40 and `403 "catch your breath"` on the
+gather at both ends. The honest half of the same guard holds: a pure-input `CHIK_PHYS` client
+gathers **8/8** with **0** holds. With `CHIK_PHYS` off the branch condition is unchanged — a
+coordinate-less body is still measured as a jump to the origin and still stamps a warp.
+
+### 12.7 Key discipline
+
+With `RPC_URL` set to a canary and `CLIENT_RPC` unset, all fifteen responses these changes can reach
+— `/world/fish/report` (granted and refused), `/world/node/claim` (granted and wrong-tool),
+`/world/mob/hit`, `/world/kill/report`, `/world/move`, `/world/feed`, `/world/event`, `/stats`,
+`/world/roster`, `/world/players`, `/assets/summary` keyed and unkeyed, `/health` — carry **zero**
+secret bytes, and `/stats.clientRpc` is `""`: it fails closed, with no fallback to `RPC_URL` and no
+rpc-shaped key carrying it under another name.

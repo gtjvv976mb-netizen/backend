@@ -13,7 +13,7 @@ import {
 import { createCup } from "./cup-live.js";   // Chikoria Cup live orchestrator (double-elim, deterministic resolver)
 import { createMatch as pvpCreate, submit as pvpSubmit, tick as pvpTick, viewFor as pvpView, forfeit as pvpForfeit, spectatorView as pvpSpectate } from "./pvp-engine.js";   // live PvP battles
 import { getAssociatedTokenAddressSync, createTransferCheckedInstruction, createAssociatedTokenAccountIdempotentInstruction, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";   // $CHIKI quest-reward payouts ($CHIKI is TOKEN-2022 — the legacy program rejects its accounts with InvalidAccountData)
-import { loadTerrain, terrainInfo } from "./world_terrain.js";     // the island heightfield — the server's copy of the floor
+import { loadTerrain, terrainInfo, terrainReady, surfaceHeight, SEA } from "./world_terrain.js";     // the island heightfield — the server's copy of the floor
 import * as PhysMod from "./world_physics.js";                     // server-side movement simulation (CHIK_PHYS=1; OFF by default)
 
 dotenv.config();
@@ -3561,6 +3561,74 @@ const CLAIM_TOKEN_REQUIRED = String(process.env.CHIK_CLAIM_TOKEN || "") === "1";
 const CLAIM_BURST = 40;           // per wallet per minute, a generous ceiling on honest play
 const claimRate = new Map();      // wallet -> {last, count, windowStart}
 
+// ============ STAGE 3: THE WORLD ADJUDICATES ACTIONS — CHIK_ACTIONS, OFF BY DEFAULT ============
+// Gathers, casts and strikes are all validated against the SERVER's own answer for where the actor
+// is and what the world contains. With the flag unset (the default, and what is deployed) NOTHING
+// here runs: actionPos() returns exactly the presence-row coordinates every reach check already
+// used, no tool is inspected, no cast is held, and every reply is byte-identical to today's —
+// old clients keep working forever. What the flag adds, and only adds:
+//
+//   POSITION. When CHIK_PHYS is also on, reach is measured against the physics state the server
+//   itself simulated (physStates) rather than the last relayed claim — the presence row already
+//   carries the corrected numbers (worldMoveApply stores physApply's answer), but reading the
+//   simulation directly cannot lag the row by a tick. A relay-only client falls back to its row,
+//   which is exactly today's rule.
+//
+//   TOOL SUITABILITY. A claim that NAMES an implement must name the one that node kind swings
+//   (Player.gd _GATHER_HELD, transcribed — this names today's behaviour, it does not rebalance it).
+//   A claim with no tool field is every shipped client and always passes; berries/honey/flower are
+//   bare-hand kinds, so only "" fits them. The refusal returns BEFORE the pace stamp, so a wrong
+//   tool never consumes the claim window — graceful, like every refusal on this route.
+//   THIS IS A CONSISTENCY CHECK, NOT AN AUTHORISATION, and the difference matters. Because a
+//   tool-less body must pass forever, a cheater deletes ONE key and the gate is gone (measured:
+//   _rv_actions_attack_sim.mjs A3 — an axe on a rock is 403, the identical claim with no `tool` is
+//   200 immediately after). Nor does it bind TIER or OWNERSHIP: NODE_TOOL maps kind -> implement
+//   NAME, nothing reads a level and nothing checks the wallet ever crafted one, because gear lives
+//   in the client-authored save. It catches an honest client that got its own rules wrong; it
+//   catches no attacker. Do not cite it as an anti-cheat control.
+//
+//   THE CAST. /world/fish/report gains the same two stand-downs a node claim always had: the warp
+//   hold (a cast teleported into is held for WARP_HOLD_MS, not consumed — the client's one-die
+//   fallback plays its local roll, so the player still lands a fish) and a WIDE water bound: a cast
+//   with no water anywhere within FISH_WATER_R of the server's position is not fishing. An honest
+//   angler is within FISH_SPOT_RANGE (24, Player.gd) of a school that swims IN water, so the 48-unit
+//   bound holds 2x margin over the furthest legitimate stance; with no terrain file the bound asks
+//   nothing (fail permissive — world_terrain answers SEA everywhere, i.e. water everywhere).
+//
+// Alive/unclaimed, cooldown, the one-item drop table, CLAIM_MIN_MS and the warp hold on claims and
+// strikes are NOT duplicated here — they are the existing gates above and below, unchanged.
+const ACTIONS_ON = String(process.env.CHIK_ACTIONS ?? "") === "1";
+if (ACTIONS_ON && !terrainReady()) loadTerrain();   // the water bound wants the real floor; absent file = permissive
+let _actToolRefusals = 0, _actCastHolds = 0, _actCastDry = 0, _actPhysPos = 0;
+export function _actionsStatsForTest() {
+  return { on: ACTIONS_ON, terrain: terrainReady(), toolRefusals: _actToolRefusals,
+           castHolds: _actCastHolds, castDry: _actCastDry, physPos: _actPhysPos };
+}
+// Which implement each node kind swings — transcribed from Player.gd _GATHER_HELD. An allowlist
+// keyed by kind; a kind absent here (berries/honey/flower) is bare-hand and only "" fits it.
+const NODE_TOOL = Object.freeze(Object.assign(Object.create(null), {
+  wood: "axe", stone: "pickaxe", iron: "pickaxe", gold: "pickaxe",
+  crystal: "drill", crystal_mine: "drill", seashell: "shovel", pig: "sword", cow: "sword",
+}));
+// The server's own answer for where a wallet stands. Flag off: exactly the presence row, exactly
+// as every reach check has always read it.
+function actionPos(wallet, me) {
+  if (ACTIONS_ON && PHYS_ON) {
+    const st = physStates.get(wallet);
+    if (st && st.driven) { _actPhysPos++; return { x: st.x, z: st.z }; }
+  }
+  return { x: (me && me.x) || 0, z: (me && me.z) || 0 };
+}
+const FISH_WATER_R = 48;      // 2x the furthest an honest angler can stand from a school's water
+const FISH_WATER_STEP = 8;    // sample stride; a school's pool is far wider than this
+function waterNear(x, z) {
+  if (!terrainReady()) return true;   // unknown terrain must never refuse a cast
+  for (let dx = -FISH_WATER_R; dx <= FISH_WATER_R; dx += FISH_WATER_STEP)
+    for (let dz = -FISH_WATER_R; dz <= FISH_WATER_R; dz += FISH_WATER_STEP)
+      if (surfaceHeight(x + dx, z + dz) < SEA) return true;
+  return false;
+}
+
 app.post("/world/node/claim", (req, res) => {
   const b = req.body || {};
   if (!isPresenceId(b.wallet)) return res.status(400).json({ error: "valid wallet required" });
@@ -3615,10 +3683,25 @@ app.post("/world/node/claim", (req, res) => {
   //     the reach check already parsed changes nothing for it — and it is what makes a future node
   //     manifest lookup sound, because a manifest consulted with a non-canonical key is no manifest.
   id = `${kind}:${Math.round(nx)}:${Math.round(nz)}`;
-  const dist = Math.hypot(nx - (me.x || 0), nz - (me.z || 0));
+  // Reach is measured against the SERVER's answer for where this wallet stands: with CHIK_ACTIONS
+  // and CHIK_PHYS both on that is the simulated physics state; otherwise it is the presence row,
+  // exactly the values this line always read (actionPos is a pass-through with the flag off).
+  const _ap = actionPos(b.wallet, me);
+  const dist = Math.hypot(nx - _ap.x, nz - _ap.z);
   const claimRadius = Object.hasOwn(CLAIM_RADIUS_KIND, kind) ? CLAIM_RADIUS_KIND[kind] : CLAIM_RADIUS;
   if (dist > claimRadius) {
     return res.status(403).json({ ok: false, error: "out of reach", dist: Math.round(dist) });
+  }
+  // 2d. STAGE 3 (CHIK_ACTIONS): a claim that NAMES an implement must name the right one. No tool
+  //     field (every shipped client) always passes; the refusal sits BEFORE the pace stamp below,
+  //     so a wrong tool never consumes the player's claim window.
+  if (ACTIONS_ON) {
+    const _tool = String(b.tool ?? "").slice(0, 16);
+    const _needs = Object.hasOwn(NODE_TOOL, kind) ? NODE_TOOL[kind] : "";
+    if (_tool && _tool !== _needs) {
+      _actToolRefusals++;
+      return res.status(403).json({ ok: false, error: "wrong tool", tool: _tool, needs: _needs || "bare hands" });
+    }
   }
 
   // 3. no claiming faster than a human can gather
@@ -3729,7 +3812,7 @@ const FISH_REC_MIN_MS = 800;         // cap the COUNTED rate to human scale; hon
 const FFISH_DAILY_MAX = Math.max(1, Number(process.env.FFISH_DAILY_MAX || 60));
 const _ffishDay = new Map();         // wallet -> { day, n }
 let _ffishCapped = 0;                // observability: legends dropped by the daily ceiling
-export function _ffishDayStatsForTest(w) { return { capped: _ffishCapped, row: _ffishDay.get(String(w)) || null }; }
+export function _ffishDayStatsForTest(w) { return { capped: _ffishCapped, outlevelled: _ffishOutlevelled, row: _ffishDay.get(String(w)) || null }; }
 // sim seam: seed a wallet's day counter so the ceiling can be exercised without a real day of casts
 export function _setFfishDayForTest(w, n) { _ffishDay.set(String(w), { day: Math.floor(Date.now() / 86400000), n: Math.max(0, n | 0) }); return n; }
 // ============ THE SERVER ROLLS THE CATCH — fantasy fish become witnessed, like eggs ============
@@ -3769,6 +3852,24 @@ const FFISH_CATCH_BASE = Object.freeze(Object.assign(Object.create(null), {   //
 const FFISH_ROD_REQ = Object.freeze(Object.assign(Object.create(null), {      // mirrors Econ.gd FFISH_ROD_REQ
   golden_chikifish: 2, crystal_koi: 4, mystic_eel: 6, rainbow_fish: 8,
 }));
+// THE TRAINER-LEVEL GATE IS THE CLIENT'S, AND THE SERVER HAS TO HONOUR IT OR THE CHRONICLE LIES.
+// The ROD decides what can be hooked; the TRAINER LEVEL decides what can be LANDED. Player.gd snaps
+// the line the instant a legend above Econ.FFISH_LEVEL is struck (_on_action, "outclassed"): the
+// player is told "the Golden Chikifish SNAPPED the line — reach Trainer Lv 5", banks nothing, and
+// the fish is gone. The server had already ownCredit'ed the ffish and announced the catch in the
+// world feed — so a level-3 angler's chronicle row said they caught a fish they watched get away,
+// and the acquisition book FFISH_AUTHORITY will one day enforce held an entitlement their save
+// never had. Measured in _rv_fish_attack_sim.mjs case C2 (lvl:1 wallet, feed row golden_chikifish).
+//
+// `lvl` IS CLIENT-ASSERTED, AND THAT IS FINE HERE BECAUSE THE GATE ONLY EVER SUBTRACTS. A caller who
+// inflates it, or omits it, gets exactly the answer they get today — so this adds no attack surface
+// and can never refuse anything a liar could not already have. An ABSENT lvl is "no assertion", not
+// "level 0": every already-shipped client sends none, so nothing deployed changes shape.
+const FFISH_LEVEL = Object.freeze(Object.assign(Object.create(null), {        // mirrors Econ.gd FFISH_LEVEL
+  golden_chikifish: 5, crystal_koi: 10, mystic_eel: 15, rainbow_fish: 20,
+}));
+let _ffishOutlevelled = 0;           // observability: legends the caller's own level could not land
+export function _ffishLevelReqForTest(sp) { return Object.hasOwn(FFISH_LEVEL, sp) ? FFISH_LEVEL[sp] : 0; }
 const FFISH_ROD_FLOOR = 0.30;
 const FISH_TIER_MULT = Object.freeze({ 1: 1.0, 2: 2.2, 3: 4.0 });
 function ffishCatchChance(sp, tier, rod) {
@@ -3787,6 +3888,9 @@ function rollFantasyCatch(tier, rod) {
   for (const sp of FFISH_ORDER) if (Math.random() < ffishCatchChance(sp, tier, rod)) return sp;
   return "";
 }
+// Sim seam: the odds table itself, so the client's Econ.ffish_catch_chance can be DIFFED against the
+// exact function the authoritative roll uses (fish_onedie_sim.js) instead of trusted to mirror it.
+export function _ffishChanceForTest(sp, tier, rod) { return ffishCatchChance(sp, tier, rod); }
 
 // ============ LIVE EVENT: the fishing festival (admin-scheduled, e.g. 24h of 4x legends) ============
 // One multiplier, applied inside ffishCatchChance — the SAME chokepoint the client mirrors — so the
@@ -3831,6 +3935,23 @@ app.post("/world/fish/report", (req, res) => {
   // you have to actually be in the world (same presence gate as a node claim)
   const me = worldPlayers.get(String(b.wallet));
   if (!me || now - me.ts > WORLD_TTL_MS) return res.status(403).json({ ok: false, error: "no live presence" });
+  // STAGE 3 (CHIK_ACTIONS): the cast is adjudicated like a claim. Both refusals return BEFORE the
+  // _lastFishRec stamp, so a refused cast is never consumed — the one-die client's verdict comes
+  // back know=false and it plays its local roll, so the player still lands their fish.
+  if (ACTIONS_ON) {
+    // a cast teleported into is held exactly as a gather is (see /world/move's warp stamp)
+    if (me.warp && now - me.warp < WARP_HOLD_MS) {
+      _actCastHolds++;
+      return res.status(403).json({ ok: false, error: "catch your breath", retryInMs: WARP_HOLD_MS - (now - me.warp) });
+    }
+    // ...and a cast with no water anywhere near the server's own position is not fishing. WIDE
+    // bound (FISH_WATER_R, 2x the furthest honest stance) and permissive without terrain.
+    const _fp = actionPos(String(b.wallet), me);
+    if (!waterNear(_fp.x, _fp.z)) {
+      _actCastDry++;
+      return res.status(403).json({ ok: false, error: "no water here" });
+    }
+  }
   // count at most one fish per human-plausible interval — a spammed loop cannot inflate the ceiling
   const last = _lastFishRec.get(String(b.wallet)) || 0;
   if (now - last < FISH_REC_MIN_MS) return res.json({ ok: true, counted: false });
@@ -3846,6 +3967,14 @@ app.post("/world/fish/report", (req, res) => {
   const _tier = Math.min(3, Math.max(1, Math.floor(Number(b.tier)) || 1));
   const _rod = Math.min(10, Math.max(0, Math.floor(Number(b.rod)) || 0));
   let _legend = rollFantasyCatch(_tier, _rod);
+  // A LEGEND THE ANGLER CANNOT LAND IS NOT A CATCH. See FFISH_LEVEL: the client snaps the line on
+  // exactly this condition, so crediting and chronicling it made the world feed announce a fish the
+  // player was shown getting away. Placed BEFORE the daily ceiling so a snapped line never spends a
+  // cap slot either. Only a NUMBER is an assertion — an absent/garbage lvl leaves today's behaviour.
+  const _lvl = Math.floor(Number(b.lvl));
+  if (_legend && Number.isFinite(_lvl) && _lvl >= 1 && _lvl < FFISH_LEVEL[_legend]) {
+    _legend = ""; _ffishOutlevelled++;
+  }
   // A DAY'S FISHING IS A DAY'S FISHING. tier and rod are asserted by the caller and only clamped, so
   // a keypair that has never played can post {tier:3, rod:10} at the 800 ms floor and win the lottery
   // 4,500 times an hour — measured 157.84 legends per 4,500 reports, i.e. ~3,780 witnessed fantasy
@@ -4704,7 +4833,10 @@ app.post("/world/mob/hit", (req, res) => {
   //    The anchor is also CARRIED BY THE MONSTER'S OWN MOTION (stored as an offset from the idle point
   //    at anchor time) and EXPIRES after MOB_ANCHOR_TTL of no accepted strike, so a stale fight releases
   //    rather than pinning a live monster to a spot it walked away from minutes ago.
-  const px = me.x || 0, pz = me.z || 0;
+  // STAGE 3: the striker's position is the SERVER's answer (physics state under CHIK_ACTIONS +
+  // CHIK_PHYS, else the presence row — actionPos is a pass-through with the flag off).
+  const _sp = actionPos(String(b.wallet), me);
+  const px = _sp.x, pz = _sp.z;
   const ip = mobIdlePos(idx, now / 1000);
   const fromIdle = Math.hypot(ip.x - px, ip.z - pz);
   const fromHome = Math.hypot(spec[1] - px, spec[2] - pz);
@@ -6977,9 +7109,17 @@ function worldMoveApply(b) {
   // attacker is held to WARP_MAX_UPS whatever their message rate. The one-shot allowance is
   // 110 * 2.5 = 275 u — TIGHTER than the old rule already gave for any gap over 2 s (at dt 10 s the
   // old rule allowed 1160 u in a single ping).
+  // A PURE-INPUT CLIENT CLAIMS NO COORDINATES, so there is no jump to measure: clampF defaults its
+  // x/z to 0, and measuring the "jump" to the ORIGIN stamped a warp on every input-only ping — an
+  // honest CHIK_PHYS client was permanently stood down from every gather (measured in
+  // stage3_actions_sim before this guard). Only a body that CLAIMS a position can look like a
+  // teleport, and for input-driven clients physApply below stamps its own warp on every implausible
+  // claim. Guarded on PHYS_ON so the deployed relay fleet (which always claims coordinates, and
+  // where a coordinate-less body really did mean "you moved to 0,0") is byte-identical to today.
+  const _claims = b.x !== undefined || b.z !== undefined;
   let _warp = _prev ? _prev.warp : 0;
   let _wbank = WARP_BANK_S;
-  if (_prev && Number.isFinite(_prev.x)) {
+  if (_prev && Number.isFinite(_prev.x) && (_claims || !PHYS_ON)) {
     const _el = Math.max(0, (Date.now() - (_prev.ts || Date.now())) / 1000);
     _wbank = Math.min(WARP_BANK_S, (Number.isFinite(_prev.wbank) ? _prev.wbank : WARP_BANK_S) + _el);
     const _jump = Math.hypot(x - _prev.x, z - _prev.z);
