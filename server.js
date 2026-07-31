@@ -1550,6 +1550,11 @@ async function adminGiftChiki(req, res) {
     res.json({ ok: true, pending: false, granted: { sp: si, level: lv, isLegend, nick: gift.nick } });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 }
+// Read-only, public: the island's chronicle — the same last-8 ring every client renders under its
+// minimap. For the operator ("did any events happen?"), the website, and diagnosis. Writes nothing.
+app.get("/world/feed", (_req, res) => {
+  res.json({ count: worldFeed.length, feed: worldFeed });
+});
 // Read-only, public: is a festival on? The operator's answer to "did my curl land?", the website's
 // banner source, and the only status check that needs no login and writes nothing.
 app.get("/world/event", (_req, res) => {
