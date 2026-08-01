@@ -5490,8 +5490,13 @@ function regEvent(row, what, extra) { row.chain.push(Object.assign({ at: Date.no
 // GRANDFATHERING: a species already past its cap simply stops issuing — nothing is ever deleted or
 // taken back. Over-issued holders keep what they have; the cap binds from here on.
 const ASSET_SUPPLY = Object.freeze({
-  avatar: Object.freeze({ classic: 500, Knight: 200, Mystic: 100, Navigator: 300, Star: 200,
-                          chemist: 50, electro: 300, fire: 300, night: 100, sailor: 200 }),
+  // Avatar caps divided by 5 (owner decision, 2026-08-01) — scarcity tightened across the board.
+  // Safe against grandfathering: every live issued count was BELOW its new cap when this was applied
+  // (worst headroom classic 22/100, chemist 3/10), so no holder is stranded above a cap. mintAsset
+  // refuses at the cap and never revokes, so even if a count later resolves higher, minting simply
+  // stops — nothing is ever taken back.
+  avatar: Object.freeze({ classic: 100, Knight: 40, Mystic: 20, Navigator: 60, Star: 40,
+                          chemist: 10, electro: 60, fire: 60, night: 20, sailor: 40 }),
   mount:  Object.freeze({ chicken: 15, boar: 20, gator: 15, horse: 10, wolf: 10, griffin: 5 }),
 });
 // ============ ONE CENSUS, THREE RECORD SOURCES ============
