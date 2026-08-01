@@ -360,6 +360,7 @@ function pgStore() {
   });
   return {
     kind: "postgres",
+    async ping() { await pool.query("SELECT 1 FROM players LIMIT 0"); return true; },
     async init() {
       await pool.query(`
         CREATE TABLE IF NOT EXISTS players(
@@ -625,6 +626,7 @@ function memStore() {
   const get = (w) => players.get(w);
   return {
     kind: "memory",
+    async ping() { return true; },
     async init() {},
     async kvGet(k) { return kv.has(k) ? kv.get(k) : null; },
     async kvSet(k, v) { kv.set(k, v); },
@@ -775,7 +777,12 @@ let battleWins = {};   // wallet -> count of server-resolved match wins
 const winsOf = (w) => Number(battleWins[w] || 0);
 let _winsDirty = false;
 function recordWin(wallet) { if (!isPubkey(wallet)) return; battleWins[wallet] = winsOf(wallet) + 1; _winsDirty = true; }
-async function saveBattleWins() { if (!_winsDirty) return; _winsDirty = false; try { await store.kvSet("battle_wins", battleWins); } catch (e) {} }
+async function saveBattleWins(strict = false) {
+  if (!_winsDirty) return;
+  _winsDirty = false;
+  try { await store.kvSet("battle_wins", battleWins); }
+  catch (e) { _winsDirty = true; if (strict) throw e; }
+}
 setInterval(() => { saveBattleWins().catch(() => {}); }, 15000);   // flush the win ledger periodically
 
 // ============ THE FLIP (2026-08-01): SERVER AUTHORITY ON BY DEFAULT, GRACE FOR THE OLD FLEET ============
@@ -832,10 +839,10 @@ const CRED_LATCH_TTL_MS = Math.max(0, Number(process.env.CHIK_CRED_LATCH_TTL_H ?
 const credLatch = new Map();          // "cls:wallet" -> { f: firstProvenTs, l: lastProvenTs }
 let _credLatchDirty = false, _credLatchTimer = null, _credLatchSavedAt = 0;
 let _graceClaims = 0, _graceQuests = 0, _graceCups = 0, _latchRefusals = 0;
-function saveCredLatchNow() {
+function saveCredLatchNow(strict = false) {
   _credLatchDirty = false; _credLatchSavedAt = Date.now();
   const o = {}; for (const [k, e] of credLatch) o[k] = { f: e.f, l: e.l };
-  return store.kvSet("cred_latch", o).catch(() => {});
+  return store.kvSet("cred_latch", o).catch(e => { _credLatchDirty = true; if (strict) throw e; });
 }
 // Same throttle shape as the world feed's: at most one write per 5 s, plus a trailing timer so a
 // burst's tail is never the row a restart forgets. The timer is unref'd — it must not hold the
@@ -1384,14 +1391,30 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-app.get("/health", async (_q, res) => res.json({
-  ok: true, network: NETWORK, store: store.kind, verifyHolders: verifyOn,
-  treasury: treasury.publicKey.toBase58(), team: TEAM_WALLET || null,
-  mint: CHIKI_MINT || null, minHold: MIN, minHoldMinutes: Number(MIN_HOLD_MINUTES),
-  dailyCap: DAILY_FRAC >= 1 ? "none" : Math.round(DAILY_FRAC * 100) + "% pool/day", perWalletDailySol: WALLET_DAILY, poolReserveSol: RESERVE,
-  maxClaimSol: CAP, earnModel: "rarity-weighted-tasks", earnMult: MULT, taskSeconds: TASK_SEC, accrualCapMin: ACCRUAL_CAP,
-  whaleMin: WHALE_MIN, whaleHoldHours: Number(WHALE_HOLD_HOURS),
-}));
+// Render sends SIGTERM before taking an instance away. From that instant onward, stop accepting
+// new work on keep-alive connections while requests already in flight are allowed to finish.
+let _draining = false, _chatReady = false;
+app.use((req, res, next) => {
+  if (_draining === false || req.path === "/health") return next();
+  res.set("Retry-After", "30");
+  return res.status(503).json({ error: "server is restarting; retry shortly" });
+});
+
+app.get("/health", async (_q, res) => {
+  let dbReady = false;
+  try { await store.ping(); dbReady = true; } catch {}
+  const stateReady = _assetsReady && _ownReady;
+  const ok = _draining === false && dbReady && _chatReady && stateReady;
+  res.status(ok ? 200 : 503).json({
+    ok, draining: _draining, dbReady, chatReady: _chatReady, stateReady,
+    network: NETWORK, store: store.kind, verifyHolders: verifyOn,
+    treasury: treasury.publicKey.toBase58(), team: TEAM_WALLET || null,
+    mint: CHIKI_MINT || null, minHold: MIN, minHoldMinutes: Number(MIN_HOLD_MINUTES),
+    dailyCap: DAILY_FRAC >= 1 ? "none" : Math.round(DAILY_FRAC * 100) + "% pool/day", perWalletDailySol: WALLET_DAILY, poolReserveSol: RESERVE,
+    maxClaimSol: CAP, earnModel: "rarity-weighted-tasks", earnMult: MULT, taskSeconds: TASK_SEC, accrualCapMin: ACCRUAL_CAP,
+    whaleMin: WHALE_MIN, whaleHoldHours: Number(WHALE_HOLD_HOURS),
+  });
+});
 
 app.get("/pool", async (_q, res) => {
   try { res.json({ poolSol: await poolSol(), players: await store.count(), dailyPaid: await store.dailyTotal() }); }
@@ -3635,25 +3658,14 @@ export function _ownAvailFor(w, kind, item) { return ownAvailable(String(w), kin
 export function _matFlipStateForTest() { return { clamps: _matSaveClamps, observedOnly: _matSaveObserved, skipped: _matSaveSkipped, baselines: _matBaselines, flagged: _matFlags.size }; }
 export function _matSaveBoundForTest(w, m) { const r = ownBook.get(String(w)); return r ? matSaveBound(r, m) : UNWITNESSED_ALLOWANCE; }
 
-async function saveWorldNodes() {
+async function saveWorldNodes(strict = false) {
   if (!_nodesDirty) return;
   _nodesDirty = false;
   try {
     await store.kvSet("world_nodes", serializeWorldNodes());
-  } catch (e) { _nodesDirty = true; }   // a failed write must not silently drop the world
+  } catch (e) { _nodesDirty = true; if (strict) throw e; }   // a failed write must not silently drop the world
 }
 setInterval(saveWorldNodes, NODE_SAVE_MS).unref?.();
-// Render sends SIGTERM on every deploy — flush so the last claims before a push are not lost.
-// ONE handler for everything that needs flushing: a second handler calling process.exit() would
-// race this one and kill the process mid-write. saveAssetLedger is a hoisted declaration below.
-for (const sig of ["SIGTERM", "SIGINT"]) {
-  process.on(sig, () => {
-    // await the IN-FLIGHT flush first, then run one more for anything minted since it started —
-    // exiting on a clean dirty flag aborted the write that was still carrying the newest assets.
-    Promise.allSettled([saveWorldNodes(), saveWorldMobs(), Promise.resolve(_assetsFlush).then(() => saveAssetLedger())])
-      .finally(() => process.exit(0));
-  });
-}
 
 store.kvGet("world_nodes").then(v => {
   const r = restoreWorldNodes(v);
@@ -4170,9 +4182,9 @@ async function restoreWorldFeed() {
 }
 restoreWorldFeed();
 let _feedSavedAt = 0, _feedSaveTimer = null;
-function saveWorldFeedNow() {
+function saveWorldFeedNow(strict = false) {
   _feedSavedAt = Date.now();
-  return store.kvSet("world_feed", worldFeed.slice(-WORLD_FEED_MAX)).catch(() => {});
+  return store.kvSet("world_feed", worldFeed.slice(-WORLD_FEED_MAX)).catch(e => { if (strict) throw e; });
 }
 function saveWorldFeed() {
   const now = Date.now();
@@ -5682,9 +5694,9 @@ export function restoreWorldMobs(v, now = Date.now()) {
   return n;
 }
 store.kvGet("world_mobs").then((v) => { const n = restoreWorldMobs(v); if (n) console.log(`world mobs restored: ${n} still down`); }).catch(() => {});
-async function saveWorldMobs() {
+async function saveWorldMobs(strict = false) {
   try { await store.kvSet("world_mobs", serializeWorldMobs()); }
-  catch (e) { console.warn("saveWorldMobs failed:", String(e?.message || e)); }
+  catch (e) { console.warn("saveWorldMobs failed:", String(e?.message || e)); if (strict) throw e; }
 }
 setInterval(saveWorldMobs, 10000).unref?.();
 
@@ -7246,7 +7258,7 @@ let _assetsReady = false;
 // `process.exit(0)` in its .finally aborted the very write that carried a just-minted egg — an
 // asset the player paid fantasy fish for, gone, on a GRACEFUL shutdown.
 let _assetsFlush = null;
-async function saveAssetLedger() {
+async function saveAssetLedger(strict = false) {
   if (_assetsFlush) return _assetsFlush;          // re-entry joins the write already running
   if (!_assetsDirty || !_assetsReady) return;
   _assetsDirty = false;
@@ -7256,7 +7268,7 @@ async function saveAssetLedger() {
       // destroys a player's property, which the ledger (a derived record) can never do.
       await store.kvSet("asset_registry", serializeAssetReg());
       await store.kvSet("asset_ledger", serializeAssetLedger());
-    } catch (e) { _assetsDirty = true; }          // a failed write must not silently drop the record
+    } catch (e) { _assetsDirty = true; if (strict) throw e; }          // a failed write must not silently drop the record
     finally { _assetsFlush = null; }
   })();
   return _assetsFlush;
@@ -7875,6 +7887,10 @@ function attachWorldSocket(server) {
   server.on("upgrade", (req, socket, head) => {
     const path = String(req.url || "").split("?")[0];
     if (path !== WS_PATH) { socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"); socket.destroy(); return; }
+    if (_draining === true) {
+      socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nRetry-After: 30\r\n\r\n");
+      socket.destroy(); return;
+    }
     if (!WS_ON) {   // the kill switch: the endpoint does not exist, and the client falls back to polling
       socket.write("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\nX-Chik-Ws: off\r\n\r\n");
       socket.destroy(); return;
@@ -8806,7 +8822,7 @@ store.kvGet("own_book").then(v => restoreOwnBook(v)).catch(() => { _ownReady = t
 // half-book: the .catch above and this backstop both flip the flag, and a skip is counted either way.
 setTimeout(() => { if (!_ownReady) { _ownReady = true; console.error("own_book restore timed out — enforcing on what restored"); } }, 20000);
 
-async function saveMarket() {
+async function saveMarket(strict = false) {
   try {
     await Promise.all([
       store.kvSet("market_listings", marketListings.slice(-400)),
@@ -8829,7 +8845,7 @@ async function saveMarket() {
       // awaits this on every op, including list.
       store.kvSet("own_book", serializeOwnBook()),
     ]);
-  } catch (e) { console.warn("saveMarket persist failed:", String(e?.message || e)); }
+  } catch (e) { console.warn("saveMarket persist failed:", String(e?.message || e)); if (strict) throw e; }
 }
 // ---- MARKET SESSION AUTH ----
 // The marketplace keys settlement on the client's `sid` (a per-install net_id). That sid is PUBLIC
@@ -9456,6 +9472,105 @@ app.post("/market/op", async (req, res) => {
   res.json({ ok: true, cancelled, returned, listings: marketListings.slice(-300) });
 });
 
+function shutdownDmSnapshot(now = Date.now()) {
+  const cutoff = now - 30 * 24 * 3600 * 1000;
+  const obj = {};
+  for (const [k, a] of worldDM) {
+    const kept = a.filter(m => (m.ts || 0) > cutoff).slice(-200);
+    if (kept.length) obj[k] = kept;
+  }
+  return obj;
+}
+
+function shutdownMarketSigSnapshot() {
+  return [..._usedTxSigs].map(([sig, e]) => ({
+    sig, listingId: e.listingId, orderId: e.orderId, buyer: e.buyer,
+    released: e.released, ts: e.ts,
+  }));
+}
+
+function shutdownPositiveMap(m) {
+  const o = {};
+  for (const [k, v] of m) if (v > 0) o[k] = v;
+  return o;
+}
+
+async function flushDurableState() {
+  // Ownership and the market are one save because escrow is derived from the board. The asset
+  // ledger first joins any write already in flight, then performs one final dirty pass.
+  const jobs = [
+    ["battle wins", () => saveBattleWins(true)],
+    ["credential latch", () => _credLatchDirty ? saveCredLatchNow(true) : Promise.resolve()],
+    ["world nodes", () => saveWorldNodes(true)],
+    ["world mobs", () => saveWorldMobs(true)],
+    ["asset ledger", () => Promise.resolve(_assetsFlush).then(() => saveAssetLedger(true))],
+    ["world feed", () => saveWorldFeedNow(true)],
+    ["world chat", () => store.kvSet("world_chat", worldChat.slice(-1000))],
+    ["world DMs", () => store.kvSet("world_dm", shutdownDmSnapshot())],
+    ["parties", () => store.kvSet("world_parties", serializeParties())],
+    ["market signatures", () => store.kvSet("market_used_sigs", shutdownMarketSigSnapshot())],
+    ["market tokens", () => store.kvSet("market_tokens", marketTokens)],
+    ["market sid owners", () => store.kvSet("market_sid_owner", sidOwner)],
+    ["market wallet sids", () => store.kvSet("market_wallet_sid", walletSid)],
+    ["market and ownership", () => saveMarket(true)],
+    ["bans", () => store.kvSet("banned_wallets", [...bannedWallets])],
+    ["pending gifts", () => store.kvSet("pending_gifts", pendingGifts)],
+    ["fishing event", () => store.kvSet("fish_event", _fishEvent)],
+    ["meme ledger", () => Promise.all([
+      store.kvSet("meme_minted", memeMinted),
+      store.kvSet("meme_hatches", memeHatches),
+      store.kvSet("meme_used_sigs", memeUsedSigs),
+    ])],
+    ["cup state", () => store.kvSet("cup_state", liveCup ? liveCup.snapshot() : null)],
+    ["cup public flag", () => store.kvSet("cup_public", cupPublic)],
+    ["cup auto flag", () => store.kvSet("cup_auto", cupAuto)],
+    ["cup prizes", () => store.kvSet("cup_prizes", shutdownPositiveMap(cupPrizes))],
+    ["cup payers", () => store.kvSet("cup_payers", shutdownPositiveMap(cupPayers))],
+    ["glory credits", () => store.kvSet("glory_credits", shutdownPositiveMap(gloryCredits))],
+    ["cup awarded", () => store.kvSet("cup_total_awarded", cupTotalAwarded)],
+    ["cup champion", () => store.kvSet("cup_champion", cupChampion)],
+  ];
+  const results = await Promise.allSettled(jobs.map(([, run]) => Promise.resolve().then(run)));
+  const failed = results.flatMap((r, i) => r.status === "rejected" ? [jobs[i][0]] : []);
+  if (failed.length) throw new Error(`shutdown flush failed: ${failed.join(", ")}`);
+}
+
+async function gracefulShutdown(sig, httpServer) {
+  if (_draining === true) return;
+  _draining = true;
+  console.log(`${sig} received — draining requests and flushing durable state`);
+
+  // A socket must not keep producing world mutations while the final snapshot is being written.
+  for (const ws of wsClients) { try { ws.terminate(); } catch {} }
+
+  // Render's default shutdown window is 30 s. Give in-flight HTTP work up to 12 s, leaving the
+  // remainder for two database passes. Closing idle connections prevents keep-alive from delaying it.
+  await new Promise(resolve => {
+    let settled = false;
+    let timer = null;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve();
+    };
+    timer = setTimeout(() => { httpServer.closeAllConnections?.(); finish(); }, 12000);
+    httpServer.close(finish);
+    httpServer.closeIdleConnections?.();
+  });
+
+  try {
+    // The second pass catches a mutation that was already awaiting its first store write.
+    await flushDurableState();
+    await flushDurableState();
+    console.log("shutdown flush complete");
+    process.exit(0);
+  } catch (e) {
+    console.error("shutdown flush FAILED:", e?.stack || e);
+    process.exit(1);
+  }
+}
+
 // Open the port FIRST so Render detects it immediately (no "No open ports" timeout on a cold DB),
 // then initialize the DB in the background (errors logged, not fatal — the server stays up and recovers).
 const httpServer = app.listen(Number(PORT), () => {
@@ -9463,5 +9578,6 @@ const httpServer = app.listen(Number(PORT), () => {
   console.log(`verifyHolders=${verifyOn} · holdMin=${MIN_HOLD_MINUTES} · dailyCap=${DAILY_FRAC>=1?"none":Math.round(DAILY_FRAC*100)+"% pool/day"} · perWallet=${WALLET_DAILY} SOL`);
 });
 attachWorldSocket(httpServer);   // the SECOND transport — see the block above /world/move's neighbours
+for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => { void gracefulShutdown(sig, httpServer); });
 store.init().then(()=>{ console.log("store ready"); return loadCupState(); }).then(()=>console.log(`cup state loaded (public=${cupPublic}, owed prizes=${cupPrizes.size})`)).catch(e=>console.error("store.init failed:", e?.message||e));
-chat.init().then(()=>console.log("chat ready")).catch(e=>console.error("chat.init failed:", e?.message||e));
+chat.init().then(()=>{ _chatReady = true; console.log("chat ready"); }).catch(e=>console.error("chat.init failed:", e?.message||e));
