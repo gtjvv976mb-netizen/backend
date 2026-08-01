@@ -24,6 +24,10 @@ process.env.ADMIN_KEY = "simonly-" + crypto.randomBytes(8).toString("hex");
 delete process.env.DATABASE_URL;
 delete process.env.MARKET_ONCHAIN;
 delete process.env.CHIK_MAT_ENFORCE;
+// This fixture audits the material ledger in isolation. The production flip now defaults fantasy-
+// fish authority ON, which correctly rejects its deliberately fish-less egg recipe before the
+// material debit under test. Pin that independent rail off here; the all-on matrix covers it.
+process.env.FFISH_AUTHORITY = "0";
 
 function signIn(kp) {
   const wallet = kp.publicKey.toBase58();

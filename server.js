@@ -778,14 +778,127 @@ function recordWin(wallet) { if (!isPubkey(wallet)) return; battleWins[wallet] =
 async function saveBattleWins() { if (!_winsDirty) return; _winsDirty = false; try { await store.kvSet("battle_wins", battleWins); } catch (e) {} }
 setInterval(() => { saveBattleWins().catch(() => {}); }, 15000);   // flush the win ledger periodically
 
+// ============ THE FLIP (2026-08-01): SERVER AUTHORITY ON BY DEFAULT, GRACE FOR THE OLD FLEET ============
+// Every stage of server authority now defaults ON, and every flag stays a KILL SWITCH: setting the
+// env var to exactly "0" turns that piece off and restores the pre-flip behaviour. The three auth
+// gates (CHIK_CLAIM_TOKEN, CHIK_CUP_AUTH, CHIK_QUEST_AUTH) take three values:
+//     "0"                 OFF — observe/log only, exactly the pre-flip default.
+//     unset / "" / "1"    GRACE — the shipping default. A credential is judged strictly when sent;
+//                         a request WITHOUT one is forgiven while the old cached fleet drains,
+//                         except where the LATCH below has matured.
+//     "2" / "strict"      STRICT — refuse every unproven request immediately (the old "=1").
+//
+// WHY GRACE EXISTS, stated plainly. The deployed fleet (f8e1463525 live, d9f6053cd6 staged) does not
+// attach mktToken on /world/node/claim, and older cached builds do not attach credentials on
+// /quest/complete or /cup/* either; browser caches keep a superseded build alive for hours-to-days
+// after a deploy. A gate that hard-refuses on day one silences honest players — that is how the gold
+// wipe and the July egg wipe happened, and it is the one failure this flip must never have. So
+// enforcement arrives in two steps:
+//
+//   THE LATCH (per wallet, per route-class): the first PROVEN request latches the wallet as
+//   credential-capable. Once the latch is CRED_LATCH_MATURE_MS old — comfortably past the browser
+//   cache horizon, so the same player's other, older cached device has turned over too — an
+//   UNPROVEN request from that wallet is refused. Stripping the credential therefore buys an
+//   attacker nothing against any wallet that has been on a current client since maturity; it only
+//   leaves the never-proven population, which is exactly the population grace exists for, and whose
+//   exposure is not new. The latch is persisted (kv "cred_latch") so a restart cannot restart every
+//   wallet's maturity clock; losing it anyway fails LENIENT (back to grace), never refusing.
+//
+//   THE WINDOW: CHIK_CLAIM_GRACE_H / CHIK_AUTH_GRACE_H hours after CHIK_FLIP_EPOCH_MS, unproven
+//   claim/quest requests from never-latched PUBKEY wallets stop being forgiven too (net_ids always
+//   stand alone — the id is the secret, presenceOk's rule). The default (336h = 14 days) is far past
+//   any cache horizon. The Cup deliberately has NO window: a desktop/demo player can never mint a
+//   token, so its live-presence fallback is permanent and only the matured latch ever hardens a
+//   wallet — full credential enforcement there applies exactly to wallets that proved they can send one.
+//
+// WHAT GRACE DOES NOT PROTECT while it lives, so nobody mistakes it for enforcement: an unproven
+// pubkey claim can still burn a victim's node cooldowns (denial-of-gathering — the attacker gains no
+// material, recordGather credits the victim), and an unproven quest report can still mint pouch
+// LIABILITY for an arbitrary wallet (a review list, not a payout — no $CHIKI moves without an
+// admin-signed batch). Both are today's exposures, unchanged in kind, shrinking with the fleet, and
+// closed at latch maturity / window close.
+function gateFlipMode(name) {
+  const v = String(process.env[name] ?? "").trim().toLowerCase();
+  if (v === "0") return "off";
+  if (v === "2" || v === "strict") return "strict";
+  return "grace";
+}
+const FLIP_EPOCH_MS = (() => { const v = Number(process.env.CHIK_FLIP_EPOCH_MS);
+  return Number.isFinite(v) && v > 0 ? v : Date.parse("2026-08-01T00:00:00Z"); })();
+const CLAIM_GRACE_MS = Math.max(0, Number(process.env.CHIK_CLAIM_GRACE_H ?? 336)) * 3600_000;
+const AUTH_GRACE_MS  = Math.max(0, Number(process.env.CHIK_AUTH_GRACE_H  ?? 336)) * 3600_000;
+const CRED_LATCH_MATURE_MS = Math.max(0, Number(process.env.CHIK_CRED_LATCH_H ?? 72)) * 3600_000;
+const CRED_LATCH_TTL_MS = Math.max(0, Number(process.env.CHIK_CRED_LATCH_TTL_H ?? 720)) * 3600_000;
+const credLatch = new Map();          // "cls:wallet" -> { f: firstProvenTs, l: lastProvenTs }
+let _credLatchDirty = false, _credLatchTimer = null, _credLatchSavedAt = 0;
+let _graceClaims = 0, _graceQuests = 0, _graceCups = 0, _latchRefusals = 0;
+function saveCredLatchNow() {
+  _credLatchDirty = false; _credLatchSavedAt = Date.now();
+  const o = {}; for (const [k, e] of credLatch) o[k] = { f: e.f, l: e.l };
+  return store.kvSet("cred_latch", o).catch(() => {});
+}
+// Same throttle shape as the world feed's: at most one write per 5 s, plus a trailing timer so a
+// burst's tail is never the row a restart forgets. The timer is unref'd — it must not hold the
+// process open.
+function saveCredLatch() {
+  _credLatchDirty = true;
+  if (Date.now() - _credLatchSavedAt > 5000) { saveCredLatchNow(); return; }
+  if (!_credLatchTimer) {
+    _credLatchTimer = setTimeout(() => { _credLatchTimer = null; if (_credLatchDirty) saveCredLatchNow(); }, 5000);
+    if (_credLatchTimer.unref) _credLatchTimer.unref();
+  }
+}
+store.kvGet("cred_latch").then(v => {
+  if (!v || typeof v !== "object") return;
+  for (const k of Object.keys(v)) {
+    const f = Number(v[k] && v[k].f), l = Number(v[k] && v[k].l);
+    if (Number.isFinite(f) && f > 0) credLatch.set(k, { f, l: Number.isFinite(l) && l > 0 ? l : f });
+  }
+}).catch(() => {});
+function credLatchNote(cls, wallet) {
+  const w = String(wallet || "");
+  if (!isPubkey(w)) return;               // a net_id never needs a credential, so it never latches
+  const k = cls + ":" + w, now = Date.now();
+  const e = credLatch.get(k);
+  if (e) { e.l = now; }
+  else {
+    if (credLatch.size >= 20000) { let d = 1000; for (const kk of credLatch.keys()) { if (d-- <= 0) break; credLatch.delete(kk); } }
+    credLatch.set(k, { f: now, l: now });
+  }
+  saveCredLatch();
+}
+// Is the latch BINDING for this wallet on this route-class right now? Rolling TTL: a wallet whose
+// proven client went quiet for CRED_LATCH_TTL_MS unlatches back to grace (fail lenient, always).
+function credLatchBinding(cls, wallet, now) {
+  const k = cls + ":" + String(wallet || "");
+  const e = credLatch.get(k);
+  if (!e) return false;
+  if (CRED_LATCH_TTL_MS && now - e.l > CRED_LATCH_TTL_MS) { credLatch.delete(k); saveCredLatch(); return false; }
+  return now - e.f >= CRED_LATCH_MATURE_MS;
+}
+// The verdict for an UNPROVEN request on a graced gate. graceMs=Infinity means "no window" (the Cup).
+function graceAllows(cls, wallet, now, graceMs) {
+  if (!isPubkey(String(wallet || ""))) return true;              // net_id — the id is the secret
+  if (credLatchBinding(cls, wallet, now)) { _latchRefusals++; return false; }
+  return now < FLIP_EPOCH_MS + graceMs;
+}
+export function _credLatchForTest(cls, w) { const e = credLatch.get(cls + ":" + String(w)); return e ? { f: e.f, l: e.l } : null; }
+export function _flipStatsForTest() {
+  return { claimMode: CLAIM_TOKEN_MODE, cupMode: CUP_AUTH_MODE, questMode: QUEST_AUTH_MODE,
+           flipEpochMs: FLIP_EPOCH_MS, claimGraceMs: CLAIM_GRACE_MS, authGraceMs: AUTH_GRACE_MS,
+           latchMatureMs: CRED_LATCH_MATURE_MS, latchTtlMs: CRED_LATCH_TTL_MS, latched: credLatch.size,
+           graceClaims: _graceClaims, graceQuests: _graceQuests, graceCups: _graceCups, latchRefusals: _latchRefusals };
+}
+
 /* ----------------------------- Chikoria Cup (live event) ----------------------------- */
 const CUP_ELEMS = ["Water", "Fire", "Beast", "Storm", "Light"];
 let liveCup = null;                  // in-memory orchestrator (null until an admin creates one)
 let cupRound = null;                 // transient: the current round's LIVE PvP matches { battling, matchByWallet, side, matches }
 let cupPublic = true;                // true = open to ALL players (launched). Admin can flip to admin-only via /cup/public.
-// Flip to "1" ONLY after a client that sends authMsg/authSig (or mktToken) on /cup/register has
-// shipped — see the note on that route. Off = presence-gated; on = credential-gated.
-const CUP_AUTH_REQUIRED = String(process.env.CHIK_CUP_AUTH || "") === "1";
+// Auth for /cup/register + /cup/ready. See THE FLIP block above: "0" = off (presence-gated, the
+// pre-flip default), default = GRACE (credential judged when sent; latch + permanent presence
+// fallback for the never-verified), "strict"/"2" = hard credential gate (the old "=1").
+const CUP_AUTH_MODE = gateFlipMode("CHIK_CUP_AUTH");
 let cupAuto = true;                  // AUTO-RUN: server starts/finalizes each round on its own (no admin clicking). Toggle via /cup/auto.
 let cupRoundStartedAt = 0;           // when the current battling round began (for the round time-limit)
 let cupAutoNextAt = 0;               // earliest time the auto-runner may act again (inter-round pause)
@@ -2132,10 +2245,11 @@ const QUEST_OPTIONAL = new Set(["s2_sold", "s2_buy", "s2_merchant"]);
 const QUEST_LEGACY21 = new Set(["s_meet", "s_kill", "s_gather", "s_stone", "s_craft", "s_forage", "s_fish",
   "s_hunt", "s_shell", "s_gear", "s_meat", "s_stock", "s_chiki", "s_honey", "s_ore",
   "s_angler", "s_slayer", "s_forge2", "s_crystal", "s_train", "s_ascend"]);
-// Flip to "1" only once a client that sends authMsg/authSig on /quest/complete has shipped — the
-// body is {wallet, questId} today (Chain.gd _drain_quests), so enforcing now refuses every honest
-// report. A credential that IS sent is checked either way, and a WRONG one is always refused.
-const QUEST_AUTH_REQUIRED = String(process.env.CHIK_QUEST_AUTH || "") === "1";
+// Auth for /quest/complete. See THE FLIP block: "0" = off (the pre-flip default — unauthenticated
+// reports accepted), default = GRACE (credential judged when sent; a bare {wallet, questId} from the
+// old fleet forgiven until latch maturity / window close), "strict"/"2" = hard gate (the old "=1").
+// A credential that IS sent is checked in every mode, and a WRONG one is always refused.
+const QUEST_AUTH_MODE = gateFlipMode("CHIK_QUEST_AUTH");
 const QUEST_MIN_GAP_MS = Math.max(0, Number(process.env.QUEST_MIN_GAP_SEC ?? 20)) * 1000;
 // Winner eligibility — FAIL-CLOSED (enforced on the reward path regardless of VERIFY_HOLDERS):
 const QUEST_MIN_HOLD = Math.max(0, Number(process.env.QUEST_MIN_HOLD || MIN));                       // must hold >= this $CHIKI
@@ -2238,7 +2352,16 @@ app.post("/quest/complete", async (req, res) => {
   if (_qTok && marketTokens[wallet] !== _qTok) return res.status(401).json({ error: "sign in again — that market token is stale" });
   const _qProven = (_qTok && marketTokens[wallet] === _qTok)
     || verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig);
-  if (QUEST_AUTH_REQUIRED && !_qProven) return res.status(401).json({ error: "sign-in required to report a chapter" });
+  if (_qProven) credLatchNote("quest", wallet);
+  if (QUEST_AUTH_MODE !== "off" && !_qProven) {
+    // STRICT refuses outright; GRACE forgives the old fleet's bare {wallet, questId} until the
+    // window closes — except a wallet the latch has matured on (THE FLIP block). The refusal
+    // precedes every write on this route, so a refused report records nothing.
+    if (QUEST_AUTH_MODE === "strict" || !graceAllows("quest", wallet, Date.now(), AUTH_GRACE_MS)) {
+      return res.status(401).json({ error: "sign-in required to report a chapter" });
+    }
+    _graceQuests++;
+  }
   try {
     const led = await _questLoad(wallet);
     const idx = QUEST_IDX.get(questId);
@@ -2598,12 +2721,20 @@ app.post("/cup/register", async (req, res) => {
   const _cupProven = (_cupTok && marketTokens[wallet] === _cupTok)
     || verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig);
   if (_cupTok && marketTokens[wallet] !== _cupTok) return res.status(401).json({ error: "sign in again — that market token is stale" });
-  if (CUP_AUTH_REQUIRED && !_cupProven) return res.status(401).json({ error: "sign-in required to enter the Cup" });
+  if (_cupProven) credLatchNote("cup", wallet);
+  if (CUP_AUTH_MODE === "strict" && !_cupProven) return res.status(401).json({ error: "sign-in required to enter the Cup" });
   if (!_cupProven) {
+    // GRACE, permanently windowless for the Cup: a desktop/demo player can never mint a token, so
+    // the live-presence fallback below is their tier for good. Only the matured latch hardens a
+    // wallet — one that has proven it can send a credential must keep sending one.
+    if (CUP_AUTH_MODE !== "off" && !graceAllows("cup", wallet, Date.now(), Infinity)) {
+      return res.status(401).json({ error: "sign-in required to enter the Cup" });
+    }
     const pres = worldPlayers.get(wallet);
     if (!pres || Date.now() - pres.ts > WORLD_TTL_MS) {
       return res.status(403).json({ error: "enter the Cup from inside Chikoria — no live presence for that trainer" });
     }
+    if (CUP_AUTH_MODE !== "off") _graceCups++;
   }
   if (!liveCup || liveCup.state.status !== "registration") return res.status(409).json({ error: "registration is not open" });
   if (!cupPublic && !isAdminWallet(wallet)) return res.status(403).json({ error: "the Cup isn't open to the public yet" });
@@ -2638,10 +2769,16 @@ app.post("/cup/ready", async (req, res) => {
   if (_rTok && marketTokens[wallet] !== _rTok) return res.status(401).json({ error: "sign in again — that market token is stale" });
   const _rProven = (_rTok && marketTokens[wallet] === _rTok)
     || verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig);
-  if (CUP_AUTH_REQUIRED && !_rProven) return res.status(401).json({ error: "sign-in required" });
+  if (_rProven) credLatchNote("cup", wallet);
+  if (CUP_AUTH_MODE === "strict" && !_rProven) return res.status(401).json({ error: "sign-in required" });
   if (!_rProven) {
+    // same grace shape as /cup/register: windowless presence fallback, hardened only by the latch
+    if (CUP_AUTH_MODE !== "off" && !graceAllows("cup", wallet, Date.now(), Infinity)) {
+      return res.status(401).json({ error: "sign-in required" });
+    }
     const pres = worldPlayers.get(wallet);
     if (!pres || Date.now() - pres.ts > WORLD_TTL_MS) return res.status(403).json({ error: "ready up from inside Chikoria" });
+    if (CUP_AUTH_MODE !== "off") _graceCups++;
   }
   try { const ok = liveCup.ready(wallet); if (!ok) return res.status(404).json({ error: "you're not in this cup" }); await persistCup(); res.json({ ok: true, ...cupSnapshot(wallet) }); }
   catch (e) { res.status(500).json({ error: String(e.message || e) }); }
@@ -3492,7 +3629,7 @@ export function _setFfishAuthorityForTest(on) { _ffishAuth = !!on; if (_ffishAut
 export function _grantOwnForTest(w, item, n, kind = "mat") { ownCredit(String(w), kind, item, n); return n; }
 export function _clearOwnBook() { ownBook.clear(); _ownWorst.clear(); _ownRefusals = 0; _ownSkipped = 0; _ownSnapshots = 0; _ownReady = true; _ownEnforce = true;
                                   _matFlags.clear(); _matSaveClamps = 0; _matSaveObserved = 0; _matSaveSkipped = 0; _matBaselines = 0; }
-export function _ownFor(w) { const r = ownBook.get(String(w)); return r ? { open: r.open, cred: r.cred, sold: r.sold, used: r.used, openSrc: r.openSrc, base: r.base, baseSrc: r.baseSrc } : null; }
+export function _ownFor(w) { const r = ownBook.get(String(w)); return r ? { open: r.open, cred: r.cred, sold: r.sold, used: r.used, openSrc: r.openSrc, ffishOpenSrc: r.ffishOpenSrc || 0, base: r.base, baseSrc: r.baseSrc } : null; }
 export function _ownAvailFor(w, kind, item) { return ownAvailable(String(w), kind, item); }
 // Step 7 seams: read-only views so the flip sim can print the actual bound and counters.
 export function _matFlipStateForTest() { return { clamps: _matSaveClamps, observedOnly: _matSaveObserved, skipped: _matSaveSkipped, baselines: _matBaselines, flagged: _matFlags.size }; }
@@ -3585,9 +3722,12 @@ const nodeDrop = (kind) => (Object.hasOwn(NODE_DROP, kind) ? NODE_DROP[kind] : [
 // how many claims arrive with a provable identity — read from /assets/summary, so the decision to
 // start refusing unproven ones is made on a real number rather than a guess
 let _provenClaims = 0, _unprovenClaims = 0;
-// The kill-switch for the gate above. OFF by default and it must stay off until a client that sends
-// mktToken on /world/node/claim has shipped — see the note at the gate.
-const CLAIM_TOKEN_REQUIRED = String(process.env.CHIK_CLAIM_TOKEN || "") === "1";
+// Auth for /world/node/claim. See THE FLIP block: "0" = off (observe-only, the pre-flip default),
+// default = GRACE (a claim carrying a valid mktToken is judged and latches the wallet; a tokenless
+// claim from the old fleet is forgiven until latch maturity / window close; net_ids stand alone
+// forever), "strict"/"2" = hard gate (the old "=1"). See the note at the gate for what leaving the
+// tokenless path open costs during grace.
+const CLAIM_TOKEN_MODE = gateFlipMode("CHIK_CLAIM_TOKEN");
 // CURRENTLY UNREACHABLE, and that is worth knowing rather than deleting. CLAIM_MIN_MS (1800 ms) caps
 // one wallet at 60000/1800 = 33.3 claims/minute, below this 40 — measured over a 60 s maximum-rate
 // run: 32 claims landed, "too fast" refused 412, burst refused 0. If the pace floor is ever lowered
@@ -3597,11 +3737,13 @@ const CLAIM_TOKEN_REQUIRED = String(process.env.CHIK_CLAIM_TOKEN || "") === "1";
 const CLAIM_BURST = 40;           // per wallet per minute, a generous ceiling on honest play
 const claimRate = new Map();      // wallet -> {last, count, windowStart}
 
-// ============ STAGE 3: THE WORLD ADJUDICATES ACTIONS — CHIK_ACTIONS, OFF BY DEFAULT ============
+// ============ STAGE 3: THE WORLD ADJUDICATES ACTIONS — CHIK_ACTIONS, ON BY DEFAULT ============
 // Gathers, casts and strikes are all validated against the SERVER's own answer for where the actor
-// is and what the world contains. With the flag unset (the default, and what is deployed) NOTHING
-// here runs: actionPos() returns exactly the presence-row coordinates every reach check already
-// used, no tool is inspected, no cast is held, and every reply is byte-identical to today's —
+// is and what the world contains. ON by default since THE FLIP (2026-08-01) — it is safe for every
+// client generation by construction (tool-less bodies pass, terrain-absent water bound is
+// permissive). CHIK_ACTIONS=0 is the kill switch: NOTHING here runs, actionPos() returns exactly
+// the presence-row coordinates every reach check already used, no tool is inspected, no cast is
+// held, and every reply is byte-identical to the pre-flip relay —
 // old clients keep working forever. What the flag adds, and only adds:
 //
 //   POSITION. When CHIK_PHYS is also on, reach is measured against the physics state the server
@@ -3633,7 +3775,7 @@ const claimRate = new Map();      // wallet -> {last, count, windowStart}
 //
 // Alive/unclaimed, cooldown, the one-item drop table, CLAIM_MIN_MS and the warp hold on claims and
 // strikes are NOT duplicated here — they are the existing gates above and below, unchanged.
-const ACTIONS_ON = String(process.env.CHIK_ACTIONS ?? "") === "1";
+const ACTIONS_ON = String(process.env.CHIK_ACTIONS ?? "") !== "0";   // default ON; "0" is the kill switch
 if (ACTIONS_ON && !terrainReady()) loadTerrain();   // the water bound wants the real floor; absent file = permissive
 let _actToolRefusals = 0, _actCastHolds = 0, _actCastDry = 0, _actPhysPos = 0;
 export function _actionsStatsForTest() {
@@ -3746,26 +3888,28 @@ app.post("/world/node/claim", (req, res) => {
   // nothing, and anyone can burn a victim's nodes and their claim budget in their name. A net_id is
   // different: it never leaves its owner's save, so it stands alone (same rule as presenceOk).
   //
-  // OBSERVE ONLY for now. Refusing today would silence every already-shipped client, whose claims
-  // carry no token — their nodes would stay standing for everyone else, which is the very desync
-  // this is meant to fix. So it is recorded and reported, and the gate comes after the roster shows
-  // the tokened client is in the wild.
+  // GRACED ENFORCEMENT since THE FLIP (2026-08-01). A proven claim (net_id, or pubkey + valid
+  // mktToken) always passes and latches the wallet as credential-capable; a tokenless pubkey claim
+  // is forgiven — counted, never silently — until either the wallet's latch matures (a proven
+  // client was seen CRED_LATCH_MATURE_MS ago, so its cached siblings have turned over) or the
+  // global CHIK_CLAIM_GRACE_H window closes. This is what lets the flag ship ON while the deployed
+  // fleet (whose claim body is {wallet, id, cd}, no token) is still alive in browser caches.
   //
-  // MEASURED COST OF LEAVING IT OPEN: an attacker POSTs {wallet:<victim>, id:"stone:900:-500"} with
-  // no token, gets 200, and the victim's own next claim is refused 429 — 12 s of contention gave the
-  // attacker 6 claims and the victim 0. The attacker GAINS nothing (recordGather credits b.wallet,
-  // i.e. the victim), so this is pure denial-of-gathering, and the victim's live position comes free
-  // from the public world snapshot.
-  //
-  // THE FLIP IS NOW ONE ENV VAR, not a code change — but it MUST NOT be turned on before a client
-  // that sends mktToken on this route is in the wild (Gather.gd's claim body is {wallet, id, cd}
-  // today), or it refuses 100% of honest wallet gathering. `nodeClaims` in /assets/summary is the
-  // gauge: flip when unproven claims from wallet ids have fallen to noise.
+  // MEASURED COST OF THE GRACE PATH while it lives (unchanged from the observe-only era): an
+  // attacker POSTs {wallet:<victim>, id:"stone:900:-500"} with no token, gets 200, and the victim's
+  // own next claim is refused 429 — 12 s of contention gave the attacker 6 claims and the victim 0.
+  // The attacker GAINS nothing (recordGather credits b.wallet, i.e. the victim), so this is pure
+  // denial-of-gathering — and once the victim's own latch matures, the masquerade is refused.
+  // `nodeClaims` in /assets/summary is still the gauge: unproven-at-noise is when the window can
+  // be shortened (CHIK_CLAIM_GRACE_H) or the gate set "strict".
   const claimProven = presenceOk(String(b.wallet), b);
   if (!claimProven) _unprovenClaims++;
-  else _provenClaims++;
-  if (CLAIM_TOKEN_REQUIRED && !claimProven) {
-    return res.status(403).json({ ok: false, error: "prove this wallet first" });
+  else { _provenClaims++; credLatchNote("claim", String(b.wallet)); }
+  if (CLAIM_TOKEN_MODE !== "off" && !claimProven) {
+    if (CLAIM_TOKEN_MODE === "strict" || !graceAllows("claim", String(b.wallet), now, CLAIM_GRACE_MS)) {
+      return res.status(403).json({ ok: false, error: "prove this wallet first" });
+    }
+    _graceClaims++;
   }
 
   const r = claimRate.get(b.wallet) || { last: 0, count: 0, windowStart: now };
@@ -3878,7 +4022,11 @@ export function _setFfishDayForTest(w, n) { _ffishDay.set(String(w), { day: Math
 // gold-wipe and the v8 egg wipe caused.
 // So: the server ROLLS and CREDITS from today (data accrues, and the credit is real entitlement), and
 // the refusals turn on with the client release that renders the server's `legend` instead of its own.
-const FFISH_AUTHORITY = String(process.env.FFISH_AUTHORITY || "") === "1";
+// ON BY DEFAULT since THE FLIP (2026-08-01); FFISH_AUTHORITY=0 is the kill switch. The old-fleet
+// harm this paragraph warns about is closed by OWN_FFISH_EPOCH_MS below: every fish a save recorded
+// before the flip epoch is grandfathered as a one-time opening balance, so the binding book only
+// ever refuses what it never witnessed AND was never declared before the book existed.
+const FFISH_AUTHORITY = String(process.env.FFISH_AUTHORITY || "") !== "0";
 let _ffishAuth = FFISH_AUTHORITY;   // test-overridable mirror; every gate below reads this
 const FFISH_ORDER = Object.freeze(["rainbow_fish", "mystic_eel", "crystal_koi", "golden_chikifish"]);
 const FFISH_SET = new Set(FFISH_ORDER);
@@ -4383,6 +4531,18 @@ const OWN_OPEN_CAP = 6200;                 // the measured legitimate one-materi
 // A wallet whose FIRST server-written save predates this is a real pre-existing player and gets a
 // one-time opening balance from that save. Anyone newer is covered by witnessed credits + allowance.
 const OWN_EPOCH_MS = Date.parse("2026-07-31T00:00:00Z");
+// THE FFISH FLIP EPOCH — the book binds only what it can know. The witnessed-catch book only became
+// the fish's ledger when the server started rolling casts itself; every fantasy fish a client
+// recorded BEFORE this epoch predates the book (or arrived from a legacy save) and must NEVER be
+// refused for sale or barter. So the ffish opening balance keys off its own, LATER epoch than the
+// material cutover: any wallet whose previous server save predates it gets its declared legends as
+// a one-time opening (capped OWN_FFISH_OPEN_CAP per species), taken at its first save-accept after
+// the flip and grandfathered PERMANENTLY. A wallet born after the epoch has no pre-book fish by
+// definition: every catch it will ever make is server-rolled and server-credited (ownCredit runs
+// with the flag off too, deliberate accrual). Set a day past the flip deploy so no save the old
+// server stamped can miss it. Env-overridable (CHIK_FFISH_EPOCH_MS) for tests and for rollback.
+const OWN_FFISH_EPOCH_MS = (() => { const v = Number(process.env.CHIK_FFISH_EPOCH_MS);
+  return Number.isFinite(v) && v > 0 ? v : Date.parse("2026-08-02T00:00:00Z"); })();
 const ownBook = new Map();                  // wallet -> { open:{key:n}, cred:{key:n}, sold:{key:n}, openSrc:ms }
 let _ownReady = false;                      // its own flag — never ride _assetsReady
 let _ownDirty = false;                      // set by every credit/sale/opening; flushed with the board
@@ -4398,6 +4558,7 @@ function _ownRow(w) {
     for (const k of ownBook.keys()) { if (drop-- <= 0) break; ownBook.delete(k); }
   }
   r = { open: Object.create(null), cred: Object.create(null), sold: Object.create(null), used: Object.create(null), openSrc: 0,
+        ffishOpenSrc: 0,                           // the fish flip's own once-marker (see OWN_FFISH_EPOCH_MS)
         base: Object.create(null), baseSrc: 0 };   // Step 7: the save-path grandfather baseline (see matSaveBaseline)
   ownBook.set(w, r);
   return r;
@@ -4504,32 +4665,46 @@ const ownAvailableForIssue = (wallet, kind, item) => ownAvailable(wallet, kind, 
 function ownSnapshotOpening(wallet, mmo, prevSavedAt) {
   if (!_ownReady || !isPubkey(String(wallet || ""))) return;
   const prev = Number(prevSavedAt) || 0;
-  if (!prev || prev >= OWN_EPOCH_MS) return;      // new account: witnessed credits + allowance cover it
+  const wantMats  = prev > 0 && prev < OWN_EPOCH_MS;         // new account: witnessed credits + allowance cover it
+  const wantFfish = prev > 0 && prev < OWN_FFISH_EPOCH_MS;   // pre-book angler — see OWN_FFISH_EPOCH_MS
+  if (!wantMats && !wantFfish) return;
   const r = _ownRow(String(wallet));
-  if (r.openSrc) return;                          // already taken — never again
-  const mats = (mmo && typeof mmo.mats === "object" && mmo.mats) || null;
-  r.openSrc = prev;
-  if (mats) {
-    for (const m of Object.keys(mats)) {
-      if (!MAT_IDS.has(m)) continue;
-      const q = Math.floor(Number(mats[m]));
-      if (!Number.isFinite(q) || q <= 0) continue;
-      r.open[ownKey("mat", m)] = Math.min(q, OWN_OPEN_CAP);
+  let took = false;
+  if (wantMats && !r.openSrc) {                   // already taken — never again
+    r.openSrc = prev;
+    took = true;
+    const mats = (mmo && typeof mmo.mats === "object" && mmo.mats) || null;
+    if (mats) {
+      for (const m of Object.keys(mats)) {
+        if (!MAT_IDS.has(m)) continue;
+        const q = Math.floor(Number(mats[m]));
+        if (!Number.isFinite(q) || q <= 0) continue;
+        r.open[ownKey("mat", m)] = Math.min(q, OWN_OPEN_CAP);
+      }
     }
   }
   // A pre-epoch angler's caught legends are real property and must survive cutover — but capped hard,
   // because these were client-recorded and a fantasy fish buys an egg. OWN_FFISH_OPEN_CAP is far above
   // any plausible real holding (a Golden is 1-in-42 per cast at the very best) and far below a forgery.
-  const ff = (mmo && typeof mmo.ffish === "object" && mmo.ffish) || null;   // credited regardless of the flag, see ownCredit
-  if (ff) {
-    for (const sp of Object.keys(ff)) {
-      if (!FFISH_SET.has(sp)) continue;
-      const q = Math.floor(Number(ff[sp]));
-      if (!Number.isFinite(q) || q <= 0) continue;
-      r.open[ownKey("ffish", sp)] = Math.min(q, OWN_FFISH_OPEN_CAP);
+  // Its own once-marker (ffishOpenSrc), because the fish epoch is LATER than the material one: a
+  // wallet whose material opening was taken at the July cutover still gets its fish grandfathered at
+  // THIS flip. max(), never overwrite — an opening already granted can only grow, grandfathering is
+  // absolute.
+  if (wantFfish && !r.ffishOpenSrc) {
+    r.ffishOpenSrc = prev;
+    took = true;
+    const ff = (mmo && typeof mmo.ffish === "object" && mmo.ffish) || null;   // credited regardless of the flag, see ownCredit
+    if (ff) {
+      for (const sp of Object.keys(ff)) {
+        if (!FFISH_SET.has(sp)) continue;
+        const q = Math.floor(Number(ff[sp]));
+        if (!Number.isFinite(q) || q <= 0) continue;
+        const k = ownKey("ffish", sp);
+        r.open[k] = Math.max(r.open[k] || 0, Math.min(q, OWN_FFISH_OPEN_CAP));
+      }
     }
   }
-  _ownSnapshots++; _ownDirty = true;
+  if (took) { _ownSnapshots++; _ownDirty = true; }
 }
 
 // ============ STEP 7 OF SERVER AUTHORITY: THE ECONOMY FLIP (save-path material bound) ============
@@ -4767,7 +4942,15 @@ app.get("/assets/summary", (req, res) => {
              matFlow: { spendingWallets: matSpent.size, gainingWallets: matGained.size },
              nodeClaims: { proven: _provenClaims, unproven: _unprovenClaims,
                            provenPct: (_provenClaims + _unprovenClaims) ? Math.round(100 * _provenClaims / (_provenClaims + _unprovenClaims)) : 0,
-                           enforcing: CLAIM_TOKEN_REQUIRED },
+                           enforcing: CLAIM_TOKEN_MODE },
+             // THE FLIP's gauges. graceAccepts are requests a "strict" gate would have refused but
+             // grace forgave — the number that must fall to noise before hardening. latchRefusals
+             // are masquerade attempts (or genuinely stale mixed-fleet devices) the latch stopped.
+             flip: { claim: CLAIM_TOKEN_MODE, cup: CUP_AUTH_MODE, quest: QUEST_AUTH_MODE,
+                     graceAccepts: { claim: _graceClaims, quest: _graceQuests, cup: _graceCups },
+                     latched: credLatch.size, latchRefusals: _latchRefusals,
+                     claimWindowLeftH: Math.max(0, Math.round((FLIP_EPOCH_MS + CLAIM_GRACE_MS - Date.now()) / 3600000)),
+                     authWindowLeftH: Math.max(0, Math.round((FLIP_EPOCH_MS + AUTH_GRACE_MS - Date.now()) / 3600000)) },
              // Refused for an impossible quantity (LIST_QTY_MAX). Unlike oversoldMaterials — which is
              // a soft signal, since materials also arrive from crafting/quests/chests/trades — every
              // row here is a listing the game could not have produced, so it names an actual attempt.
@@ -7094,27 +7277,28 @@ Promise.all([store.kvGet("asset_registry"), store.kvGet("asset_ledger")]).then((
   console.error("asset restore FAILED — issuing and auditing are suspended until a restart reads it:", e && e.message);
 });
 
-// ============ SERVER-SIMULATED MOVEMENT — CHIK_PHYS, OFF BY DEFAULT ============
-// The whole of world_physics.js hangs off this flag. With CHIK_PHYS unset (the default, and what is
-// deployed) NOTHING below runs: no terrain is loaded, no state is kept, no field is added to any
-// reply, and /world/move relays the client's position exactly as it always has. That is not a
-// courtesy — the deployed fleet is thousands of clients that send positions and no inputs, and they
-// must keep working forever.
+// ============ SERVER-SIMULATED MOVEMENT — CHIK_PHYS, ON BY DEFAULT ============
+// The whole of world_physics.js hangs off this flag. ON by default since THE FLIP (2026-08-01):
+// a relay client (coords, no inputs) is still served untouched — its presence row keeps the claimed
+// numbers, nothing simulates it, the reply merely gains a `phys` echo — so the deployed fleet keeps
+// working forever while input-sending clients are simulated and judged. CHIK_PHYS=0 is the kill
+// switch: NOTHING below runs, no terrain is loaded, no state is kept, no field is added to any
+// reply, and /world/move relays the client's position exactly as it always has.
 // NO TERRAIN, NO PHYSICS. world_terrain fails PERMISSIVE by design (surfaceHeight returns sea level
 // when the file is absent, so it can never refuse a player), which is right for a lookup and
 // catastrophic for an authority: every ground test would put the island's floor at 6.0, lifting
 // anyone in a valley and blocking nothing. island_data.bin is 7 MB and lives in the CLIENT project,
 // so a deploy that sets CHIK_PHYS=1 without vendoring it is a plausible accident. Make it a no-op
 // instead of a wrong answer.
-const _physWanted = String(process.env.CHIK_PHYS ?? "") === "1";
+const _physWanted = String(process.env.CHIK_PHYS ?? "") !== "0";   // default ON; "0" is the kill switch
 const _physTerrain = _physWanted ? loadTerrain() : null;
 const PHYS_ON = _physWanted && !!(_physTerrain && _physTerrain.ok);
 const physStates = new Map();      // wallet -> world_physics state (only while PHYS_ON)
 let _physCorrections = 0, _physDrops = 0, _physTeleports = 0, _physResyncs = 0;
 if (_physWanted) {
   console.log(PHYS_ON
-    ? `server physics ON (CHIK_PHYS=1) — terrain ${terrainInfo().w}x${terrainInfo().h} from ${terrainInfo().source}`
-    : `server physics REFUSED TO START: CHIK_PHYS=1 but island_data.bin was not found, so movement stays a pure relay. Tried ${JSON.stringify(_physTerrain && _physTerrain.tried)}`);
+    ? `server physics ON (CHIK_PHYS default-on) — terrain ${terrainInfo().w}x${terrainInfo().h} from ${terrainInfo().source}`
+    : `server physics REFUSED TO START: CHIK_PHYS is on (the default) but island_data.bin was not found, so movement stays a pure relay and no player is judged. FIX, pick one: (1) vendor island_data.bin next to server.js — the deploy repo ships it, so a missing file means the deploy did not copy it; (2) set CHIK_ISLAND_BIN=/absolute/path/to/island_data.bin; (3) set CHIK_PHYS=0 to choose relay mode deliberately. Tried ${JSON.stringify(_physTerrain && _physTerrain.tried)}`);
 }
 export function _physStatsForTest() {
   return { on: PHYS_ON, states: physStates.size, corrections: _physCorrections, drops: _physDrops, teleports: _physTeleports, resyncs: _physResyncs };
@@ -7477,7 +7661,7 @@ const WS_MOVE_IDLE_MS = Math.max(1000, Number(process.env.CHIK_WS_IDLE_MS) || 40
 // CPU is NOT a reason to hesitate: 60 sockets x 9.5 KB is 0.466 ms p50 / 0.781 ms p95 per tick,
 // 0.9% of the 50 ms budget, because `ws` runs zlib on the libuv threadpool. Added frame latency,
 // honest one-in-flight ping-pong: +0.070 ms p50.
-const WS_DEFLATE_ON = String(process.env.CHIK_WS_DEFLATE ?? "") === "1";
+const WS_DEFLATE_ON = String(process.env.CHIK_WS_DEFLATE ?? "") !== "0";   // default ON since THE FLIP; "0" kills
 const WS_DEFLATE_MAX = Math.max(0, Math.min(20000, Number(process.env.CHIK_WS_DEFLATE_MAX ?? 120)));  // 0 = no ceiling
 // Below this many bytes `ws` sends the frame UNCOMPRESSED (RSV1 clear) and does not touch the
 // stream context. The move ack — the one latency-critical frame, it carries the `phys` verdict — is
@@ -7486,7 +7670,7 @@ const WS_DEFLATE_MAX = Math.max(0, Math.min(20000, Number(process.env.CHIK_WS_DE
 const WS_DEFLATE_THRESHOLD = Math.max(0, Number(process.env.CHIK_WS_DEFLATE_MIN ?? 256));
 const WS_DEFLATE_LEVEL = Math.min(9, Math.max(1, Number(process.env.CHIK_WS_DEFLATE_LEVEL ?? 6)));
 const WS_DEFLATE_MEMLEVEL = Math.min(9, Math.max(1, Number(process.env.CHIK_WS_DEFLATE_MEMLEVEL ?? 8)));
-// ============ TICK DEDUPE — do not push a frame that says nothing new. OFF BY DEFAULT ============
+// ============ TICK DEDUPE — do not push a frame that says nothing new. ON BY DEFAULT (=0 kills) ============
 // A tick is unconditional today: a socket sitting in an empty field is handed 20 byte-identical
 // snapshots a second. This suppresses a tick frame that is identical to the last one that socket
 // RECEIVED, comparing with `a` (the per-row sample age, the only field that moves on its own)
@@ -7561,7 +7745,7 @@ function deflateOfferSafe(req) {
   }
   return true;
 }
-const WS_DEDUPE_ON = String(process.env.CHIK_WS_DEDUPE ?? "") === "1";
+const WS_DEDUPE_ON = String(process.env.CHIK_WS_DEDUPE ?? "") !== "0";   // default ON since THE FLIP; "0" kills
 const WS_AGE_RE = /"a":-?\d+(\.\d+)?/g;   // safe: JSON.stringify escapes quotes, so `"a":` cannot occur inside a string value
 const wsClients = new Set();
 let _wsFrames = 0, _wsBytes = 0, _wsTicks = 0, _wsCpuUs = 0, _wsJitMax = 0, _wsJitSum = 0, _wsJitN = 0, _wsLastTick = 0, _wsIv = null;
@@ -8544,6 +8728,7 @@ function _capAuctions() {
 function serializeOwnBook() {
   const out = [];
   for (const [w, r] of ownBook) out.push([w, { open: r.open, cred: r.cred, sold: r.sold, used: r.used, openSrc: r.openSrc || 0,
+                                               ffishOpenSrc: r.ffishOpenSrc || 0,
                                                base: r.base || {}, baseSrc: r.baseSrc || 0 }]);
   return out.slice(-GATHER_WALLETS_MAX);
 }
@@ -8560,6 +8745,7 @@ export function restoreOwnBook(v) {
     const w = String(e[0] || "").slice(0, 64);
     if (!isPubkey(w)) continue;
     const r = { open: Object.create(null), cred: Object.create(null), sold: Object.create(null), used: Object.create(null), openSrc: 0,
+                ffishOpenSrc: 0,
                 base: Object.create(null), baseSrc: 0 };
     for (const bucket of ["open", "cred", "sold", "used"]) {
       const src = e[1][bucket];
@@ -8568,7 +8754,10 @@ export function restoreOwnBook(v) {
         const cut = String(k).indexOf(":");
         if (cut < 1) continue;
         const kind = k.slice(0, cut), item = k.slice(cut + 1);
-        if (!OWN_KINDS.has(kind) || !ownItemOk(kind, item)) continue;
+        // ffish is accepted here even when FFISH_AUTHORITY=0 (OWN_KINDS then lacks it): crediting
+        // deliberately ignores the flag (see ownCredit), so a kill-switch boot must not DROP the
+        // persisted fish entitlement — a later save from that boot would erase it forever.
+        if (!(OWN_KINDS.has(kind) || kind === "ffish") || !ownItemOk(kind, item)) continue;
         const q = Number(src[k]);
         if (Number.isFinite(q) && q > 0) r[bucket][`${kind}:${item}`] = Math.min(q, Number.MAX_SAFE_INTEGER);
       }
@@ -8602,6 +8791,8 @@ export function restoreOwnBook(v) {
     }
     const os = Number(e[1].openSrc);
     r.openSrc = Number.isFinite(os) && os > 0 ? os : 0;
+    const fs2 = Number(e[1].ffishOpenSrc);   // absent in pre-flip blobs -> 0, i.e. "not yet taken"
+    r.ffishOpenSrc = Number.isFinite(fs2) && fs2 > 0 ? fs2 : 0;
     const bs = Number(e[1].baseSrc);
     r.baseSrc = Number.isFinite(bs) && bs > 0 ? bs : 0;
     ownBook.set(w, r); n++;
