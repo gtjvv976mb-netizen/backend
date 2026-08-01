@@ -860,3 +860,110 @@ With `RPC_URL` set to a canary and `CLIENT_RPC` unset, all fifteen responses the
 `/world/roster`, `/world/players`, `/assets/summary` keyed and unkeyed, `/health` — carry **zero**
 secret bytes, and `/stats.clientRpc` is `""`: it fails closed, with no fallback to `RPC_URL` and no
 rpc-shaped key carrying it under another name.
+
+## 13. The WS latency work (permessage-deflate + tick dedupe), attacked (2026-08-01)
+
+Both flags default OFF and flag-off is byte-identical to `git show HEAD:server.js`
+(`_av_lw_rerun.mjs a`, 9/9: same key order, same payload, same tick frame count 17/17, 0 frames
+suppressed, `WS_MAX_SOCKETS` 250 and `WS_TICK_HZ` 20 asserted unchanged). Regression on the fixed
+build: **449 assertions, 0 failures** across ws_transport 78, world_tick 66, physics_authority 67,
+mobile_desktop_sync 45, party 40, mmo_sync 29, mount_sync 26, world_share 24, pvp_live 19,
+interest_radius 16, delta_snapshot 15, world_share_v2 14, critical_econ 10.
+
+### 13.1 DEFECT FIXED — a configured extension could refuse an upgrade that is accepted today
+
+`ws` 7.5.11 (`websocket-server.js:242-251`) only parses `Sec-WebSocket-Extensions` when the server
+was configured with `perMessageDeflate`; if the parse or the accept throws it answers
+`abortHandshake(socket, 400)` — the **whole upgrade**, not just the extension. And
+`serverNoContextTakeover: false` means "refuse any offer that asks for no-context-takeover", which
+is a legal RFC 7692 offer an intermediary may add.
+
+Measured side by side, flags-off vs flags-on (`_av_lw_attack_sim.mjs` section D): four headers that
+answer **101 today** answered **400** with `CHIK_WS_DEFLATE=1` — `server_max_window_bits=99`, a
+duplicated parameter, an unknown parameter, and `permessage-deflate; server_no_context_takeover`.
+A refused upgrade is survivable (the client falls back to polling) but it is silent, and if
+Cloudflare ever rewrote the offer the flag would disable the socket for the whole fleet.
+
+Fixed with `deflateOfferSafe(req)`: an ALLOW-LIST screen in the upgrade handler. Anything outside
+the shape `ws` is certain to accept goes to the **plain** server — today's behaviour exactly. After
+the fix all eight offers answer 101 on both builds, the real browser offer
+(`permessage-deflate; client_max_window_bits`) still negotiates compression, and
+`server_no_context_takeover` degrades to a plain socket rather than to no socket.
+
+### 13.2 The DoS numbers were measured against an attacker that COOPERATES
+
+`latency_wins_sim.mjs` PHASE D gives the attacker two choices it would never make: it offers
+permessage-deflate (`sock(url, !!env.CHIK_WS_DEFLATE)`) and parks 250 sockets on fixed coordinates.
+`_av_lw_dos_sim.mjs` runs both profiles in one process, same rig, same 250 sockets, same 3.5 s
+cadence. An adversary declines the extension (one constructor option) and staggers the same cadence
+so one peer moves every 14 ms:
+
+| | cooperative | HOSTILE |
+|---|---|---|
+| today | 29.5 MiB/s x3542 | 33.97 MiB/s x3653 |
+| deflate | 1.34 MiB/s x161 | **33.95 MiB/s x3655 — zero effect** |
+| dedupe | 0.86 MiB/s x103 | 23.93 MiB/s x2573 |
+| both | 0.04 MiB/s x5 | **23.98 MiB/s x2576** |
+
+So the real reduction under attack is ~30%, not 99.9%; deflate contributes nothing (the attacker's
+`negotiated` is 0); and dedupe **costs** CPU when it cannot suppress (43% → 49% of a core at 250
+sockets). **Neither flag buys headroom to raise `WS_MAX_SOCKETS`.** The bound that holds an
+attacker is still `WS_MAX_SOCKETS` + `WS_MOVE_IDLE_MS`. This is now written into the code comment
+above `WS_DEDUPE_ON`.
+
+### 13.3 The flip's own verification instrument was unreachable — now an admin gauge
+
+The deploy plan says "after flipping, read `_wsStatsForTest().deflate.negotiated`" to learn whether
+Cloudflare forwards the extension **accept**. `_wsStatsForTest` is exported but **no route serves
+it**. Added `wsTransport` to `GET /assets/summary` (already `cupAdminOk`-gated, 403 unkeyed),
+integers and booleans only: `{deflate, deflateMax, negotiated, dedupe, dupSkips, dupBytes, sockets,
+max, refused, frames, bytes, hz}`. Canary sweep unchanged: zero secret bytes across `/stats`,
+`/health`, `/world/roster`, `/world/players`, `/assets/summary` keyed **and** unkeyed, `/world/feed`,
+`/leaderboard` and every socket frame; `/stats.clientRpc === ""`.
+
+### 13.4 Measured, not fixed
+
+* **The deployed fleet takes the COMPRESSING path, and the desktop probe never exercised it.**
+  `chikimonsters-repo-FIXED/realm/index.js` creates the socket with `new WebSocket(url, ...)` — the
+  browser API, which always offers `permessage-deflate; client_max_window_bits`. `dev_wstransport.gd`
+  proves desktop Godot, which offers nothing. A browser-shaped client driven against the real server
+  reconstructs an **identical** world view to a plain client at **3,647 B vs 37,908 B (90.4% less)**.
+* **Compression is deniable by an attacker.** 3 sockets that merely *offer* the extension fill a
+  `CHIK_WS_DEFLATE_MAX` of 3; the honest client arriving next still connects and still receives
+  frames, but plain. Cost is the optimisation, never the session.
+* **Dedupe is disabled for 90 s by any monster death.** `mobSnapshot` emits
+  `back: MOB_RESPAWN_MS - (now - deadAt)` for a dead mob and `now` is re-read every tick, so every
+  socket's frame differs. Measured on a real kill (darkeet, spawn 0, 2×120 dmg): the same still
+  world went **49 → 0 dupSkips** in a 3 s window. The "78% saved in a still square" figure holds
+  only while all 24 spawns are alive.
+* **Backpressure holds; the number is 1.2 MiB per stalled reader, not 256 KiB.** 60 sockets paused
+  at the OS level while still sending moves: RSS plateaus (last-8-second slope 0.47 MiB/s off /
+  0.12 MiB/s on), 1174 KiB/socket off and 1328 KiB/socket on — `WS_BACKPRESSURE` caps *application*
+  buffering at 256 KiB, the rest is the kernel send buffer. Honest sockets are untouched (frame gap
+  p95 52.6 → 52.7 ms off, 53.0 → 54.9 ms on). Extrapolated to `WS_MAX_SOCKETS` 250 that is
+  **287 MiB (off) / 324 MiB (on)** of RSS — deflate adds 13%, and on a 512 MiB instance it is worth
+  knowing before the ceiling is raised.
+* **`WS_MSG_BURST` does not bound decompression.** The 40/s counter lives in the message handler,
+  which only runs after `ws` has already inflated the frame, and `ws` 7.5.11's `zlibLimiter` is
+  MODULE-scoped (`permessage-deflate.js:23,64-69`) so inbound inflate shares a 10-slot queue with
+  every socket's outbound compression. 117,000 inbound 15 KiB-inflating frames from 40 compressing
+  sockets (≈487 msg/s per socket against a 40/s app cap) moved an honest socket's frame gap p95
+  **52.7 → 52.9 ms**, max 63 ms, tick 18.8 Hz, CPU 73%. Not a practical amplifier — stated as a
+  residual, not fixed.
+* **A 6 MiB compressed-inbound bomb is refused** and RSS moves 124.2 → 124.3 MiB (`maxPayload` is
+  enforced on the inflated size).
+
+### 13.5 The honest-play verdict: the flags are a BANDWIDTH change, not a latency change
+
+Propagation A/B/A, free-running 280 ms receiver, both actors inside `INTEREST_ENTER`, 60 cycles at
+three occupancies (`_av_lw_honest_sim.mjs`, 12/12):
+
+| peers | HTTP poll p50/p95 | WS p50/p95 | flags delta p50 | A-to-A noise |
+|---|---|---|---|---|
+| 0 | 139.6 / 257.9 ms | 26.0 / 52.5 ms | −0.23 ms | 0.83 ms |
+| 12 | 149.9 / 273.3 ms | 24.2 / 47.9 ms | −0.53 ms | 1.09 ms |
+| 40 | 142.5 / 267.4 ms | 25.2 / 51.5 ms | +1.92 ms | 2.00 ms |
+
+The latency win is the **socket**, which already shipped. The two new flags move propagation by less
+than the A-to-A noise at every occupancy — they buy bytes (90.4% for a browser, 72.4% for a
+non-offering client in a slow-updating world), not milliseconds.

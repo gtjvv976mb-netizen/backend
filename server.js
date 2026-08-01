@@ -4607,6 +4607,17 @@ app.get("/assets/summary", (req, res) => {
              worldTick: { running: _worldTickOn, mobsTracked: worldMobs.size, hits: _mobHits,
                           kills: _mobKills, hitsRefused: _mobHitsRefused,
                           maxKillsPerHour: Math.round(MOB_SPAWNS.length * 3600000 / MOB_RESPAWN_MS) },
+             // THE PRE-FLIGHT GAUGE FOR CHIK_WS_DEFLATE, and the ONLY way to answer the one question
+             // the flag cannot be tested for beforehand: does Cloudflare forward the extension ACCEPT
+             // back to the browser. `negotiated` counts sockets that actually agreed on
+             // permessage-deflate right now — nonzero after the flip means it works end to end, zero
+             // with players connected means CF stripped it and the flag is a silent no-op.
+             // It was previously readable only through _wsStatsForTest(), which no route serves, so
+             // the deploy plan's own check had nowhere to be read. Integers and booleans only.
+             wsTransport: { deflate: WS_DEFLATE_ON, deflateMax: WS_DEFLATE_MAX, negotiated: _wsDeflating,
+                            dedupe: WS_DEDUPE_ON, dupSkips: _wsDupSkips, dupBytes: _wsDupBytes,
+                            sockets: wsClients.size, max: WS_MAX_SOCKETS, refused: _wsRefused,
+                            frames: _wsFrames, bytes: _wsBytes, hz: WS_TICK_HZ },
              acquisitionBound: { enforcing: _ownReady, refused: _ownRefusals, skipped: _ownSkipped,
                                  openings: _ownSnapshots, wallets: ownBook.size,
                                  worst: [..._ownWorst.values()].sort((a, b) => (b.asked - b.had) - (a.asked - a.had)).slice(0, 20) },
@@ -7269,24 +7280,157 @@ const WS_MAX_SOCKETS = Math.max(0, Math.min(20000, Number(process.env.CHIK_WS_MA
 // between GRACE and GRACE+5 s. Env-tunable so a sim can prove the sweep without waiting 30 s.
 const WS_AUTH_GRACE_MS = Math.max(1000, Number(process.env.CHIK_WS_GRACE_MS) || 30000);
 const WS_MOVE_IDLE_MS = Math.max(1000, Number(process.env.CHIK_WS_IDLE_MS) || 4000);   // stop PUSHING to a socket this quiet; never closes it, the next move re-arms it
+// ============ TRANSPORT COMPRESSION — permessage-deflate, OFF BY DEFAULT ============
+// MEASURED, not argued (wire_bytes_sim.mjs, on real captured frames with real 44-char base58
+// wallets): consecutive 20 Hz snapshots are nearly identical, so a deflate stream WITH CONTEXT
+// TAKEOVER gets 93.9%/95.3% (12-peer/60-peer) — more than every hand-rolled JSON trick COMBINED
+// (39.8%) and more than a packed binary wire (88%), for one option object and zero client change.
+// Without context takeover the same deflate only manages 54.7%/67.5%, so the streaming context IS
+// the win and `serverNoContextTakeover` must stay false.
+//
+// WHY THIS IS THE ONE COMPRESSION LEVER LEFT. Measured read-only against the live host: HTTP
+// replies already come back `content-encoding: gzip` from the Cloudflare edge (/world/players 590 ->
+// 374 B, /health 484 -> 355 B) even though this origin sends none — so the poll transport is ALREADY
+// compressed on the last mile and origin gzip would only save the Render->edge leg. Cloudflare does
+// not compress WebSocket frames. The socket is the only uncompressed hop a player actually sees.
+//
+// WHY IT IS OFF BY DEFAULT ANYWAY — two costs, both measured:
+//  * RAM. ~330 KiB RSS per socket for the deflate+inflate context pair (_wire_zmem_child.mjs), i.e.
+//    80.7 MiB at WS_MAX_SOCKETS 250 in a bare process. Nobody has read RSS on the deployed dyno, so
+//    WS_DEFLATE_MAX bounds it independently of WS_MAX_SOCKETS: sockets past the ceiling are handed
+//    to a second, extension-less WS.Server and behave EXACTLY as they do today. Compression can
+//    therefore never be the reason the 251st player fails to connect.
+//  * The proxy. The extension is negotiated end to end; if Cloudflare ever forwarded the offer but
+//    stripped the accept, a compressing server would talk RSV1 at a browser that is not expecting
+//    it. That is survivable (the client's _ws_fail hands the world back to polling) but it would
+//    silently disable the socket for the fleet, so the flip is a deliberate, observable act:
+//    _wsStatsForTest().deflate.negotiated counts sockets that actually agreed on it.
+// CPU is NOT a reason to hesitate: 60 sockets x 9.5 KB is 0.466 ms p50 / 0.781 ms p95 per tick,
+// 0.9% of the 50 ms budget, because `ws` runs zlib on the libuv threadpool. Added frame latency,
+// honest one-in-flight ping-pong: +0.070 ms p50.
+const WS_DEFLATE_ON = String(process.env.CHIK_WS_DEFLATE ?? "") === "1";
+const WS_DEFLATE_MAX = Math.max(0, Math.min(20000, Number(process.env.CHIK_WS_DEFLATE_MAX ?? 120)));  // 0 = no ceiling
+// Below this many bytes `ws` sends the frame UNCOMPRESSED (RSV1 clear) and does not touch the
+// stream context. The move ack — the one latency-critical frame, it carries the `phys` verdict — is
+// p50 66 B, so it stays out of the compressor entirely at this setting. Nothing is lost: a 66 B
+// frame has nothing to give.
+const WS_DEFLATE_THRESHOLD = Math.max(0, Number(process.env.CHIK_WS_DEFLATE_MIN ?? 256));
+const WS_DEFLATE_LEVEL = Math.min(9, Math.max(1, Number(process.env.CHIK_WS_DEFLATE_LEVEL ?? 6)));
+const WS_DEFLATE_MEMLEVEL = Math.min(9, Math.max(1, Number(process.env.CHIK_WS_DEFLATE_MEMLEVEL ?? 8)));
+// ============ TICK DEDUPE — do not push a frame that says nothing new. OFF BY DEFAULT ============
+// A tick is unconditional today: a socket sitting in an empty field is handed 20 byte-identical
+// snapshots a second. This suppresses a tick frame that is identical to the last one that socket
+// RECEIVED, comparing with `a` (the per-row sample age, the only field that moves on its own)
+// normalised out.
+//
+// WHY THIS IS SAFE FOR THE CLIENT AND ROW-LEVEL SUPPRESSION IS NOT. Dropping a ROW makes the peer
+// absent from the snapshot, and Net.gd `_mark_unseen` HIDES a remote the instant it is absent
+// (grace only decides when it is freed) — so suppressing unchanged rows would make every standing
+// player invisible on every client in the wild. Dropping the WHOLE FRAME is invisible to that
+// mechanism: the client is not told anything, so it concludes nothing. The client's own silence
+// watchdog (WS_SILENCE 0.6 s) is fed by the IMMEDIATE MOVE ACK, which is sent synchronously on
+// every one of its 280 ms moves and is never deduped — 2.1x headroom that does not depend on the
+// tick at all.
+//
+// WHAT IT CANNOT DO: help a crowded square. With K peers each reporting every 280 ms, ~K*50/280 rows
+// change per 50 ms tick, so at K=30 a frame is essentially never identical. It targets the idle
+// case, not the plaza.
+//
+// AND IT IS NOT A DoS BOUND — READ THIS BEFORE RAISING WS_MAX_SOCKETS. Both flags were benchmarked
+// against an attacker that HELPS them: one that offers permessage-deflate and parks 250 sockets on
+// fixed coordinates. That attacker's egress falls 29.7 -> 0.04 MiB/s (x3572 -> x5). An adversary
+// makes the other two choices — decline the extension (one constructor flag) and STAGGER the same
+// 3.5 s move cadence across the sockets so one peer moves every 14 ms — and the same 250 sockets
+// measure (_av_lw_dos_sim.mjs, both profiles in one run, in-process rig identical to
+// latency_wins_sim.mjs PHASE D):
+//     today 33.46 MiB/s x3700 | deflate 33.46 x3706 (ZERO effect) | dedupe 23.61 x2598 | both 23.38 x2575
+// So the real reduction under attack is ~30%, not 99.9%, deflate contributes nothing at all, and
+// dedupe COSTS cpu when it cannot suppress (42% -> 49% of a core at 250 sockets). The bound that
+// actually holds an attacker is still WS_MAX_SOCKETS + WS_MOVE_IDLE_MS, exactly as before. Neither
+// flag buys headroom to raise the socket ceiling.
+//
+// SIDE-EFFECT SAFETY: building a reply advances the receiver's `seen`/`vis` delta memory and the
+// feed cursor. A frame that consumed any of that CANNOT be identical to the previous one (a newly
+// delivered static makes the row full, a lost/regained peer changes the row set, a pushed headline
+// adds `feed`), so a suppressed frame is by construction one that consumed nothing.
+// A CONFIGURED EXTENSION CAN REFUSE AN UPGRADE THAT IS ACCEPTED TODAY, AND THAT IS THE ONE WAY THIS
+// FLAG COULD HURT A REAL PLAYER. `ws` (7.5.11, websocket-server.js:242-251) parses
+// Sec-WebSocket-Extensions and calls PerMessageDeflate.accept ONLY when the server was configured
+// with perMessageDeflate; if either throws it answers `abortHandshake(socket, 400)` — the WHOLE
+// upgrade, not just the extension. And `serverNoContextTakeover: false` below means "refuse any
+// offer that asks for no-context-takeover", which is a legal RFC 7692 offer a proxy may add.
+// MEASURED (_av_lw_attack_sim.mjs section D, flags-off vs flags-on side by side): four headers that
+// answer 101 today answer 400 with the flag on — `server_max_window_bits=99`, a duplicated
+// parameter, an unknown parameter, and `server_no_context_takeover`.
+// So the offer is screened here and anything outside the shape `ws` is certain to accept goes to
+// the PLAIN server, i.e. exactly today's behaviour. Deliberately an ALLOW-LIST: an offer nobody
+// recognises must degrade to no compression, never to no socket. Real browser offers
+// (`permessage-deflate`, `permessage-deflate; client_max_window_bits`) are inside it.
+function deflateOfferSafe(req) {
+  const h = String((req && req.headers && req.headers["sec-websocket-extensions"]) || "");
+  if (!h) return true;                                  // no offer at all — nothing to negotiate
+  if (h.length > 512) return false;                     // not a client, and ws's parser would throw
+  for (const offer of h.split(",")) {
+    const parts = offer.split(";").map(s => s.trim()).filter(Boolean);
+    if (!parts.length) return false;                    // empty element — ws's parse() throws
+    if (parts[0].toLowerCase() !== "permessage-deflate") continue;   // some other extension: ws ignores it
+    const seen = new Set();
+    for (const p of parts.slice(1)) {
+      const eq = p.indexOf("=");
+      const k = (eq < 0 ? p : p.slice(0, eq)).trim().toLowerCase();
+      const v = eq < 0 ? "" : p.slice(eq + 1).trim().replace(/^"|"$/g, "");
+      if (seen.has(k)) return false;                    // duplicate parameter — ws's parse() throws
+      seen.add(k);
+      if (k === "client_no_context_takeover") { if (v !== "") return false; continue; }
+      if (k === "client_max_window_bits" || k === "server_max_window_bits") {
+        if (v === "" && k === "server_max_window_bits") return false;   // must carry a value
+        if (v !== "" && !(Number(v) >= 8 && Number(v) <= 15 && /^\d+$/.test(v))) return false;
+        continue;
+      }
+      return false;   // server_no_context_takeover, or anything unrecognised
+    }
+  }
+  return true;
+}
+const WS_DEDUPE_ON = String(process.env.CHIK_WS_DEDUPE ?? "") === "1";
+const WS_AGE_RE = /"a":-?\d+(\.\d+)?/g;   // safe: JSON.stringify escapes quotes, so `"a":` cannot occur inside a string value
 const wsClients = new Set();
 let _wsFrames = 0, _wsBytes = 0, _wsTicks = 0, _wsCpuUs = 0, _wsJitMax = 0, _wsJitSum = 0, _wsJitN = 0, _wsLastTick = 0, _wsIv = null;
-let _wsRefused = 0, _wsIdleSkips = 0, _wsGraceClosed = 0;
+let _wsRefused = 0, _wsIdleSkips = 0, _wsGraceClosed = 0, _wsDupSkips = 0, _wsDupBytes = 0, _wsDeflating = 0;
 // Observability + the sim's measuring stick. Never returns anything a client sent.
 export function _wsStatsForTest() {
   return { on: WS_ON, path: WS_PATH, hz: WS_TICK_HZ, tickMs: WS_TICK_MS, max: WS_MAX_SOCKETS,
            sockets: wsClients.size, authed: [...wsClients].filter(w => w._chik && w._chik.wallet).length, ticking: !!_wsIv,
            frames: _wsFrames, bytes: _wsBytes, ticks: _wsTicks, cpuUs: _wsCpuUs,
            refused: _wsRefused, idleSkips: _wsIdleSkips, graceClosed: _wsGraceClosed,
+           dupSkips: _wsDupSkips, dupBytes: _wsDupBytes,
+           deflate: { on: WS_DEFLATE_ON, max: WS_DEFLATE_MAX, threshold: WS_DEFLATE_THRESHOLD,
+                      level: WS_DEFLATE_LEVEL, memLevel: WS_DEFLATE_MEMLEVEL, negotiated: _wsDeflating },
+           dedupe: WS_DEDUPE_ON,
            jitterMaxMs: _wsJitMax, jitterAvgMs: _wsJitN ? _wsJitSum / _wsJitN : 0 };
 }
 export function _wsResetStatsForTest() {
   _wsFrames = 0; _wsBytes = 0; _wsTicks = 0; _wsCpuUs = 0; _wsJitMax = 0; _wsJitSum = 0; _wsJitN = 0; _wsLastTick = 0;
-  _wsRefused = 0; _wsIdleSkips = 0; _wsGraceClosed = 0;
+  _wsRefused = 0; _wsIdleSkips = 0; _wsGraceClosed = 0; _wsDupSkips = 0; _wsDupBytes = 0;
 }
 function wsSend(ws, obj) {
   if (ws.readyState !== 1) return 0;
   const s = JSON.stringify(obj);
+  ws.send(s);
+  _wsFrames++; _wsBytes += s.length;
+  return s.length;
+}
+// The tick's send. Identical to wsSend when CHIK_WS_DEDUPE is unset — same JSON, same counters —
+// so the OFF path is the shipped path. Only the tick uses this; the move ack never does, because
+// the ack is what feeds the client's silence watchdog and carries the `phys` verdict.
+function wsSendTick(ws, st, obj) {
+  if (ws.readyState !== 1) return 0;
+  const s = JSON.stringify(obj);
+  if (WS_DEDUPE_ON) {
+    const key = s.replace(WS_AGE_RE, '"a":0');
+    if (key === st.lastKey) { _wsDupSkips++; _wsDupBytes += s.length; return 0; }
+    st.lastKey = key;
+  }
   ws.send(s);
   _wsFrames++; _wsBytes += s.length;
   return s.length;
@@ -7334,8 +7478,17 @@ function wsTick() {
     const body = worldMoveReply({ t: "world" }, st.wallet, p.x, p.z, st.dl, st.fs, proven);
     // Advance the feed cursor by what we actually pushed, so the next tick does not repeat a headline.
     // The client's own `fs` still governs its move acks, exactly as it does over HTTP.
-    if (body.feed) for (const r of body.feed) if (r.t > st.fs) st.fs = r.t;
-    wsSend(ws, body);
+    // A HEADLINE IS NEVER DEDUPED. The cursor advances here, before the send, so a suppressed frame
+    // would eat the headline for good. In practice a feed-bearing frame can never equal the previous
+    // one (the cursor guarantees the previous frame did not carry the same rows), but the loss is
+    // permanent if that reasoning is ever wrong, so the bypass is explicit rather than derived.
+    if (body.feed && body.feed.length) {
+      for (const r of body.feed) if (r.t > st.fs) st.fs = r.t;
+      st.lastKey = "";
+      wsSend(ws, body);
+    } else {
+      wsSendTick(ws, st, body);
+    }
   }
   const cpu = process.cpuUsage(cpu0);
   _wsCpuUs += cpu.user + cpu.system;
@@ -7346,6 +7499,26 @@ function attachWorldSocket(server) {
   // closed rather than left hanging (once ANY upgrade listener exists, Node stops auto-destroying),
   // and CHIK_WS=0 must answer with a real refusal instead of a reset.
   const wss = WS_ON ? new WS.Server({ noServer: true, maxPayload: WS_MAX_PAYLOAD, clientTracking: false }) : null;
+  // THE SECOND SERVER EXISTS ONLY TO BOUND MEMORY. `perMessageDeflate` is a WS.Server option, not a
+  // per-connection one, so the only way to stop compressing past a socket count is to hand the
+  // upgrade to a server that does not offer the extension. `wss` above is that server — it is the
+  // one every socket uses today and the one every socket past WS_DEFLATE_MAX still uses. Nothing
+  // about the ceiling can refuse a connection; it can only decline an optimisation.
+  // maxPayload is set on BOTH: `ws` enforces it on the INFLATED size as well, which is what stops a
+  // small compressed inbound frame expanding into a heap bomb. Proven in the sim, not assumed.
+  const wssZ = (WS_ON && WS_DEFLATE_ON) ? new WS.Server({
+    noServer: true, maxPayload: WS_MAX_PAYLOAD, clientTracking: false,
+    perMessageDeflate: {
+      // serverNoContextTakeover MUST stay false — the streaming context is the entire win
+      // (93.9-95.3% with it, 54.7-67.5% without). clientNoContextTakeover is true because the
+      // inbound direction is 3.57 moves/s of ~300 B, where the context buys nothing and costs RAM.
+      serverNoContextTakeover: false,
+      clientNoContextTakeover: true,
+      threshold: WS_DEFLATE_THRESHOLD,
+      zlibDeflateOptions: { level: WS_DEFLATE_LEVEL, memLevel: WS_DEFLATE_MEMLEVEL },
+      concurrencyLimit: 10,
+    },
+  }) : null;
   server.on("upgrade", (req, socket, head) => {
     const path = String(req.url || "").split("?")[0];
     if (path !== WS_PATH) { socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"); socket.destroy(); return; }
@@ -7362,7 +7535,13 @@ function attachWorldSocket(server) {
       socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nX-Chik-Ws: full\r\nRetry-After: 30\r\n\r\n");
       socket.destroy(); return;
     }
-    wss.handleUpgrade(req, socket, head, (ws) => wsOpen(ws));
+    // Compress only while under the ceiling, only for a client that offered the extension, and only
+    // when the offer is one the compressing server is CERTAIN to accept — `ws` decides the second,
+    // deflateOfferSafe the third. A Godot native WebSocketPeer (measured: offers nothing) lands on
+    // the compressing server and still gets an uncompressed stream. Both paths reach the same
+    // wsOpen; the socket's own `extensions` is what says which one it got.
+    const useZ = wssZ && (WS_DEFLATE_MAX === 0 || _wsDeflating < WS_DEFLATE_MAX) && deflateOfferSafe(req);
+    (useZ ? wssZ : wss).handleUpgrade(req, socket, head, (ws) => wsOpen(ws));
   });
   if (WS_ON) {
     // A half-open TCP connection (laptop lid, dead wifi) never fires 'close'. Ping; a socket that
@@ -7390,7 +7569,9 @@ function attachWorldSocket(server) {
         if (st && !st.authed && now - (st.born || 0) > WS_AUTH_GRACE_MS) { _wsGraceClosed++; try { ws.terminate(); } catch {} }
       }
     }, 5000); gv.unref?.();
-    console.log(`world socket on ${WS_PATH} · ${WS_TICK_HZ}Hz · max ${WS_MAX_SOCKETS || "unlimited"}`);
+    console.log(`world socket on ${WS_PATH} · ${WS_TICK_HZ}Hz · max ${WS_MAX_SOCKETS || "unlimited"}`
+      + ` · deflate ${WS_DEFLATE_ON ? `ON (max ${WS_DEFLATE_MAX || "unlimited"}, >=${WS_DEFLATE_THRESHOLD}B, L${WS_DEFLATE_LEVEL}/M${WS_DEFLATE_MEMLEVEL})` : "off"}`
+      + ` · dedupe ${WS_DEDUPE_ON ? "ON" : "off"}`);
   } else {
     console.log(`world socket DISABLED (CHIK_WS=0) — clients fall back to /world/move polling`);
   }
@@ -7406,8 +7587,12 @@ function wsLoopSync() {
   else if (wsClients.size === 0 && _wsIv) { clearInterval(_wsIv); _wsIv = null; _wsLastTick = 0; }
 }
 function wsOpen(ws) {
+  // `pmd` is read from the socket, never assumed from the flag: the client has to have offered the
+  // extension for it to be there. It is the only honest count of what compression is actually doing.
+  const pmd = String(ws.extensions || "").includes("permessage-deflate");
   ws._chik = { wallet: "", auth: null, dl: 0, fs: 0, dead: false, msgs: 0, win: 0,
-               born: Date.now(), authed: false, lastMove: 0 };
+               born: Date.now(), authed: false, lastMove: 0, lastKey: "", pmd };
+  if (pmd) _wsDeflating++;
   wsClients.add(ws);
   wsLoopSync();
   ws.on("pong", () => { if (ws._chik) ws._chik.dead = false; });
@@ -7415,7 +7600,7 @@ function wsOpen(ws) {
   // A DROPPED SOCKET CLEARS PRESENCE THE WAY A STOPPED POLL DOES: it stops refreshing `ts`, and
   // WORLD_TTL_MS (12 s) sweeps the row. Deleting it here instead would make a transport switch
   // (socket → poll, or a reconnect) visibly pop the trainer out of everyone's world for a frame.
-  ws.on("close", () => { wsClients.delete(ws); wsLoopSync(); });
+  ws.on("close", () => { if (ws._chik && ws._chik.pmd) { ws._chik.pmd = false; _wsDeflating = Math.max(0, _wsDeflating - 1); } wsClients.delete(ws); wsLoopSync(); });
   ws.on("message", (raw) => {
     const st = ws._chik; if (!st) return;
     const now = Date.now();
@@ -7441,6 +7626,12 @@ function wsOpen(ws) {
     st.dl = m.dl ? 1 : 0;
     const fs = Number(m.fs) || 0; if (fs > st.fs) st.fs = fs;
     if (r.body.feed) for (const row of r.body.feed) if (row.t > st.fs) st.fs = row.t;   // don't re-push what the ack carried
+    // THE ACK IS NEVER DEDUPED, and it invalidates the tick's memory. Two reasons, both structural:
+    // it is the frame that feeds the client's WS_SILENCE watchdog (0.6 s, one ack per 280 ms move —
+    // so the watchdog does not depend on the tick at all), and it carries the `phys` verdict. Zeroing
+    // lastKey means a tick can only ever be suppressed against a state the client received FROM A
+    // TICK, so the ack can never leave the client holding a value the next tick then withholds.
+    st.lastKey = "";
     // The ack IS the HTTP reply. Byte-for-byte the same object the POST would have returned for this
     // body, plus the frame tag — ws_transport_sim.mjs asserts that field by field against a live POST.
     wsSend(ws, Object.assign({ t: "move" }, r.body));
