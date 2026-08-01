@@ -967,3 +967,139 @@ three occupancies (`_av_lw_honest_sim.mjs`, 12/12):
 The latency win is the **socket**, which already shipped. The two new flags move propagation by less
 than the A-to-A noise at every occupancy — they buy bytes (90.4% for a browser, 72.4% for a
 non-offering client in a slow-updating world), not milliseconds.
+
+## 14. The Island's Chronicle, attacked (2026-08-01)
+
+The owner's requirement for the chronicle pop-up was one sentence: **"DO NOT ERASE THE HISTORY."**
+Raising `WORLD_FEED_MAX` 8 → 400 and persisting the ring to the kv store made that history real —
+and, unchanged in every other respect, made it **destroyable by anyone on the internet**.
+
+Sims (real `server.js` in-process, throwaway keypair, memory store, dead RPC, unique port):
+`chron_attack_sim.mjs` 46/46, `chron_secrets_probe.mjs` 16/16, A/B against the deployed HEAD
+(`chron_ab_child.mjs`). Godot (windowed, real Main.tscn): `dev_chronattack.gd` 19/19 desktop and
+19/19 `CHIK_FORCEPHONE=1`, `dev_chronicles.gd` 33/33 desktop + 39/39 phone, `dev_scriptcheck` bad=0.
+
+### 14.1 CONFIRMED, CRITICAL — a stranger erased the whole island's history in 12.3 seconds
+
+`presenceOk` lets a private `godot-…` net_id stand alone (presence is not identity, and for an
+avatar that is right). `worldFeedPush` inherited that: **900 fabricated ids, no wallet, no
+signature, no token, nothing bought**, POSTed `/world/move` and then `/world/fish/report` at the
+route's own 800 ms floor. The server rolled their legends for them.
+
+| | before the flood | after 11,700 requests / 12.3 s |
+|---|---|---|
+| genuine moments retained | 12 | **0** |
+| attacker rows | 0 | **400 / 400** |
+| after a save→wipe→restore restart | the history | **the flood** |
+
+Pre-retention the identical flood cost 8 rows of a ticker that died on reload. Retention is exactly
+what turned a cosmetic nuisance into the permanent destruction of the feature, **including in the
+database**. The attacker also chose the name on every headline.
+
+**Fixed with three bounds, in order of force** (`server.js`, note at `WORLD_FEED_MAX`):
+
+1. **A proven wallet, or nothing.** `worldFeedPush` refuses any author that is not a pubkey — and a
+   pubkey reached `presenceOk` only by proving the market token. A durable, shared, persisted world
+   record is value, and value settles against a wallet. Measured: the same flood now rolls 423
+   legends and writes **0 rows**; all 12 genuine moments survive. It is also the rule `ownCredit`
+   already applied — a net_id catch is credited to nobody either, so the two now agree.
+2. **No author may evict another.** At `WORLD_FEED_PER_AUTHOR` (24, ≤6% of the ring) an author
+   replaces their *own* oldest row. Measured: one wallet pushing 200 rows holds 24 and evicts none
+   of the 12.
+3. **Fair trim.** When the ring is genuinely full the row dropped belongs to whoever holds the most
+   (ties → oldest). Measured: 12 one-row authors survived 500 rows of noise from 30 loud authors,
+   12/12 — an oldest-first trim leaves 0.
+
+There is deliberately **no per-author rate limit**. A 4 s floor was written and then removed: with
+the share cap it protects nothing, and it *does* drop a real moment when an angler lands two legends
+inside the window. Refusing to record something that happened is the one failure this feature cannot
+have, so the bound is a share, not a rate. (`back-to-back legends 0 ms apart both chronicle`.)
+
+### 14.2 CONFIRMED — the restored blob was not re-validated
+
+`restoreWorldFeed` pushed whatever the kv store returned straight into `worldFeed`, against the rule
+`restoreWorldNodes` already follows. `sanitizeFeedRows` now re-imposes shape, types, `stripTags`, the
+20/32 string clamps and the ring bound on the way IN. The clock matters most: a row with a
+far-future `t` is served to every client, advances every client's `fs` cursor past every real row
+and **silences the chronicle for the whole fleet**. Measured: 7 hostile entries (null, number,
+string, array, empty kind, `id:"../../etc"` with 5,000/9,000-char fields and `t:9e18`) → 1 row out.
+
+### 14.3 CONFIRMED — the public GET became a 33 KB unauthenticated amplifier
+
+Serving the whole ring by default took a 505 B endpoint to **33,761 B**; one client pulled
+**569 req/s = 18.3 MiB/s of egress** with no wallet and no rate limit, on a host that has already had
+a bandwidth incident. The default page is now `WORLD_FEED_PUBLIC_PAGE` = 60 rows (5,433 B at full
+retention, 6.6× smaller); the full backlog is still available, it just has to be asked for
+(`?limit=400`). Rows never carry the author wallet — `feedWire` strips `w`, which exists only to key
+the fairness bounds.
+
+### 14.4 CONFIRMED (client) — a stranger's name was BBCODE, and retention made it stored
+
+`Minimap._feed_line` interpolated the wire's `h` into a bbcode string rendered through
+`Econ.rt_set_bb`, whose own docstring says never to feed it player text. The server strips only
+`<` and `>`, so `[font_size=99]` or `[url=…]` in a handle rendered as markup in every player's HUD.
+Harmless while the pill was a 4-line ticker that died on reload; with the chronicle retained,
+persisted and **re-seeded from the save**, it becomes a stored injection that replays on every boot
+and rides the cloud profile. Escaped at the one place player text meets our markup
+(`_feed_bb_safe`); the pop-up's rows were already plain `Label`s and were safe. Measured: the pill
+now shows the literal `[font_size=99]X`.
+
+### 14.5 CONFIRMED (client) — four ways the retained history could still be lost
+
+* **A crafted save was unbounded.** `_chron_hydrate` read `d["chronicle"]` with no row cap and no
+  string clamp; 5,000 rows × 4,000-char fields loaded whole, then built one `Control` per row in the
+  pop-up. Now clamped to `CHRON_CAP` and to the wire's own 20/32 limits. Measured: 5,000 → 300 rows,
+  longest handle 20.
+* **One poisoned stamp silenced the feed forever.** `_feed_fs` was advanced from saved timestamps
+  with no ceiling and is itself persisted, so `t = 4e15` would freeze the cursor past every future
+  row *across reloads*. Now refused (`_chron_stamp_ok`, local now + 1 day). Measured: fs stays 0 and
+  the next real moment still arrives.
+* **The dedupe key dropped distinct events.** `k|h|t` collides for two different moments that share
+  a kind, a name and a millisecond; the second was silently gone. `d` is now in the key, in both
+  `Net._chron_key` and `Minimap.push_world_feed`. Measured: 2 retained where 1 was.
+* **A flood evicted the player's own history.** The client trimmed oldest-first at 300, so 300 rows
+  from one loud source erased everything. `_chron_evict_idx` drops the oldest row of the
+  most-represented handle and never the local player's while anyone else's remain. Measured: a
+  600-row flood left all 12 other trainers' moments and all 3 of the player's own.
+
+### 14.6 CONFIRMED (client) — the history could 413 the whole cloud save away
+
+`/profile` refuses a profile whose JSON exceeds 65,000 bytes, and that refusal loses the **whole**
+save, not the rider that overflowed. A full 200-row chronicle is 22.6 KB of a veteran's budget.
+`Profile.export_server` now trims the chronicle *in the export only* until it fits `CLOUD_JSON_MAX`
+(60,000) and drops it entirely if the profile is over the line on its own; the chronicle is
+signature-neutral (`_econ_sig` never reads it), so nothing is invalidated and the local history keeps
+all 200 rows. Measured: a 45 KB profile that would have been ~67,622 B exports at 58,637 B with 100
+of 200 rows kept; a 62 KB profile drops the key and **returns** (the first draft of the trim loop
+could not reduce below one row and hung a probe — a proportional step that rounds to zero never
+terminates).
+
+### 14.7 What did NOT change, proven by A/B against the deployed server
+
+Two child servers (deployed `git HEAD` vs patched), one fixed transcript, one proven wallet: the
+move reply — the only feed path any shipped client reads — is **identical at every step** (empty
+`fs=0`, a 3-row backlog delta, a caught-up cursor with the `feed` key absent, a one-row delta, row
+keys `d,h,k,t`, 8-row window, 649 B at full retention). The single wire delta anywhere is an `id`
+key added to `GET /world/feed`, which **no production client calls** (grep of every `.gd`: only dev
+probes). Key discipline re-swept across `/world/feed` (default, `?limit=400`, `?since`, garbage,
+negative and huge limits), `/world/move`, `/stats`, `/health`, `/world/roster`, `/world/event`: zero
+canary bytes, `/stats.clientRpc === ""`, no stack traces on malformed queries.
+
+### 14.8 Stated residuals
+
+* **The chronicle is still a bounded shared log, so it is still floodable by someone willing to pay
+  for identities.** With `VERIFY_HOLDERS=false` (today's devnet setting) a keypair is free, so ~17
+  verified wallets can still fill 400 slots. What changed is that every row is now attributable to a
+  pubkey (bannable), no single identity can evict anyone, and the zero-cost anonymous version is
+  gone. Turning `VERIFY_HOLDERS` on is what makes the remaining cost real.
+* **A wallet-less client no longer chronicles.** `Net._presence_id()` falls back to a `godot-…`
+  net_id when no wallet is connected; that player's server-rolled legend is still shown and banked
+  locally but does not enter the island's record. This is what `dev_fishonedie_w.gd` measures, and
+  both fish probes now encode the rule instead of the old assumption.
+* **Pre-existing and NOT introduced here** (proven by running the same probe against the deployed
+  HEAD server): `dev_rvfishw.gd` fails 4/4 the same way on both servers (festival not reaching the
+  client, verdict-by-strike-time 0/24, no legends rolled, the snap branch), and `dev_fishonedie_w`
+  fails the festival case on both. On desktop `dev_hudfit HUDFIT_MODE=pop` reports 2 overlaps — the
+  **minimap's own 152×152 map Button** against the catalog's category tabs, which predates this
+  work. The chronicle pill was fixed: it now drops its input filter while a foreign pop is open
+  (desktop `small` 13 → 12, phone 0 overlaps / 0 offscreen in every mode).

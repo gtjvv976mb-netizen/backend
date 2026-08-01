@@ -178,10 +178,16 @@ sec("D. can a client show/SELL itself a legend the server did not roll?");
   chk(feedAfter === feedBefore, `declaring a Rainbow Fish on the market pushes NO chronicle row (feed ${feedBefore} -> ${feedAfter}) — the world feed is server-rolled only`);
 }
 
-// ============================================================= E. THE CHRONICLE IS FLOODABLE
+// ====================================================== E. THE CHRONICLE IS NO LONGER FLOODABLE
 sec("E. who may write the chronicle?");
 {
-  // net_ids stand alone under presenceOk (the deferred sid-auth class), and the feed holds 8 rows.
+  // HISTORY: this case used to assert `flood > 0` — it RECORDED the hole rather than refusing it,
+  // because at 8 rolling rows the flood was cosmetic griefing and the fix sat in the deferred
+  // sid-auth class. Raising retention to 400 persisted rows turned that same flood into permanent
+  // destruction of the island's history, so worldFeedPush now demands a proven wallet. Bisected:
+  // the deployed baseline (server_chron_baseline.mjs == git HEAD:server.js) still scores
+  // "24 net_ids wrote 8 of the 8 chronicle rows"; the patched server scores 0. The assertion is
+  // inverted deliberately — the old expectation was a vulnerability, not a contract.
   const feed0 = await feedRows();
   const ids = Array.from({ length: 24 }, (_, i) => `godot-fl${String(i).padStart(6, "0")}`);
   for (const w of ids) await post("/world/move", { wallet: w, x: 5, z: 5, dir: 0, handle: "Legit Angler" });
@@ -194,8 +200,9 @@ sec("E. who may write the chronicle?");
   }
   const feed1 = await feedRows();
   const flood = feed1.filter((r) => r.h === "Legit Angler").length;
-  chk(flood > 0, `${ids.length} FABRICATED net_ids (no wallet, no signature, no token) wrote ${flood} of the ${feed1.length} chronicle rows in ${rows} legend rolls; feed was ${feed0.length} rows before`);
-  note("CHRONICLE FLOOD (PRE-EXISTING, present in the pre-stage3 baseline at line 3869): worldFeedPush takes the HANDLE off an unauthenticated presence row, ownCredit skips net_ids so there is no economic gain — it is pure display griefing of an 8-row ring, and it lets an attacker put any handle next to any legend.");
+  chk(flood === 0, `${ids.length} FABRICATED net_ids (no wallet, no signature, no token) wrote ${flood} of the ${feed1.length} chronicle rows in ${rows} legend rolls; feed was ${feed0.length} rows before (deployed HEAD scores 8 of 8 here)`);
+  chk(feed1.length >= feed0.length, `and no genuine row was evicted by the attempt (feed ${feed0.length} -> ${feed1.length})`);
+  note("CHRONICLE FLOOD (CLOSED by the chronicle-retention change): worldFeedPush now refuses any author that is not a proven pubkey, so an unauthenticated presence row can no longer put its handle next to a legend. The floodable behaviour is still live on the deployed HEAD — this only ships with the new server.js.");
 }
 
 console.log(`\nRV_FISH_ATTACK_DONE pass=${pass} fail=${fail} findings=${findings.length}`);

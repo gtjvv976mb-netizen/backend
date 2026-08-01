@@ -1622,10 +1622,26 @@ app.get("/world/rarity", (_req, res) => {
   }
   res.json(out);
 });
-// Read-only, public: the island's chronicle — the same last-8 ring every client renders under its
-// minimap. For the operator ("did any events happen?"), the website, and diagnosis. Writes nothing.
-app.get("/world/feed", (_req, res) => {
-  res.json({ count: worldFeed.length, feed: worldFeed });
+// Read-only, public: the island's chronicle — the FULL retained backlog (the client pop-up's
+// history), the operator's "did any events happen?", and diagnosis. Writes nothing.
+// Contract: rows are OLDEST → NEWEST, each {id,k,h,d,t} where id is a monotonic sequence (the
+// unambiguous cursor — `t` can collide within one millisecond). `?since=<epoch ms>` keeps the
+// exact strictly-greater clock semantics of the move reply's fs cursor; `?limit=N` (clamped to
+// 1..WORLD_FEED_MAX) keeps the NEWEST N of whatever matched. `count` is rows returned (as before —
+// the two were always equal), `total` is rows retained.
+//
+// THE DEFAULT PAGE IS SMALL ON PURPOSE. Measured (chron_attack_sim case G): serving the whole ring
+// by default turned a 505 B public endpoint into 33,761 B, and one unauthenticated client pulled
+// 569 req/s = 18.3 MiB/s of egress from a machine that has already had a hosting bandwidth incident.
+// The backlog is still available in full — it just has to be ASKED for (`?limit=400`), which is what
+// a pop-up opening once per session does and what a bandwidth drain will not bother to do.
+// Rows never carry the author wallet (feedWire).
+app.get("/world/feed", (req, res) => {
+  const since = Number(req.query?.since) || 0;
+  let lim = Math.floor(Number(req.query?.limit)) || WORLD_FEED_PUBLIC_PAGE;
+  lim = Math.max(1, Math.min(WORLD_FEED_MAX, lim));
+  const rows = (since > 0 ? worldFeed.filter((r) => r.t > since) : worldFeed).slice(-lim);
+  res.json({ count: rows.length, total: worldFeed.length, max: WORLD_FEED_MAX, feed: rows.map(feedWire) });
 });
 // Read-only, public: is a festival on? The operator's answer to "did my curl land?", the website's
 // banner source, and the only status check that needs no login and writes nothing.
@@ -3451,7 +3467,27 @@ export function _clearWorldNodes() { worldNodes.clear(); worldNodeUses.clear(); 
 export function _setOwnEnforceForTest(on) { _ownEnforce = !!on; return _ownEnforce; }
 // Lets the sim prove both sides of the flag without two server boots. Production reads the env var.
 export function _rollFantasyCatchForTest(tier, rod) { return rollFantasyCatch(tier, rod); }
-export function _worldFeedPushForTest(k, w, d) { worldFeedPush(k, w, d); }
+// Goes through the REAL guard (proven author + per-author floor + fair trim), so a sim that seeds a
+// row through it is also testing the guard. Returns whether the row was accepted. Ring-mechanics
+// tests that need rows from an unproven id use _worldFeedSeam.seed instead.
+export function _worldFeedPushForTest(k, w, d) { return worldFeedPush(k, w, d); }
+// The persistence round-trip seam: this machine has no Postgres, so a sim proves save/restore by
+// running the REAL functions in one process — save, wipe, restore, assert (the node_persist_sim
+// pattern). Never reachable from a request.
+export const _worldFeedSeam = {
+  save: () => saveWorldFeedNow(),
+  restore: () => restoreWorldFeed(),
+  wipe: () => { worldFeed = []; _wfeedSeq = 0; _feedSavedAt = 0; },
+  rows: () => worldFeed.slice(),
+  seq: () => _wfeedSeq,
+  // Ring-mechanics seed for sims that test the WIRE (cursor, ticks, trim) rather than the author
+  // gate: it bypasses the proven-wallet check and the floor, and nothing else. Never a request path.
+  seed: (k, h, d, w) => {
+    const row = { id: ++_wfeedSeq, k: String(k), h: stripTags(String(h)).slice(0, 20),
+                  d: String(d).slice(0, 32), t: Date.now(), w: String(w || h) };
+    worldFeed.push(row); feedTrimFair(); return row;
+  },
+};
 export function _setFfishAuthorityForTest(on) { _ffishAuth = !!on; if (_ffishAuth) OWN_KINDS.add("ffish"); else OWN_KINDS.delete("ffish"); return _ffishAuth; }
 export function _grantOwnForTest(w, item, n, kind = "mat") { ownCredit(String(w), kind, item, n); return n; }
 export function _clearOwnBook() { ownBook.clear(); _ownWorst.clear(); _ownRefusals = 0; _ownSkipped = 0; _ownSnapshots = 0; _ownReady = true; _ownEnforce = true;
@@ -3906,21 +3942,154 @@ async function saveFishEvent() { try { await store.kvSet("fish_event", _fishEven
 
 // ============ THE WORLD FEED: server-witnessed rare moments, shown under every minimap ============
 // Only events THIS server rolled may enter (fantasy catches, server-rolled legendary/meme hatches),
-// so every headline is a fact. Ephemeral by design — a restart forgets old headlines, it cannot
-// forge new ones. The move reply ships only rows newer than the client's fs cursor.
-const WORLD_FEED_MAX = 8;
+// so every headline is a fact — a restart cannot forge one. The chronicle is now a RETAINED,
+// PERSISTED history (the world_chat pattern: kv restore at boot, throttled kv save on push), so a
+// deploy or an idle spin-down no longer erases it. The move reply is unchanged: it ships only rows
+// newer than the client's fs cursor, capped to the same 8-row window the shipped client has always
+// received. The full backlog rides GET /world/feed only.
+//
+// Retention arithmetic (measured by feed_retention_sim: 505 B for 8 {k,h,d,t} rows = 63.1 B/row;
+// the id key adds ~10 B): 400 rows x ~73 B ≈ 29 KB as a ONE-SHOT backlog fetch / kv value, well
+// under the 1000-row world_chat kv row, and ~tens of KB resident. Feed events are rare (legendary/
+// meme/mount hatches, fantasy catches), so 400 entries is weeks of history, not hours.
+// ============ WHY THE CHRONICLE IS AUTHORISED, RATE-LIMITED AND FAIRLY TRIMMED ============
+// MEASURED ATTACK (chron_attack_sim.mjs, real server in-process): with the retention raise and no
+// author gate, 900 fabricated `godot-…` presence ids — no wallet, no signature, no token, nothing
+// bought — POSTed /world/move and then /world/fish/report at the 800 ms floor and **erased the
+// island's entire history in 12.3 s** (11,700 requests): 12 genuine moments -> 0, 400/400 rows the
+// attacker's, and the save/restore round-trip then handed the FLOOD back after a restart. Before the
+// raise the same flood cost 8 rows of a rolling ticker; retention is exactly what turned a cosmetic
+// nuisance into the permanent destruction of the feature. Three bounds, in order of force:
+//
+//  1. AUTHOR MUST BE A PROVEN WALLET. presenceOk lets a private net_id stand alone (presence is not
+//     identity, and that is right for an avatar) — but a durable, shared, PERSISTED world record is
+//     value, and value settles against a wallet (isPubkey ⇒ presenceOk already demanded the market
+//     token). A net_id may fish, hatch and be seen; it may not write the island's permanent record.
+//     This alone makes the measured attack cost zero rows.
+//  2. NO AUTHOR MAY EVICT ANOTHER. An author at WORLD_FEED_PER_AUTHOR replaces their OWN oldest row
+//     instead of appending, so one identity can never push a stranger's moment out of the history.
+//     That is the owner's requirement stated as an invariant, and it holds even if 1. is ever bypassed.
+//  3. FAIR TRIM. When the ring is genuinely full the row dropped belongs to whoever holds the MOST
+//     rows (ties → oldest), so the quietest author is never the one who loses their moment.
+//
+// THERE IS DELIBERATELY NO PER-AUTHOR RATE LIMIT. A 4 s floor was written and then removed: with
+// the fair share above, a wallet spamming rows only ever replaces its OWN oldest, so a limit adds
+// no protection — while it DOES drop a real moment whenever an angler lands two legends inside the
+// window (the fish route's own floor is 800 ms). Refusing to record something that happened is the
+// one failure this feature cannot have, so the bound is a SHARE, not a rate.
+const WORLD_FEED_MAX = 400;        // retained history — the pop-up backlog
+const WORLD_FEED_MOVE_WINDOW = 8;  // the move reply's delta cap — the shipped pill's contract
+const WORLD_FEED_PER_AUTHOR = 24;  // ≤6% of the ring — one wallet's fair share of the island's memory
+const WORLD_FEED_PUBLIC_PAGE = 60; // anonymous default page — the full 400 needs an explicit ?limit
 let worldFeed = [];
+let _wfeedSeq = 0;                 // monotonic row id — a cursor that, unlike `t`, never collides within a millisecond
+let _feedAnonRefused = 0, _feedSelfReplaced = 0, _feedFairEvicted = 0;
+// Anything restored from the store is re-validated on the way IN, exactly as restoreWorldNodes does:
+// a persisted blob comes back from a database a future bug (or an operator) could corrupt, and this
+// one is served to every client and copied into their local history. Shape, types, string lengths and
+// the clock are all re-imposed — a row with a far-future `t` would otherwise advance every client's
+// `fs` cursor past every real row and silence the chronicle for the whole fleet.
+function sanitizeFeedRows(v) {
+  if (!Array.isArray(v)) return [];
+  const now = Date.now();
+  const out = [];
+  for (const r of v.slice(-WORLD_FEED_MAX)) {
+    if (!r || typeof r !== "object" || Array.isArray(r)) continue;
+    const t = Number(r.t);
+    if (!Number.isFinite(t) || t <= 0 || t > now + 60000) continue;   // no future stamps, ever
+    const k = stripTags(String(r.k == null ? "" : r.k)).slice(0, 12);
+    const h = stripTags(String(r.h == null ? "" : r.h)).slice(0, 20);
+    const d = stripTags(String(r.d == null ? "" : r.d)).slice(0, 32);
+    if (!k) continue;
+    const id = Math.floor(Number(r.id));
+    out.push({ id: Number.isFinite(id) && id > 0 ? id : 0, k, h, d, t: Math.floor(t),
+               w: typeof r.w === "string" ? r.w.slice(0, 44) : undefined });
+  }
+  return out;
+}
+export function _sanitizeFeedRowsForTest(v) { return sanitizeFeedRows(v); }
+async function restoreWorldFeed() {
+  try {
+    const v = await store.kvGet("world_feed");
+    if (Array.isArray(v) && !worldFeed.length) {
+      worldFeed.push(...sanitizeFeedRows(v));
+      let seq = 0;
+      for (const r of worldFeed) seq = Math.max(seq, Number(r.id) || 0);
+      for (const r of worldFeed) if (!r.id) r.id = ++seq;   // a blob that lost its ids still gets a cursor
+      _wfeedSeq = seq;
+    }
+  } catch (e) {}
+}
+restoreWorldFeed();
+let _feedSavedAt = 0, _feedSaveTimer = null;
+function saveWorldFeedNow() {
+  _feedSavedAt = Date.now();
+  return store.kvSet("world_feed", worldFeed.slice(-WORLD_FEED_MAX)).catch(() => {});
+}
+function saveWorldFeed() {
+  const now = Date.now();
+  if (now - _feedSavedAt < 5000) {   // batch bursts like world_chat does…
+    if (!_feedSaveTimer) {           // …but with a trailing write, so a burst's TAIL is never the row a restart forgets
+      _feedSaveTimer = setTimeout(() => { _feedSaveTimer = null; saveWorldFeedNow(); }, 5000);
+      if (_feedSaveTimer.unref) _feedSaveTimer.unref();
+    }
+    return;
+  }
+  saveWorldFeedNow();
+}
+// The public projection of a row. `w` (the author wallet) is the key the fairness bounds are keyed
+// on and it NEVER goes on the wire — the roster publishes wallets for players who are in the world
+// right now, a permanent log that names who caught what is a different and worse thing.
+const feedWire = (r) => ({ id: r.id, k: r.k, h: r.h, d: r.d, t: r.t });
+// Full ⇒ drop one row, choosing the author who currently holds the MOST. The quietest author is
+// never the one who loses a moment; a loud one pays for their own volume first.
+function feedTrimFair() {
+  while (worldFeed.length > WORLD_FEED_MAX) {
+    const counts = new Map();
+    for (const r of worldFeed) counts.set(r.w, (counts.get(r.w) || 0) + 1);
+    let worst = null, worstN = 0;
+    for (const [w, n] of counts) if (n > worstN) { worstN = n; worst = w; }
+    const i = worstN > 1 ? worldFeed.findIndex((r) => r.w === worst) : 0;   // that author's OLDEST
+    worldFeed.splice(i < 0 ? 0 : i, 1);
+    _feedFairEvicted++;
+  }
+}
 function worldFeedPush(k, wallet, d) {
-  const me = worldPlayers.get(String(wallet));
+  const w = String(wallet);
+  // 1. a proven wallet, or nothing. See the note at WORLD_FEED_MAX for the measured attack.
+  if (!isPubkey(w)) { _feedAnonRefused++; return false; }
+  const now = Date.now();
+  const me = worldPlayers.get(w);
   const h = stripTags(String((me && me.handle) || "A trainer")).slice(0, 20);
-  worldFeed.push({ k, h, d: String(d).slice(0, 32), t: Date.now() });
-  if (worldFeed.length > WORLD_FEED_MAX) worldFeed = worldFeed.slice(-WORLD_FEED_MAX);
+  const row = { id: ++_wfeedSeq, k, h, d: String(d).slice(0, 32), t: now, w };
+  // 2. at their fair share an author replaces their OWN oldest row — never a stranger's
+  let mine = 0;
+  for (const r of worldFeed) if (r.w === w) mine++;
+  if (mine >= WORLD_FEED_PER_AUTHOR) {
+    const i = worldFeed.findIndex((r) => r.w === w);
+    worldFeed.splice(i, 1);
+    _feedSelfReplaced++;
+  }
+  worldFeed.push(row);
+  feedTrimFair();
+  saveWorldFeed();
+  return true;
 }
 function worldFeedSince(fs) {
   if (!worldFeed.length) return undefined;
   const cut = Number(fs) || 0;
-  const rows = worldFeed.filter((r) => r.t > cut);
-  return rows.length ? rows : undefined;
+  // The shipped incremental wire is UNCHANGED by the retention raise: same {k,h,d,t} row shape
+  // (no id key), and at most the newest 8 — exactly what a fresh fs=0 client received when the
+  // whole ring WAS 8. History belongs to GET /world/feed, never to the per-tick move reply.
+  const rows = worldFeed.filter((r) => r.t > cut).slice(-WORLD_FEED_MOVE_WINDOW);
+  return rows.length ? rows.map((r) => ({ k: r.k, h: r.h, d: r.d, t: r.t })) : undefined;
+}
+// Observability for the three chronicle bounds — refusals are invisible by design (the caller still
+// gets their fish and their creature), so the only way to know they are firing is to count them.
+export function _feedGuardStatsForTest() {
+  return { anonRefused: _feedAnonRefused,
+           selfReplaced: _feedSelfReplaced, fairEvicted: _feedFairEvicted,
+           authors: new Set(worldFeed.map((r) => r.w)).size, rows: worldFeed.length };
 }
 const _lastFishRec = new Map();      // wallet -> last COUNTED catch ms (anti-inflation, not a refusal)
 app.post("/world/fish/report", (req, res) => {
