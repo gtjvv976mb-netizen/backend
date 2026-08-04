@@ -133,12 +133,31 @@ DRY RUN - nothing was written. Re-run with --commit to apply.
 ```
 
 **How to read it:** INSERT is players coming back. The known-answer test re-derives each save's
-anti-cheat seal and checks it against the player's own stored seal — `fail=0` means the reseal is
-byte-perfect. QUARANTINED/ABORTS are wallets the tool refuses to touch rather than risk shrinking
-— they stay exactly as they are and are listed in the audit file for a human decision.
+anti-cheat seal and checks it against the player's own stored seal.
 
-**If instead** INSERT is far below ~2,400 (say under 2,000), or `fail=` is not 0: **stop and
-report the output.** Far-too-few means the sources on the command line do not hold the players.
+**The exact numbers this dry run produced against restored copies of the real databases
+(2026-08-04), so you know what "normal" looks like:**
+
+```
+  INSERT 2450 · MERGE 30 (three-source) or 18 (two-source) · QUARANTINED 7 · ABORTS 0
+  known-answer: pass=133 fail=12 none=2387 (wallets with any FAIL: 11)
+```
+
+`fail` is NOT zero, and that is expected — the 11 wallets split into two known groups:
+
+- **4 wallets** where one OLD copy of the save (client versions v12–v13) fails its seal but a
+  NEWER copy of the same wallet passes — the tool reseals from the proven copy automatically.
+  Safe by construction; nothing for you to do.
+- **7 wallets** (the QUARANTINED count) whose ONLY save fails its own seal — client versions
+  v3–v13, either pre-dating the seal formulas the tool can reproduce or tampered. The tool
+  REFUSES to write these rather than forge a seal. Each holds only 1–2 assets (an avatar, an
+  egg, at most one creature — 12 assets across all seven). They stay exactly as they are and
+  are listed in the audit file; if one of these players ever reports missing items, handle
+  that wallet individually from the audit record.
+
+**If instead** INSERT is far below ~2,400 (say under 2,000), `fail` is far above ~12, or
+MONOTONICITY ABORTS is not 0: **stop and report the output.** Far-too-few INSERTs means the
+sources on the command line do not hold the players.
 
 To look at one specific player before going further:
 
