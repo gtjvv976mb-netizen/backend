@@ -5978,6 +5978,151 @@ function regOwned(wallet, type, state = "active") {
 // the provenance, and a mutable provenance is not one.
 function regEvent(row, what, extra) { row.chain.push(Object.assign({ at: Date.now(), what }, extra || {})); }
 
+// ============ NFT MINT AUTHORITY — CHIK_NFT_MINT (default OFF) ============
+// The mint LAUNDERS whatever it touches, so ONLY a server-witnessed, registry-owned, rare-tier row
+// may mint. Opt-in like every new subsystem: with the flag OFF every /assets/nft/* route 503s and
+// nothing below writes a field, so a flag-off server is byte-identical in HTTP behaviour to today.
+// (serializeAssetReg/restoreAssetReg change unconditionally but are ADDITIVE-PASSTHROUGH: with no
+// minted rows — the only state a flag-off server can reach — they emit the exact bytes they did before.)
+const NFT_MINT_ON = String(process.env.CHIK_NFT_MINT ?? "0") === "1";
+// A second, independent lever (L10): pause NEW mints while reconciliation keeps running. Default OFF,
+// so master-off stays byte-identical. Never pauses reconcile, minted-recording, or config.
+const NFT_MINT_PAUSED = String(process.env.NFT_MINT_PAUSED ?? "0") === "1";
+// Mintable ORIGINS — server-witnessed births ONLY. legacy/unverified/adopted rows were never vouched;
+// minting them would launder exactly what the mint is meant to prove. Widen via env without a deploy.
+const NFT_MINT_ORIGINS = new Set(String(process.env.NFT_MINT_ORIGINS || "hatched").split(",").map(s => s.trim()).filter(Boolean));
+// Royalty (owner lock D7): 15% on the WNS transfer hook, routed to the POOL wallet — the market's
+// 20%-tax destination (TEAM_WALLET). Redirect without code via NFT_ROYALTY_WALLET. Income budgeted 0.
+const NFT_ROYALTY_BPS = Math.max(0, Math.min(10000, Number(process.env.NFT_ROYALTY_BPS ?? "1500") || 1500));
+const NFT_ROYALTY_WALLET = (process.env.NFT_ROYALTY_WALLET && isPubkey(String(process.env.NFT_ROYALTY_WALLET).trim()))
+  ? String(process.env.NFT_ROYALTY_WALLET).trim() : (TEAM_WALLET || null);
+const NFT_COLLECTION = String(process.env.NFT_COLLECTION || "").trim() || null;
+// Sequential, server-ASSIGNED edition per (type,species): assigned and recorded, NEVER recomputed, so
+// two wallets can never both hold "#1". Persisted with the rows; floored at max(row.edition) on restore.
+const nftEdition = Object.create(null);   // _censusKey(type,sp) -> highest edition issued
+const _nftMinting = new Set();            // asset ids with an in-flight mint (claim BEFORE the await — TOCTOU)
+// Programs that can appear as a token's "holder" while it is merely LISTED (escrow), not sold. Off-curve
+// is caught structurally; this catches on-curve program-owned edge cases (Magic Eden/Tensor PDAs).
+const NFT_HOLDER_DENYLIST = new Set(String(process.env.NFT_HOLDER_DENYLIST || "").split(",").map(s => s.trim()).filter(Boolean));
+const NFT_DWELL_MS = 60000;               // min hold before a transfer is trusted (closes the flash-hold window)
+let _nftDasUnsupported = false;           // structural DAS-unsupported hard-stop (fail-safe, D6)
+let _nftDasStub = null;                   // test seam: mint -> obs (function or Map); real path hits DAS
+let _nftSyncBusy = false, _nftSyncAt = 0;
+const _nftReviewFlags = new Map();        // id -> {reason, at} — operator-visible; owner NEVER mutated
+const _nftHolderObs = new Map();          // id -> {owner, since} — the two-read + dwell state machine
+
+const _nftCap = (s) => { s = String(s || ""); return s ? s[0].toUpperCase() + s.slice(1) : s; };
+function _isOnCurve(addr) { try { return PublicKey.isOnCurve(new PublicKey(addr).toBytes()); } catch { return false; } }
+// Rare tiers only (owner lock): mounts + legendary/meme chikimon. NO normals, NO avatars, NO eggs.
+function nftMintableKind(row) {
+  if (!row) return false;
+  if (row.type === "mount") return true;
+  return row.type === "chikimon" && (row.kind === "legendary" || row.kind === "meme");
+}
+// The airtight gate, in order. Pure (row + wallet) so a sim drives it directly. code "ok" == mintable.
+function nftEligibility(row, wallet) {
+  if (!row) return { code: "no-asset", status: 404, error: "no such asset" };
+  if (!wallet || row.owner !== wallet) return { code: "not-owner", status: 403, error: "the registry says this wallet does not own that asset" };
+  if (row.state !== "active") return { code: "not-active", status: 409, error: `asset is ${row.state}, not mintable` };
+  if (row.type === "avatar") return { code: "avatar", status: 403, error: "avatars are not mintable in this increment" };
+  if (!nftMintableKind(row)) return { code: "kind", status: 403, error: "only legendaries, Meme Dynasty and mounts can be minted" };
+  if (!NFT_MINT_ORIGINS.has(String(row.origin))) return { code: "origin", status: 403, error: "only server-witnessed births can be minted" };
+  if ((row.gameStatus ?? "good") !== "good") return { code: "flagged", status: 409, error: "asset is flagged and cannot be minted" };
+  if (row.listedOffchain || row.pendingHandover) return { code: "busy", status: 409, error: "asset is listed on-chain or has a pending transfer" };
+  return { code: "ok", status: 200 };
+}
+function nftEditionFor(row) { const k = _censusKey(row.type, row.sp); nftEdition[k] = (nftEdition[k] || 0) + 1; return nftEdition[k]; }
+// The UNSIGNED mint intent the player's own wallet signs — the server NEVER signs a player mint.
+function nftMintIntent(row) {
+  return {
+    id: row.id, standard: "wns", tokenProgram: "token-2022",
+    name: `${_nftCap(row.sp)} #${row.edition}`, collection: NFT_COLLECTION,
+    sellerFeeBasisPoints: NFT_ROYALTY_BPS, royaltyWallet: NFT_ROYALTY_WALLET,
+    immutable: { registryId: row.id, species: row.sp, kind: row.kind, origin: row.origin,
+                 edition: row.edition, born: row.born, hatcher: row.hatcher || row.owner },
+    note: "unsigned — the player's wallet signs & submits this; the server records the resulting address at /assets/nft/mint",
+  };
+}
+// Never act on a raw ownership.owner — CLASSIFY first (F1/L2). Pure; the sim drives it directly.
+function nftClassifyHolder(row, obs) {
+  obs = obs || {};
+  if (obs.structuralUnsupported) return { action: "das-unsupported" };   // hard-stop, fail-safe (D6)
+  if (obs.dasFailed) return { action: "noop" };                          // a failed read changes NOTHING
+  if (obs.burned) return { action: "retire" };                           // D5 — retire permanently, record KEPT
+  const owner = obs.owner ? String(obs.owner) : "";
+  if (!owner || !isPubkey(owner)) return { action: "noop" };
+  if (owner === row.owner) return { action: "same" };
+  const onCurve = (obs.onCurve !== undefined) ? !!obs.onCurve : _isOnCurve(owner);
+  if (!onCurve || NFT_HOLDER_DENYLIST.has(owner)) return { action: "listed" };   // escrow/program — LISTED, still theirs
+  if (obs.hasGameAccount) return { action: "handover", to: owner };
+  return { action: "limbo", to: owner };                                 // on-curve wallet, no game account — dormant
+}
+// Apply a classification. NEVER deletes a row; a burn RETIRES (state:"burned", record kept). A handover
+// is QUEUED (pendingHandover), never a live yank — the boundary that applies it lives in the client increment.
+function nftApplyClassification(row, cls, now) {
+  now = now || Date.now();
+  switch (cls.action) {
+    case "das-unsupported":
+      _nftDasUnsupported = true;                                   // hard-stop the loop
+      _nftReviewFlags.set(row.id, { reason: "das-unsupported", at: now });   // owner NEVER mutated
+      return { applied: "das-unsupported" };
+    case "retire":
+      if (row.state !== "burned") { row.state = "burned"; regEvent(row, "burned", {}); _assetsDirty = true; censusInvalidate(); }
+      _nftHolderObs.delete(row.id);
+      return { applied: "retired" };
+    case "same":
+      row.holderSince = row.holderSince || now;
+      if (row.listedOffchain) { row.listedOffchain = false; _assetsDirty = true; }   // cleared ONLY here
+      _nftHolderObs.delete(row.id);
+      return { applied: "same" };
+    case "listed":
+      if (!row.listedOffchain) { row.listedOffchain = true; _assetsDirty = true; }   // set here, NEVER cleared here (F1b)
+      _nftHolderObs.delete(row.id);
+      return { applied: "listed" };
+    case "handover":
+    case "limbo": {
+      const prev = _nftHolderObs.get(row.id);   // require SAME holder across two reads + a dwell
+      if (!prev || prev.owner !== cls.to) { _nftHolderObs.set(row.id, { owner: cls.to, since: now }); return { applied: "observed" }; }
+      if (now - prev.since < NFT_DWELL_MS) return { applied: "dwelling" };
+      row.pendingHandover = { to: cls.to, at: now, dormant: cls.action === "limbo" };   // QUEUED, applied at a safe boundary
+      regEvent(row, "handover_queued", { to: cls.to, dormant: cls.action === "limbo" });
+      _assetsDirty = true;
+      return { applied: cls.action === "limbo" ? "limbo-queued" : "handover-queued" };
+    }
+    default:
+      return { applied: "noop" };
+  }
+}
+async function _nftDasRead(mint) {
+  if (_nftDasStub) { const v = typeof _nftDasStub === "function" ? _nftDasStub(mint) : _nftDasStub.get(mint); return v || { dasFailed: true }; }
+  try {
+    const r = await fetch(RPC_URL, { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: "nft", method: "getAsset", params: { id: mint } }) });
+    const j = await r.json();
+    if (!j || !j.result) return { dasFailed: true };
+    const own = j.result.ownership;
+    if (!own || typeof own.owner !== "string") return { structuralUnsupported: true };   // WNS/T22 shape unsupported
+    return { owner: own.owner, burned: !!j.result.burnt };
+  } catch (e) { return { dasFailed: true }; }
+}
+// Reconcile every minted registry row against its on-chain holder. Fail-safe on DAS outage; never a
+// silent deletion. Keeps running while NEW mints are paused (L10). The chain is authoritative for
+// OWNERSHIP; the server stays authoritative for EMBODIMENT (a read only QUEUES a handover).
+async function reconcileNftOwners() {
+  if (!NFT_MINT_ON || _nftSyncBusy || _nftDasUnsupported) return;
+  _nftSyncBusy = true;
+  try {
+    for (const row of assetReg.values()) {
+      if (!row.mint) continue;
+      const obs = await _nftDasRead(row.mint);
+      nftApplyClassification(row, nftClassifyHolder(row, obs));
+      if (_nftDasUnsupported) break;                               // structural outage — stop the whole loop
+    }
+    if (_assetsDirty) { try { await saveAssetLedger(true); } catch (e) {} }
+  } finally { _nftSyncBusy = false; _nftSyncAt = Date.now(); }
+}
+if (NFT_MINT_ON) setInterval(() => { reconcileNftOwners().catch(() => {}); }, 5 * 60 * 1000).unref?.();
+
 // ============ RARITY IS A LAW, NOT A LABEL ============
 // Advertised scarcity used to be enforced NOWHERE for avatars, and for mounts the "supply" numbers
 // were only pickWeighted WEIGHTS — rarer to roll, unlimited to own. Only Meme Dynasty had real
@@ -6901,12 +7046,136 @@ app.get("/assets/cert", (req, res) => {
     cur = cur.parent ? assetReg.get(cur.parent) : null;
   }
   // owner is public here on purpose: a certificate nobody can check is not a certificate.
-  res.json({ id: r.id, type: r.type, sp: r.sp, kind: r.kind, born: r.born, origin: r.origin,
-             state: r.state, owner: r.owner, lineage, chain: r.chain.slice(0, 64) });
+  const out = { id: r.id, type: r.type, sp: r.sp, kind: r.kind, born: r.born, origin: r.origin,
+                state: r.state, owner: r.owner, lineage, chain: r.chain.slice(0, 64) };
+  // The mint facts, served LIVE off the cert URI (gated so flag-off is byte-identical to today):
+  // origin/edition/hatcher are immutable provenance; gameStatus is mutable and can flip post-mint (F6).
+  if (NFT_MINT_ON) {
+    out.mint = r.mint || null;
+    out.edition = r.edition || null;
+    out.hatcher = r.hatcher || r.owner;
+    out.gameStatus = r.gameStatus || "good";
+    if (r.gameStatus === "restricted") { out.statusReason = r.statusReason || null; out.statusAt = r.statusAt || null; }
+  }
+  res.json(out);
 });
 
+// ---- NFT mint routes (all behind CHIK_NFT_MINT; each 503s when the flag is off) ---------------
+// A minted asset's in-game listings must carry the registry id — so a pre-mint "is it on the board?"
+// check matches by that id. Best-effort in this increment; full board integration ships with the client.
+function _nftBoardListed(row) {
+  try { return marketListings.some(l => l && String(l.uid || "") === row.id && String(l.wallet || "") === row.owner); }
+  catch (e) { return false; }
+}
+function _nftAuth(req) { const wallet = regWallet(req), admin = cupAdminOk(req); return { wallet, admin, ok: !!(wallet || admin) }; }
+function _nftResolveWho(a, row) { return a.wallet || (a.admin && row ? row.owner : ""); }
+
+// PREPARE an UNSIGNED mint for the player's own wallet to sign. Assigns + persists the sequential
+// edition write-once (so the signed metadata is stable across retries). The server NEVER signs.
+app.post("/assets/nft/prepare", async (req, res) => {
+  if (!NFT_MINT_ON) return res.status(503).json({ error: "minting is not open" });
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  if (!matEnforceOn()) return res.status(503).json({ error: "minting is paused" });      // E11 kill switch
+  if (NFT_MINT_PAUSED) return res.status(503).json({ error: "new mints are paused" });
+  const a = _nftAuth(req);
+  if (!a.ok) return res.status(403).json({ error: "prove this wallet first" });
+  const id = String(req.body?.id || "").slice(0, 64);
+  const row = assetReg.get(id);
+  const el = nftEligibility(row, _nftResolveWho(a, row));
+  if (el.code !== "ok") return res.status(el.status).json({ error: el.error });
+  if (_nftBoardListed(row)) return res.status(409).json({ error: "asset is listed on the in-game board — unlist it first" });
+  if (row.mint) return res.json({ ok: true, already: true, mint: row.mint, edition: row.edition, intent: nftMintIntent(row) });
+  if (!row.edition) {
+    row.edition = nftEditionFor(row);
+    row.hatcher = row.hatcher || row.owner;
+    regEvent(row, "mint_authorized", { edition: row.edition });
+    _assetsDirty = true; try { await saveAssetLedger(true); } catch (e) {}
+  }
+  res.json({ ok: true, prepared: true, edition: row.edition, intent: nftMintIntent(row) });
+});
+
+// RECORD the on-chain mint address the player's wallet produced, marking the row minted (write-once,
+// idempotent). This is the mint AUTHORITY's commit — reversible only by a real on-chain burn read.
+app.post("/assets/nft/mint", async (req, res) => {
+  if (!NFT_MINT_ON) return res.status(503).json({ error: "minting is not open" });
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  if (!matEnforceOn()) return res.status(503).json({ error: "minting is paused" });      // E11
+  const a = _nftAuth(req);
+  if (!a.ok) return res.status(403).json({ error: "prove this wallet first" });
+  const id = String(req.body?.id || "").slice(0, 64);
+  const row = assetReg.get(id);
+  const el = nftEligibility(row, _nftResolveWho(a, row));
+  if (el.code !== "ok") return res.status(el.status).json({ error: el.error });
+  // IDEMPOTENT: a retry returns the SAME mint, never a second one.
+  if (row.mint) return res.json({ ok: true, already: true, mint: row.mint, edition: row.edition });
+  if (NFT_MINT_PAUSED && !row.edition) return res.status(503).json({ error: "new mints are paused" });
+  if (_nftBoardListed(row)) return res.status(409).json({ error: "asset is listed on the in-game board — unlist it first" });
+  const mintAddr = String(req.body?.mintAddr || "").slice(0, 64);
+  if (!isPubkey(mintAddr)) return res.status(400).json({ error: "a valid on-chain mint address is required (the player's wallet creates it; the server never signs a player mint)" });
+  if (_nftMinting.has(id)) return res.status(409).json({ error: "a mint for this asset is already in flight" });
+  _nftMinting.add(id);                                       // CLAIM the dedup key BEFORE the await (TOCTOU)
+  try {
+    if (!row.edition) row.edition = nftEditionFor(row);       // sequential, write-once
+    row.hatcher = row.hatcher || row.owner;                   // birth-hatcher split from current owner
+    row.mint = mintAddr;                                      // write-once — the on-chain address
+    row.holderSince = Date.now();
+    regEvent(row, "minted_onchain", { addr: mintAddr, edition: row.edition });
+    _assetsDirty = true; censusInvalidate();
+    try { await saveAssetLedger(true); } catch (e) {}         // registry first; on failure _assetsDirty retries
+    res.json({ ok: true, mint: row.mint, edition: row.edition, royalty: { bps: NFT_ROYALTY_BPS, wallet: NFT_ROYALTY_WALLET } });
+  } finally { _nftMinting.delete(id); }
+});
+
+// Admin: force an immediate on-chain ownership reconcile (mirrors /meme/sync).
+app.post("/assets/nft/reconcile", async (req, res) => {
+  if (!NFT_MINT_ON) return res.status(503).json({ error: "minting is not open" });
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  await reconcileNftOwners();
+  res.json({ ok: true, syncedAt: _nftSyncAt, dasUnsupported: _nftDasUnsupported, flags: [..._nftReviewFlags.keys()] });
+});
+
+// Admin: set a MINTED asset's live gameStatus (F6). origin on-chain is immutable; privileges are not.
+app.post("/assets/nft/status", async (req, res) => {
+  if (!NFT_MINT_ON) return res.status(503).json({ error: "minting is not open" });
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  const row = assetReg.get(String(req.body?.id || "").slice(0, 64));
+  if (!row) return res.status(404).json({ error: "no such asset" });
+  const st = String(req.body?.gameStatus || "");
+  if (st !== "good" && st !== "restricted") return res.status(400).json({ error: "gameStatus must be good|restricted" });
+  if (st === "restricted") { row.gameStatus = "restricted"; row.statusReason = String(req.body?.reason || "").slice(0, 120) || "flagged"; row.statusAt = Date.now(); }
+  else { row.gameStatus = "good"; delete row.statusReason; delete row.statusAt; }
+  regEvent(row, "status", { gameStatus: row.gameStatus, reason: row.statusReason || null });
+  _assetsDirty = true; try { await saveAssetLedger(true); } catch (e) {}
+  res.json({ ok: true, gameStatus: row.gameStatus });
+});
+
+// Public (behind flag): the mint config the client needs — royalty, collection, mintable set.
+app.get("/assets/nft/config", (req, res) => {
+  if (!NFT_MINT_ON) return res.status(503).json({ error: "minting is not open" });
+  res.json({ standard: "wns", tokenProgram: "token-2022", paused: NFT_MINT_PAUSED,
+    royalty: { bps: NFT_ROYALTY_BPS, wallet: NFT_ROYALTY_WALLET }, collection: NFT_COLLECTION,
+    mintableKinds: { mount: true, chikimon: ["legendary", "meme"] }, origins: [...NFT_MINT_ORIGINS] });
+});
+
+// Partition for persistence: rows carrying an on-chain `mint` are truncation-EXEMPT — dropping the
+// earliest rows at capacity would delete the FIRST-minted NFTs. Keep every minted row, then fill the
+// remainder to `max` with the NEWEST unminted rows. Under capacity this returns `all` unchanged, so a
+// no-mint blob is byte-identical to the old `.slice(-ASSET_REG_MAX)`.
+export function _partitionAssetRows(all, max) {
+  if (all.length <= max) return all;
+  const minted = all.filter(r => r && r.mint);
+  const rest = all.filter(r => !(r && r.mint));
+  // fill the REMAINING capacity with the newest unminted rows. NB: `rest.slice(-0)` returns the WHOLE
+  // array (-0 === 0), so a zero fill must short-circuit — otherwise minted rows past cap keep every
+  // unminted row too. When minted already meets/exceeds `max`, keep ALL minted (exempt) and 0 unminted.
+  const fill = Math.max(0, max - minted.length);
+  return fill > 0 ? minted.concat(rest.slice(-fill)) : minted;
+}
 export function serializeAssetReg() {
-  return { rows: [...assetReg.values()].slice(-ASSET_REG_MAX), restitution: [...eggRestitutionDone.entries()] };
+  const out = { rows: _partitionAssetRows([...assetReg.values()], ASSET_REG_MAX), restitution: [...eggRestitutionDone.entries()] };
+  // The edition counter travels WITH the rows so a restart can never re-issue a live edition.
+  if (Object.keys(nftEdition).length) out.nftEdition = { ...nftEdition };
+  return out;
 }
 export function restoreAssetReg(v) {
   if (!v || typeof v !== "object" || !Array.isArray(v.rows)) return 0;
@@ -6935,15 +7204,41 @@ export function restoreAssetReg(v) {
     // restored with state flipped back to "active", re-arming a spent egg to mint a second creature.
     // The evidence that it hatched lives in the row itself and outranks the flag.
     const spent = hatchedTo || chain.some(c => c && c.what === "hatched");
+    // A BURNED (retired) CREATURE IS RETIRED FOREVER — owner lock D5. Identical hazard to the
+    // consumed-egg one above: trusting the persisted `state` alone let a blob with `state:"burned"`
+    // (or any state) come back "active", RESURRECTING a retired NFT — it re-enters the census and
+    // can push a capped species OVER cap (proven: griffin 5 -> 6 across a restart). The `burned`
+    // provenance event lives in the row's own chain and outranks the flag, so retirement survives a
+    // restart even under a DAS outage that stops the reconcile from re-burning it. Record KEPT,
+    // dormant, never restored to anyone — grandfathering absolute (nothing deleted).
+    const retired = src.state === "burned" || chain.some(c => c && c.what === "burned");
     const row = { id, type, owner, sp: String(src.sp || "").slice(0, 24), kind: String(src.kind || "").slice(0, 12),
                   born: Number(src.born) || Date.now(), origin: String(src.origin || "issued").slice(0, 16),
-                  state: (src.state === "consumed" || spent) ? "consumed" : "active",
+                  state: retired ? "burned" : ((src.state === "consumed" || spent) ? "consumed" : "active"),
                   parent: src.parent ? String(src.parent).slice(0, 64) : null,
                   hatchedTo, lvl: Number(src.lvl) || undefined, chain,
                   // the census dedup key, re-typed like everything else — a row that adopted a
                   // ledger entry must keep saying so, or the restart double-counts that creature
                   luid: src.luid ? String(src.luid).slice(0, 32) : undefined };
+    // NFT provenance — validated, write-once, ADDITIVE: a field absent from `src` leaves the row
+    // byte-identical to a pre-NFT restore, so a flag-off round-trip is unchanged. A lost `mint` field
+    // used to VANISH here while `minted_onchain` survived in the chain — orphaning a live NFT (F7).
+    if (src.mint && isPubkey(String(src.mint))) row.mint = String(src.mint).slice(0, 64);   // write-once: only ever SET here
+    { const ed = Number(src.edition); if (Number.isInteger(ed) && ed > 0) row.edition = ed; }
+    if (src.hatcher && isPubkey(String(src.hatcher))) row.hatcher = String(src.hatcher).slice(0, 64);
+    if (String(src.gameStatus || "") === "restricted") { row.gameStatus = "restricted"; if (src.statusReason) row.statusReason = String(src.statusReason).slice(0, 120); if (Number(src.statusAt) > 0) row.statusAt = Number(src.statusAt); }
+    if (src.listedOffchain) row.listedOffchain = true;
+    if (Number(src.holderSince) > 0) row.holderSince = Number(src.holderSince);
+    if (src.pendingHandover && typeof src.pendingHandover === "object" && isPubkey(String(src.pendingHandover.to || "")))
+      row.pendingHandover = { to: String(src.pendingHandover.to).slice(0, 64), at: Number(src.pendingHandover.at) || Date.now(), dormant: !!src.pendingHandover.dormant };
+    // Defensive: floor the edition counter at the highest edition ever issued, so a lost counter can
+    // never re-issue a live edition (mint rows are truncation-exempt, but a prepared row may be dropped).
+    if (row.edition) { const k = _censusKey(row.type, row.sp); if ((nftEdition[k] || 0) < row.edition) nftEdition[k] = row.edition; }
     assetReg.set(id, row); ownerSet(owner).add(id); n++;
+  }
+  // The persisted edition counter — floored, never lowered — so a truncated prepared row can't reset it.
+  if (v.nftEdition && typeof v.nftEdition === "object") {
+    for (const [k, cnt] of Object.entries(v.nftEdition)) { const c = Number(cnt); if (Number.isInteger(c) && c > 0 && (nftEdition[k] || 0) < c) nftEdition[k] = c; }
   }
   censusInvalidate();
   return n;
@@ -6959,6 +7254,19 @@ export function _censusStats() { return { builds: _censusBuilds, keys: censusAll
 // test seam: age an egg past its incubation window without waiting real hours
 export function _ageAsset(id, ms) { const r = assetReg.get(id); if (r) { r.born -= ms; return true; } return false; }
 export function _transferAssetForTest(id, from, to, why) { return transferAsset(id, from, to, why); }
+// NFT-mint test seams: drive the pure classifier/gate directly, stub DAS, inspect edition + royalty +
+// review flags, and run a reconcile deterministically — never a live chain.
+export function _nftClassifyForTest(row, obs) { return nftClassifyHolder(row, obs); }
+export function _nftApplyForTest(row, cls, now) { return nftApplyClassification(row, cls, now); }
+export function _nftEligibilityForTest(row, wallet) { return nftEligibility(row, wallet); }
+export function _nftEditionState() { return { ...nftEdition }; }
+export function _nftRoyaltyForTest() { return { bps: NFT_ROYALTY_BPS, wallet: NFT_ROYALTY_WALLET }; }
+export function _nftFlagStateForTest() { return { dasUnsupported: _nftDasUnsupported, flags: [..._nftReviewFlags.keys()] }; }
+export function _setNftDasStubForTest(stub) { _nftDasStub = stub; }
+export function _nftReconcileForTest() { return reconcileNftOwners(); }
+export function _nftResetDasForTest() { _nftDasUnsupported = false; _nftReviewFlags.clear(); _nftHolderObs.clear(); _nftDasStub = null; }
+export function _nftMintOn() { return NFT_MINT_ON; }
+export function _assetRowForTest(id) { return assetReg.get(id); }
 // test seam: the two per-wallet rate maps in this region, so a sim can prove they are BOUNDED
 // without minting five thousand real wallets
 export function _issueRateMapsForTest() { return { egg: _lastEggClaim, scroll: _lastScrollRedeem }; }
