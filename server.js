@@ -6037,6 +6037,12 @@ const ASSET_SUPPLY = Object.freeze({
 // paid for by the innocent. Nothing is deleted or taken (that is not what flags are for): they ride
 // in the published `flagged` line, visible and auditable, and simply do not bind the cap.
 const CENSUS_TTL_MS = 30000;            // backstop only; every mutation invalidates explicitly
+// For a CAPPED species, a wallet's CLEAN census contribution is its registry-backed holdings (the
+// authoritative issuance record — every row passed the mintAsset chokepoint) plus at most this many
+// self-declared, un-registry-backed ledger units. Beyond it the surplus is REPORTED (flagged), never
+// counted, so no single /profile save can inflate a rare species to false-Extinct. See the reconcile
+// loop in buildCensus. No stored origin is touched, so nothing is deleted, revoked or made unsellable.
+const LEDGER_CLEAN_QUOTA = 1;
 let _census = null, _censusAt = 0, _censusBuilds = 0;
 function censusInvalidate() { _census = null; }
 // the asset TYPE is a closed set that never contains ":", so type+sp is unambiguous as one key
@@ -6127,15 +6133,36 @@ function buildCensus() {
   }
 
   // ---- reconcile: registry first, then whatever the registry does not already stand for -------
+  // SELF-REPORTED LEDGER SURPLUS DOES NOT BIND A CAPPED SPECIES. The registry (source 1) is the
+  // authoritative issuance record, so a wallet's registry-backed holdings ALWAYS count in full
+  // (`w.c.R`). But a /profile save self-declares mmo.units, and the grader stamps those units CLEAN
+  // when the wallet is preExisting ("legacy") or already owns ONE registry row of the species
+  // ("issued", species-blanket via regVouchesSpecies). Counting an UNBOUNDED number of those per
+  // wallet let a single save inflate a capped meme/legendary to false-Extinct and refuse honest
+  // buyers/hatchers (SUPPLY_EXHAUSTED) though only a handful truly exist. So a wallet's clean count
+  // for a capped species is its registry-backed holdings plus at most LEDGER_CLEAN_QUOTA un-backed
+  // ledger units; the surplus is moved to `flagged` (reported, not counted) — the SAME treatment
+  // "unverified" already gets. Nothing is deleted or downgraded (no origin changes, so the surplus
+  // units stay held & listable): grandfathering is absolute. Undercount is the safe direction (at
+  // worst one extra legitimate issuance), the opposite of the false-Extinct denial it removes.
+  // Registry-backed collectors are never clamped, and species-keyed sources (mounts, avatars) hold
+  // at most one ledger unit per wallet, so this is a no-op for them.
   for (const slot of byKey.values()) {
-    let total = slot.orphanSales, flagged = 0;
+    const capped = supplyOf(slot.type, slot.sp) > 0;
+    let total = slot.orphanSales, flagged = 0, dropped = 0;
     for (const w of slot.w.values()) {
-      const base = distinctOf(w.c);
-      total += base + Math.max(0, w.S - base);       // a sale already standing in (1)/(2) adds nothing
-      flagged += distinctOf(w.f);
+      const base = distinctOf(w.c);                  // this wallet's TRUE distinct clean holdings
+      let counted = base;
+      if (capped) {
+        const surplus = base - w.c.R;                // ledger units beyond the registry-backed ones
+        if (surplus > LEDGER_CLEAN_QUOTA) { const d = surplus - LEDGER_CLEAN_QUOTA; counted -= d; dropped += d; }
+      }
+      total += counted + Math.max(0, w.S - base);    // a sale already standing in (1)/(2) adds nothing
+      flagged += distinctOf(w.f) + (base - counted); // clamped clean surplus is reported, not counted
     }
     slot.count = total;
     slot.flagged = flagged;
+    slot.ledger = Math.max(0, slot.ledger - dropped);           // dropped surplus no longer a ledger row
     slot.deduped = Math.max(0, slot.registry + slot.ledger + slot.sales - slot.count);
     slot.w = null;                                    // working state, not a published record
   }
@@ -7182,8 +7209,20 @@ function auditAssets(wallet, mmo, walletFirstSeen = 0) {
     newMounts++;
     // Mounts never consulted the egg evidence at all, so an HONEST mount-egg hatch was flagged
     // identically to appending all six ids. Same test as units — it is the same act.
+    //
+    // RARITY IS THE VALUE, exactly as on the unit path (see the `commonEnough` gate above): the
+    // fresh-wallet grandfather never covers a capped asset. EVERY mount is capped (griffin 5 is the
+    // rarest thing in the game), so — unlike normal chikimon, which are UNCAPPED and legitimately
+    // grandfathered a couple at a time — there is no "common enough" mount to grandfather. A brand-new
+    // keypair (firstEver but NOT preExisting) that first-saves a mount could conjure one "legacy" per
+    // wallet into the CLEAN census, and a handful of free throwaway wallets would then Extinct a
+    // capped species and lock honest players out permanently (grandfathering is absolute, never
+    // revoked). So the amnesty is limited to a REAL pre-existing player (`preExisting`) alone. A
+    // genuine first-save mount still earns a clean origin below: the server-rolled registry hatch
+    // (regVouchesSpecies -> "issued") or the mount-egg evidence (-> "hatched"); only a forgery with
+    // no evidence falls to "unverified", which is reported-but-not-counted and cannot bind the cap.
     let origin;
-    if (firstEver && (preExisting || newMounts <= NEW_WALLET_GRANDFATHER_MOUNTS)) origin = "legacy";
+    if (firstEver && preExisting) origin = "legacy";
     else if (regVouchesSpecies(wallet, "mount", id)) origin = "issued";   // the server rolled it
     else if (!eggGlut && eggsHatchable >= newUnits + newMounts) origin = "hatched";
     else origin = "unverified";
