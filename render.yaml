@@ -6,6 +6,13 @@ services:
     name: chiki-backend
     runtime: node
     plan: free
+    # REGION IS SET AT CREATION AND CAN NEVER BE CHANGED. Without this key a Blueprint deploy
+    # silently lands on Render's default (Oregon) no matter what the service is NAMED. Pinned so
+    # any future recreation of this service stays with the playerbase. Verified 2026-08-04: the
+    # live service IS in Singapore (min TTFB tracks the owner's 66ms SG baseline, not the 182ms
+    # Oregon one; the gcp-us-west1 origin CNAME is Render's shared CDN front for ALL services and
+    # says nothing about region — do not be fooled by it again).
+    region: singapore
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /health

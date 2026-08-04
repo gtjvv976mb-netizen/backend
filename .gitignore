@@ -12,3 +12,9 @@ secret*.json
 node_modules/
 npm-debug.log*
 .DS_Store
+dbcheck.sh
+
+# operator tooling — takes DB URLs on the command line, writes audits full of player data.
+# Lives in the dev copy (~/Downloads/chiki-backend) and must never be deployed.
+roster_merge.mjs
+roster_merge_audit_*.json

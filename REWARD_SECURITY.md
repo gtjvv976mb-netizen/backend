@@ -1103,3 +1103,63 @@ canary bytes, `/stats.clientRpc === ""`, no stack traces on malformed queries.
   **minimap's own 152×152 map Button** against the catalog's category tabs, which predates this
   work. The chronicle pill was fixed: it now drops its input filter while a foreign pop is open
   (desktop `small` 13 → 12, phone 0 overlaps / 0 offscreen in every mode).
+
+## 15. Multi-database roster recovery — the kv blob shapes are a data-destruction class
+
+`roster_merge.mjs` (dev-only, gitignored, never deployed) merges an arbitrary number of frozen
+Postgres databases into the live one. Adversarially re-attacked 2026-08-04 on a local
+`initdb` cluster whose fixtures are written in the shapes the REAL `server.js` `serialize*`
+functions emit, and then read back through the REAL `restore*` functions. Five defects were
+confirmed by measurement and fixed. All of them shared one root cause.
+
+**The class: a kv blob whose serialise/restore contract is not read from the code that owns it.**
+Three of the five defects were shape mismatches, and each of them would have destroyed live data
+while every profile-level proof still reported "0 reductions". They fail SILENTLY: `restore*`
+validates its input and returns 0 rather than throwing.
+
+* `asset_ledger` is `{ w: [[wallet, rec], …], buys, gather, spent, gained, raid }` —
+  `restoreAssetLedger` returns 0 unless `Array.isArray(v.w)`. Reading `blob.rows` instead produced
+  **0 records from a 3-record blob**, and writing `{rows: […]}` would have wiped every wallet's
+  unit/mount/avatar/egg provenance, the `held` flags, the material flow counters **and the weekly
+  raid claim gate** (`raid`), which on its own hands the whole playerbase a fresh weekly claim.
+* `own_book` is `[[wallet, rec], …]` — `restoreOwnBook` returns 0 unless `Array.isArray(v)`.
+  Treating it as an object produced `{}`, which would have wiped every wallet's selling entitlement
+  (`open/cred/sold/used`) and the Step-7 matSave grandfather baseline (`base/baseSrc`). The bucket
+  keys are `kind:item` (`mat:wood`), not `kind|item`.
+* `market_sold_ids` is `[{id, ts}, …]` — the boot path reads `e.id`. Taking the ENTRY as the id
+  built `'{"id":"L-SOLD-1","ts":…}'`, so the double-sale guard never matched a single listing and
+  every already-settled listing would have been resurrected into the recovered profile.
+
+**Census: a registry id is per-process, so "restore what the wallet already owns" can mint supply.**
+`mintAssetId` is `type[0] + Date.now() + seq + 6 random bytes`, so the SAME creature adopted in two
+databases always carries two different ids. Deduping the registry on id alone left both rows, and
+`buildCensus` counts registry rows individually (`g.R++`) with only a *Set* of `luid`s — measured
+**census 2 for one griffin** (`registry=2 ledger=1 deduped=1`), i.e. a second rarity-cap slot
+consumed by restoring a player's own property. Fixed by deduping on the creature
+(`owner|type|sp|luid`, falling back to `id` where no `luid` exists), keeping the oldest `born`, and
+never laundering a `consumed` state or an `unverified` origin away. The same rule was needed in the
+ledger: `rec.units` is keyed on a **uid, which is a per-save counter**, so two databases that
+recorded one creature under different uids unioned to two ledger units — also measured as census 2.
+
+**Eggs.** The union key rounded `started` to the second, so one egg stored as `…000.4` and `…000.6`
+became **two** eggs — and an egg hatches into a capped creature. Now clustered within 5 s, taking
+the MAX count any single database holds rather than a union.
+
+**The pre-epoch opening balance is destroyed by a correct recovery, and that has to be said out
+loud.** `ownSnapshotOpening` grants a wallet its one-time material selling entitlement only when
+`prev._serverSavedAt < OWN_EPOCH_MS` (2026-07-31). The merge MUST stamp `_serverSavedAt = writeAt`
+or `apply_server` will not adopt the restored blob at all (`take = srv_at_ms > mine_ms + 1000`), so
+the evidence is necessarily lost: **407 of 407 recovered wallets went pre-epoch → post-epoch**, and
+would never again be able to sell the hoard they hold. The tool now reports the count every run and
+can write the opening itself (`--restore-opening`, `min(mats, OWN_OPEN_CAP)` under the server's own
+`openSrc` once-marker) — opt-in, because it grants selling rights.
+
+**Verified after the fixes**, on a local cluster only, 100+ assertions with no failures: dry run
+leaves all three databases checksum-identical; 42 992 field comparisons over 482 wallets with 0
+reductions; live-only wallets byte-identical; counters MAX never SUM; the live census equals the
+fixture's own ground truth exactly (**0 over-counted, 0 under-counted species**); prefix/case/
+whitespace/unicode-look-alike wallet pairs never merge and a `'; DROP TABLE players; --` handle
+travels as data; a mid-run save and a first-ever INSERT both survive; SIGKILL mid-commit leaves the
+database byte-identical and a re-run completes; a second `--commit` is a true no-op; and a merged
+profile loaded through the REAL server round-trips (GET → POST → GET) with assets, seal, and glory
+intact.

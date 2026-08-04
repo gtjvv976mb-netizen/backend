@@ -587,6 +587,10 @@ function pgStore() {
       await pool.query(`UPDATE players SET last_claim=$2, lifetime_paid=GREATEST(0,lifetime_paid-$3) WHERE wallet=$1`, [wallet, prevLastClaim, amount]);
     },
     async count() { return Number((await pool.query(`SELECT COUNT(*) n FROM players`)).rows[0].n); },
+    // The roster guard's only input. Counts SAVED PLAYERS, not rows: a wallet with no profile is
+    // someone who connected once and never played, so it must not pad the number that proves the
+    // database still holds the people.
+    async profileCount() { return Number((await pool.query(`SELECT COUNT(*) n FROM players WHERE profile IS NOT NULL`)).rows[0].n); },
     async allChikis(exclude, cap) {
       // bounded scan — only pull enough rows to fill the cap (avoids loading ALL profiles into memory each call)
       const r = await pool.query(`SELECT wallet, profile FROM players WHERE profile IS NOT NULL ORDER BY last_claim DESC LIMIT $1`, [Math.max(20, Math.min(300, (cap||60) * 3))]);
@@ -724,6 +728,7 @@ function memStore() {
       const p = get(wallet); if (p) { p.last_claim = prevLastClaim; p.lifetime_paid = Math.max(0, p.lifetime_paid - amount); }
     },
     async count() { return players.size; },
+    async profileCount() { let n = 0; for (const p of players.values()) if (p && p.profile) n++; return n; },
     async allChikis(exclude, cap) {
       const out = [];
       for (const [wallet, p] of players) {
@@ -1400,13 +1405,122 @@ app.use((req, res, next) => {
   return res.status(503).json({ error: "server is restarting; retry shortly" });
 });
 
+/* ------------------------- THE ROSTER GUARD -------------------------
+ * 2026-08-04: the service was pointed at a database that did not hold the players. ~2,443 wallets
+ * opened the game, the server found no row for their wallet, and handed each of them a fresh empty
+ * profile — which their client then saved back. Nothing alarmed, because a server that cannot find
+ * you is indistinguishable from a server meeting a brand-new player. The damage was silent and it
+ * ran for days.
+ *
+ * The tripwire therefore has to be a number the server knows BEFORE it reads the database, and it
+ * has to live OUTSIDE the database — otherwise it travels with the wrong one and agrees with it.
+ * Two independent wires, because they fail in opposite directions:
+ *
+ *   CHIK_ROSTER_MIN   an env var on the SERVICE. Survives a DATABASE_URL swap, so it is the one
+ *                     that fires the moment a new/short database is promoted to live. THIS IS THE
+ *                     WIRE THAT WOULD HAVE CAUGHT 2026-08-04. Unset = unarmed (and said so loudly).
+ *   kv roster_hwm     a high-water mark learned INSIDE each database, only ever revised upward.
+ *                     Survives nothing, but catches a truncate/restore/partial-wipe of the database
+ *                     the service is already on — which the env var cannot see.
+ *
+ * Floor = max(CHIK_ROSTER_MIN, hwm × (1 − CHIK_ROSTER_DROP)). Below the floor the guard trips.
+ * Modes: off | warn (default — loud alarm, keeps serving) | refuse (503 everything but /health).
+ * The default is `warn` on purpose: a mis-set env var must never be able to take a live game down.
+ * The runbook's instruction is to arm MIN first, watch one boot, then move to `refuse`.
+ */
+const ROSTER_GUARD_MODE = (() => {
+  const v = String(process.env.CHIK_ROSTER_GUARD ?? "warn").trim().toLowerCase();
+  return (v === "off" || v === "0" || v === "refuse") ? (v === "0" ? "off" : v) : "warn";
+})();
+const ROSTER_MIN = Math.max(0, Math.floor(Number(process.env.CHIK_ROSTER_MIN ?? 0)) || 0);
+const ROSTER_DROP = (() => { const v = Number(process.env.CHIK_ROSTER_DROP);
+  return Number.isFinite(v) && v >= 0 && v < 1 ? v : 0.20; })();
+const ROSTER_RECHECK_MS = Math.max(60_000, Number(process.env.CHIK_ROSTER_RECHECK_MS) || 600_000);
+// A trip is latched: it must not un-trip on its own while players keep arriving and re-saving empty
+// profiles (which would slowly walk the count back up over the floor and hide the incident).
+let _rosterGuard = { mode: ROSTER_GUARD_MODE, checked: false, tripped: false, profiles: -1,
+                     floor: 0, hwm: 0, min: ROSTER_MIN, drop: ROSTER_DROP, reason: "", at: 0 };
+export function _rosterGuardState() { return { ..._rosterGuard }; }
+
+async function rosterGuardCheck(why) {
+  if (ROSTER_GUARD_MODE === "off") { _rosterGuard.checked = true; return _rosterGuard; }
+  let profiles;
+  try { profiles = await store.profileCount(); }
+  catch (e) {
+    // A database that will not answer is a different failure (/health's dbReady already covers it).
+    // Never trip on it: an unreachable database must not be reported as an empty one.
+    console.warn(`roster guard: profile count unavailable (${String(e?.message || e)}) — check skipped`);
+    return _rosterGuard;
+  }
+  let hwm = 0;
+  try { const v = await store.kvGet("roster_hwm"); hwm = Math.max(0, Math.floor(Number(v?.n ?? v ?? 0)) || 0); } catch (e) {}
+  const floor = Math.max(ROSTER_MIN, Math.floor(hwm * (1 - ROSTER_DROP)));
+  const short = profiles < floor;
+  _rosterGuard.checked = true; _rosterGuard.profiles = profiles; _rosterGuard.floor = floor;
+  _rosterGuard.hwm = hwm; _rosterGuard.at = Date.now();
+
+  if (short) {
+    const reason = `${profiles} saved profiles, expected at least ${floor}` +
+      ` (CHIK_ROSTER_MIN=${ROSTER_MIN}, learned high-water mark=${hwm}, tolerance=${Math.round(ROSTER_DROP * 100)}%)`;
+    if (!_rosterGuard.tripped) {
+      console.error("");
+      console.error("  ############################################################");
+      console.error("  #  ROSTER GUARD TRIPPED — THIS DATABASE IS MISSING PLAYERS  #");
+      console.error("  ############################################################");
+      console.error(`  ${reason}`);
+      console.error(`  Checked because: ${why}`);
+      console.error(`  This is what a wrong DATABASE_URL looks like. Every wallet that connects now`);
+      console.error(`  gets a FRESH EMPTY PROFILE and saves it back over nothing.`);
+      console.error(`  Mode=${ROSTER_GUARD_MODE}. ` + (ROSTER_GUARD_MODE === "refuse"
+        ? "REFUSING ALL REQUESTS except /health until this is resolved."
+        : "STILL SERVING (mode=warn). Set CHIK_ROSTER_GUARD=refuse to stop serving instead."));
+      console.error(`  Do NOT delete any database. See ROSTER_RECOVERY.md.`);
+      console.error("");
+    }
+    _rosterGuard.tripped = true; _rosterGuard.reason = reason;
+    return _rosterGuard;
+  }
+
+  _rosterGuard.reason = "";
+  if (_rosterGuard.tripped) {
+    // Only a check that PASSES the floor clears the latch, and it is announced.
+    console.log(`roster guard: cleared — ${profiles} saved profiles is at or above the floor of ${floor}`);
+    _rosterGuard.tripped = false;
+  }
+  // Learn upward only. A wipe can never teach the guard a smaller number.
+  if (profiles > hwm) {
+    try { await store.kvSet("roster_hwm", { n: profiles, at: Date.now() }); _rosterGuard.hwm = profiles; } catch (e) {}
+  }
+  return _rosterGuard;
+}
+
+// Refuse mode. /health stays open so the platform and the owner can both see WHY, and so the fix
+// is diagnosable without a redeploy. Everything else — including every path that would read a
+// missing profile, hand back an empty one, or write one — is closed.
+app.use((req, res, next) => {
+  if (!(_rosterGuard.tripped && ROSTER_GUARD_MODE === "refuse") || req.path === "/health") return next();
+  res.set("Retry-After", "300");
+  return res.status(503).json({
+    error: "the server is not serving: its database is missing player rosters",
+    rosterGuard: { tripped: true, profiles: _rosterGuard.profiles, floor: _rosterGuard.floor, reason: _rosterGuard.reason },
+  });
+});
+
 app.get("/health", async (_q, res) => {
   let dbReady = false;
   try { await store.ping(); dbReady = true; } catch {}
   const stateReady = _assetsReady && _ownReady;
-  const ok = _draining === false && dbReady && _chatReady && stateReady;
+  // A tripped guard makes /health RED only in refuse mode. In warn mode the alarm is reported but
+  // /health stays green, or the platform would restart-loop a service that is still serving players.
+  const rosterOk = !(_rosterGuard.tripped && ROSTER_GUARD_MODE === "refuse");
+  const ok = _draining === false && dbReady && _chatReady && stateReady && rosterOk;
   res.status(ok ? 200 : 503).json({
     ok, draining: _draining, dbReady, chatReady: _chatReady, stateReady,
+    rosterGuard: {
+      mode: ROSTER_GUARD_MODE, armed: ROSTER_MIN > 0, tripped: _rosterGuard.tripped,
+      profiles: _rosterGuard.profiles, floor: _rosterGuard.floor, min: ROSTER_MIN,
+      hwm: _rosterGuard.hwm, checkedAt: _rosterGuard.at, reason: _rosterGuard.reason || null,
+    },
     network: NETWORK, store: store.kind, verifyHolders: verifyOn,
     treasury: treasury.publicKey.toBase58(), team: TEAM_WALLET || null,
     mint: CHIKI_MINT || null, minHold: MIN, minHoldMinutes: Number(MIN_HOLD_MINUTES),
@@ -9579,5 +9693,26 @@ const httpServer = app.listen(Number(PORT), () => {
 });
 attachWorldSocket(httpServer);   // the SECOND transport — see the block above /world/move's neighbours
 for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => { void gracefulShutdown(sig, httpServer); });
-store.init().then(()=>{ console.log("store ready"); return loadCupState(); }).then(()=>console.log(`cup state loaded (public=${cupPublic}, owed prizes=${cupPrizes.size})`)).catch(e=>console.error("store.init failed:", e?.message||e));
+store.init()
+  .then(()=>{ console.log("store ready"); return rosterGuardBoot(); })
+  .then(()=>loadCupState())
+  .then(()=>console.log(`cup state loaded (public=${cupPublic}, owed prizes=${cupPrizes.size})`))
+  .catch(e=>console.error("store.init failed:", e?.message||e));
+
+// The guard runs the moment the database is reachable — before the first player can be handed an
+// empty profile — and then on a slow timer, so an in-place wipe of a database we are already on is
+// caught too. The timer is unref'd: it must never be the reason a process stays alive.
+async function rosterGuardBoot() {
+  if (ROSTER_GUARD_MODE === "off") { console.log("roster guard: OFF (CHIK_ROSTER_GUARD=off)"); return; }
+  const st = await rosterGuardCheck("boot");
+  if (!st.tripped) {
+    console.log(`roster guard: OK — ${st.profiles} saved profiles (floor ${st.floor}, mode=${ROSTER_GUARD_MODE})`);
+    if (ROSTER_MIN === 0 && store.kind === "postgres") {
+      console.warn(`⚠ roster guard is UNARMED: CHIK_ROSTER_MIN is not set, so pointing this service at a`);
+      console.warn(`  DIFFERENT (empty) database would NOT be caught — a fresh database has no high-water`);
+      console.warn(`  mark either. Set CHIK_ROSTER_MIN to about 90% of ${st.profiles} (i.e. ${Math.floor(st.profiles * 0.9)}).`);
+    }
+  }
+  setInterval(() => { rosterGuardCheck("periodic recheck").catch(()=>{}); }, ROSTER_RECHECK_MS).unref?.();
+}
 chat.init().then(()=>{ _chatReady = true; console.log("chat ready"); }).catch(e=>console.error("chat.init failed:", e?.message||e));
