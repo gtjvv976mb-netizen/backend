@@ -608,14 +608,26 @@ function pgStore() {
     async claimedTotals() {
       // Keepers + active Chikis = CURRENT eligible holders only (a wallet's last-known balance ≥ threshold);
       // legends = all-time hatched. This stops counting wallets that hatched a Chiki once and have since left.
-      const r = await pool.query(`SELECT profile, eligible FROM players WHERE profile IS NOT NULL`);
-      let chikis = 0, holders = 0, legends = 0;
-      for (const row of r.rows) {
-        const c = row.profile?.chikis || []; if (!c.length) continue;
-        legends += c.filter(x => x.isLegend).length;
-        if (row.eligible) { holders++; chikis += c.length; }
-      }
-      return { chikis, holders, legends };
+      //
+      // AGGREGATE IN POSTGRES, never in Node. The old form shipped EVERY profile to this process and
+      // summed in a JS loop — fine at 31 profiles, a killer at 2,481: /stats (which polls this) held
+      // the whole player table in memory per cache-miss, and a thundering herd of reconnecting clients
+      // OOM/GC-stalled the process into a 502 loop (reproduced at 2,481 profiles on 460MB heap, 2026-08-04).
+      // Same three numbers, computed server-side, three integers on the wire. `chikis` array elements
+      // may be non-array on legacy saves, hence the jsonb_typeof guard; isLegend is a jsonb boolean.
+      const r = await pool.query(`
+        SELECT
+          COALESCE(SUM(jsonb_array_length(profile->'chikis'))
+                   FILTER (WHERE eligible), 0)::bigint AS chikis,
+          COUNT(*) FILTER (WHERE eligible AND jsonb_array_length(profile->'chikis') > 0)::bigint AS holders,
+          COALESCE(SUM((
+            SELECT count(*) FROM jsonb_array_elements(profile->'chikis') e
+            WHERE (e->'isLegend') = 'true'::jsonb
+          )), 0)::bigint AS legends
+        FROM players
+        WHERE profile IS NOT NULL AND jsonb_typeof(profile->'chikis') = 'array'`);
+      const row = r.rows[0] || {};
+      return { chikis: Number(row.chikis || 0), holders: Number(row.holders || 0), legends: Number(row.legends || 0) };
     },
     // Wallets whose roster contains a Legendary (for Glory gifts).
     async legendHolderWallets() {
