@@ -1163,3 +1163,71 @@ travels as data; a mid-run save and a first-ever INSERT both survive; SIGKILL mi
 database byte-identical and a re-run completes; a second `--commit` is a true no-op; and a merged
 profile loaded through the REAL server round-trips (GET → POST → GET) with assets, seal, and glory
 intact.
+
+## 16. The NFT mint gate — an origin STRING is not provenance (2026-08-05)
+
+`CHIK_NFT_MINT` lets a player put a real Metaplex Core NFT into their own wallet, inside the official
+collection `2iyJEoY5mUnBXJ139R5mQSkfQtgzZXTP4BtnQaiGEgTN`, signed by a scoped collection
+`UpdateDelegate` the server holds (never the cold master key, never `TREASURY_SECRET`). A certificate
+is permanent and public, so the gate that decides *who may be certified* is the whole security
+surface of the feature.
+
+### The exploit: laundering a crafted save into the official collection
+
+`nftEligibility` accepted `origin === "hatched"` on the strength of a comment that read "server-
+witnessed births ONLY". **Two unrelated writers produce that same seven-character string:**
+
+| writer | what it means | shape it leaves |
+|---|---|---|
+| `mintAsset(…, "hatched", row.id)` — `/assets/egg/hatch` (server.js:6690/6704), `/assets/egg/consume` (:6781) | a **real** birth: a server-minted, server-timed egg row was consumed into this creature | `parent` = the egg's row id, no `luid` |
+| `auditAssets` (:7799) `else if (!eggGlut && eggsHatchable >= newUnits)` | a **delta inference** over the client-authored `mmo.eggs` array of a save the client signs itself | no `parent`; laundered into the registry by `/assets/chikimon/sync` (:6903) and `/assets/mounts/sync` (:6839), which set `luid` |
+
+The second reached the mint. Measured end to end (`_ax_nftlaunder_sim.mjs`, log `launder1.log`): a
+throwaway wallet pushes a save *declaring* a legendary egg, waits out `EGG_HOURS.legendary` (12 h),
+pushes a second save where the egg is gone and a level-50 galador has appeared, calls
+`/assets/chikimon/sync`, then `/assets/nft/mint` → **`200 OK`, `Galador #1`,
+`5h4yqToyL8bzPhA9jNLcjnRQdkrM7UreumdJ311xuKWq`**, a Core asset in the official collection at 20%
+royalty with `origin=hatched` written into its on-chain Attributes plugin. Declaring all four egg
+kinds at once (`EGG_KINDS_MAX = 4`) certified **four** legendaries from one free wallet in one cycle;
+the same trick on the mount path certified a **griffin** (cap 5, the rarest asset in the game). Six
+forged certificates in a single run. Cost: wall-clock only.
+
+### The fix
+
+`parent` is only ever `mintAsset`'s 5th argument and only the three hatch call sites pass it; no
+client-reachable route can set it, and `restoreAssetReg` carries it across restarts. `luid` is its
+mirror image — only the two sync routes set it (see the comment at server.js:6483). `nftEligibility`
+now fails **closed** on both:
+
+```js
+if (!row.parent || row.luid) return { code: "no-lineage", status: 403,
+  error: "only a creature this server hatched from a registered egg can be certified" };
+// and, when the egg row is still present, it must be an egg that hatched into THIS creature
+```
+
+Refusal is `403 no-lineage` and is served through `/assets/mine` (`mintable:false`, `mintWhy`) so the
+client never re-implements a rule. **Nothing is taken from anyone**: the creature is untouched in the
+player's game, only the certificate is withheld, and the feature has never shipped.
+
+### The lesson
+
+**A provenance FIELD is only as good as the narrowest thing that writes it.** Before trusting an
+enum value as a security predicate, enumerate *every* writer of that value — here `grep -n
+'"hatched"' server.js` finds five call sites and only three of them are witnesses. Prefer a structural
+witness that no client-reachable route can produce (`parent`, a foreign key to a row the server
+minted) over a label any inference can spell.
+
+### Verified
+
+`_ax_nftlaunder_sim.mjs` **27/0** — the attack refused with **0** creates reaching the chain on the
+unit path, the 4-at-once path and the mount path, *and* both honest routes still mint first try
+(`Galador #1` from the server-rolled hatch, `Adalor #1` from the paid-egg hatch where the player
+chose the species). `_ax_nftmint_sim.mjs` **121/0** — not-owner / no-token / forged-token, normal /
+avatar / egg / `legacy` / `unverified`, double mint, 5-way concurrent mint, foreign-collection Core
+asset, Token-2022, legacy `V1_NFT`, burnt asset, someone else's asset, a certificate already bound to
+another creature, burned-stays-burned across a hostile restore blob, `/world/rarity` + `/assets/dex`
++ `/assets/census` byte-identical across a mint, and a secret sweep of 59 response bodies (0 bytes of
+the RPC URL, the delegate secret or the treasury secret; `/stats.clientRpc === ""`). Flag OFF stays
+byte-identical to `git HEAD:server.js` (`_adv_nftoff_sim` 27/0, `_nft_offdiff` 13/0,
+`_nft_offdiff2` 19/0). Regression subset unchanged; `_av_census_attack_sim.mjs` 58/2 is
+**pre-existing** — bisected, `git HEAD:server.js` produces the identical two failures.

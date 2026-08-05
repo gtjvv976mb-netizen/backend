@@ -5991,12 +5991,32 @@ const NFT_MINT_PAUSED = String(process.env.NFT_MINT_PAUSED ?? "0") === "1";
 // Mintable ORIGINS — server-witnessed births ONLY. legacy/unverified/adopted rows were never vouched;
 // minting them would launder exactly what the mint is meant to prove. Widen via env without a deploy.
 const NFT_MINT_ORIGINS = new Set(String(process.env.NFT_MINT_ORIGINS || "hatched").split(",").map(s => s.trim()).filter(Boolean));
-// Royalty (owner lock D7): 15% on the WNS transfer hook, routed to the POOL wallet — the market's
-// 20%-tax destination (TEAM_WALLET). Redirect without code via NFT_ROYALTY_WALLET. Income budgeted 0.
-const NFT_ROYALTY_BPS = Math.max(0, Math.min(10000, Number(process.env.NFT_ROYALTY_BPS ?? "2000") || 2000));   // 20% — matches the collection's Royalties plugin (owner-confirmed 2026-08-05)
+// Royalty (owner lock D7 — set to the LIVE Metaplex Core collection's rate): 20%, routed to the POOL
+// wallet (the market's tax destination, TEAM_WALLET). Core enforces royalty via a COLLECTION-level
+// Royalties plugin every member INHERITS — NOT a WNS transfer hook. The live collection carries no such
+// plugin yet (verified on mainnet: 0 bps / no plugin registry), so go-live must add one ONCE at
+// basisPoints=NFT_ROYALTY_BPS, creators=[{NFT_ROYALTY_WALLET,100%}] via an authority-signed
+// UpdateCollectionPluginV1 — pick collection-level, never mix a per-asset rate into the same collection.
+// Redirect the destination without code via NFT_ROYALTY_WALLET. Income budgeted 0.
+const NFT_ROYALTY_BPS = Math.max(0, Math.min(10000, Number(process.env.NFT_ROYALTY_BPS ?? "2000") || 2000));
 const NFT_ROYALTY_WALLET = (process.env.NFT_ROYALTY_WALLET && isPubkey(String(process.env.NFT_ROYALTY_WALLET).trim()))
   ? String(process.env.NFT_ROYALTY_WALLET).trim() : (TEAM_WALLET || null);
+// The LIVE Metaplex Core collection. NO DEFAULT, on purpose: the address that used to sit here
+// (4io9QC3g…) is the DEAD collection — create_collection.mjs:3 records that its update authority is
+// LOST, so a server defaulting to it would verify membership of a collection nobody controls. A wrong
+// default is worse than none, so this FAILS CLOSED: unset => every mint refuses 503 "the NFT collection
+// is not configured". The owner sets NFT_COLLECTION=2iyJEoY5mUnBXJ139R5mQSkfQtgzZXTP4BtnQaiGEgTN.
+// Read ONLY inside CHIK_NFT_MINT-gated code, so this changes NO flag-off HTTP behaviour.
 const NFT_COLLECTION = String(process.env.NFT_COLLECTION || "").trim() || null;
+// Where a minted asset's on-chain `uri` points — this backend's public origin. The metadata JSON is
+// served live at GET /assets/nft/meta/:id, so a marketplace reads the same provenance the cert does.
+const NFT_META_BASE = String(process.env.NFT_META_BASE || "").trim().replace(/\/+$/, "");
+// Per-species art for the metadata `image` (display only; omitted when unset — never a broken guess).
+const NFT_IMAGE_BASE = String(process.env.NFT_IMAGE_BASE || "").trim().replace(/\/+$/, "");
+const NFT_EXPLORER_BASE = String(process.env.NFT_EXPLORER_BASE || "https://solscan.io/token").trim().replace(/\/+$/, "");
+// How long a reserved-but-unconfirmed mint address holds its row before it may be abandoned. In-memory
+// `_nftMinting` dies with the process; `row.mintPending` is the CRASH-DURABLE half of the same claim.
+const NFT_PENDING_TTL_MS = Math.max(60000, Number(process.env.NFT_PENDING_TTL_MS || 600000) || 600000);
 // Sequential, server-ASSIGNED edition per (type,species): assigned and recorded, NEVER recomputed, so
 // two wallets can never both hold "#1". Persisted with the rows; floored at max(row.edition) on restore.
 const nftEdition = Object.create(null);   // _censusKey(type,sp) -> highest edition issued
@@ -6010,6 +6030,72 @@ let _nftDasStub = null;                   // test seam: mint -> obs (function or
 let _nftSyncBusy = false, _nftSyncAt = 0;
 const _nftReviewFlags = new Map();        // id -> {reason, at} — operator-visible; owner NEVER mutated
 const _nftHolderObs = new Map();          // id -> {owner, since} — the two-read + dwell state machine
+// The ephemeral asset keypairs of mints that were SUBMITTED but not yet confirmed. Memory only — never
+// persisted, never logged, never in a response — so a retry inside this process re-submits the SAME
+// address instead of creating a second one. A restart loses them, which is exactly what the durable
+// `row.mintPending` + NFT_PENDING_TTL_MS pair is for.
+const _nftPendingKeys = new Map();        // asset id -> {addr, secret:Uint8Array, at}
+let _nftCoreStub = null;                  // test seam: the Core create client (sims stub it — no chain, no key)
+
+// The MINTING AUTHORITY. A Core asset cannot join a collection unless an authority for that collection
+// signs the create (CreateV2's `authority` is a required signer whenever `collection` is set), so a
+// pure player-wallet mint into our collection is impossible. The server therefore holds a scoped
+// UpdateDelegate on the collection — NOT the master team key, which stays cold — and mints the asset
+// TO THE PLAYER (owner = the player, royalty inherited from the collection). This key is read from the
+// environment ONLY; it is never in the repo, a sim, a log or a response body. Its PUBLIC half may be
+// logged. TREASURY_SECRET is never read on any NFT path — the delegate is also the rent payer.
+let _nftDelegate;                         // undefined = not parsed yet; null = absent/unusable
+function nftDelegate() {
+  if (_nftDelegate !== undefined) return _nftDelegate;
+  _nftDelegate = null;
+  const raw = String(process.env.NFT_MINT_DELEGATE_SECRET || "").trim();
+  if (raw) {
+    try { const kp = Keypair.fromSecretKey(parseSecret(raw)); _nftDelegate = { secret: kp.secretKey, pubkey: kp.publicKey.toBase58() }; }
+    catch (e) { console.error("✖ NFT_MINT_DELEGATE_SECRET is not a usable keypair — minting stays closed"); }
+  }
+  return _nftDelegate;
+}
+const nftAssetName = (row) => `${_nftCap(row.sp)} #${row.edition}`;
+const nftMetaUri = (row) => (NFT_META_BASE ? `${NFT_META_BASE}/assets/nft/meta/${encodeURIComponent(row.id)}` : "");
+// The provenance, pinned ON CHAIN as a Core Attributes plugin — so the certificate outlives the
+// metadata host. Same facts /assets/cert serves; strings only (the plugin's type is {key,value}).
+function nftAttributes(row) {
+  return [{ key: "registryId", value: String(row.id) }, { key: "species", value: String(row.sp || "") },
+          { key: "kind", value: String(row.kind || "") }, { key: "origin", value: String(row.origin || "") },
+          { key: "edition", value: String(row.edition || "") }, { key: "born", value: String(row.born || "") },
+          { key: "hatcher", value: String(row.hatcher || row.owner || "") }];
+}
+// Build + submit the Core create. The SDK is imported LAZILY inside this function so a flag-off boot
+// never loads @metaplex-foundation at all (cold start + flag-off byte-identity). Sims replace the whole
+// function with `_nftCoreStub`, so no sim ever builds a transaction, touches a network or reads a key.
+// NOTE the plugin list carries NO Royalties entry: in Core an ASSET-level Royalties plugin OVERRIDES
+// the collection's, so adding one here would silently detach that asset from the collection's 20%.
+async function nftCoreCreate(args) {
+  if (_nftCoreStub) return await _nftCoreStub(args);
+  const d = nftDelegate();
+  if (!d) throw new Error("minting is not configured");
+  if (!NFT_COLLECTION) throw new Error("the NFT collection is not configured");
+  const [umiMod, bundle, core] = await Promise.all([
+    import("@metaplex-foundation/umi"), import("@metaplex-foundation/umi-bundle-defaults"), import("@metaplex-foundation/mpl-core"),
+  ]);
+  const umi = bundle.createUmi(RPC_URL);
+  const delegateSigner = umiMod.createSignerFromKeypair(umi, umi.eddsa.createKeypairFromSecretKey(d.secret));
+  umi.use(umiMod.signerIdentity(delegateSigner));                 // delegate signs AND pays the ~0.004 SOL rent
+  const assetSigner = umiMod.createSignerFromKeypair(umi, umi.eddsa.createKeypairFromSecretKey(args.assetSecret));
+  const collection = await core.fetchCollection(umi, umiMod.publicKey(NFT_COLLECTION));
+  const r = await core.create(umi, {
+    asset: assetSigner, collection, authority: delegateSigner, owner: umiMod.publicKey(args.owner),
+    name: args.name, uri: args.uri, plugins: args.plugins,
+  }).sendAndConfirm(umi, { confirm: { commitment: "confirmed" } });
+  return { address: assetSigner.publicKey.toString(), signature: r && r.signature ? bs58.encode(r.signature) : null };
+}
+// ONE certificate per creature, and one creature per certificate: an on-chain address already bound to
+// another registry row can never be adopted by a second one. `nftEligibility` guards the first
+// direction (row.mint is write-once); this guards the second, which a format check alone left open.
+function nftMintBoundTo(addr, exceptId) {
+  for (const r of assetReg.values()) if (r && r.mint === addr && r.id !== exceptId) return r.id;
+  return null;
+}
 
 const _nftCap = (s) => { s = String(s || ""); return s ? s[0].toUpperCase() + s.slice(1) : s; };
 function _isOnCurve(addr) { try { return PublicKey.isOnCurve(new PublicKey(addr).toBytes()); } catch { return false; } }
@@ -6027,20 +6113,54 @@ function nftEligibility(row, wallet) {
   if (row.type === "avatar") return { code: "avatar", status: 403, error: "avatars are not mintable in this increment" };
   if (!nftMintableKind(row)) return { code: "kind", status: 403, error: "only legendaries, Meme Dynasty and mounts can be minted" };
   if (!NFT_MINT_ORIGINS.has(String(row.origin))) return { code: "origin", status: 403, error: "only server-witnessed births can be minted" };
+  // AN ORIGIN STRING IS NOT PROVENANCE. Two completely different writers produce the seven characters
+  // "hatched", and the origin field cannot tell them apart:
+  //   (a) the REAL egg routes — /assets/egg/hatch (:6690/:6704) and /assets/egg/consume (:6781) —
+  //       which always pass the consumed egg's row id as mintAsset's `parent`. The egg was minted by
+  //       this server, timed by this server's clock, and consumed by this server, so the birth is
+  //       genuinely witnessed;
+  //   (b) auditAssets' DELTA INFERENCE (:7799, `!eggGlut && eggsHatchable >= newUnits`), which reads
+  //       the CLIENT-AUTHORED `mmo.eggs` array of a save the client signs itself, and is then
+  //       laundered into the registry by /assets/chikimon/sync (:6903) and /assets/mounts/sync
+  //       (:6839) — routes that pass NO parent and set `luid` instead.
+  // Accepting (b) put creatures the server never rolled into the official Metaplex Core collection
+  // permanently: measured 6 certificates from free throwaway wallets, four legendaries from ONE
+  // wallet in one cycle, and a GRIFFIN (cap 5, the rarest asset in the game), each with
+  // `origin=hatched` written into the on-chain Attributes plugin — `_ax_nftlaunder_sim.mjs` §B/C/D.
+  // The cost was wall-clock only: declare an egg, wait EGG_HOURS, declare a legendary.
+  // THE WITNESS IS THE PARENT LINK. `parent` is only ever mintAsset's 5th argument and only the three
+  // hatch call sites ever pass it; no client-reachable route can set it, and restoreAssetReg carries
+  // it across restarts. `luid` is its mirror image — only the two sync routes set it (:6483). A
+  // certificate is forever, so this gate fails CLOSED: no lineage, no mint.
+  if (!row.parent || row.luid) return { code: "no-lineage", status: 403, error: "only a creature this server hatched from a registered egg can be certified" };
+  // If the egg row is still here, it must be an egg that hatched into THIS creature. (Truncation at
+  // ASSET_REG_MAX can drop an old egg row; the unforgeable `parent` link above still stands alone.)
+  {
+    const par = assetReg.get(String(row.parent));
+    if (par && (par.type !== "egg" || (par.hatchedTo && par.hatchedTo !== row.id)))
+      return { code: "no-lineage", status: 403, error: "only a creature this server hatched from a registered egg can be certified" };
+  }
   if ((row.gameStatus ?? "good") !== "good") return { code: "flagged", status: 409, error: "asset is flagged and cannot be minted" };
   if (row.listedOffchain || row.pendingHandover) return { code: "busy", status: 409, error: "asset is listed on-chain or has a pending transfer" };
   return { code: "ok", status: 200 };
 }
 function nftEditionFor(row) { const k = _censusKey(row.type, row.sp); nftEdition[k] = (nftEdition[k] || 0) + 1; return nftEdition[k]; }
-// The UNSIGNED mint intent the player's own wallet signs — the server NEVER signs a player mint.
-function nftMintIntent(row) {
+// A PREVIEW of the mint the server will submit — never a transaction the client signs. A Core member
+// mint (CreateV2 with `collection` set) requires a collection authority signature, so the SERVER signs
+// with a scoped UpdateDelegate (never TREASURY_SECRET, never the cold master key) and mints the asset
+// to the PLAYER's wallet: owner = the player, payer = the delegate. Royalty is inherited from the
+// collection-level Core Royalties plugin — NOT set per asset — so one rate governs every member.
+// `edition` here is the number that WOULD be issued; the real one is assigned by the committing route.
+function nftMintIntent(row, previewEdition) {
+  const ed = row.edition || previewEdition || null;
   return {
-    id: row.id, standard: "wns", tokenProgram: "token-2022",
-    name: `${_nftCap(row.sp)} #${row.edition}`, collection: NFT_COLLECTION,
-    sellerFeeBasisPoints: NFT_ROYALTY_BPS, royaltyWallet: NFT_ROYALTY_WALLET,
+    id: row.id, standard: "core", program: "mpl-core", instruction: "CreateV2", mintModel: "server-mints",
+    name: `${_nftCap(row.sp)} #${ed}`, collection: NFT_COLLECTION,
+    royaltyModel: "collection-inherited", sellerFeeBasisPoints: NFT_ROYALTY_BPS, royaltyWallet: NFT_ROYALTY_WALLET,
+    signers: { assetKeypair: "server-ephemeral", payer: "mint-delegate", owner: "player-wallet", collectionAuthority: "mint-delegate-scoped-non-treasury" },
     immutable: { registryId: row.id, species: row.sp, kind: row.kind, origin: row.origin,
-                 edition: row.edition, born: row.born, hatcher: row.hatcher || row.owner },
-    note: "unsigned — the player's wallet signs & submits this; the server records the resulting address at /assets/nft/mint",
+                 edition: ed, born: row.born, hatcher: row.hatcher || row.owner },
+    note: "preview only — the player signs NOTHING. POST /assets/nft/mint {wallet,mktToken,id} and the server submits a Metaplex Core CreateV2 signed by the scoped collection delegate, owner = your wallet, then verifies membership+ownership on-chain before recording it",
   };
 }
 // Never act on a raw ownership.owner — CLASSIFY first (F1/L2). Pure; the sim drives it directly.
@@ -6099,11 +6219,34 @@ async function _nftDasRead(mint) {
     const r = await fetch(RPC_URL, { method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: "nft", method: "getAsset", params: { id: mint } }) });
     const j = await r.json();
-    if (!j || !j.result) return { dasFailed: true };
-    const own = j.result.ownership;
-    if (!own || typeof own.owner !== "string") return { structuralUnsupported: true };   // WNS/T22 shape unsupported
-    return { owner: own.owner, burned: !!j.result.burnt };
+    // A well-formed JSON-RPC ERROR means the reader ANSWERED and the account is not there; a throw or a
+    // shapeless body means the reader is down. Both stay `dasFailed` (every existing caller treats a
+    // failed read as "change nothing"), but `absent` is the extra bit the pending-mint retry needs so it
+    // can tell "that submit never landed" from "I cannot see right now" and never re-mint on an outage.
+    if (!j || !j.result) return j && j.error ? { dasFailed: true, absent: true } : { dasFailed: true };
+    const res = j.result, own = res.ownership;
+    // Metaplex Core DAS returns a STRING owner and interface "MplCoreAsset"; this structural guard was
+    // built for the WNS/T22 shape (a missing ownership.owner) and is a dead-but-kept fail-safe for Core.
+    if (!own || typeof own.owner !== "string") return { structuralUnsupported: true };
+    // Core membership lives in `grouping`: {group_key:"collection", group_value:<collection address>}.
+    let collection = null;
+    if (Array.isArray(res.grouping)) { const g = res.grouping.find(x => x && x.group_key === "collection"); if (g && g.group_value) collection = String(g.group_value); }
+    return { owner: own.owner, burned: !!res.burnt, iface: res.interface || null, collection };
   } catch (e) { return { dasFailed: true }; }
+}
+// GO-LIVE GATE the WNS build lacked: before recording a player-supplied mint address, PROVE via the
+// reader that it is a Metaplex Core asset, a MEMBER of NFT_COLLECTION, OWNED by the minting wallet, and
+// not burnt. A format check alone let a client record ANY pubkey — including an out-of-collection token
+// that would evade the pool royalty on resale. This is a READ, not a format check. Pure over (obs, wallet).
+function nftVerifyOnchain(obs, wallet) {
+  if (!obs || obs.dasFailed) return { ok: false, status: 503, error: "could not read that mint on-chain — try again" };
+  if (obs.structuralUnsupported) return { ok: false, status: 503, error: "that mint could not be read in a supported shape" };
+  if (obs.burned) return { ok: false, status: 409, error: "that mint is burnt" };
+  if (obs.iface !== "MplCoreAsset") return { ok: false, status: 400, error: "that address is not a Metaplex Core asset" };
+  if (!NFT_COLLECTION) return { ok: false, status: 503, error: "the NFT collection is not configured" };
+  if (String(obs.collection || "") !== NFT_COLLECTION) return { ok: false, status: 400, error: "that asset is not a member of the official collection" };
+  if (!wallet || String(obs.owner || "") !== String(wallet)) return { ok: false, status: 403, error: "the on-chain owner of that mint is not this wallet" };
+  return { ok: true };
 }
 // Reconcile every minted registry row against its on-chain holder. Fail-safe on DAS outage; never a
 // silent deletion. Keeps running while NEW mints are paused (L10). The chain is authoritative for
@@ -6115,13 +6258,24 @@ async function reconcileNftOwners() {
     for (const row of assetReg.values()) {
       if (!row.mint) continue;
       const obs = await _nftDasRead(row.mint);
+      // Defense in depth (Core): a minted row whose on-chain grouping no longer names OUR collection is
+      // FLAGGED for review — never stripped. A bad/looted read must not yank a holder, so ownership is
+      // left to the classifier below; this only surfaces the anomaly to an operator.
+      if (NFT_COLLECTION && obs && obs.collection && obs.collection !== NFT_COLLECTION && !obs.dasFailed && !obs.structuralUnsupported && !obs.burned)
+        _nftReviewFlags.set(row.id, { reason: "collection-mismatch", at: Date.now() });
       nftApplyClassification(row, nftClassifyHolder(row, obs));
       if (_nftDasUnsupported) break;                               // structural outage — stop the whole loop
     }
     if (_assetsDirty) { try { await saveAssetLedger(true); } catch (e) {} }
   } finally { _nftSyncBusy = false; _nftSyncAt = Date.now(); }
 }
-if (NFT_MINT_ON) setInterval(() => { reconcileNftOwners().catch(() => {}); }, 5 * 60 * 1000).unref?.();
+if (NFT_MINT_ON) {
+  // One honest boot line so the owner can see WHY minting is or is not open. Public halves only —
+  // the delegate's secret is never printed, and TREASURY_SECRET is not read anywhere on this path.
+  const _d = nftDelegate();
+  console.log(`◆ NFT minting ON — model=server-mints collection=${NFT_COLLECTION || "NOT CONFIGURED"} authority=${_d ? _d.pubkey : "NOT CONFIGURED"}${NFT_MINT_PAUSED ? " paused=1" : ""}`);
+  setInterval(() => { reconcileNftOwners().catch(() => {}); }, 5 * 60 * 1000).unref?.();
+}
 
 // ============ RARITY IS A LAW, NOT A LABEL ============
 // Advertised scarcity used to be enforced NOWHERE for avatars, and for mounts the "supply" numbers
@@ -7026,6 +7180,17 @@ app.get("/assets/mine", (req, res) => {
     const r = assetReg.get(id);
     if (!r) continue;
     const card = { id: r.id, sp: r.sp, kind: r.kind, born: r.born, origin: r.origin, state: r.state };
+    // Mint eligibility is SERVER-decided and served here so the client never re-implements a single
+    // rule of the gate (and an old client, which never asks, is unaffected). Flag-gated: with
+    // CHIK_NFT_MINT off this block adds no key and the reply is byte-identical to today's.
+    if (NFT_MINT_ON) {
+      const el = nftEligibility(r, w);
+      card.mint = r.mint || null;
+      card.edition = r.edition || null;
+      card.mintCode = r.mint ? "minted" : el.code;
+      card.mintWhy = r.mint ? null : (el.error || null);
+      card.mintable = !r.mint && el.code === "ok" && !_nftBoardListed(r);
+    }
     if (r.type === "egg") { card.readyAt = eggReadyAt(r); card.hatchedTo = r.hatchedTo || null; out.eggs.push(card); }
     else if (r.type === "chikimon") { card.lvl = r.lvl; out.chikimon.push(card); }
     else if (r.type === "mount") out.mounts.push(card);
@@ -7070,8 +7235,10 @@ function _nftBoardListed(row) {
 function _nftAuth(req) { const wallet = regWallet(req), admin = cupAdminOk(req); return { wallet, admin, ok: !!(wallet || admin) }; }
 function _nftResolveWho(a, row) { return a.wallet || (a.admin && row ? row.owner : ""); }
 
-// PREPARE an UNSIGNED mint for the player's own wallet to sign. Assigns + persists the sequential
-// edition write-once (so the signed metadata is stable across retries). The server NEVER signs.
+// PREVIEW the mint: the eligibility answer plus the name/collection/royalty the asset will carry.
+// READ-ONLY as of the server-mints model — it no longer assigns an edition. Assignment moved to the
+// COMMITTING route, because a number handed out by a route that never mints is a number that leaks:
+// every abandoned preview used to burn an edition permanently and leave a hole in the series.
 app.post("/assets/nft/prepare", async (req, res) => {
   if (!NFT_MINT_ON) return res.status(503).json({ error: "minting is not open" });
   if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
@@ -7085,17 +7252,37 @@ app.post("/assets/nft/prepare", async (req, res) => {
   if (el.code !== "ok") return res.status(el.status).json({ error: el.error });
   if (_nftBoardListed(row)) return res.status(409).json({ error: "asset is listed on the in-game board — unlist it first" });
   if (row.mint) return res.json({ ok: true, already: true, mint: row.mint, edition: row.edition, intent: nftMintIntent(row) });
-  if (!row.edition) {
-    row.edition = nftEditionFor(row);
-    row.hatcher = row.hatcher || row.owner;
-    regEvent(row, "mint_authorized", { edition: row.edition });
-    _assetsDirty = true; try { await saveAssetLedger(true); } catch (e) {}
-  }
-  res.json({ ok: true, prepared: true, edition: row.edition, intent: nftMintIntent(row) });
+  // The number this row WOULD get, read without incrementing anything. Two previews can show the same
+  // "#1"; only the mint route decides, and it decides once.
+  const previewEdition = (nftEdition[_censusKey(row.type, row.sp)] || 0) + 1;
+  res.json({ ok: true, prepared: true, preview: true, edition: previewEdition,
+             mintModel: "server-mints", collectionConfigured: !!NFT_COLLECTION, mintConfigured: !!nftDelegate(),
+             intent: nftMintIntent(row, previewEdition) });
 });
 
-// RECORD the on-chain mint address the player's wallet produced, marking the row minted (write-once,
-// idempotent). This is the mint AUTHORITY's commit — reversible only by a real on-chain burn read.
+// MINT. One click: the player signs nothing, the server submits a Metaplex Core CreateV2 into
+// NFT_COLLECTION signed by the scoped delegate, with the PLAYER as owner. Write-once and idempotent —
+// a retry can only ever return the first mint. `mintAddr` in the body switches to the ADOPT path (a
+// client reporting an address minted elsewhere); either way the address is PROVEN on chain — a Core
+// asset, a member of our collection, owned by this wallet, not burnt, and not already another
+// creature's certificate — before a single field is recorded. Reversible only by a real burn read.
+function _nftCommitMint(row, addr, sig) {
+  if (!row.edition) row.edition = nftEditionFor(row);         // sequential, write-once
+  row.hatcher = row.hatcher || row.owner;                     // birth-hatcher split from current owner
+  row.mint = addr;                                            // write-once — the on-chain address
+  row.holderSince = Date.now();
+  delete row.mintPending;
+  _nftPendingKeys.delete(row.id);
+  regEvent(row, "minted_onchain", Object.assign({ addr, edition: row.edition }, sig ? { sig } : {}));
+  _assetsDirty = true; censusInvalidate();
+}
+function _nftMintReply(row, already) {
+  const out = { ok: true, mint: row.mint, edition: row.edition, name: nftAssetName(row),
+    collection: NFT_COLLECTION, royalty: { bps: NFT_ROYALTY_BPS, wallet: NFT_ROYALTY_WALLET, model: "collection-inherited" },
+    explorer: `${NFT_EXPLORER_BASE}/${row.mint}`, magicEden: `https://magiceden.io/item-details/${row.mint}` };
+  if (already) out.already = true;
+  return out;
+}
 app.post("/assets/nft/mint", async (req, res) => {
   if (!NFT_MINT_ON) return res.status(503).json({ error: "minting is not open" });
   if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
@@ -7104,25 +7291,122 @@ app.post("/assets/nft/mint", async (req, res) => {
   if (!a.ok) return res.status(403).json({ error: "prove this wallet first" });
   const id = String(req.body?.id || "").slice(0, 64);
   const row = assetReg.get(id);
-  const el = nftEligibility(row, _nftResolveWho(a, row));
+  const who = _nftResolveWho(a, row);
+  const el = nftEligibility(row, who);
   if (el.code !== "ok") return res.status(el.status).json({ error: el.error });
   // IDEMPOTENT: a retry returns the SAME mint, never a second one.
-  if (row.mint) return res.json({ ok: true, already: true, mint: row.mint, edition: row.edition });
+  if (row.mint) return res.json(_nftMintReply(row, true));
   if (NFT_MINT_PAUSED && !row.edition) return res.status(503).json({ error: "new mints are paused" });
   if (_nftBoardListed(row)) return res.status(409).json({ error: "asset is listed on the in-game board — unlist it first" });
+  // Fail CLOSED on configuration: without a collection there is nothing to verify membership AGAINST,
+  // and without the delegate there is no authority to sign a member create. Neither ever crashes.
+  if (!NFT_COLLECTION) return res.status(503).json({ error: "the NFT collection is not configured" });
   const mintAddr = String(req.body?.mintAddr || "").slice(0, 64);
-  if (!isPubkey(mintAddr)) return res.status(400).json({ error: "a valid on-chain mint address is required (the player's wallet creates it; the server never signs a player mint)" });
+  const adopt = !!mintAddr;
+  if (adopt && !isPubkey(mintAddr)) return res.status(400).json({ error: "a valid on-chain mint address is required (the player's wallet creates it; the server never signs a player mint)" });
+  if (!adopt && !nftDelegate()) return res.status(503).json({ error: "minting is not configured" });
   if (_nftMinting.has(id)) return res.status(409).json({ error: "a mint for this asset is already in flight" });
   _nftMinting.add(id);                                       // CLAIM the dedup key BEFORE the await (TOCTOU)
   try {
-    if (!row.edition) row.edition = nftEditionFor(row);       // sequential, write-once
-    row.hatcher = row.hatcher || row.owner;                   // birth-hatcher split from current owner
-    row.mint = mintAddr;                                      // write-once — the on-chain address
-    row.holderSince = Date.now();
-    regEvent(row, "minted_onchain", { addr: mintAddr, edition: row.edition });
-    _assetsDirty = true; censusInvalidate();
+    // ---- ADOPT: record an address the caller supplied ----------------------------------------
+    if (adopt) {
+      // GO-LIVE GATE (Core): the claimed address must be a Core asset, a MEMBER of NFT_COLLECTION, OWNED
+      // by THIS wallet, and not burnt — verified via the reader, NOT a format check. Refuse (releasing the
+      // claim in `finally`) on any failure, so a later legitimate mint of the same row can still proceed;
+      // the edition is assigned only AFTER the verify passes, so a refused attempt never burns a number.
+      const vf = nftVerifyOnchain(await _nftDasRead(mintAddr), who);
+      if (!vf.ok) return res.status(vf.status).json({ error: vf.error });
+      const dupe = nftMintBoundTo(mintAddr, id);
+      if (dupe) return res.status(409).json({ error: "that on-chain asset is already the certificate of another creature" });
+      _nftCommitMint(row, mintAddr);
+      try { await saveAssetLedger(true); } catch (e) {}       // registry first; on failure _assetsDirty retries
+      return res.json(_nftMintReply(row, false));
+    }
+    // ---- SERVER-MINTS ------------------------------------------------------------------------
+    // A crash between "submitted" and "recorded" is the one way a server-signing model can double-mint,
+    // so the reserved address is PERSISTED before the submit and consulted first on every retry.
+    let key = _nftPendingKeys.get(id);
+    if (row.mintPending && row.mintPending.addr) {
+      const pAddr = String(row.mintPending.addr), pAt = Number(row.mintPending.at) || 0;
+      const obs = await _nftDasRead(pAddr);
+      const vf = nftVerifyOnchain(obs, who);
+      if (vf.ok) {                                            // it DID land — promote, never re-create
+        _nftCommitMint(row, pAddr);
+        try { await saveAssetLedger(true); } catch (e) {}
+        return res.json(_nftMintReply(row, true));
+      }
+      const gone = !!(obs && obs.dasFailed);                  // could not be CONFIRMED (reader down OR account absent)
+      if (!gone) {                                            // it EXISTS but is not ours/not right: never re-mint
+        _nftReviewFlags.set(row.id, { reason: "pending-verify-failed", at: Date.now() });
+        return res.status(409).json({ error: "that mint is still confirming — try again in a moment", pending: true });
+      }
+      if (key && key.addr === pAddr) { /* same process: re-submit the SAME address below. Safe even when
+           the reader is merely down: if the first submit DID land, CreateV2 on an existing account fails,
+           so this branch can never produce a second asset. */ }
+      // ABANDONING REQUIRES THE READER TO HAVE ANSWERED. `dasFailed` alone conflates "the reader said
+      // that account is not there" with "the reader could not answer at all", and only the FIRST means
+      // the submit never landed. Abandoning on an OUTAGE generates a fresh keypair and submits a SECOND
+      // CreateV2 — two on-chain certificates for one creature, the exact failure this whole reservation
+      // dance exists to prevent (measured: reader down + past TTL + a restart = 2 creates for 1 row,
+      // `_adv_nftgo_sim.mjs` §9). `absent` is the bit `_nftDasRead` sets when the RPC returns a
+      // well-formed JSON-RPC error, i.e. it ANSWERED. No answer => hold the reservation forever and
+      // say "still confirming"; a stuck row is recoverable, a duplicate mint is not.
+      else if (!obs.absent) {
+        return res.status(409).json({ error: "that mint is still confirming — try again in a moment", pending: true });
+      }
+      else if (Date.now() - pAt > NFT_PENDING_TTL_MS) {       // the key died with a restart and it never landed
+        regEvent(row, "mint_abandoned", { addr: pAddr });
+        delete row.mintPending; _assetsDirty = true;
+        try { await saveAssetLedger(true); } catch (e) {}
+      } else {
+        return res.status(409).json({ error: "that mint is still confirming — try again in a moment", pending: true });
+      }
+    }
+    // Reserve the edition and the address, and PERSIST BOTH before anything is submitted. A reserved
+    // but unminted edition is reused by the very next retry of this row, so the series has no holes.
+    if (!row.edition) row.edition = nftEditionFor(row);
+    row.hatcher = row.hatcher || row.owner;
+    if (!key || !row.mintPending) {
+      const kp = Keypair.generate();                          // ephemeral; the secret never leaves memory
+      key = { addr: kp.publicKey.toBase58(), secret: kp.secretKey, at: Date.now() };
+      _nftPendingKeys.set(id, key);
+      row.mintPending = { addr: key.addr, at: key.at };
+      regEvent(row, "mint_submitted", { addr: key.addr, edition: row.edition });
+      _assetsDirty = true;
+      try { await saveAssetLedger(true); } catch (e) {}       // durable BEFORE the submit — never after
+    }
+    let out;
+    try {
+      // The plugin list is built HERE so it is inspectable by a sim: exactly one Attributes plugin and
+      // NEVER a Royalties one — an asset-level Royalties plugin OVERRIDES the collection's inherited
+      // 20%, which would silently make this asset royalty-free on resale.
+      out = await nftCoreCreate({ id: row.id, owner: who, assetSecret: key.secret, assetAddr: key.addr,
+        name: nftAssetName(row), uri: nftMetaUri(row), collection: NFT_COLLECTION,
+        plugins: [{ type: "Attributes", attributeList: nftAttributes(row) }] });
+    } catch (e) {
+      // Transient: the row keeps its reserved address, so the retry aims at the SAME one and can never
+      // produce a second asset. Nothing about the failure is echoed back (it can carry key material).
+      return res.status(502).json({ error: "the chain did not accept that mint — try again; you will not get two", pending: true });
+    }
+    const addr = String((out && out.address) || key.addr);
+    // VERIFY BEFORE RECORDING — the same predicate the adopt path uses. A submit that cannot yet be
+    // read back is NOT a failure: the reservation stands and the next retry promotes it.
+    const obs2 = await _nftDasRead(addr);
+    const vf2 = nftVerifyOnchain(obs2, who);
+    if (!vf2.ok) {
+      if (addr !== key.addr) { row.mintPending = { addr, at: Date.now() }; _assetsDirty = true; try { await saveAssetLedger(true); } catch (e) {} }
+      // Unreadable is not the same as WRONG. A reader that cannot see it yet leaves the reservation
+      // standing and says so; an asset that IS readable and fails the membership/ownership test is a
+      // real anomaly — surfaced to an operator and answered with the true reason, never recorded.
+      if (obs2 && obs2.dasFailed) return res.status(409).json({ error: "that mint is still confirming — try again in a moment", pending: true });
+      _nftReviewFlags.set(row.id, { reason: "submitted-asset-failed-verify", at: Date.now() });
+      return res.status(vf2.status).json({ error: vf2.error, pending: true });
+    }
+    const dupe2 = nftMintBoundTo(addr, id);
+    if (dupe2) return res.status(409).json({ error: "that on-chain asset is already the certificate of another creature" });
+    _nftCommitMint(row, addr, out && out.signature);
     try { await saveAssetLedger(true); } catch (e) {}         // registry first; on failure _assetsDirty retries
-    res.json({ ok: true, mint: row.mint, edition: row.edition, royalty: { bps: NFT_ROYALTY_BPS, wallet: NFT_ROYALTY_WALLET } });
+    res.json(_nftMintReply(row, false));
   } finally { _nftMinting.delete(id); }
 });
 
@@ -7152,9 +7436,34 @@ app.post("/assets/nft/status", async (req, res) => {
 // Public (behind flag): the mint config the client needs — royalty, collection, mintable set.
 app.get("/assets/nft/config", (req, res) => {
   if (!NFT_MINT_ON) return res.status(503).json({ error: "minting is not open" });
-  res.json({ standard: "wns", tokenProgram: "token-2022", paused: NFT_MINT_PAUSED,
-    royalty: { bps: NFT_ROYALTY_BPS, wallet: NFT_ROYALTY_WALLET }, collection: NFT_COLLECTION,
+  res.json({ standard: "core", program: "mpl-core", paused: NFT_MINT_PAUSED, mintModel: "server-mints",
+    royalty: { bps: NFT_ROYALTY_BPS, wallet: NFT_ROYALTY_WALLET, model: "collection-inherited" }, collection: NFT_COLLECTION,
+    // `ready` is the honest one-word answer to "can anyone mint right now": a collection to verify
+    // against AND an authority to sign with. The delegate's PUBLIC key is safe to publish; its secret
+    // half never leaves the environment.
+    ready: !!(NFT_COLLECTION && nftDelegate() && !NFT_MINT_PAUSED), mintAuthority: nftDelegate() ? nftDelegate().pubkey : null,
+    metaBase: NFT_META_BASE || null, explorerBase: NFT_EXPLORER_BASE,
     mintableKinds: { mount: true, chikimon: ["legendary", "meme"] }, origins: [...NFT_MINT_ORIGINS] });
+});
+
+// The metadata JSON every minted asset's on-chain `uri` points at (public — a certificate nobody can
+// read is not one). Flag-off it does not exist at all: `next()` reproduces today's 404 exactly, rather
+// than inventing a new 503 on a URL that has never answered.
+app.get("/assets/nft/meta/:id", (req, res, next) => {
+  if (!NFT_MINT_ON) return next();
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const r = assetReg.get(String(req.params?.id || "").slice(0, 64));
+  if (!r) return res.status(404).json({ error: "no such asset" });
+  const attrs = nftAttributes(r).map(a => ({ trait_type: a.key, value: a.value }));
+  attrs.push({ trait_type: "gameStatus", value: String(r.gameStatus || "good") });
+  const out = {
+    name: r.edition ? nftAssetName(r) : _nftCap(r.sp), symbol: "CHIKI",
+    description: `${_nftCap(r.sp)} — a ${r.kind || r.type} of Chikoria, hatched in-world and certified by the Chikoria registry. Provenance is on-chain in this asset's Attributes.`,
+    attributes: attrs,
+  };
+  if (NFT_IMAGE_BASE) out.image = `${NFT_IMAGE_BASE}/${encodeURIComponent(r.type)}/${encodeURIComponent(r.sp)}.png`;
+  if (NFT_META_BASE) out.external_url = `${NFT_META_BASE}/assets/cert?id=${encodeURIComponent(r.id)}`;
+  res.json(out);
 });
 
 // Partition for persistence: rows carrying an on-chain `mint` are truncation-EXEMPT — dropping the
@@ -7231,6 +7540,11 @@ export function restoreAssetReg(v) {
     if (Number(src.holderSince) > 0) row.holderSince = Number(src.holderSince);
     if (src.pendingHandover && typeof src.pendingHandover === "object" && isPubkey(String(src.pendingHandover.to || "")))
       row.pendingHandover = { to: String(src.pendingHandover.to).slice(0, 64), at: Number(src.pendingHandover.at) || Date.now(), dormant: !!src.pendingHandover.dormant };
+    // The RESERVED-but-unconfirmed mint address. This is the crash-durable half of the double-mint
+    // guard: drop it here and a restart mid-submit would mint a SECOND asset for a creature that may
+    // already have one on chain. Never restored over a recorded mint (that row is already settled).
+    if (!row.mint && src.mintPending && typeof src.mintPending === "object" && isPubkey(String(src.mintPending.addr || "")))
+      row.mintPending = { addr: String(src.mintPending.addr).slice(0, 64), at: Number(src.mintPending.at) || Date.now() };
     // Defensive: floor the edition counter at the highest edition ever issued, so a lost counter can
     // never re-issue a live edition (mint rows are truncation-exempt, but a prepared row may be dropped).
     if (row.edition) { const k = _censusKey(row.type, row.sp); if ((nftEdition[k] || 0) < row.edition) nftEdition[k] = row.edition; }
@@ -7245,7 +7559,24 @@ export function restoreAssetReg(v) {
 }
 // test seams for the meme cap sim: mint a creature exactly as an in-game egg hatch does, and set
 // the paid-sale tally, so the two routes can be exercised independently
-export function _mintAssetForTest(type, wallet, fields, origin) { return mintAsset(type, wallet, fields, origin); }
+export function _mintAssetForTest(type, wallet, fields, origin, parent) { return mintAsset(type, wallet, fields, origin, parent); }
+// A creature born the way the REAL hatch routes make one: a server-minted egg row, consumed into it,
+// leaving the `parent` link that is the mint gate's only unforgeable witness of a witnessed birth
+// (see nftEligibility's no-lineage guard). A sim that mints a bare `origin:"hatched"` row is asking
+// the gate to accept a shape only /assets/chikimon/sync can produce — i.e. the laundering path.
+export function _mintHatchedForTest(type, wallet, fields) {
+  const kind = String((fields && fields.kind) || "normal");
+  // `luid` names a LEDGER entry this row adopts (:6483) — a real hatch has none, and carrying one
+  // would make the seam reproduce the very shape the lineage guard exists to refuse. Stripped here so
+  // a sim cannot accidentally "prove" the gate accepts an adopted row.
+  const f = Object.assign({}, fields); delete f.luid;
+  const egg = mintAsset("egg", wallet, { kind: kind === "mount" ? "mount" : kind, sp: kind }, "issued");
+  const born = mintAsset(type, wallet, f, "hatched", egg.id);
+  egg.state = "consumed"; egg.hatchedTo = born.id;
+  regEvent(egg, "hatched", { into: born.id, sp: born.sp });
+  censusInvalidate();
+  return born;
+}
 export function _setMemeMintedForTest(key, n) { memeMinted[key] = n; censusInvalidate(); }
 export function _clearAssetReg() { assetReg.clear(); assetsByOwner.clear(); eggRestitutionDone.clear(); censusInvalidate(); }
 // the WHOLE truth about one species: the consolidated count and where every number came from
@@ -7259,12 +7590,25 @@ export function _transferAssetForTest(id, from, to, why) { return transferAsset(
 export function _nftClassifyForTest(row, obs) { return nftClassifyHolder(row, obs); }
 export function _nftApplyForTest(row, cls, now) { return nftApplyClassification(row, cls, now); }
 export function _nftEligibilityForTest(row, wallet) { return nftEligibility(row, wallet); }
+export function _nftVerifyOnchainForTest(obs, wallet) { return nftVerifyOnchain(obs, wallet); }
 export function _nftEditionState() { return { ...nftEdition }; }
 export function _nftRoyaltyForTest() { return { bps: NFT_ROYALTY_BPS, wallet: NFT_ROYALTY_WALLET }; }
 export function _nftFlagStateForTest() { return { dasUnsupported: _nftDasUnsupported, flags: [..._nftReviewFlags.keys()] }; }
 export function _setNftDasStubForTest(stub) { _nftDasStub = stub; }
 export function _nftReconcileForTest() { return reconcileNftOwners(); }
 export function _nftResetDasForTest() { _nftDasUnsupported = false; _nftReviewFlags.clear(); _nftHolderObs.clear(); _nftDasStub = null; }
+// The Core CREATE seam: a sim installs its own submitter, so no sim ever builds a transaction, opens a
+// socket or reads a key — the real submit path is exercised only in SHAPE (args in, {address} out).
+export function _setNftCoreStubForTest(fn) { _nftCoreStub = fn; }
+// Delegate visibility for sims: the PUBLIC key only, never the secret. `_nftDelegateResetForTest`
+// re-reads the environment so a sim can prove the missing-key refusal without restarting the server.
+export function _nftDelegateInfoForTest() { const d = nftDelegate(); return { configured: !!d, pubkey: d ? d.pubkey : null }; }
+export function _nftDelegateResetForTest() { _nftDelegate = undefined; }
+// Simulate the ONE state a crash can leave behind: a persisted reservation whose in-memory ephemeral
+// key is gone. Returns the reserved address so the sim can assert the retry lands on it or abandons it.
+export function _nftForgetPendingKeyForTest(id) { const k = _nftPendingKeys.get(id); _nftPendingKeys.delete(id); return k ? k.addr : null; }
+export function _nftAgePendingForTest(id, ms) { const r = assetReg.get(id); if (r && r.mintPending) { r.mintPending.at -= ms; const k = _nftPendingKeys.get(id); if (k) k.at -= ms; return r.mintPending.at; } return 0; }
+export function _nftCollectionForTest() { return NFT_COLLECTION; }
 export function _nftMintOn() { return NFT_MINT_ON; }
 export function _assetRowForTest(id) { return assetReg.get(id); }
 // test seam: the two per-wallet rate maps in this region, so a sim can prove they are BOUNDED
