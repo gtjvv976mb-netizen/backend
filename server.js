@@ -1175,7 +1175,26 @@ export async function cupSnapFromBody(wallet, snap) {
   const prof = await store.getProfile(wallet);
   const roster = (prof && Array.isArray(prof.chikis)) ? prof.chikis : [];
   const legends = roster.filter(c => c && c.isLegend);
-  if (!legends.length) return { error: "Hatch a Legendary first to enter the Cup." };
+  // THE MMO'S OWN HATCH HAS TO COUNT. `prof.chikis` is the OLD game's array; the MMO client only
+  // ever READS it (Onboarding.gd:371 import_legacy_roster) and never writes it. So a pure-MMO
+  // trainer whose Legendary came from the server's own rolled hatch had an empty roster here and
+  // was told "Hatch a Legendary first" — the exact thing they had just done. Measured in
+  // world_continuum_sim.mjs P9 on 2026-08-06: server-rolled legendary in the registry, Cup entry 403.
+  //
+  // The registry is the right authority for the GATE: mintAsset rolled that kind server-side, so
+  // it cannot be claimed by a modified client. ORIGIN_CLEAN keeps an "unverified" adopted row from
+  // vouching, exactly as it does on the sale path.
+  //
+  // BUT IT IS DELIBERATELY NOT AN AUTHORITY FOR BR. A registry row's `lvl` is graded from the
+  // client's own save (auditAssets, "OBSERVE ONLY" at r.lvl = newLvl) and this tournament pays real
+  // SOL, so feeding it into bestBr would let a save inflate a prize bracket. A server-rolled hatch
+  // starts at lvl 1, so 1 is also its honest rating. A pure-MMO trainer therefore ENTERS — which is
+  // the bug — and enters at the floor. Raising that floor needs a server-owned MMO battle stat that
+  // does not exist yet; that is a balance decision for the owner, not one to guess here.
+  const regLegends = _assetsReady
+    ? regOwned(wallet, "chikimon").filter(r => r.kind === "legendary" && ORIGIN_CLEAN.has(r.origin))
+    : [];
+  if (!legends.length && !regLegends.length) return { error: "Hatch a Legendary first to enter the Cup." };
   const bestBr = legends.reduce((m, c) => Math.max(m, Number(c.br) || 1), 1);
   const el = CUP_ELEMS.includes(snap?.element) ? snap.element : "Fire";
   // THE DECK IS THE SERVER'S, NOT THE CALLER'S. br was already clamped to the player's best
@@ -1363,7 +1382,20 @@ async function getStats() {
     try { out.teamSol = (await conn.getBalance(new PublicKey(TEAM_WALLET))) / LAMPORTS_PER_SOL; } catch (e) {}
     try { out.teamChiki = await chikiBalance(TEAM_WALLET); } catch (e) {}
   }
-  try { const t = await store.claimedTotals(); out.legendsHatched = t.legends; } catch (e) {}   // legends = all-time hatched
+  // legends = all-time hatched. claimedTotals() counts profile.chikis[].isLegend — the OLD game's
+  // array — so every Legendary the MMO itself rolled was invisible here (measured: 3 → 3 across a
+  // server hatch, world_continuum_sim.mjs P7). Add the registry's own, counting ONLY origin
+  // "hatched": that origin is minted by the server's roll and never appears in `chikis`, so the two
+  // sources cannot overlap. Adopted rows ("legacy"/"issued") are deliberately excluded — those DO
+  // descend from a chikis entry and adding them would double-count a single creature.
+  try {
+    const t = await store.claimedTotals();
+    let rolled = 0;
+    if (_assetsReady) for (const r of assetReg.values()) {
+      if (r.type === "chikimon" && r.kind === "legendary" && r.origin === "hatched" && r.state !== "burned") rolled++;
+    }
+    out.legendsHatched = t.legends + rolled;
+  } catch (e) {}
   // KEEPERS + ACTIVE CHIKIS — accurate, from the on-chain ≥MIN holder set (not the stale eligible flag)
   out.holders = _holdersCache.keepers || 0;
   try { out.claimedChikis = await store.chikisForWallets([...(_holdersCache.keeperSet || [])]); } catch (e) { out.claimedChikis = 0; }
@@ -5988,6 +6020,17 @@ const NFT_MINT_ON = String(process.env.CHIK_NFT_MINT ?? "0") === "1";
 // A second, independent lever (L10): pause NEW mints while reconciliation keeps running. Default OFF,
 // so master-off stays byte-identical. Never pauses reconcile, minted-recording, or config.
 const NFT_MINT_PAUSED = String(process.env.NFT_MINT_PAUSED ?? "0") === "1";
+// ============ THE MIGRATION — CHIK_NFT_HANDOVER (default OFF) ============
+// The owner's decision, 2026-08-06: a listed creature is NEVER locked. The player keeps playing with
+// it while it sits on the marketplace; only when the sale SETTLES ON CHAIN does the creature leave
+// them and arrive, playable, for the buyer. Everything below is the ARRIVAL half of that — the
+// detection half (reconcileNftOwners -> nftClassifyHolder) already existed and only ever wrote a
+// marker nobody read.
+//
+// A THIRD flag, not a widening of CHIK_NFT_MINT, because moving somebody's creature is a different
+// decision from minting one and the owner must be able to take it separately. OFF => nothing here
+// runs, no field is written, no route exists, and the census reads exactly what it reads today.
+const NFT_HANDOVER_ON = String(process.env.CHIK_NFT_HANDOVER ?? "0") === "1";
 // Mintable ORIGINS — server-witnessed births ONLY. legacy/unverified/adopted rows were never vouched;
 // minting them would launder exactly what the mint is meant to prove. Widen via env without a deploy.
 const NFT_MINT_ORIGINS = new Set(String(process.env.NFT_MINT_ORIGINS || "hatched").split(",").map(s => s.trim()).filter(Boolean));
@@ -6030,6 +6073,21 @@ let _nftDasStub = null;                   // test seam: mint -> obs (function or
 let _nftSyncBusy = false, _nftSyncAt = 0;
 const _nftReviewFlags = new Map();        // id -> {reason, at} — operator-visible; owner NEVER mutated
 const _nftHolderObs = new Map();          // id -> {owner, since} — the two-read + dwell state machine
+// ---- handover state. All three are inert while CHIK_NFT_HANDOVER is off. ----
+// The NEWS a hand-off owes its two parties. PULL + ACK, never a push: a one-shot notification is
+// exactly what a sleeping client misses, so a notice is stored HERE, persisted inside the same
+// `serializeAssetReg()` blob as the rows it describes (so the move and the news can never persist
+// separately), and re-served on every poll until that wallet acknowledges its seq.
+const nftNews = new Map();                // wallet -> [notice]
+let _nftNewsSeq = 0;                      // monotonic notice cursor; persisted with the news
+const NFT_NEWS_MAX = 60;                  // per wallet, oldest dropped — bounded, and 60 unacked sales is a lot
+// The CENSUS DEBIT. A hand-off is not an issuance, so a species' count must be identical before and
+// after one. The registry half re-groups itself (the row moved wallets), but the SELLER's ledger copy
+// is a client-authored save the server cannot edit and would keep standing for the same creature —
+// counting it twice. One debit per settled hand-off cancels exactly that ghost. DERIVED, never
+// persisted on its own: rebuilt in restoreAssetReg from the append-only chain events, so it can never
+// disagree with the provenance and a pre-handover blob rebuilds to zero.
+const nftHandDebit = new Map();           // wallet -> Map("type:sp" -> n)
 // The ephemeral asset keypairs of mints that were SUBMITTED but not yet confirmed. Memory only — never
 // persisted, never logged, never in a response — so a retry inside this process re-submits the SAME
 // address instead of creating a second one. A restart loses them, which is exactly what the durable
@@ -6177,8 +6235,116 @@ function nftClassifyHolder(row, obs) {
   if (obs.hasGameAccount) return { action: "handover", to: owner };
   return { action: "limbo", to: owner };                                 // on-curve wallet, no game account — dormant
 }
-// Apply a classification. NEVER deletes a row; a burn RETIRES (state:"burned", record kept). A handover
-// is QUEUED (pendingHandover), never a live yank — the boundary that applies it lives in the client increment.
+// ---- THE MIGRATION (CHIK_NFT_HANDOVER) ---------------------------------------------------------
+// `_nftDasRead` can only see the CHAIN, so it never knows whether a buyer plays Chikoria — which made
+// nftClassifyHolder's `hasGameAccount` branch unreachable on the live path and labelled every real
+// buyer "limbo". Answer it from the server's own records instead. In-memory answers first; the store
+// is asked ONLY as a last resort and ONLY for a holder that actually differs from the row's owner
+// (see the reconcile loop), so this adds no per-row query to the normal no-change pass.
+// `players.first_seen` is the honest test: `store.touch` writes that row the first time a wallet
+// connects at /verify, so it means "this address has a Chikoria account", not "this address has played".
+async function nftWalletKnown(w) {
+  w = String(w || "");
+  if (!w) return false;
+  const s = assetsByOwner.get(w);
+  if (s && s.size) return true;                 // holds a registry row
+  if (assetLedger.has(w)) return true;          // has pushed at least one cloud save
+  try { return (Number(await store.firstSeen(w)) || 0) > 0; } catch (e) { return false; }
+}
+function nftDebitKeyAdd(wallet, type, sp, n) {
+  wallet = String(wallet || "");
+  if (!wallet || !type || !sp) return;
+  let m = nftHandDebit.get(wallet);
+  if (!m) { m = new Map(); nftHandDebit.set(wallet, m); }
+  const k = _censusKey(type, sp);
+  m.set(k, (m.get(k) || 0) + (n || 1));
+}
+function nftDebitOf(wallet, type, sp) {
+  const m = nftHandDebit.get(String(wallet || ""));
+  return m ? (m.get(_censusKey(type, sp)) || 0) : 0;
+}
+// THE RE-ADOPTION HOLE, CLOSED BEFORE IT OPENS. `/assets/mounts/sync` and `/assets/chikimon/sync`
+// convert a LEDGER entry into a registry row and skip only species the wallet ALREADY has a row for.
+// A hand-off removes that row while the seller's client-authored ledger entry stays put — so without
+// this the seller could sell, re-sync, sell, re-sync and mint a fresh registry row every cycle. Worse,
+// an adoption carries `luid`, which is exactly the flag that EXEMPTS mintAsset from the supply cap: a
+// capped species could be pushed past its ceiling by trading. (Armed and scored as a tripwire by
+// `_av_census_attack_sim.mjs` §A4/A5 — "the moment a transfer route lands, this becomes an exploit".)
+// A ledger entry this wallet has already converted and then handed over is not converted a second
+// time. The cost is UNDER-registration for a seller who later re-acquires the same species by trade:
+// that creature stays ledger-known and fully playable, it simply gets no registry row — the same safe
+// direction every other clamp in this file takes. A HATCH is unaffected: it mints through the egg
+// routes with a `parent` link and no `luid`, and never touches adoption.
+function nftAdoptionHandedOver(wallet, type, sp) {
+  return nftHandDebit.size > 0 && nftDebitOf(wallet, type, sp) > 0;
+}
+function nftNewsPush(wallet, n) {
+  if (!isPubkey(String(wallet || ""))) return null;
+  let q = nftNews.get(String(wallet));
+  if (!q) { q = []; nftNews.set(String(wallet), q); }
+  const row = Object.assign({ seq: ++_nftNewsSeq, at: Date.now() }, n);
+  q.push(row);
+  while (q.length > NFT_NEWS_MAX) q.shift();
+  _assetsDirty = true;
+  return row;
+}
+// THE TRANSFER CONTRACT — one creature, one owner, EXACTLY ONCE.
+//
+// Preconditions, all hard and all checked here:
+//   1. the handover flag is on;                     4. `to` is a real pubkey;
+//   2. the row carries an on-chain `mint`;          5. `to` is NOT already the owner.
+//   3. the row is ACTIVE — a burned/retired row NEVER moves, so a stale holder read can never
+//      resurrect something the burn path retired (owner lock D5 is untouched by this);
+//
+// (5) IS THE IDEMPOTENCY KEY. The pair (asset id, new owner) can only settle while the row is not
+// already at that owner, and `transferAsset` re-checks `row.owner === from` under the same rule. So a
+// re-read, a double reconcile, a replay after a restart and a rapid A->B->C resale all converge on ONE
+// row with ONE owner: the second attempt at the same destination is a no-op, and a NEW destination is
+// simply the next hop. Nothing here creates a row, so a transfer can never produce two creatures.
+//
+// Everything below is SYNCHRONOUS and lands in the SAME persisted blob (serializeAssetReg writes the
+// rows, the news and the edition counter under one key), so a crash keeps the whole hand-off or none
+// of it. If the flush is lost the chain is still the truth: the next reconcile re-reads the same
+// on-chain owner and settles once.
+function nftSettleHandover(row, to, now, dormant) {
+  if (!NFT_HANDOVER_ON) return { ok: false, why: "flag-off" };
+  if (!row || !row.mint) return { ok: false, why: "not-minted" };
+  if (row.state !== "active") return { ok: false, why: `state-${row.state}` };
+  to = String(to || "");
+  if (!isPubkey(to)) return { ok: false, why: "bad-destination" };
+  const from = String(row.owner || "");
+  if (to === from) return { ok: false, why: "already-owner" };
+  now = now || Date.now();
+  const moved = transferAsset(row.id, from, to, "nft-handover", { mint: row.mint });
+  if (!moved) return { ok: false, why: "transfer-refused" };
+  // the seller's ledger ghost stops counting; the registry row counts once, at the buyer
+  nftDebitKeyAdd(from, row.type, row.sp, 1);
+  censusInvalidate();
+  row.handover = { from, to, at: now, mint: row.mint };
+  row.arrivedAt = now;                       // what /assets/arrivals materialises from
+  // The queued marker is SPENT. Left set it made the NEW owner read `busy` from nftEligibility
+  // forever (it is never deleted anywhere else) and it survived serialize+restore.
+  if (row.pendingHandover) delete row.pendingHandover;
+  // A SETTLED SALE ENDS THE LISTING. `listedOffchain` is set when an escrow holds the asset and is
+  // otherwise cleared only by the "same" branch — so a row that went escrow -> buyer arrived at its
+  // new owner still advertising "listed", read `busy` from nftEligibility until the NEXT reconcile
+  // five minutes later, and carried that state across a restart. The sale is the end of the listing.
+  if (row.listedOffchain) row.listedOffchain = false;
+  _nftHolderObs.delete(row.id);
+  const what = row.type === "mount" ? "mount" : (row.kind || row.type);
+  nftNewsPush(from, { kind: "sold", id: row.id, type: row.type, sp: row.sp, cls: row.kind || null,
+    lvl: row.lvl || null, mint: row.mint, other: to, dormant: !!dormant,
+    text: `Your ${row.sp} (${what}) sold on the NFT marketplace. It has said goodbye and left for its new owner.` });
+  nftNewsPush(to, { kind: "arrived", id: row.id, type: row.type, sp: row.sp, cls: row.kind || null,
+    lvl: row.lvl || null, mint: row.mint, other: from, dormant: !!dormant,
+    text: `${row.sp} (${what}) has arrived from its previous owner — it is yours to play.` });
+  _assetsDirty = true;
+  return { ok: true, from, to, id: row.id, sp: row.sp, type: row.type };
+}
+
+// Apply a classification. NEVER deletes a row; a burn RETIRES (state:"burned", record kept). With
+// CHIK_NFT_HANDOVER off a handover is only QUEUED (pendingHandover), exactly as before; with it on the
+// same two-read + dwell evidence SETTLES the migration through nftSettleHandover.
 function nftApplyClassification(row, cls, now) {
   now = now || Date.now();
   switch (cls.action) {
@@ -6193,6 +6359,13 @@ function nftApplyClassification(row, cls, now) {
     case "same":
       row.holderSince = row.holderSince || now;
       if (row.listedOffchain) { row.listedOffchain = false; _assetsDirty = true; }   // cleared ONLY here
+      // A pendingHandover whose destination IS the current owner is spent evidence — the move it was
+      // waiting for has happened. Nothing anywhere else ever deleted it, so it sat on the row and made
+      // the new owner read `busy` from nftEligibility permanently. Flag-gated: with the migration off
+      // no code path can produce that state, so this is byte-identical to today.
+      if (NFT_HANDOVER_ON && row.pendingHandover && String(row.pendingHandover.to) === String(row.owner)) {
+        delete row.pendingHandover; _assetsDirty = true;
+      }
       _nftHolderObs.delete(row.id);
       return { applied: "same" };
     case "listed":
@@ -6204,6 +6377,18 @@ function nftApplyClassification(row, cls, now) {
       const prev = _nftHolderObs.get(row.id);   // require SAME holder across two reads + a dwell
       if (!prev || prev.owner !== cls.to) { _nftHolderObs.set(row.id, { owner: cls.to, since: now }); return { applied: "observed" }; }
       if (now - prev.since < NFT_DWELL_MS) return { applied: "dwelling" };
+      // THE OWNER-CHANGED ACTION. `limbo` settles too, and that is deliberate: the owner's design says
+      // a buyer with NO Chikoria account keeps the creature waiting in the registry and materialises it
+      // on first sign-in, so "no game account" is a fact recorded on the notice (`dormant`), never a
+      // reason to refuse the sale a buyer has already paid for.
+      if (NFT_HANDOVER_ON) {
+        const st = nftSettleHandover(row, cls.to, now, cls.action === "limbo");
+        if (st.ok) return { applied: "handed-over", to: cls.to, dormant: cls.action === "limbo" };
+        // A settle the CONTRACT refused (a retired row above all) must never fall through to the old
+        // queue marker — that would leave a burned creature advertising a pending move. Surface it.
+        _nftReviewFlags.set(row.id, { reason: `handover-refused:${st.why}`, at: now });
+        return { applied: "handover-refused", why: st.why };
+      }
       row.pendingHandover = { to: cls.to, at: now, dormant: cls.action === "limbo" };   // QUEUED, applied at a safe boundary
       regEvent(row, "handover_queued", { to: cls.to, dormant: cls.action === "limbo" });
       _assetsDirty = true;
@@ -6257,12 +6442,29 @@ async function reconcileNftOwners() {
   try {
     for (const row of assetReg.values()) {
       if (!row.mint) continue;
-      const obs = await _nftDasRead(row.mint);
+      let obs = await _nftDasRead(row.mint);
+      // DAS SEES THE CHAIN, NOT THE GAME. `_nftDasRead` has no way to emit `hasGameAccount`, so
+      // nftClassifyHolder's `handover` branch was unreachable on the live path and every real buyer
+      // classified `limbo`/dormant. The server knows the answer; supply it here. Both branches settle
+      // under CHIK_NFT_HANDOVER, so this only decides whether the notices say "dormant" — but a field
+      // that is always wrong is a field an operator will one day trust.
+      if (NFT_HANDOVER_ON && obs && obs.owner && !obs.dasFailed && !obs.burned
+          && String(obs.owner) !== String(row.owner) && obs.hasGameAccount === undefined)
+        obs = Object.assign({}, obs, { hasGameAccount: await nftWalletKnown(String(obs.owner)) });
       // Defense in depth (Core): a minted row whose on-chain grouping no longer names OUR collection is
       // FLAGGED for review — never stripped. A bad/looted read must not yank a holder, so ownership is
       // left to the classifier below; this only surfaces the anomaly to an operator.
-      if (NFT_COLLECTION && obs && obs.collection && obs.collection !== NFT_COLLECTION && !obs.dasFailed && !obs.structuralUnsupported && !obs.burned)
-        _nftReviewFlags.set(row.id, { reason: "collection-mismatch", at: Date.now() });
+      const _mismatched = !!(NFT_COLLECTION && obs && obs.collection && obs.collection !== NFT_COLLECTION && !obs.dasFailed && !obs.structuralUnsupported && !obs.burned);
+      if (_mismatched) _nftReviewFlags.set(row.id, { reason: "collection-mismatch", at: Date.now() });
+      // ...AND UNDER THE MIGRATION THAT SENTENCE HAS TEETH IT DID NOT HAVE BEFORE. When the worst a
+      // classification could do was write a `pendingHandover` marker nobody read, letting a mismatched
+      // read fall through to the classifier was free. Now the same read MOVES THE CREATURE: measured
+      // 2026-08-06 (`_ax_handover_attack_sim.mjs` B8b) — a DAS answer naming a foreign collection and a
+      // stranger as holder took a wolf off its owner while the row sat flagged for review. A read the
+      // server has just declared untrustworthy must change NOTHING, which is what the comment above
+      // always claimed. Flag-gated, so a CHIK_NFT_HANDOVER=0 server behaves exactly as it does today.
+      // (`burned` is excluded from `_mismatched`, so a genuine burn still retires through the classifier.)
+      if (NFT_HANDOVER_ON && _mismatched) continue;
       nftApplyClassification(row, nftClassifyHolder(row, obs));
       if (_nftDasUnsupported) break;                               // structural outage — stop the whole loop
     }
@@ -6273,9 +6475,13 @@ if (NFT_MINT_ON) {
   // One honest boot line so the owner can see WHY minting is or is not open. Public halves only —
   // the delegate's secret is never printed, and TREASURY_SECRET is not read anywhere on this path.
   const _d = nftDelegate();
-  console.log(`◆ NFT minting ON — model=server-mints collection=${NFT_COLLECTION || "NOT CONFIGURED"} authority=${_d ? _d.pubkey : "NOT CONFIGURED"}${NFT_MINT_PAUSED ? " paused=1" : ""}`);
+  console.log(`◆ NFT minting ON — model=server-mints collection=${NFT_COLLECTION || "NOT CONFIGURED"} authority=${_d ? _d.pubkey : "NOT CONFIGURED"}${NFT_MINT_PAUSED ? " paused=1" : ""}${NFT_HANDOVER_ON ? " handover=1" : ""}`);
   setInterval(() => { reconcileNftOwners().catch(() => {}); }, 5 * 60 * 1000).unref?.();
 }
+// The migration rides the reconcile loop, and that loop only runs while CHIK_NFT_MINT is on. Setting
+// one flag without the other is a silent no-op, which is the worst way for an operator to find out.
+if (NFT_HANDOVER_ON && !NFT_MINT_ON)
+  console.warn("✖ CHIK_NFT_HANDOVER=1 but CHIK_NFT_MINT=0 — the reconcile loop is off, so NO hand-off can ever settle");
 
 // ============ RARITY IS A LAW, NOT A LABEL ============
 // Advertised scarcity used to be enforced NOWHERE for avatars, and for mounts the "supply" numbers
@@ -6448,20 +6654,36 @@ function buildCensus() {
   // at most one ledger unit per wallet, so this is a no-op for them.
   for (const slot of byKey.values()) {
     const capped = supplyOf(slot.type, slot.sp) > 0;
-    let total = slot.orphanSales, flagged = 0, dropped = 0;
-    for (const w of slot.w.values()) {
+    let total = slot.orphanSales, flagged = 0, dropped = 0, gone = 0;
+    for (const [_wallet, w] of slot.w) {
       const base = distinctOf(w.c);                  // this wallet's TRUE distinct clean holdings
       let counted = base;
       if (capped) {
         const surplus = base - w.c.R;                // ledger units beyond the registry-backed ones
         if (surplus > LEDGER_CLEAN_QUOTA) { const d = surplus - LEDGER_CLEAN_QUOTA; counted -= d; dropped += d; }
       }
+      // A CREATURE THAT CHANGED HANDS IS NOT A NEW CREATURE. When a settled NFT hand-off moves a
+      // registry row to the buyer, the SELLER's ledger copy of the same creature stops being deduped
+      // against it (the dedup is per wallet) and the species reads one higher — a transfer would
+      // silently spend a cap slot, and a capped species would go Extinct by being TRADED. One debit
+      // per settled hand-off cancels exactly that ghost. It can only ever eat LEDGER-derived count
+      // (`counted - w.c.R`), never a registry-backed holding, so a seller who still owns a real row of
+      // the species keeps counting it; and if the seller's client honestly dropped the creature there
+      // is no ledger part left and the debit takes nothing. Undercount is the safe direction, and the
+      // whole block is skipped while no hand-off has ever settled (`nftHandDebit` empty).
+      let left = 0;
+      if (nftHandDebit.size) {
+        const deb = nftDebitOf(_wallet, slot.type, slot.sp);
+        if (deb > 0) { left = Math.min(deb, Math.max(0, counted - w.c.R)); counted -= left; gone += left; }
+      }
       total += counted + Math.max(0, w.S - base);    // a sale already standing in (1)/(2) adds nothing
-      flagged += distinctOf(w.f) + (base - counted); // clamped clean surplus is reported, not counted
+      // clamped clean surplus is reported, not counted. A handed-over ghost is NOT flagged — nobody
+      // forged anything, the creature simply lives in another wallet now — so it is excluded here.
+      flagged += distinctOf(w.f) + (base - counted - left);
     }
     slot.count = total;
     slot.flagged = flagged;
-    slot.ledger = Math.max(0, slot.ledger - dropped);           // dropped surplus no longer a ledger row
+    slot.ledger = Math.max(0, slot.ledger - dropped - gone);    // dropped surplus no longer a ledger row
     slot.deduped = Math.max(0, slot.registry + slot.ledger + slot.sales - slot.count);
     slot.w = null;                                    // working state, not a published record
   }
@@ -6542,6 +6764,13 @@ function mintAsset(type, wallet, fields, origin, parent) {
 
 // Ownership moves ONLY through here, and the old owner's claim is removed in the same step — which
 // is what makes a registered asset impossible to clone: it exists once, in one place.
+//
+// TO WHOEVER ADDS THE NEXT CALLER: moving a row is not the whole job. The SELLER's client-authored
+// ledger entry for the same creature does not move with it, so the census would count that creature
+// in two wallets and adoption (/assets/*/sync) would mint them a replacement row that BYPASSES the
+// supply cap (`luid` exempts mintAsset). The migration path handles both in nftSettleHandover — via
+// nftDebitKeyAdd and the `why:"nft-handover"` chain event that restoreAssetReg rebuilds the debits
+// from. A caller with a different `why` gets NEITHER. Copy that pattern or the census will move.
 function transferAsset(id, from, to, why, extra) {
   // Validate the DESTINATION. Without this, a transfer to a garbage string moved the asset to an
   // owner no wallet can ever prove — an irrecoverable erase, and a griefing primitive the moment
@@ -6857,6 +7086,7 @@ app.post("/assets/mounts/sync", (req, res) => {
     for (const sp of Object.keys(lrec.mounts)) {
       if (!MOUNT_IDS.has(sp)) continue;     // catalog species only — ledger keys are clamped text, not validated
       if (ownedSp.has(sp)) continue;        // already property; adoption is one row per species per wallet
+      if (nftAdoptionHandedOver(wallet, "mount", sp)) continue;   // already adopted once and sold — never twice
       const lo = lrec.mounts[sp] && lrec.mounts[sp].origin;
       const origin = ORIGINS.has(lo) ? lo : "unverified";   // the ledger's verdict rides along, never upgraded
       try {
@@ -6923,6 +7153,7 @@ app.post("/assets/chikimon/sync", (req, res) => {
       const sp = String(u.sp || "");
       if (!CHIKIMON_IDS.has(sp)) continue;        // catalog species only — ledger keys are clamped text
       if (ownedSp.has(sp)) continue;              // already property; one row per species per wallet
+      if (nftAdoptionHandedOver(wallet, "chikimon", sp)) continue;   // already adopted once and sold — never twice
       const origin = ORIGINS.has(u.origin) ? u.origin : "unverified";   // the ledger's verdict rides along, never upgraded
       try {
         // `luid` is the DEDUP KEY: the ledger's own uid for the creature this row adopts, so the
@@ -7225,6 +7456,75 @@ app.get("/assets/cert", (req, res) => {
   res.json(out);
 });
 
+// ---- THE MIGRATION's player-facing half (all behind CHIK_NFT_HANDOVER) -------------------------
+// Every route here uses `next()` when the flag is off, which reproduces today's 404 for a URL that has
+// never answered EXACTLY — a new 503 would be a new behaviour on a path that had none.
+//
+// PULL AND ACKNOWLEDGE, NEVER PUSH. The seller may have closed the game the moment they listed; the
+// buyer may not have a Chikoria account at all. A one-shot notification is precisely what those two
+// miss, so the notice is stored with the asset rows and re-served on EVERY poll until the wallet acks
+// its seq. Being told twice costs nothing; being told zero times is the bug this shape removes.
+app.get("/assets/news", (req, res, next) => {
+  if (!NFT_HANDOVER_ON) return next();
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const w = String(req.query?.wallet || "");
+  if (!isPubkey(w)) return res.status(400).json({ error: "valid wallet required" });
+  // your own news, or an admin's. A hand-off names both parties, so it is as private as the roster.
+  if (!cupAdminOk(req) && mktWallet({ wallet: w, mktToken: String(req.query?.mktToken || "") }) !== w)
+    return res.status(403).json({ error: "prove this wallet first" });
+  const q = nftNews.get(w) || [];
+  res.json({ wallet: w, notices: q.map(n => ({ ...n })), count: q.length, seq: _nftNewsSeq });
+});
+
+// The acknowledgement. Only the OWNER of the news may clear it (no admin shortcut — an operator must
+// never be able to silently delete a player's unread notice).
+app.post("/assets/news/ack", (req, res, next) => {
+  if (!NFT_HANDOVER_ON) return next();
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const w = regWallet(req);
+  if (!isPubkey(String(w || ""))) return res.status(403).json({ error: "prove this wallet first" });
+  const q = nftNews.get(w);
+  if (!q || !q.length) return res.json({ ok: true, acked: 0, left: 0 });
+  const upTo = Math.max(0, Math.floor(Number(req.body?.upTo) || 0));
+  const seqs = Array.isArray(req.body?.seqs)
+    ? new Set(req.body.seqs.slice(0, 200).map(x => Math.floor(Number(x) || 0))) : null;
+  if (!upTo && !seqs) return res.status(400).json({ error: "say which notices: upTo or seqs" });
+  const before = q.length;
+  const kept = q.filter(n => !((upTo && n.seq <= upTo) || (seqs && seqs.has(n.seq))));
+  if (kept.length) nftNews.set(w, kept); else nftNews.delete(w);
+  if (kept.length !== before) _assetsDirty = true;
+  res.json({ ok: true, acked: before - kept.length, left: kept.length });
+});
+
+// THE ARRIVAL. The buyer may never have played Chikoria: the registry simply holds the creature for
+// the ADDRESS — no placeholder account, no reservation — and this is where it materialises into a
+// roster on first sign-in. IDEMPOTENT BY CONSTRUCTION: the client sends the registry ids it already
+// carries and gets back only what is missing, so calling this every login, or twice in a row, adds the
+// creature exactly once. Ownership itself is NOT gated on calling it — /assets/mine already answers
+// truthfully to a wallet that has never saved a profile.
+app.post("/assets/arrivals", (req, res, next) => {
+  if (!NFT_HANDOVER_ON) return next();
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const w = regWallet(req);
+  if (!isPubkey(String(w || ""))) return res.status(403).json({ error: "prove this wallet first" });
+  const have = new Set((Array.isArray(req.body?.have) ? req.body.have : []).slice(0, 4000).map(x => String(x || "").slice(0, 64)));
+  // MOUNTS HAVE NO PER-INSTANCE IDENTITY IN THE SAVE (`mmo.mounts` is a list of species strings), so a
+  // client cannot report a mount by registry id. It reports the SPECIES it already has instead, and a
+  // mount whose species is already in the roster is reported `already` — the wallet genuinely owns the
+  // row (certifiable, counted, mintable) but the save has nowhere to put a second one. Stated, not faked.
+  const haveMounts = new Set((Array.isArray(req.body?.haveMounts) ? req.body.haveMounts : []).slice(0, 64).map(x => String(x || "").slice(0, 24)));
+  const add = []; let already = 0;
+  for (const id of (assetsByOwner.get(w) || [])) {
+    const r = assetReg.get(id);
+    if (!r || !r.arrivedAt || r.state !== "active") continue;
+    if (have.has(r.id) || (r.type === "mount" && haveMounts.has(String(r.sp)))) { already++; continue; }
+    add.push({ id: r.id, type: r.type, sp: r.sp, kind: r.kind || null, lvl: r.lvl || null,
+               born: r.born, origin: r.origin, mint: r.mint || null, arrivedAt: r.arrivedAt,
+               from: r.handover ? r.handover.from : null });
+  }
+  res.json({ wallet: w, add, already, count: add.length });
+});
+
 // ---- NFT mint routes (all behind CHIK_NFT_MINT; each 503s when the flag is off) ---------------
 // A minted asset's in-game listings must carry the registry id — so a pre-mint "is it on the board?"
 // check matches by that id. Best-effort in this increment; full board integration ships with the client.
@@ -7484,6 +7784,11 @@ export function serializeAssetReg() {
   const out = { rows: _partitionAssetRows([...assetReg.values()], ASSET_REG_MAX), restitution: [...eggRestitutionDone.entries()] };
   // The edition counter travels WITH the rows so a restart can never re-issue a live edition.
   if (Object.keys(nftEdition).length) out.nftEdition = { ...nftEdition };
+  // Hand-off NEWS rides in the SAME blob as the rows it describes, on purpose: the move and the two
+  // notices it owes then persist together or not at all. A separate kv key could flush one without the
+  // other and lose a notice a sleeping player was owed. Empty (no hand-off has ever settled — the only
+  // state a flag-off server can reach) emits no key at all, so the blob is byte-identical to today's.
+  if (nftNews.size) { out.nftNews = [...nftNews.entries()]; out.nftNewsSeq = _nftNewsSeq; }
   return out;
 }
 export function restoreAssetReg(v) {
@@ -7508,7 +7813,17 @@ export function restoreAssetReg(v) {
     // flush — deleting the earliest players' property.
     if (assetReg.size >= ASSET_REG_MAX) break;
     const hatchedTo = src.hatchedTo ? String(src.hatchedTo).slice(0, 64) : undefined;
-    const chain = Array.isArray(src.chain) ? src.chain.slice(0, 64) : [];
+    // THE PROVENANCE CAP KEPT THE OLDEST 64 EVENTS AND THREW AWAY THE NEWEST — the exact wrong end.
+    // Every sticky fact this file derives from the chain is written LATE: `burned` (the retirement
+    // lock), and now `transferred{why:"nft-handover"}` (the census debit + the re-adoption guard).
+    // Measured 2026-08-06 (`_ax_handover_attack_sim.mjs` D4): a row 73 events deep came back 64 deep
+    // and the most recent seller's debit was `undefined` — the census re-counted their ghost and
+    // `/assets/*/sync` would have minted them a cap-exempt replacement row. Keep BOTH ends: the
+    // genesis half (minted/hatched/parent evidence) and the recent half (transfers/burn). Identical
+    // to the old expression for any chain of 64 events or fewer, which is every row in existence.
+    const _rawChain = Array.isArray(src.chain) ? src.chain : [];
+    const chain = _rawChain.length <= 64 ? _rawChain.slice(0, 64)
+                                         : _rawChain.slice(0, 32).concat(_rawChain.slice(-32));
     // A CONSUMED EGG IS CONSUMED FOREVER. Trusting the persisted `state` alone let a row be
     // restored with state flipped back to "active", re-arming a spent egg to mint a second creature.
     // The evidence that it hatched lives in the row itself and outranks the flag.
@@ -7545,6 +7860,24 @@ export function restoreAssetReg(v) {
     // already have one on chain. Never restored over a recorded mint (that row is already settled).
     if (!row.mint && src.mintPending && typeof src.mintPending === "object" && isPubkey(String(src.mintPending.addr || "")))
       row.mintPending = { addr: String(src.mintPending.addr).slice(0, 64), at: Number(src.mintPending.at) || Date.now() };
+    // The settled hand-off, re-typed like everything else: `handover` is the last one (who, when) and
+    // `arrivedAt` is the buyer's materialisation marker that /assets/arrivals reads.
+    if (src.handover && typeof src.handover === "object" && isPubkey(String(src.handover.from || "")) && isPubkey(String(src.handover.to || "")))
+      row.handover = { from: String(src.handover.from).slice(0, 64), to: String(src.handover.to).slice(0, 64),
+                       at: Number(src.handover.at) || Date.now(),
+                       mint: isPubkey(String(src.handover.mint || "")) ? String(src.handover.mint).slice(0, 64) : null };
+    if (Number(src.arrivedAt) > 0) row.arrivedAt = Number(src.arrivedAt);
+    // THE CENSUS DEBIT IS DERIVED, NEVER STORED. Every settled hand-off left an append-only
+    // `transferred{why:"nft-handover"}` event on this row, so rebuilding the seller debits from the
+    // chain means the census can never disagree with the provenance — no second source to drift, and a
+    // blob written before this build carries no such event and rebuilds to zero debits. `assetReg.has`
+    // above guarantees one pass per id, so a repeated restore cannot double-count.
+    // Read the UNTRUNCATED blob chain, not the row's capped copy: the cap is a memory bound, and a
+    // debit dropped by it is a creature counted twice and a cap-exempt re-adoption handed back to a
+    // seller. What the blob remembers, the debit remembers.
+    for (const c of _rawChain)
+      if (c && c.what === "transferred" && c.why === "nft-handover" && isPubkey(String(c.from || "")))
+        nftDebitKeyAdd(String(c.from), row.type, row.sp, 1);
     // Defensive: floor the edition counter at the highest edition ever issued, so a lost counter can
     // never re-issue a live edition (mint rows are truncation-exempt, but a prepared row may be dropped).
     if (row.edition) { const k = _censusKey(row.type, row.sp); if ((nftEdition[k] || 0) < row.edition) nftEdition[k] = row.edition; }
@@ -7554,6 +7887,31 @@ export function restoreAssetReg(v) {
   if (v.nftEdition && typeof v.nftEdition === "object") {
     for (const [k, cnt] of Object.entries(v.nftEdition)) { const c = Number(cnt); if (Number.isInteger(c) && c > 0 && (nftEdition[k] || 0) < c) nftEdition[k] = c; }
   }
+  // The UNACKNOWLEDGED hand-off news. This is the whole reason it lives in this blob: a player who was
+  // offline when their creature sold must still be told after a deploy, a restart or a cold spin-up.
+  // Re-typed field by field like the rows — a persisted blob is untrusted input like any other.
+  if (Array.isArray(v.nftNews)) {
+    for (const e of v.nftNews) {
+      if (!Array.isArray(e) || !isPubkey(String(e[0] || "")) || !Array.isArray(e[1])) continue;
+      const q = [];
+      for (const s of e[1].slice(-NFT_NEWS_MAX)) {
+        if (!s || typeof s !== "object") continue;
+        const kind = String(s.kind || "");
+        if (kind !== "sold" && kind !== "arrived") continue;
+        const seq = Math.max(0, Math.floor(Number(s.seq) || 0));
+        q.push({ seq, at: Number(s.at) || Date.now(), kind,
+                 id: String(s.id || "").slice(0, 64), type: String(s.type || "").slice(0, 12),
+                 sp: String(s.sp || "").slice(0, 24), cls: s.cls ? String(s.cls).slice(0, 12) : null,
+                 lvl: Number(s.lvl) || null,
+                 mint: isPubkey(String(s.mint || "")) ? String(s.mint).slice(0, 64) : null,
+                 other: isPubkey(String(s.other || "")) ? String(s.other).slice(0, 64) : null,
+                 dormant: !!s.dormant, text: String(s.text || "").slice(0, 200) });
+        if (seq > _nftNewsSeq) _nftNewsSeq = seq;
+      }
+      if (q.length) nftNews.set(String(e[0]), q);
+    }
+  }
+  { const s = Number(v.nftNewsSeq); if (Number.isInteger(s) && s > _nftNewsSeq) _nftNewsSeq = s; }
   censusInvalidate();
   return n;
 }
@@ -7578,7 +7936,7 @@ export function _mintHatchedForTest(type, wallet, fields) {
   return born;
 }
 export function _setMemeMintedForTest(key, n) { memeMinted[key] = n; censusInvalidate(); }
-export function _clearAssetReg() { assetReg.clear(); assetsByOwner.clear(); eggRestitutionDone.clear(); censusInvalidate(); }
+export function _clearAssetReg() { assetReg.clear(); assetsByOwner.clear(); eggRestitutionDone.clear(); nftNews.clear(); nftHandDebit.clear(); _nftNewsSeq = 0; censusInvalidate(); }
 // the WHOLE truth about one species: the consolidated count and where every number came from
 export function _trueIssued(type, sp) { return trueIssued(type, sp); }
 export function _censusStats() { return { builds: _censusBuilds, keys: censusAll().size }; }
@@ -7608,6 +7966,15 @@ export function _nftDelegateResetForTest() { _nftDelegate = undefined; }
 // key is gone. Returns the reserved address so the sim can assert the retry lands on it or abandons it.
 export function _nftForgetPendingKeyForTest(id) { const k = _nftPendingKeys.get(id); _nftPendingKeys.delete(id); return k ? k.addr : null; }
 export function _nftAgePendingForTest(id, ms) { const r = assetReg.get(id); if (r && r.mintPending) { r.mintPending.at -= ms; const k = _nftPendingKeys.get(id); if (k) k.at -= ms; return r.mintPending.at; } return 0; }
+// ---- migration seams (CHIK_NFT_HANDOVER). Never a chain, never a key. ----
+export function _nftHandoverOn() { return NFT_HANDOVER_ON; }
+// Age the two-read DWELL so a sim exercises the REAL reconcile loop instead of a hand-driven apply.
+export function _nftAgeHolderObsForTest(id, ms) { const o = _nftHolderObs.get(id); if (o) { o.since -= ms; return o.since; } return 0; }
+export function _nftNewsForTest(w) { return (nftNews.get(String(w)) || []).map(n => ({ ...n })); }
+export function _nftHandDebitForTest(w) { const m = nftHandDebit.get(String(w)); return m ? Object.fromEntries(m) : {}; }
+export function _nftSettleForTest(id, to) { const r = assetReg.get(id); return r ? nftSettleHandover(r, to, Date.now(), false) : { ok: false, why: "no-row" }; }
+export function _nftRowForTest(id) { const r = assetReg.get(id); return r ? JSON.parse(JSON.stringify(r)) : null; }
+export function _nftOwnerSetForTest(w) { return [...(assetsByOwner.get(String(w)) || [])]; }
 export function _nftCollectionForTest() { return NFT_COLLECTION; }
 export function _nftMintOn() { return NFT_MINT_ON; }
 export function _assetRowForTest(id) { return assetReg.get(id); }
@@ -8097,14 +8464,36 @@ process.on("uncaughtException", (e) => {
   Promise.resolve(_assetsFlush).then(() => saveAssetLedger()).finally(() => process.exit(1));
 });
 setInterval(saveAssetLedger, ASSET_SAVE_MS).unref?.();   // SIGTERM flush lives with saveWorldNodes
-Promise.all([store.kvGet("asset_registry"), store.kvGet("asset_ledger")]).then(([rv, lv]) => {
-  const rn = restoreAssetReg(rv);
-  const n = restoreAssetLedger(lv);
-  _assetsReady = true;
-  if (rn || n) console.log(`assets restored: ${rn} registered, ${n} ledger wallets`);
-}).catch(e => {
-  console.error("asset restore FAILED — issuing and auditing are suspended until a restart reads it:", e && e.message);
-});
+// THIS RUNS AT IMPORT TIME, BEFORE store.init() HAS CREATED THE `kv` TABLE.
+// On a database that already has `kv` the read happens to win and the race is invisible. On a
+// FRESH or newly-swapped database it loses: kvGet throws "relation kv does not exist",
+// _assetsReady stays false forever, and every value route — eggs, hatch, mint, dex, census, NFT —
+// answers 503 until a human restarts the service. One log line is the only symptom. Measured
+// 2026-08-06 with a two-boot probe on one empty database: boot 1 stateReady=false (yet `kv` existed
+// by the end of that same boot), boot 2 stateReady=true. That is the Jul 28 database-swap shape.
+// So retry instead of surrendering after one attempt: it closes the fresh-database case and a
+// transient DB blip alike, and it still fails CLOSED (refusing to issue) while it waits.
+(async () => {
+  const ASSET_RESTORE_TRIES = 40;          // ~60s of patience, then give up loudly
+  for (let i = 1; i <= ASSET_RESTORE_TRIES; i++) {
+    try {
+      const [rv, lv] = await Promise.all([store.kvGet("asset_registry"), store.kvGet("asset_ledger")]);
+      const rn = restoreAssetReg(rv);
+      const n = restoreAssetLedger(lv);
+      _assetsReady = true;
+      if (rn || n) console.log(`assets restored: ${rn} registered, ${n} ledger wallets`);
+      else console.log(`assets restored: empty registry (fresh database)`);
+      if (i > 1) console.log(`  (the asset store was not readable until attempt ${i} — the schema was still being created)`);
+      return;
+    } catch (e) {
+      if (i === ASSET_RESTORE_TRIES) {
+        console.error(`asset restore FAILED after ${i} attempts — issuing and auditing are suspended until a restart reads it:`, e && e.message);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+})();
 
 // ============ SERVER-SIMULATED MOVEMENT — CHIK_PHYS, ON BY DEFAULT ============
 // The whole of world_physics.js hangs off this flag. ON by default since THE FLIP (2026-08-01):

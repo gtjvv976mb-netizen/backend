@@ -24,3 +24,6 @@ create_collection.mjs
 make_keyfile.mjs
 update_collection.mjs
 upload_image.mjs
+make_devnet_wallet.mjs
+devnet-authority.json
+mint_test.mjs
