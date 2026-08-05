@@ -18,3 +18,9 @@ dbcheck.sh
 # Lives in the dev copy (~/Downloads/chiki-backend) and must never be deployed.
 roster_merge.mjs
 roster_merge_audit_*.json
+fix_collection.mjs
+authority.json
+create_collection.mjs
+make_keyfile.mjs
+update_collection.mjs
+upload_image.mjs

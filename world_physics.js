@@ -129,9 +129,21 @@ export const TUNE = {
   DT_MAX: 0.10,          // biggest dt a single input frame may claim (6 client frames at 60 Hz)
   DT_MIN: 0.0005,        // below this a frame is noise
   SUB_DT: 1 / 60,        // integrate in client-sized substeps so a big dt cannot tunnel a wall
-  BUDGET_MAX: 0.50,      // the wall-clock bank an input frame spends from (see grantDt)
+  // The wall-clock bank an input frame spends from (see grantDt). SIZED FROM THE WIRE, not taste:
+  // one /world/move body carries at most INPUT_MAX_FRAMES 16 buckets (Net.gd:1535) and sanitizeInput
+  // clamps each to DT_MAX, so 1.60 s is the most a single honest message can ever describe. It was
+  // 0.50, which is SMALLER than one message — a client whose report was 1.8 s late sent 1.44 s of
+  // perfectly honest input frames and grantDt could afford 0.50 s of them, so the model sat still
+  // while the player ran and reconcile called the difference a cheat (strand_min.mjs, 2026-08-05).
+  // The anti-inflation invariant is untouched: the bank still fills at exactly one second per second
+  // of wall clock, so sixty frames claiming dt:1.0 still buy nothing.
+  BUDGET_MAX: 1.60,
   INPUT_TTL: 0.35,       // a held input older than this stops steering (the tick must not run a
                          // backgrounded tab across the island); slightly over MOVE_DT 0.28
+  // How much of a report interval the SOFT gate will forgive as "the server had no model here".
+  // See the open-loop note in reconcile(). Deliberately smaller than the reach bank (2.5 s): past
+  // OPEN_MAX the HARD gate is the binding one, which is where the security boundary belongs.
+  OPEN_MAX: 1.00,
 
   // THE TOLERANCE. A claim more than this far AHEAD of the simulation is corrected. Chosen from
   // measurement, not taste: the shipped client authors a position every MOVE_DT = 0.28 s (Net.gd:12)
@@ -227,6 +239,9 @@ export function newState(x, y, z, dir = 0, nowMs = Date.now()) {
     simT: 0,               // seconds of simulation this state has actually been granted
     budget: 0,             // unspent wall-clock, in seconds (the anti-dt-inflation bank)
     lastMs: nowMs,         // when the budget was last topped up
+    coastMs: nowMs,        // when the model last coasted (see tickPlayer) — a SEPARATE clock from lastMs
+    driveT: 0,             // seconds of simulation granted since the last ACCEPTED claim (reconcile reads it)
+    claimedMove: false,    // has the client sent a MOVING input frame since the last accepted claim?
     claimX: num(x), claimY: num(y), claimZ: num(z), claimMs: nowMs,   // last ACCEPTED client claim (reach check base)
     acceptUntil: 0,        // a granted teleport window: accept whatever the client says until then
     reachS: TUNE.REACH_BANK_S,  // unspent reach budget, in SECONDS of ceiling-speed travel
@@ -443,8 +458,18 @@ export function advance(state, input, wantDt, nowMs = Date.now()) {
   // a frame the wall-clock bank refuses still arrived and must never be resent. Acking only the
   // frames that were granted dt made the ack stall behind a client whose frames summed to slightly
   // more than real time (measured: 48 frames sent, ack stuck at 45).
+  // THE EVIDENCE LEDGER, read by reconcile's open-loop allowance. `claimedMove` records that the
+  // client has actually TOLD the server it was moving since the last accepted claim, which is what
+  // separates an honest late report (16 buckets of real motion) from a client that went quiet and
+  // then blinked — the second one earns no open-loop credit at all. Only a NEW seq counts, so the
+  // 20 Hz tick re-using the held input cannot inflate it.
+  const _isNew = !!(input && Number.isFinite(input.seq) && input.seq > (state.lastInputSeq || 0));
   if (input && Number.isFinite(input.seq)) state.lastInputSeq = Math.max(state.lastInputSeq, input.seq);
+  if (_isNew && input.move && Math.hypot(num(input.move.x), num(input.move.z)) > PHYS.DIR_EPS) state.claimedMove = true;
   const dt = grantDt(state, wantDt, nowMs);
+  // Seconds the model was actually INTEGRATED since the last accepted claim. Everything reconcile
+  // cannot explain with this is open loop; adopt() zeroes it on every accepted claim.
+  state.driveT = (state.driveT || 0) + dt;
   if (dt <= 0) return { state, dt: 0, steps: 0 };
   let s = state, steps = 0, left = dt;
   while (left > 1e-9 && steps < 64) {
@@ -461,9 +486,31 @@ export function advance(state, input, wantDt, nowMs = Date.now()) {
 export function tickPlayer(state, nowMs = Date.now()) {
   const held = state.input || null;
   const fresh = held && (nowMs - (state.inputMs || 0)) / 1000 <= TUNE.INPUT_TTL;
-  const inp = fresh ? held : { seq: state.lastInputSeq, dt: 0, move: { x: 0, z: 0 }, jump: false, sprint: false, mode: state.mode };
-  const dtWant = Math.min(TUNE.DT_MAX, Math.max(0, (nowMs - (state.lastMs || nowMs)) / 1000));
-  return advance(state, inp, dtWant, nowMs).state;
+  // TWO CLOCKS. `lastMs` is the BANK's clock (grantDt tops the budget up from it); `coastMs` is the
+  // integration clock. They are the same thing while the model is being steered and must not be
+  // while it is coasting — see below.
+  const clk = Math.max(state.lastMs || 0, state.coastMs || 0) || nowMs;
+  const dtWant = Math.min(TUNE.DT_MAX, Math.max(0, (nowMs - clk) / 1000));
+  if (fresh) { const s = advance(state, held, dtWant, nowMs).state; s.coastMs = nowMs; return s; }
+  // ---- COASTING: no fresh input, so the model has NOTHING TO SIMULATE. ----
+  // Gravity still applies (a player who disconnects mid-jump must land) but the horizontal move
+  // vector is zero, so this stretch moves nobody sideways. THE WALL-CLOCK BANK IS NOT DEBITED and
+  // `lastMs` is not advanced, because those seconds do not belong to the server's guess — they
+  // belong to the input frames the client is about to send describing them. Draining the bank here
+  // WAS THE STRAND: the 20 Hz tick spent every second of a late report interval on "you stood
+  // still", so when the client's own 16 honest buckets arrived grantDt could afford ~0 of them, the
+  // model stayed where it was, and reconcile read the player's real distance as a cheat. Measured
+  // before this change (strand_min.mjs, 2026-08-05): one 1.60 s gap accepted, 1.65 s refused, and
+  // 14 of the next 20 replies still carried corr:1 at a normal 0.28 s cadence.
+  // simT is left alone for the same reason: nothing was GRANTED, so nothing was simulated.
+  const idle = { seq: state.lastInputSeq, dt: 0, move: { x: 0, z: 0 }, jump: false, sprint: false, mode: state.mode };
+  const simT0 = state.simT;
+  let s = state, left = dtWant, steps = 0;
+  while (left > 1e-9 && steps < 8) { const d = Math.min(TUNE.SUB_DT, left); s = step(s, idle, d); left -= d; steps++; }
+  if (s === state) s = { ...state };
+  s.simT = simT0;
+  s.coastMs = nowMs;
+  return s;
 }
 
 // ============ RECONCILIATION — the tolerant part ============
@@ -500,6 +547,21 @@ export function reconcile(state, claim, nowMs = Date.now(), opts = {}) {
   const mayResync = stuckFor > TUNE.STUCK_MS && (nowMs - (state.lastResyncMs || 0)) > TUNE.RESYNC_COOLDOWN_MS;
   const refuse = (why, extra) => {
     state.corrections++; state.rejects++;
+    // A REFUSED PLAYER STILL TEACHES THE MODEL HOW FAST THEY ARE, and without this line a refusal is
+    // SELF-SUSTAINING: learnMult used to sit only on the accept path, so a corrected sprinter left
+    // the model running at mult 1.0 (18 u/s) against their real 30.24, the gap grew by 12 u every
+    // interval, and the next claim was refused for exactly the same reason — a closed loop broken
+    // only by STUCK_MS and then a 15 s cooldown. It authorises nothing: learnMult hard-clamps to
+    // MAX_MULT_*, mult never touches the HARD gate (rule 2 uses maxSpeed, the ceiling) and a faster
+    // model makes the soft gate TIGHTER, not looser, because it shrinks the `unknown` term below.
+    // THE WINDOW HAS TO BE LONG ENOUGH TO *BE* A SPEED, and learnMult's own 0.05 s floor is not:
+    // Net.gd keeps two request lanes in flight, so when a stalled link frees up the pair lands
+    // milliseconds apart and the second one reads one whole report interval of honest travel over
+    // ~0.002 s of wall clock. Measured letting that through (dev_strandnet p3/p5, 2026-08-05): mult
+    // was taught the 3.271 CAP from a 30.24 u/s player, and a model running at 58.88 over-runs the
+    // real client, which DISARMS the soft gate (it only fires when moved > simMoved) and hands a
+    // small teleport a free pass. MOVE_DT is 0.28 s; 0.2 s admits a real report and nothing else.
+    if (dtWall >= 0.2) learnMult(state, moved, dtWall);
     if (!state.stuckSince) state.stuckSince = nowMs;
     if (mayResync) {
       // THE RESYNC IS BOUNDED, and this matters more than it looks. An unbounded one adopts the
@@ -525,6 +587,15 @@ export function reconcile(state, claim, nowMs = Date.now(), opts = {}) {
       state.vx = 0; state.vy = 0; state.vz = 0; state.blocked = false;
       return { ...out, action: "resync", why, stuckMs: stuckFor, moveTo: r3(gap * t), holdMs: TUNE.RESYNC_HOLD_MS };
     }
+    // A REFUSAL HANDS BACK THE SERVER'S OWN POSITION AND MOVES THE PLAYER NOWHERE, and that stays
+    // exactly as it is. A "carry" that dragged a refused claim along the line by whatever the reach
+    // bank could pay for was tried and REVERTED on 2026-08-05: it fixed nothing the open-loop
+    // allowance above had not already fixed, and it cost three measured contracts — a silent 900 u
+    // jump moved 147 u instead of 0 (physics_authority_sim test 7), a 1900 u jump nine seconds after
+    // a drown rescue moved 175 u (_av_phys_attack_sim A5), and stacking on top of the STUCK_MS
+    // resync it carried a sustained 200 u/s claimant at 139.83 u/s against a 58.88 u/s ceiling
+    // (physics_authority_sim test 5). The escape from a persistent refusal is the bounded resync
+    // above and nothing else.
     return { ...out, action: "correct", why, ...extra, x: r3(state.x), y: r3(state.y), z: r3(state.z) };
   };
 
@@ -565,11 +636,31 @@ export function reconcile(state, claim, nowMs = Date.now(), opts = {}) {
   //                a gully is baked into wall_voxels.bin, which this server does not read).
   //      gear    — the server does not know your boots, your perk or your serum, so the part of the
   //                gap that an unknown multiplier could explain is subtracted before judging.
+  //
+  //    AND THE THIRD CARVE-OUT, WHICH IS THE ONE THAT STRANDED PLAYERS: THE OPEN LOOP.
+  //    The model only steers while the held input is FRESH (INPUT_TTL 0.35 s). A report interval
+  //    longer than that leaves it coasting to a stop while the player is still running, and the gap
+  //    that opens is the SERVER's, not the player's — charging it to them is what pinned honest
+  //    logins at the spawn. `driveT` is the wall clock the model was actually integrated over since
+  //    the last accepted claim (advance() counts it, adopt() clears it); anything left over is open
+  //    loop and is allowed at the CEILING, because over that stretch the server has no model and the
+  //    ceiling is the only honest bound it has.
+  //    THREE THINGS KEEP THAT FROM BECOMING A TELEPORT HOLE:
+  //      · it is capped at OPEN_MAX 1.0 s, so it can never grow into the reach bank's 2.5 s;
+  //      · it requires `claimedMove` — a client that goes quiet and then blinks has sent no moving
+  //        input frame, earns nothing, and is judged exactly as it is today;
+  //      · the HARD gate (rule 2) is unchanged and still binds first for every mode: at the ceiling
+  //        it refuses past 2.5 s of silence, while this allowance only reaches 2.79 s.
+  //    The gear term is likewise a rate over the seconds actually simulated, floored at the flat
+  //    1 s constant this line used to carry, so the allowance can never be SMALLER than it was.
   if (soft && !state.blocked && moved > simMoved) {
     const base = state.mode === "mount" || state.mode === "fly" ? PHYS.WALK : PHYS.RUN;
     const capM = state.mode === "mount" || state.mode === "fly" ? MAX_MULT_MOUNT : MAX_MULT_FOOT;
-    const unknown = Math.max(0, capM - (state.mult || 1)) * base * Math.min(dtWall, 1);
-    if (simDist > TUNE.POS_TOL + unknown) return refuse("ahead-of-sim", { allow: r3(TUNE.POS_TOL + unknown) });
+    const driveS = Math.min(dtWall, Math.max(Math.min(dtWall, 1), num(state.driveT, 0)));
+    const openS = state.claimedMove ? clamp(dtWall - driveS, 0, TUNE.OPEN_MAX) : 0;
+    const unknown = Math.max(0, capM - (state.mult || 1)) * base * driveS + ceilSpeed * openS;
+    if (simDist > TUNE.POS_TOL + unknown)
+      return refuse("ahead-of-sim", { allow: r3(TUNE.POS_TOL + unknown), drive: r3(driveS), open: r3(openS) });
   }
   // 5. ACCEPTED. Resync so the model's error cannot accumulate, and learn how fast this player is.
   const g = groundAt(cx, cz);
@@ -592,6 +683,8 @@ export function reconcile(state, claim, nowMs = Date.now(), opts = {}) {
 function adopt(state, x, y, z, nowMs) {
   state.x = x; state.y = y; state.z = z;
   state.claimX = x; state.claimY = y; state.claimZ = z; state.claimMs = nowMs;
+  // The open-loop ledger is per-INTERVAL, and the interval restarts here (claimMs just moved).
+  state.driveT = 0; state.claimedMove = false;
   state.grounded = y <= groundAt(x, z) + 0.05;
   state.wet = y < PHYS.WATER - PHYS.WATER_ENTER;
 }

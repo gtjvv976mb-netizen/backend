@@ -5993,7 +5993,7 @@ const NFT_MINT_PAUSED = String(process.env.NFT_MINT_PAUSED ?? "0") === "1";
 const NFT_MINT_ORIGINS = new Set(String(process.env.NFT_MINT_ORIGINS || "hatched").split(",").map(s => s.trim()).filter(Boolean));
 // Royalty (owner lock D7): 15% on the WNS transfer hook, routed to the POOL wallet — the market's
 // 20%-tax destination (TEAM_WALLET). Redirect without code via NFT_ROYALTY_WALLET. Income budgeted 0.
-const NFT_ROYALTY_BPS = Math.max(0, Math.min(10000, Number(process.env.NFT_ROYALTY_BPS ?? "1500") || 1500));
+const NFT_ROYALTY_BPS = Math.max(0, Math.min(10000, Number(process.env.NFT_ROYALTY_BPS ?? "2000") || 2000));   // 20% — matches the collection's Royalties plugin (owner-confirmed 2026-08-05)
 const NFT_ROYALTY_WALLET = (process.env.NFT_ROYALTY_WALLET && isPubkey(String(process.env.NFT_ROYALTY_WALLET).trim()))
   ? String(process.env.NFT_ROYALTY_WALLET).trim() : (TEAM_WALLET || null);
 const NFT_COLLECTION = String(process.env.NFT_COLLECTION || "").trim() || null;
