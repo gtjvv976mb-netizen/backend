@@ -491,8 +491,24 @@ export function tickPlayer(state, nowMs = Date.now()) {
   // while it is coasting — see below.
   const clk = Math.max(state.lastMs || 0, state.coastMs || 0) || nowMs;
   const dtWant = Math.min(TUNE.DT_MAX, Math.max(0, (nowMs - clk) / 1000));
-  if (fresh) { const s = advance(state, held, dtWant, nowMs).state; s.coastMs = nowMs; return s; }
-  // ---- COASTING: no fresh input, so the model has NOTHING TO SIMULATE. ----
+  // ---- THE TICK NEVER SPENDS THE CLIENT'S WALL-CLOCK BANK, ON EITHER BRANCH. ----
+  // The coasting branch below stopped debiting it because "those seconds belong to the input frames
+  // the client is about to send describing them". That is just as true of the CARRY-FORWARD branch:
+  // re-running an already-acked input frame is the server EXTRAPOLATING so peers see continuous
+  // motion between a mover's 280 ms reports — it is presentation, not simulation the player pays
+  // for. Calling advance() here charged those seconds to grantDt, and the client's own frames for
+  // the same seconds then arrived with nothing left to pay for them. Measured with advance() still
+  // on this branch (adv_e20.mjs, 2026-08-05, IDENTICAL on the pre-strand-fix and post-strand-fix
+  // trees, so it is the OLDER half of the same bug): Net.gd keeps two request lanes in flight, so a
+  // stalled link delivers a pair ~8 ms apart; the first is accepted, the tick has already spent
+  // ~0.35 s of the 0.56 s budget, and the SECOND of every pair is granted driveT 0.003 s and refused
+  // "ahead-of-sim" — 12 corrections in 25 reports for a player running in a straight line. After
+  // this change: 1 in 25, and that one is the very first pair, before mult has learned the player.
+  // No inflation is possible without the bank here: this branch integrates WALL CLOCK (now - clk,
+  // capped at DT_MAX per tick), never a client-declared dt, so it can never run faster than time.
+  const drive = fresh ? held
+    : { seq: state.lastInputSeq, dt: 0, move: { x: 0, z: 0 }, jump: false, sprint: false, mode: state.mode };
+  // ---- COASTING (`drive` is the idle frame): no fresh input, so NOTHING TO SIMULATE. ----
   // Gravity still applies (a player who disconnects mid-jump must land) but the horizontal move
   // vector is zero, so this stretch moves nobody sideways. THE WALL-CLOCK BANK IS NOT DEBITED and
   // `lastMs` is not advanced, because those seconds do not belong to the server's guess — they
@@ -503,10 +519,9 @@ export function tickPlayer(state, nowMs = Date.now()) {
   // before this change (strand_min.mjs, 2026-08-05): one 1.60 s gap accepted, 1.65 s refused, and
   // 14 of the next 20 replies still carried corr:1 at a normal 0.28 s cadence.
   // simT is left alone for the same reason: nothing was GRANTED, so nothing was simulated.
-  const idle = { seq: state.lastInputSeq, dt: 0, move: { x: 0, z: 0 }, jump: false, sprint: false, mode: state.mode };
   const simT0 = state.simT;
   let s = state, left = dtWant, steps = 0;
-  while (left > 1e-9 && steps < 8) { const d = Math.min(TUNE.SUB_DT, left); s = step(s, idle, d); left -= d; steps++; }
+  while (left > 1e-9 && steps < 8) { const d = Math.min(TUNE.SUB_DT, left); s = step(s, drive, d); left -= d; steps++; }
   if (s === state) s = { ...state };
   s.simT = simT0;
   s.coastMs = nowMs;
@@ -561,7 +576,23 @@ export function reconcile(state, claim, nowMs = Date.now(), opts = {}) {
     // was taught the 3.271 CAP from a 30.24 u/s player, and a model running at 58.88 over-runs the
     // real client, which DISARMS the soft gate (it only fires when moved > simMoved) and hands a
     // small teleport a free pass. MOVE_DT is 0.28 s; 0.2 s admits a real report and nothing else.
-    if (dtWall >= 0.2) learnMult(state, moved, dtWall);
+    // REMOVED 2026-08-05 — and the removal is the STRICTLY BETTER of the two, measured both ways.
+    // `moved` on a REFUSED claim is not a speed: on an "unreachable" refusal it is a TELEPORT
+    // distance, and one refused 432 u respawn jump took mult 1.020 -> the 3.271 CAP in a single hop.
+    // The model then ran at 58.88 u/s in whatever direction the client's inputs pushed — AWAY from
+    // the player — so 20 honest reports after the jump the trainer was still 418.93 u from their own
+    // presence row, where it closed to 192.03 u without this line (adv_diag D5). End to end that was
+    // the difference between a respawn re-converging in 9.4 s and NEVER re-converging inside 11.2 s
+    // (adv_entry E18). It also handed a plain speed hacker the max-gear model for free: a sustained
+    // 200 u/s claim moved the row at 73.85 u/s with this line and 38.61 u/s without it (adv_fix_sim
+    // F5), against a 58.88 u/s ceiling.
+    // AND THE SELF-SUSTAINING REFUSAL IT WAS WRITTEN FOR CANNOT HAPPEN ONCE THE GEAR TERM IS RIGHT.
+    // That loop needs the allowance to be NARROWER than the player's real divergence, and the
+    // allowance is WIDEST at mult 1 — `ceilSpeed - modelTop` is 40.88 u/s for a foot player who has
+    // been taught nothing, against the 12.24 u/s a 30.24 u/s sprinter actually diverges at. Not
+    // learning on a refusal is therefore self-correcting: the refused player keeps the widest
+    // tolerance the server has. Proven on the REAL client, not argued — dev_strandnet.gd 13/13,
+    // 100.0% travel efficiency and 0 corrections at 0 / 2600 / 4500 ms of injected move lag.
     if (!state.stuckSince) state.stuckSince = nowMs;
     if (mayResync) {
       // THE RESYNC IS BOUNDED, and this matters more than it looks. An unbounded one adopts the
@@ -654,11 +685,31 @@ export function reconcile(state, claim, nowMs = Date.now(), opts = {}) {
   //    The gear term is likewise a rate over the seconds actually simulated, floored at the flat
   //    1 s constant this line used to carry, so the allowance can never be SMALLER than it was.
   if (soft && !state.blocked && moved > simMoved) {
-    const base = state.mode === "mount" || state.mode === "fly" ? PHYS.WALK : PHYS.RUN;
-    const capM = state.mode === "mount" || state.mode === "fly" ? MAX_MULT_MOUNT : MAX_MULT_FOOT;
     const driveS = Math.min(dtWall, Math.max(Math.min(dtWall, 1), num(state.driveT, 0)));
     const openS = state.claimedMove ? clamp(dtWall - driveS, 0, TUNE.OPEN_MAX) : 0;
-    const unknown = Math.max(0, capM - (state.mult || 1)) * base * driveS + ceilSpeed * openS;
+    //    THE GEAR TERM WAS WRITTEN IN MULTIPLIER SPACE AND THAT UNDER-COUNTS EVERY MOUNT.
+    //    `(capM - mult) * base` is exactly `ceilSpeed - modelSpeed` for FOOT (18*(3.271-mult) ==
+    //    58.88 - 18*mult) and is NOT for a mount: `base` was WALK 9, so the term ignored the dash
+    //    multiplier entirely. maxSpeed("mount") is WALK x MAX_MULT_MOUNT x MOUNT_DASH_WOLF = 95.76
+    //    (the Direwolf's "dashspd" perk, Econ.gd:269) while simSpeed can only ever produce
+    //    WALK x mult x MOUNT_DASH = 80.23 — and the server cannot see which mount you ride, nor that
+    //    its real dash budget is 6.0 s against the 1 s newState seeds. So an honest Direwolf riding
+    //    at the ceiling the HARD gate declares legal was refused by the SOFT gate on every report:
+    //    12/12 refusals with the model 138 u behind in 3.4 s (adv_diag D1), and through the route
+    //    57.66% travel efficiency with 14 of 15 replies carrying corr:1 (adv_entry E15). It had
+    //    never shown up because the honest mount test rode the position-relay shape, where `soft`
+    //    is false and rule 4 never runs at all.
+    //    SO SAY IT IN SPEED, NOT IN MULTIPLIERS: the unknown is the gap between the CEILING and the
+    //    model's OWN top speed, which is simSpeed's job to know. For foot it is algebraically the
+    //    identical number — RUN*(capM - mult) == RUN*capM - RUN*mult == ceilSpeed - modelTop —
+    //    asserted numerically over a full mult sweep at 7.1e-15 u/s worst delta (adv_fix_sim F0), so
+    //    nothing changes for the overwhelming majority of players. For a mount it finally counts the
+    //    dash, and it self-corrects when the model's dash budget runs out (simSpeed then returns the
+    //    un-dashed speed, so the allowance widens by exactly what the model lost). It reads nothing
+    //    the client controls that the old term did not, so it opens no new farming surface: the
+    //    alternating-direction input farm still buys 40 u (adv_attack A7, same on all three trees).
+    const modelTop = simSpeed(state, { sprint: true }, state.wet);
+    const unknown = Math.max(0, ceilSpeed - modelTop) * driveS + ceilSpeed * openS;
     if (simDist > TUNE.POS_TOL + unknown)
       return refuse("ahead-of-sim", { allow: r3(TUNE.POS_TOL + unknown), drive: r3(driveS), open: r3(openS) });
   }
