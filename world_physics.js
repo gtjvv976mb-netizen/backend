@@ -130,14 +130,34 @@ export const TUNE = {
   DT_MIN: 0.0005,        // below this a frame is noise
   SUB_DT: 1 / 60,        // integrate in client-sized substeps so a big dt cannot tunnel a wall
   // The wall-clock bank an input frame spends from (see grantDt). SIZED FROM THE WIRE, not taste:
-  // one /world/move body carries at most INPUT_MAX_FRAMES 16 buckets (Net.gd:1535) and sanitizeInput
-  // clamps each to DT_MAX, so 1.60 s is the most a single honest message can ever describe. It was
+  // one /world/move body carries at most INPUT_MAX_FRAMES 16 buckets (Net.gd:1546) and sanitizeInput
+  // clamps each to DT_MAX, so 1.60 s is the most a single honest MESSAGE can ever describe. It was
   // 0.50, which is SMALLER than one message — a client whose report was 1.8 s late sent 1.44 s of
   // perfectly honest input frames and grantDt could afford 0.50 s of them, so the model sat still
   // while the player ran and reconcile called the difference a cheat (strand_min.mjs, 2026-08-05).
-  // The anti-inflation invariant is untouched: the bank still fills at exactly one second per second
-  // of wall clock, so sixty frames claiming dt:1.0 still buy nothing.
-  BUDGET_MAX: 1.60,
+  //
+  // 3.20, NOT 1.60, BECAUSE THE CLIENT DOES NOT SEND ONE MESSAGE AT A TIME. Net.gd:44 keeps TWO
+  // request lanes in flight ("PIPELINED MOVES"), so a link that frees up after a stall delivers a
+  // PAIR milliseconds apart: lane 1 with its 16 trimmed buckets and lane 2 with everything since.
+  // A bank sized for one message pays for lane 1 and then short-changes lane 2 — measured on the
+  // plateau at a 30.24 u/s geared sprint (fgs_fix_phys_sim F1, and the same shape end-to-end through
+  // real server.js in fgs_move_spike_sim): lane 2 carried 0.280 s of honest input frames and the
+  // bank could fund 0.163 s of them, so the model fell exactly the unfunded 0.117 s x 30.24 = 3.54 u
+  // behind and rule 4 refused the player "ahead-of-sim" by 0.53 u. 16 of 22 stall lengths between
+  // 1.8 s and 4.4 s corrected a player running in a straight line on flat ground, and each one cost
+  // them 3 s of "catch your breath" on the next gather, cast, strike and raid claim.
+  // The ceiling is the same derivation as before, for the number of lanes that actually exist:
+  // 2 x INPUT_MAX_FRAMES 16 x DT_MAX 0.10 = 3.20 s is the most a coalesced PAIR can ever describe
+  // (2 x 16 x INPUT_BUCKET 0.09 = 2.88 s honestly), so no honest burst can outrun the bank again.
+  // THE ANTI-INFLATION INVARIANT IS UNTOUCHED AND IS THE WHOLE POINT: the bank still fills at
+  // exactly one second per second of WALL CLOCK, so this buys a client nothing it did not wait for —
+  // 600 frames claiming dt:1.0 posted inside one millisecond still buy 0.000 s (fgs_fix_phys_sim
+  // F1b), and the sustained grant rate over 60 s of real time is still <= 60 s. All that changes is
+  // that seconds the client REALLY WAITED THROUGH may now be spent in one burst instead of being
+  // thrown away, which is the difference between the model tracking a recovering player and the
+  // model being told they cheated. The security boundary is unmoved: the HARD reach gate (rule 2)
+  // is a SEPARATE bank of REACH_BANK_S 2.5 s at the ceiling speed and still binds every claim.
+  BUDGET_MAX: 3.20,
   INPUT_TTL: 0.35,       // a held input older than this stops steering (the tick must not run a
                          // backgrounded tab across the island); slightly over MOVE_DT 0.28
   // How much of a report interval the SOFT gate will forgive as "the server had no model here".
@@ -223,6 +243,16 @@ export function teleportDestination(x, z) {
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 function num(v, dflt = 0) { const n = +v; return Number.isFinite(n) ? n : dflt; }
 export function groundAt(x, z) { return surfaceHeight(x, z) + PHYS.FOOT; }
+
+// THE FLOOR, AS APPLIED TO A POSITION THE SERVER IS ABOUT TO PUBLISH. Exactly reconcile rule 5's
+// rule and no other: more than FLOOR_EPS under the terrain is lifted onto it, anything at or above
+// the terrain is left completely alone — bridges, road decks, shop floors and rooftops are real
+// collision the heightfield cannot see, and disputing THOSE is what adopt() warns against. This is
+// only the "you may not be under the island" half, which step() already treats as absolute.
+export function liftToFloor(x, y, z) {
+  const g = groundAt(x, z);
+  return y < g - TUNE.FLOOR_EPS ? g : y;
+}
 
 // ============ STATE ============
 export function newState(x, y, z, dir = 0, nowMs = Date.now()) {
@@ -338,7 +368,16 @@ export function step(state, input, dt) {
     const sp = PHYS.BOAT;
     s.vx = moving ? mx * sp : 0; s.vz = moving ? mz * sp : 0;
     s.x += s.vx * dt; s.z += s.vz * dt;      // a boat does not collide with the heightfield: it is at sea
-    s.y = PHYS.WATER + PHYS.BOAT_DECK + PHYS.BOAT_SEAT;
+    // THE HORIZONTAL non-collision above is deliberate and stays. THE FLOOR IS NOT PART OF IT: the
+    // land, swim and fly branches all end by refusing to leave a body under the island, and this one
+    // pinned y to the deck height unconditionally. At sea that is the same number either way (the
+    // seabed on the recorded runs is -7 to -8, against a deck at 6.60), so no sailor can tell the
+    // difference — but a hull the 20 Hz tick carries inland on its last held input (INPUT_TTL 0.35 s
+    // x BOAT 70 u/s = 24.5 u) sits at 6.60 under a 22.00 plateau, and physTickAll writes that y
+    // straight into the presence row 20 times a second. Measured through real server.js before this
+    // line (fgs_fix_underterrain_probe): worst hull sample x=348.11 y=6.6000 with groundAt 22.00 —
+    // BURIED 15.40 u, published to every peer, with corr=1 on 10 of 26 reports.
+    s.y = Math.max(PHYS.WATER + PHYS.BOAT_DECK + PHYS.BOAT_SEAT, groundAt(s.x, s.z));
     s.vy = 0; s.grounded = false;
     return s;
   }
@@ -562,6 +601,20 @@ export function reconcile(state, claim, nowMs = Date.now(), opts = {}) {
   const mayResync = stuckFor > TUNE.STUCK_MS && (nowMs - (state.lastResyncMs || 0)) > TUNE.RESYNC_COOLDOWN_MS;
   const refuse = (why, extra) => {
     state.corrections++; state.rejects++;
+    // A REFUSAL PUBLISHES THE MODEL'S OWN POSITION, SO THE MODEL MAY NOT BE UNDER THE ISLAND.
+    // server.js:8774 takes physApply's y and server.js:8794 writes it into the presence row, which
+    // is the y every OTHER client draws this player at — the mover themself is protected, because
+    // Net.gd/_net_take lifts the replay start onto the client's own generator, so the whole cost of
+    // a buried y lands on everyone else's screen. step() treats the floor as absolute on the land,
+    // swim, fly and (as of the line above) boat paths, but TWO adopt paths still seat the model
+    // wherever the client says without any floor test, because rule 5's lift is on the accept path
+    // only: rule 1's granted-teleport window and the STUCK_MS resync both take `cy` VERBATIM.
+    // Neither has a live caller in server.js today (grantTeleport/grantModeSwitch are test-only and
+    // the only armed window is the drown rescue), so this is the belt to the boat branch's braces —
+    // one line, the same rule as rule 5, and it costs an honest player nothing because a claim at or
+    // above the ground is never touched. Lifting the MODEL and not just the reply also unwedges it:
+    // passable() measures from s.y, and a buried model can enter no column at all.
+    state.y = liftToFloor(state.x, state.y, state.z);
     // A REFUSED PLAYER STILL TEACHES THE MODEL HOW FAST THEY ARE, and without this line a refusal is
     // SELF-SUSTAINING: learnMult used to sit only on the accept path, so a corrected sprinter left
     // the model running at mult 1.0 (18 u/s) against their real 30.24, the gap grew by 12 u every
@@ -606,7 +659,10 @@ export function reconcile(state, claim, nowMs = Date.now(), opts = {}) {
       const gap = Math.hypot(cx - state.x, cz - state.z);
       const t = gap > reachable ? reachable / gap : 1;
       const rx = state.x + (cx - state.x) * t, rz = state.z + (cz - state.z) * t;
-      const ry = t >= 1 ? cy : Math.max(cy, groundAt(rx, rz));
+      // Same floor as the refusal above and as rule 5: the resync publishes a position too (server.js
+      // stores st.y for EVERY action), and `t >= 1` took the client's y verbatim, so a sub-terrain
+      // claim inside the reachable radius was handed to every peer unchecked.
+      const ry = liftToFloor(rx, t >= 1 ? cy : Math.max(cy, groundAt(rx, rz)), rz);
       state.lastResyncMs = nowMs; state.resyncs = (state.resyncs || 0) + 1;
       state.stuckSince = 0; state.acceptUntil = 0;
       // DEBIT the bank by what the resync actually moved, do not ZERO it. Zeroing looks safer and is
@@ -785,4 +841,4 @@ export function snapshotOf(state) {
 
 function r3(v) { return Math.round(v * 1000) / 1000; }
 
-export default { PHYS, TUNE, MODES, newState, segmentPenetration, sanitizeInput, step, advance, tickPlayer, reconcile, grantTeleport, grantModeSwitch, grantDt, snapshotOf, maxSpeed, groundAt, teleportDestination, MAX_MULT_FOOT, MAX_MULT_MOUNT };
+export default { PHYS, TUNE, MODES, newState, segmentPenetration, sanitizeInput, step, advance, tickPlayer, reconcile, grantTeleport, grantModeSwitch, grantDt, snapshotOf, maxSpeed, groundAt, liftToFloor, teleportDestination, MAX_MULT_FOOT, MAX_MULT_MOUNT };

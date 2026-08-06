@@ -2310,6 +2310,19 @@ const CHIKI_DECIMALS = Math.max(0, Number(process.env.CHIKI_DECIMALS || 6));   /
 // Legacy bits 0-20 belong to the original 21 chapters in their OLD list order and
 // must NEVER move (live wallets hold masks minted at those positions); promoted
 // chapters take bits 21-62 in chapter order. 63 bits > 32 → ALL mask math is BigInt.
+//
+// BOND-CHAPTER REORDER 2026-08-06 — s2_comp4 (Ch.19 -> Ch.48) and s_chiki (Ch.27 -> Ch.49).
+// Both ask the player to raise a LEGENDARY, and the campaign does not hand anyone one until
+// s2_eggleg/s2_hatchleg. The client's `complvl` counter only advances for a non-normal unit, and a
+// pure-MMO player owns nothing but COMMONS, so Ch.19 froze Ch.19..Ch.63 for every player who never
+// imported an old-game roster (measured: 18 of 63 chapters claimable, 34,580 of 112,030 $CHIKI,
+// winner slot unreachable). The rows MOVED — nothing else changed: every `bit:` is explicit and
+// untouched, so no live done_mask shifts and no payout differs; only the "// Ch.N" labels renumber.
+// THIS TABLE IS ONE OF THREE COPIES OF THE LADDER AND ALL THREE MOVE TOGETHER: Econ.gd STORY,
+// this table, and dev_act1.gd's SERVER mirror. Moving only Econ.gd is the failure that was caught:
+// s_chiki is in QUEST_LEGACY21, i.e. a required predecessor, so the new client sent chapters ahead
+// of it and the gate below 409'd 36 of 63 (65,970 $CHIKI deferred into Chain.gd's retry queue).
+// DEPLOY THIS BACKEND BEFORE (or with) the client pck that carries the reordered Econ.gd.
 const MAIN_QUESTS = [
   { id: "s_meet",      chiki: 1000, bit: 0 },   // Ch.1
   { id: "s_kill",      chiki: 1500, bit: 1 },   // Ch.2
@@ -2329,37 +2342,37 @@ const MAIN_QUESTS = [
   { id: "s_shell",     chiki: 3500, bit: 8 },   // Ch.16
   { id: "s_gear",      chiki: 4000, bit: 9 },   // Ch.17
   { id: "s_meat",      chiki: 4500, bit: 10 },   // Ch.18
-  { id: "s2_comp4",    chiki: 110,  bit: 28 },   // Ch.19
-  { id: "s_stock",     chiki: 5000, bit: 11 },   // Ch.20
-  { id: "s2_fish2",    chiki: 120,  bit: 29 },   // Ch.21
-  { id: "s2_berry2",   chiki: 130,  bit: 30 },   // Ch.22
-  { id: "s2_ffish",    chiki: 150,  bit: 31 },   // Ch.23
-  { id: "s2_ffgold",   chiki: 160,  bit: 32 },   // Ch.24
-  { id: "s2_eggmake",  chiki: 160,  bit: 33 },   // Ch.25
-  { id: "s2_tend",     chiki: 150,  bit: 34 },   // Ch.26
-  { id: "s_chiki",     chiki: 5500, bit: 12 },   // Ch.27
-  { id: "s2_hatch1",   chiki: 200,  bit: 35 },   // Ch.28
-  { id: "s_honey",     chiki: 5500, bit: 13 },   // Ch.29
-  { id: "s2_train10",  chiki: 180,  bit: 36 },   // Ch.30
-  { id: "s2_ffkoi",    chiki: 220,  bit: 37 },   // Ch.31
-  { id: "s2_hide",     chiki: 200,  bit: 38 },   // Ch.32
-  { id: "s2_eggmount", chiki: 220,  bit: 39 },   // Ch.33
-  { id: "s2_kill3",    chiki: 240,  bit: 40 },   // Ch.34
-  { id: "s2_hatchmount",chiki: 280,  bit: 41 },   // Ch.35
-  { id: "s2_ride",     chiki: 240,  bit: 42 },   // Ch.36
-  { id: "s_ore",       chiki: 5500, bit: 14 },   // Ch.37
-  { id: "s2_list",     chiki: 260,  bit: 43 },   // Ch.38
-  { id: "s2_sold",     chiki: 280,  bit: 44 },   // Ch.39
-  { id: "s2_buy",      chiki: 260,  bit: 45 },   // Ch.40
-  { id: "s2_merchant", chiki: 300,  bit: 46 },   // Ch.41
-  { id: "s_angler",    chiki: 6000, bit: 15 },   // Ch.42
-  { id: "s2_train15",  chiki: 320,  bit: 47 },   // Ch.43
-  { id: "s2_ffeel",    chiki: 360,  bit: 48 },   // Ch.44
-  { id: "s2_ore2",     chiki: 340,  bit: 49 },   // Ch.45
-  { id: "s2_eggleg",   chiki: 380,  bit: 50 },   // Ch.46
-  { id: "s_slayer",    chiki: 7500, bit: 16 },   // Ch.47
-  { id: "s_forge2",    chiki: 7000, bit: 17 },   // Ch.48
-  { id: "s2_hatchleg", chiki: 450,  bit: 51 },   // Ch.49
+  { id: "s_stock",     chiki: 5000, bit: 11 },   // Ch.19
+  { id: "s2_fish2",    chiki: 120,  bit: 29 },   // Ch.20
+  { id: "s2_berry2",   chiki: 130,  bit: 30 },   // Ch.21
+  { id: "s2_ffish",    chiki: 150,  bit: 31 },   // Ch.22
+  { id: "s2_ffgold",   chiki: 160,  bit: 32 },   // Ch.23
+  { id: "s2_eggmake",  chiki: 160,  bit: 33 },   // Ch.24
+  { id: "s2_tend",     chiki: 150,  bit: 34 },   // Ch.25
+  { id: "s2_hatch1",   chiki: 200,  bit: 35 },   // Ch.26
+  { id: "s_honey",     chiki: 5500, bit: 13 },   // Ch.27
+  { id: "s2_train10",  chiki: 180,  bit: 36 },   // Ch.28
+  { id: "s2_ffkoi",    chiki: 220,  bit: 37 },   // Ch.29
+  { id: "s2_hide",     chiki: 200,  bit: 38 },   // Ch.30
+  { id: "s2_eggmount", chiki: 220,  bit: 39 },   // Ch.31
+  { id: "s2_kill3",    chiki: 240,  bit: 40 },   // Ch.32
+  { id: "s2_hatchmount",chiki: 280,  bit: 41 },   // Ch.33
+  { id: "s2_ride",     chiki: 240,  bit: 42 },   // Ch.34
+  { id: "s_ore",       chiki: 5500, bit: 14 },   // Ch.35
+  { id: "s2_list",     chiki: 260,  bit: 43 },   // Ch.36
+  { id: "s2_sold",     chiki: 280,  bit: 44 },   // Ch.37
+  { id: "s2_buy",      chiki: 260,  bit: 45 },   // Ch.38
+  { id: "s2_merchant", chiki: 300,  bit: 46 },   // Ch.39
+  { id: "s_angler",    chiki: 6000, bit: 15 },   // Ch.40
+  { id: "s2_train15",  chiki: 320,  bit: 47 },   // Ch.41
+  { id: "s2_ffeel",    chiki: 360,  bit: 48 },   // Ch.42
+  { id: "s2_ore2",     chiki: 340,  bit: 49 },   // Ch.43
+  { id: "s2_eggleg",   chiki: 380,  bit: 50 },   // Ch.44
+  { id: "s_slayer",    chiki: 7500, bit: 16 },   // Ch.45
+  { id: "s_forge2",    chiki: 7000, bit: 17 },   // Ch.46
+  { id: "s2_hatchleg", chiki: 450,  bit: 51 },   // Ch.47
+  { id: "s2_comp4",    chiki: 110,  bit: 28 },   // Ch.48
+  { id: "s_chiki",     chiki: 5500, bit: 12 },   // Ch.49
   { id: "s_crystal",   chiki: 7500, bit: 18 },   // Ch.50
   { id: "s_train",     chiki: 7500, bit: 19 },   // Ch.51
   { id: "s2_train20",  chiki: 420,  bit: 52 },   // Ch.52
@@ -2436,9 +2449,32 @@ const QUEST_MIN_GAP_MS = Math.max(0, Number(process.env.QUEST_MIN_GAP_SEC ?? 20)
 const QUEST_MIN_HOLD = Math.max(0, Number(process.env.QUEST_MIN_HOLD || MIN));                       // must hold >= this $CHIKI
 const QUEST_HOLD_MS  = Math.max(0, Number(process.env.QUEST_MIN_HOLD_MINUTES || 60)) * 60_000;       // wallet must be aged-in (anti-sybil)
 const QKEY = (w) => "quest:" + w;   // per-wallet PROGRESS ledger (done map + throttle) — NOT money
+// TEST-ONLY fault injection, in the same shape as _setOwnEnforceForTest / _physGrantTeleportForTest:
+// makes the next N quest-ledger READS fail exactly where a real store rejection lands. Not reachable
+// over HTTP, and the counter is consumed on use, so a sim can prove the refusal without an outage.
+let _qLoadFailN = 0;
+export function _failNextQuestLoadForTest(n = 1) { _qLoadFailN = Math.max(0, n | 0); return _qLoadFailN; }
+// A READ THAT FAILED IS NOT AN EMPTY LEDGER. This `catch` used to swallow the error and hand back
+// `{}`, which is indistinguishable from "this wallet has never reported a chapter" — and _questSave
+// then writes that synthesised ledger back WHOLESALE. Measured with one injected read failure on a
+// wallet that had reported 20 chapters: the report answered 200 and /quest/state went done 20 -> 1,
+// i.e. one blip erased the server's record of a whole Act. No $CHIKI was lost, but only because the
+// pouch mask is OR-only and never cleared — the safety was incidental, and any future change that
+// recomputed earned value from the `done` list would have turned it into real loss.
+// So the failure PROPAGATES: both callers answer 503 and the client's retry queue (which dequeues
+// only on a 400) simply re-sends. A refusal is survivable; a fabricated empty ledger is not.
+const QLEDGER_UNREADABLE = "QLEDGER_UNREADABLE";
 async function _questLoad(wallet) {
   let led = null;
-  try { led = await store.kvGet(QKEY(wallet)); } catch (e) {}
+  try {
+    if (_qLoadFailN > 0) { _qLoadFailN--; throw new Error("simulated store read failure"); }
+    led = await store.kvGet(QKEY(wallet));
+  } catch (e) {
+    const err = new Error("the chapter ledger is temporarily unreadable — nothing was recorded, try again");
+    err.code = QLEDGER_UNREADABLE;
+    err.cause = e;
+    throw err;
+  }
   if (!led || typeof led !== "object") led = {};
   led.done   = (led.done && typeof led.done === "object") ? led.done : {};
   led.lastAt = Number(led.lastAt) || 0;
@@ -2530,8 +2566,8 @@ app.post("/quest/complete", async (req, res) => {
   // The credential the client already holds is honoured here now, and a WRONG one is refused, so the
   // client half can ship and be verified before CHIK_QUEST_AUTH turns the gate on.
   const _qTok = String(req.body?.mktToken || "");
-  if (_qTok && marketTokens[wallet] !== _qTok) return res.status(401).json({ error: "sign in again — that market token is stale" });
-  const _qProven = (_qTok && marketTokens[wallet] === _qTok)
+  if (_qTok && !mktTokenOk(wallet, _qTok)) return res.status(401).json({ error: "sign in again — that market token is stale" });
+  const _qProven = (_qTok && mktTokenOk(wallet, _qTok))
     || verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig);
   if (_qProven) credLatchNote("quest", wallet);
   if (QUEST_AUTH_MODE !== "off" && !_qProven) {
@@ -2593,7 +2629,11 @@ app.post("/quest/complete", async (req, res) => {
       won: !!(award && award.won), rank: award ? (award.rank || 0) : 0,
       winnersRemaining: await store.winnersRemaining(WINNER_CAP),
       poolFull: !!(award && !award.won), done: Object.keys(led.done) });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) {
+    // A store read that THREW is retryable and must not read as a server bug the client gives up on.
+    if (e && e.code === QLEDGER_UNREADABLE) return res.status(503).json({ error: e.message, retry: true });
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
 // ---- Per-quest reward pouch payout (admin-released, variable amount = earned - already paid) ----
@@ -2712,7 +2752,12 @@ app.get("/quest/state", async (req, res) => {
       payoutSig: (wrow && wrow.paid) ? wrow.payout_sig : null,
       questRewardEarned: qrEarned, questRewardPaid: qrPaid, questRewardTotal: QUEST_REWARD_TOTAL,
       prize: WINNER_REWARD, winnerCap: WINNER_CAP, winnersRemaining: await store.winnersRemaining(WINNER_CAP) });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) {
+    // Same rule as the report path: an unreadable ledger is a 503 the client retries, never a
+    // silently shorter `done` list that makes a finished Act look unfinished.
+    if (e && e.code === QLEDGER_UNREADABLE) return res.status(503).json({ error: e.message, retry: true });
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
 // POST /quest/claim — STATUS ONLY (payouts are an admin batch, never user-triggered). No token transfer here.
@@ -2899,9 +2944,9 @@ app.post("/cup/register", async (req, res) => {
   //   2. A CREDENTIAL IS HONOURED IF SENT, AND A BAD ONE IS REFUSED — so the client half can ship
   //      and be verified before CHIK_CUP_AUTH is flipped.
   const _cupTok = String(req.body?.mktToken || "");
-  const _cupProven = (_cupTok && marketTokens[wallet] === _cupTok)
+  const _cupProven = (_cupTok && mktTokenOk(wallet, _cupTok))
     || verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig);
-  if (_cupTok && marketTokens[wallet] !== _cupTok) return res.status(401).json({ error: "sign in again — that market token is stale" });
+  if (_cupTok && !mktTokenOk(wallet, _cupTok)) return res.status(401).json({ error: "sign in again — that market token is stale" });
   if (_cupProven) credLatchNote("cup", wallet);
   if (CUP_AUTH_MODE === "strict" && !_cupProven) return res.status(401).json({ error: "sign-in required to enter the Cup" });
   if (!_cupProven) {
@@ -2947,8 +2992,8 @@ app.post("/cup/ready", async (req, res) => {
   // same rule as /cup/register: readying a stranger starts a round they are not sitting at, which
   // costs them the match. Credential honoured if sent, wrong one refused, otherwise a live presence.
   const _rTok = String(req.body?.mktToken || "");
-  if (_rTok && marketTokens[wallet] !== _rTok) return res.status(401).json({ error: "sign in again — that market token is stale" });
-  const _rProven = (_rTok && marketTokens[wallet] === _rTok)
+  if (_rTok && !mktTokenOk(wallet, _rTok)) return res.status(401).json({ error: "sign in again — that market token is stale" });
+  const _rProven = (_rTok && mktTokenOk(wallet, _rTok))
     || verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig);
   if (_rProven) credLatchNote("cup", wallet);
   if (CUP_AUTH_MODE === "strict" && !_rProven) return res.status(401).json({ error: "sign-in required" });
@@ -3033,8 +3078,8 @@ app.post("/cup/chat", (req, res) => {
   // refused; without one the speaker must at least be a live trainer OR seated in this cup, which is
   // who the cup room is for.
   const _chTok = String(req.body?.mktToken || "");
-  if (_chTok && marketTokens[wallet] !== _chTok) return res.status(401).json({ error: "sign in again — that market token is stale" });
-  const _chProven = (_chTok && marketTokens[wallet] === _chTok)
+  if (_chTok && !mktTokenOk(wallet, _chTok)) return res.status(401).json({ error: "sign in again — that market token is stale" });
+  const _chProven = (_chTok && mktTokenOk(wallet, _chTok))
     || verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig);
   if (!_chProven) {
     const seated = !!(liveCup && Array.isArray(liveCup.state.entrants) && liveCup.state.entrants.some(e => e && e.wallet === wallet));
@@ -3176,7 +3221,13 @@ app.post("/cup/start-round", async (req, res) => {
   if (!liveCup || liveCup.state.status !== "live") return res.status(409).json({ error: "no live round" });
   try {
     const n = await cupStartRoundLive();
-    res.json({ ok: true, liveMatches: n, ...cupSnapshot(req.body?.wallet) });
+    // THE COUNT NEEDS ITS OWN NAME. `...cupSnapshot()` comes last and ALWAYS sets `liveMatches` —
+    // the spectate ARRAY on the battling path, `[]` otherwise (server.js:1154/1157) — so the route's
+    // own `n` was overwritten on every call and no operator ever saw it. Measured: n=3 and n=7 both
+    // answered `liveMatches: []`, and `Number([])` is 0, so tooling that gated on it silently never
+    // ran. Renamed rather than reordered, so cupSnapshot's array keeps the name every existing
+    // reader already uses (nothing can be reading the count — it was never observable).
+    res.json({ ok: true, liveMatchesStarted: n, ...cupSnapshot(req.body?.wallet) });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
@@ -3597,7 +3648,7 @@ app.post("/pvp/challenge", (req, res) => {
   // A CLAIMED-SLOT RULE, not a flat gate — the same shape /world/move uses. An unproven caller may
   // still challenge from an id nobody has proven (a net_id-era client, or the beat between sign-in
   // and /verify returning a token); what it may never do is speak for a wallet that IS proven.
-  const _fromProven = isPubkey(from) && String(req.body?.mktToken || "").length >= 16 && marketTokens[from] === String(req.body?.mktToken || "");
+  const _fromProven = isPubkey(from) && mktTokenOk(from, req.body?.mktToken);
   if (!_fromProven && marketTokens[from]) {
     return res.status(403).json({ error: "that Trainer is signed in — prove this wallet first" });
   }
@@ -3696,6 +3747,24 @@ app.get("/fund", async (req, res) => {
 // nearby online players to render them live. In-memory + TTL-pruned (mirrors the PvP lobby). No DB, no rewards.
 const worldPlayers = new Map();   // wallet -> { x, z, dir, handle, leg, el, br, ts }
 const WORLD_TTL_MS = 12000;       // drop a trainer who hasn't pinged in 12s
+// ============ THE REORDER WINDOW — how a "stale" body is told apart from a NEW COUNTER ============
+// Net.gd's `_move_seq` is a plain per-SESSION counter (var _move_seq := 0), so a browser REFRESH or
+// a second tab/device restarts it at 1 under a presence row that already holds a big seq. The
+// ordering rule read `seq <= held.seq` alone, so every report from the new session answered
+// {stale:true} and returned before the row was written: measured on this build, a refresh after
+// 20 minutes of play was refused 44/55 reports and heard again only at 12.57 s (WORLD_TTL_MS was
+// the ONLY escape), during which the world drew the player 465.70 u from where they were, a peer
+// 3 u away saw them 101.61 u off, and a gather at their real feet answered
+// 403 {"error":"out of reach","dist":102}. On a SECOND device the escape never fires at all,
+// because the first device keeps refreshing `ts`: 60/60 reports stale, 0 accepted over 17.3 s.
+//
+// The discriminator is DISTANCE IN THE COUNTER, not the counter itself. Net.gd keeps at most two
+// moves in flight, so a genuinely reordered reply is 1–2 behind and lands within milliseconds of
+// the body that overtook it; a restarted counter is thousands behind. So the ordering rule now
+// binds only inside a window a real reorder can actually occupy — outside it the counter is treated
+// as NEW and adopted, which is exactly what happens today for a client that sends no seq at all.
+const SEQ_REORDER_MAX = 8;        // how far behind `held.seq` an in-flight reorder may be
+const SEQ_REORDER_MS = 2000;      // ...and how stale the row it is overtaking may be
 // The movement plausibility bound (see the long note in /world/move). Not a refusal — a stamp that
 // makes the two value-bearing reach checks stand down for a moment.
 const WARP_MAX_UPS = 110;         // units/second; the boat (70) is the fastest legitimate thing
@@ -3703,6 +3772,19 @@ const WARP_SLACK = 60;            // units of free jump per ping, for latency an
 // Seconds of WARP_MAX_UPS travel a presence row may bank. Replaces WARP_SLACK's per-ping grant —
 // see the long note at the stamp in worldMoveApply for the measurement that forced it.
 const WARP_BANK_S = 2.5;
+// ...and A SILENCE IS NOT A TELEPORT. The bank saturates at WARP_BANK_S however long the gap was, so
+// a phone that lost signal in a lift handed back a stamp for movement that never left boat speed:
+// measured on the production config (CHIK_PHYS=0), a boat 6 s offline covered 420.00 u (70.00 u/s,
+// exactly Player.gd boat_speed) and its next gather answered
+// 403 {"error":"catch your breath","retryInMs":2996}; a plain geared sprinter 10 s offline covered
+// 302.40 u (30.24 u/s) and answered the same. Neither is a cheat — only the silence was.
+// So one report that follows a genuine gap is additionally allowed WARP_MAX_UPS x THAT GAP, capped
+// at the longest silence a presence row survives at all (WORLD_TTL_MS — past that `_prev` is gone
+// and there is no jump to measure, which is a bigger hole than this one). It is a per-gap credit,
+// NOT bank: it is not carried into `wbank`, and the jump that spends it empties the bank
+// (Math.max(0, ...) below), so the sustained bound stays exactly WARP_MAX_UPS. A cheat is repeated
+// jumps and is still caught — measured after the change in fgs_fix_warp_sim T2.
+const WARP_STALL_MAX_S = WORLD_TTL_MS / 1000;
 const WARP_HOLD_MS = 3000;        // how long a node claim / monster kill stands down after a warp
 let _warpPings = 0;               // observability: how often this fires at all
 export function _warpStatsForTest() { return { warps: _warpPings }; }
@@ -4763,6 +4845,23 @@ function ownSold(wallet, kind, item, n) {
 // this, because the server decides that the egg was issued. So the book still only ever moves on
 // events this server authorised, in either direction, and the declare-a-spend laundering direction
 // stays closed.
+// The EXACT inverse of ownDebit: give a server-authorised spend back. Used by /assets/egg/discard to
+// make whole a player charged for an egg that could never hatch. It reduces `used` rather than adding
+// to `cred`, because nothing was acquired — a spend is being unwound — so the lifetime acquisition
+// bound is left saying exactly what it said before the charge. Never below zero, so it can neither
+// invent entitlement nor be run twice for profit.
+function ownRefund(wallet, kind, item, n) {
+  const w = String(wallet || "");
+  if (!isPubkey(w) || !OWN_KINDS.has(kind) || !ownItemOk(kind, item)) return 0;
+  const q = Math.floor(Number(n));
+  if (!Number.isFinite(q) || q <= 0) return 0;
+  const r = _ownRow(w), k = ownKey(kind, item);
+  const back = Math.min(q, r.used[k] || 0);          // only ever give back what was actually taken
+  if (back <= 0) return 0;
+  r.used[k] -= back;
+  _ownDirty = true;
+  return back;
+}
 function ownDebit(wallet, kind, item, n) {
   const w = String(wallet || "");
   if (!isPubkey(w) || !OWN_KINDS.has(kind) || !ownItemOk(kind, item)) return;
@@ -6854,6 +6953,37 @@ const EGG_RECIPE_MATS = Object.freeze({
 });
 const _lastEggClaim = new Map();
 
+// ============ WHAT THIS EGG COULD STILL PRODUCE FOR THIS WALLET ============
+// ONE definition, read by /claim, /hatch and /discard. /assets/egg/hatch has always computed this
+// and refused when it came back empty ("you already own every species from that egg"); /claim never
+// asked. So Mithra took the barter, minted an egg that could not exist, and the one-egg-per-kind
+// rule below meant that kind of egg could never be claimed again — with no discard and no refund
+// anywhere in the file, the nest slot was blocked for good. Measured before this guard: a wallet
+// holding all 10 normal species and all 6 mounts was sold BOTH a normal egg and a mount egg,
+// status 200, each landing as an active row it could never hatch (fgs_fix_egg_sim F2-a/F2-b).
+// Deliberately IDENTICAL to what /hatch rolls from — if the two ever disagree, the shop is again
+// selling something the nest cannot deliver.
+function eggPoolFor(wallet, kind) {
+  if (kind === "mount") {
+    const have = ownedMounts(wallet);
+    return MOUNT_SUPPLY.filter(([mid]) => !have.has(mid) && !atSupplyCap("mount", mid));
+  }
+  const have = ownedSpecies(wallet);
+  let pool = (EGG_KIND_POOL[kind] || SPECIES_NORMAL).filter(s => !have.has(s));
+  if (kind === "meme") pool = pool.filter((sp) => !memeAtCap(sp));
+  return pool;
+}
+function eggPoolEmptyMsg(wallet, kind) {
+  if (kind === "mount") {
+    return ownedMounts(wallet).size >= MOUNT_SUPPLY.length
+      ? "your stable is already full — every chikimount is yours"
+      : "every remaining steed has been claimed — the stable is legendary now";
+  }
+  return kind === "meme"
+    ? "every Meme Dynasty edition you could still receive has been claimed"
+    : "you already own every species that egg could hatch";
+}
+
 // Issue an egg. The client has already taken the barter from the player's own inventory; what the
 // server adds — and what the client cannot fake — is the identity and the clock.
 app.post("/assets/egg/claim", (req, res) => {
@@ -6867,6 +6997,12 @@ app.post("/assets/egg/claim", (req, res) => {
   // the client's own rule: one egg of each kind at a time (Profile.gd start_egg)
   if (regOwned(wallet, "egg").some(e => e.kind === kind)) {
     return res.status(409).json({ error: "your nest already cradles an egg of that kind" });
+  }
+  // ...AND THE EGG HAS TO BE ABLE TO EXIST. Asked BEFORE a single material is charged — see the note
+  // at eggPoolFor. A completionist is the most invested player there is and was the only one this
+  // could ever hit; the answer names what happened so it does not read as a bug.
+  if (!eggPoolFor(wallet, kind).length) {
+    return res.status(409).json({ error: eggPoolEmptyMsg(wallet, kind) + " — nothing was taken", poolEmpty: true });
   }
   // CAN THIS WALLET AFFORD MITHRA'S PRICE? Fails OPEN while the book is loading — refusing a claim on
   // missing data would strand a real player's progression, which is worse than the egg.
@@ -6935,27 +7071,16 @@ app.post("/assets/egg/hatch", (req, res) => {
 
   let born;
   try {
+  // ONE POOL DEFINITION, shared with /claim and /discard (see eggPoolFor). The supply cap binds the
+  // ROLL too, exactly as it does for memes: a steed whose last piece is claimed can no longer be
+  // rolled, and a meme edition at its cap simply leaves the pool. The egg is NOT consumed when
+  // nothing is left (409 before any state change) — a player must never lose an egg to the world
+  // running out; /assets/egg/discard is the way out for one that can never hatch again.
+  const pool = eggPoolFor(wallet, row.kind);
+  if (!pool.length) return res.status(409).json({ error: eggPoolEmptyMsg(wallet, row.kind), poolEmpty: true });
   if (row.kind === "mount") {
-    const have = ownedMounts(wallet);
-    // the supply cap binds the ROLL too, exactly as it does for memes: a steed whose last piece is
-    // claimed can no longer be rolled. The egg is NOT consumed when nothing is left (409 before any
-    // state change) — a player must never lose an egg to the world running out.
-    const pool = MOUNT_SUPPLY.filter(([mid]) => !have.has(mid) && !atSupplyCap("mount", mid));
-    if (!pool.length) return res.status(409).json({ error: ownedMounts(wallet).size >= MOUNT_SUPPLY.length
-      ? "your stable is already full" : "every remaining steed has been claimed — the stable is legendary now" });
     born = mintAsset("mount", wallet, { sp: pickWeighted(pool), kind: "mount" }, "hatched", row.id);
   } else {
-    const have = ownedSpecies(wallet);
-    let pool = (EGG_KIND_POOL[row.kind] || SPECIES_NORMAL).filter(s => !have.has(s));
-    // THE EDITION CAP IS A PROMISE, so it binds here too. A meme egg used to roll freely from all
-    // six characters with no reference to how many of each already exist, which made "Alon, 1 of 10"
-    // decoration rather than a limit. Anything at its cap simply leaves the pool.
-    if (row.kind === "meme") pool = pool.filter((sp) => !memeAtCap(sp));
-    if (!pool.length) {
-      return res.status(409).json({ error: row.kind === "meme"
-        ? "every Meme Dynasty edition you could still receive has been claimed"
-        : "you already own every species from that egg" });
-    }
     const sp = pool[crypto.randomInt(pool.length)];
     born = mintAsset("chikimon", wallet, { sp, kind: row.kind === "normal" ? "normal" : row.kind, lvl: 1 }, "hatched", row.id);
   }
@@ -6991,6 +7116,43 @@ app.post("/assets/egg/hatch", (req, res) => {
 // What it DOES buy, and the reason it exists: the egg is marked consumed with a server timestamp,
 // so it can never be presented again or vouch a second hatch, and the creature carries a permanent
 // parent link back to the egg that was genuinely paid for.
+// ============ THE MAKE-GOOD FOR AN EGG THAT CAN NEVER HATCH ============
+// /claim now refuses before charging, but eggs claimed BEFORE that guard are still sitting in real
+// nests: state "active", pool empty, hatch answering 409 forever, and the one-egg-per-kind rule
+// blocking that kind of egg for good. There was no discard and no refund route anywhere in the file,
+// so nothing in the game could clear one. This is that route, and it is deliberately narrow:
+//   * the caller must PROVE the wallet and own the egg;
+//   * the pool must genuinely be empty — a healthy egg is never discardable, so this can never be
+//     used to reroll a slow incubation or to farm a refund;
+//   * the barter is handed back through ownRefund, which only ever returns what was actually taken.
+// The egg row is KEPT (state "consumed", with a `discarded` provenance event) rather than deleted —
+// grandfathering is absolute and the lineage stays readable. "consumed" is the state used because it
+// is the one restoreAssetReg round-trips; an invented state would come back "active" on the next
+// restart and re-block the nest.
+app.post("/assets/egg/discard", (req, res) => {
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const wallet = regWallet(req);
+  if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
+  const id = String(req.body?.id || "").slice(0, 64);
+  const row = assetReg.get(id);
+  if (!row || row.type !== "egg" || row.owner !== wallet) return res.status(404).json({ error: "no such egg" });
+  if (row.state !== "active") return res.status(409).json({ error: "that egg is already spent" });
+  if (eggPoolFor(wallet, row.kind).length) {
+    return res.status(409).json({ error: "that egg can still hatch — let it finish", canHatch: true });
+  }
+  const refunded = {};
+  const _mats = Object.hasOwn(EGG_RECIPE_MATS, row.kind) ? EGG_RECIPE_MATS[row.kind] : null;
+  if (_mats) for (const m of Object.keys(_mats)) { const n = ownRefund(wallet, "mat", m, _mats[m]); if (n) refunded[m] = n; }
+  const _fish = Object.hasOwn(EGG_RECIPE_FISH, row.kind) ? EGG_RECIPE_FISH[row.kind] : null;
+  if (_ffishAuth && _fish) { const n = ownRefund(wallet, "ffish", _fish.sp, _fish.n); if (n) refunded[_fish.sp] = n; }
+  row.state = "consumed";
+  regEvent(row, "discarded", { why: "pool-empty", refunded });
+  censusInvalidate();      // a discarded egg leaves the live count
+  _assetsDirty = true;
+  res.json({ ok: true, discarded: row.id, kind: row.kind, refunded,
+             message: "Mithra takes the egg back and returns what you paid for it." });
+});
+
 app.post("/assets/egg/consume", (req, res) => {
   if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
   const wallet = regWallet(req);
@@ -8571,10 +8733,19 @@ function physApply(wallet, b, x, y, z, dir) {
   //         clampF turns a missing x into 0, and "reconciling" against the origin would correct
   //         every one of them, every ping, into the middle of the sea. ----
   const claims = b.x !== undefined || b.z !== undefined;
+  // ONE TELEPORT, ONE STAND-DOWN. world_physics answers action "teleport" for EVERY report that
+  // lands inside the TELEPORT_HOLD_MS window it armed, not just the one that armed it — and
+  // worldMoveApply stamped `_warp = Date.now()` on each of them, pushing the WARP_HOLD_MS stand-down
+  // out by another 3 s every 280 ms. Measured on an identical 456.76 u drowning rescue polled every
+  // 400 ms: CHIK_PHYS=0 let the player gather again after 3272 ms, CHIK_PHYS=1 after 6124 ms.
+  // `acceptUntil` is armed ONLY by world_physics (grantTeleport/grantModeSwitch have no live caller
+  // in this file), so a rise across this call is exactly "a window was newly armed".
+  const _tpBefore = Number(st.acceptUntil) || 0;
   const r = claims ? PhysMod.reconcile(st, { x, y, z }, now, {
     soft: !!st.driven,                                   // no inputs => no model => nothing to compare
     minSpeed: st.driven ? 0 : PhysMod.PHYS.BOAT,         // see physModeOf
   }) : { action: "derived" };
+  const _tpArmed = (Number(st.acceptUntil) || 0) > _tpBefore;
   st.lastAction = r.action;
   if (r.action === "correct") _physCorrections++;
   else if (r.action === "teleport") _physTeleports++;
@@ -8585,7 +8756,8 @@ function physApply(wallet, b, x, y, z, dir) {
   // 235 u behind, permanently). The stand-down is longer than world_physics' own resync cooldown, so
   // a client that forces resyncs deliberately never gets a window in which a gather would settle.
   return { x: Math.round(st.x * 100) / 100, y: Math.round(st.y * 100) / 100, z: Math.round(st.z * 100) / 100,
-           action: r.action, holdMs: r.action === "resync" ? PhysMod.TUNE.RESYNC_HOLD_MS : 0 };
+           action: r.action, tpArmed: _tpArmed,
+           holdMs: r.action === "resync" ? PhysMod.TUNE.RESYNC_HOLD_MS : 0 };
 }
 // What the mover is told about itself. `undefined` when the flag is off, so JSON.stringify omits the
 // key entirely and the reply is byte-identical to today's.
@@ -8646,8 +8818,16 @@ function worldMoveApply(b) {
   // newest; a stale one must NOT overwrite the row (position would step backwards for every peer),
   // but its reply is still useful — the snapshot is read fresh either way. seq is optional: an older
   // client sends none and behaves exactly as before.
+  // ...and it is bounded, because the counter is per-SESSION and a refresh restarts it. Only a body
+  // inside the reorder window (SEQ_REORDER_MAX behind a row written in the last SEQ_REORDER_MS) can
+  // be a reply that was overtaken; anything further behind is a NEW counter and is adopted. A stale
+  // reply also REFRESHES `ts` now — the caller is demonstrably alive, and letting the row expire was
+  // what made WORLD_TTL_MS the only way out of the freeze.
   const seq = Number.isFinite(+b.seq) ? Math.max(0, Math.floor(+b.seq)) : null;
-  if (seq !== null && held && Number.isFinite(held.seq) && seq <= held.seq) {
+  if (seq !== null && held && Number.isFinite(held.seq) && seq <= held.seq
+      && held.seq - seq <= SEQ_REORDER_MAX
+      && Date.now() - (held.ts || 0) <= SEQ_REORDER_MS) {
+    held.ts = Date.now();
     return { code: 200, wallet, proven: iAmProven,
              body: worldMoveReply({ ok: true, stale: true, seq }, wallet, held.x, held.z, b.dl, b.fs, iAmProven) };
   }
@@ -8709,9 +8889,13 @@ function worldMoveApply(b) {
   if (_prev && Number.isFinite(_prev.x) && (_claims || !PHYS_ON)) {
     const _el = Math.max(0, (Date.now() - (_prev.ts || Date.now())) / 1000);
     _wbank = Math.min(WARP_BANK_S, (Number.isFinite(_prev.wbank) ? _prev.wbank : WARP_BANK_S) + _el);
+    // THE ALLOWANCE FOR THIS ONE REPORT: the bank, or the real gap since the last one, whichever is
+    // larger (see WARP_STALL_MAX_S). At the 280 ms cadence the gap term is 0.28 s and the bank wins,
+    // so an actively-reporting client's burst ceiling is unchanged at WARP_MAX_UPS * WARP_BANK_S.
+    const _allowS = Math.max(_wbank, Math.min(_el, WARP_STALL_MAX_S));
     const _jump = Math.hypot(x - _prev.x, z - _prev.z);
-    if (_jump > WARP_MAX_UPS * _wbank) { _warp = Date.now(); _warpPings++; _wbank = 0; }
-    else _wbank = Math.max(0, _wbank - _jump / WARP_MAX_UPS);
+    if (_jump > WARP_MAX_UPS * _allowS) { _warp = Date.now(); _warpPings++; _wbank = 0; }
+    else _wbank = Math.max(0, _wbank - _jump / WARP_MAX_UPS);   // a stall catch-up empties the bank
   }
   // ============ THE SERVER'S OWN ANSWER (CHIK_PHYS) ============
   // With the flag off these three are the client's numbers, unchanged, and physApply is never
@@ -8722,7 +8906,9 @@ function worldMoveApply(b) {
     px = _pr.x; py = _pr.y; pz = _pr.z;
     // A corrected claim is also an implausible one: stand the value routes down exactly as a warp
     // does, so nobody banks a gather or a kill on a position the server just refused.
-    if (_pr.action === "correct" || _pr.action === "teleport") _warp = Date.now();
+    // ...but a teleport stamps ONCE, on the report that ARMED the window (physApply's `tpArmed`) —
+    // not on the honest reports that merely land inside it. See the note at _tpBefore in physApply.
+    if (_pr.action === "correct" || (_pr.action === "teleport" && _pr.tpArmed)) _warp = Date.now();
     // A RESYNC gives the position back after STUCK_MS of refusals, so it must withhold value for
     // longer than a client can force another one. The value routes compare `now - warp < WARP_HOLD_MS`,
     // so a warp stamped in the FUTURE is simply a longer stand-down — 16 s here against
@@ -9657,15 +9843,28 @@ async function txMarketSplit(sig, buyer, seller, price) {
     } };
     scanBurn(tx.transaction && tx.transaction.message && tx.transaction.message.instructions);
     for (const inner of ((tx.meta && tx.meta.innerInstructions) || [])) scanBurn(inner.instructions);
-    // tolerance = a couple whole $CHIKI (each leg is rounded to whole tokens client-side); NOT a % of price
-    // slack ONLY for whole-token client rounding — tight (≤25 tokens, 0.1%) and capped so a large
-    // sale can't be proportionally underpaid. The zero-value legs are rejected explicitly below.
-    const tol = Math.min(25, Math.max(2, price * 0.001));
+    // ============ TOLERANCE IS PER LEG, AND NEVER LARGER THAN THE LEG IT TOLERATES ============
+    // It used to be ONE absolute figure — `min(25, max(2, price*0.001))` — subtracted from all four
+    // checks, so on a cheap listing the slack SWALLOWED the requirement: at price 2 every leg's
+    // adjusted floor was <= 0, and at price 10 the team leg's was 0.000 and the burn leg's -1.500.
+    // Measured on a local fake RPC: a price-2 listing of 1400 GOLD was released for a total payment
+    // of 0.000002 $CHIKI (status 200), and a price-10 buy settled while paying the 20% team tax and
+    // the 5% burn 0.000001 each. Quantity is not part of the check, so the goods released were
+    // unbounded — a sniping window on mis-priced listings and a fee-evasion window on cheap ones.
+    //
+    // WHAT THE SLACK IS ACTUALLY FOR, and it is the only thing it is for: Market.gd:1001-1003 puts
+    // WHOLE tokens on chain — pool = round(price*0.20), burn = round(price*0.05), seller = price -
+    // pool - burn — so each of team/burn can land up to 0.5 short of its exact share and the seller,
+    // absorbing both remainders, up to 1.0. Those are the real bounds; anything beyond them was
+    // never rounding. Each leg is additionally capped at HALF ITS OWN REQUIREMENT so the tolerance
+    // can never exceed what it is tolerating (the price-29 burn leg legitimately needs 1.45 and gets
+    // 1, i.e. 31% short — hence half, not a token percentage).
+    const legTol = (need, cap) => Math.min(cap, Math.max(0, need) * 0.5);
     if (dBuyer <= 0 || dSeller <= 0 || dTeam <= 0 || burned <= 0) return { ok: false, reason: "no $CHIKI actually moved on one of the legs" };
-    if (dBuyer  < price * 1.0                 - tol) return { ok: false, reason: `buyer paid ${dBuyer}, need ${price}` };
-    if (dSeller < price * MARKET_SELLER_SHARE - tol) return { ok: false, reason: `seller got ${dSeller}, need ${price * MARKET_SELLER_SHARE}` };
-    if (dTeam   < price * MARKET_TEAM_TAX     - tol) return { ok: false, reason: `team wallet got ${dTeam}, need ${price * MARKET_TEAM_TAX}` };
-    if (burned  < price * MARKET_BURN         - tol) return { ok: false, reason: `only ${burned} $CHIKI burned, need ${price * MARKET_BURN}` };
+    if (dBuyer  < price * 1.0                 - legTol(price * 1.0, 1.0))                 return { ok: false, reason: `buyer paid ${dBuyer}, need ${price}` };
+    if (dSeller < price * MARKET_SELLER_SHARE - legTol(price * MARKET_SELLER_SHARE, 1.5)) return { ok: false, reason: `seller got ${dSeller}, need ${price * MARKET_SELLER_SHARE}` };
+    if (dTeam   < price * MARKET_TEAM_TAX     - legTol(price * MARKET_TEAM_TAX, 1.0))     return { ok: false, reason: `team wallet got ${dTeam}, need ${price * MARKET_TEAM_TAX}` };
+    if (burned  < price * MARKET_BURN         - legTol(price * MARKET_BURN, 1.0))         return { ok: false, reason: `only ${burned} $CHIKI burned, need ${price * MARKET_BURN}` };
     return { ok: true, seller: dSeller, team: dTeam, spent: dBuyer, burned };
   } catch (e) { return { ok: false, reason: "rpc error verifying transfer" }; }
 }
@@ -10107,6 +10306,13 @@ function mktWallet(b) {
   const w = String(b?.wallet || ""), t = String(b?.mktToken || "");
   return (isPubkey(w) && t.length >= 16 && marketTokens[w] === t) ? w : "";
 }
+// The same rule as mktWallet, for the routes that check the token against a wallet field of their OWN
+// instead of `b.wallet` (quest, Cup register/ready/chat, PvP challenge). It was written out inline in
+// nine places; one definition means the next change to the token model cannot land in eight of them.
+function mktTokenOk(w, t) {
+  t = String(t || "");
+  return !!w && t.length >= 16 && marketTokens[w] === t;
+}
 // the wallet the persisted board already attributes this sid to (or "" if none) — used to reject a
 // hijack where an attacker asserts a victim's (public, still-unbound) net_id at /verify.
 function _sidBoardWallet(sid) {
@@ -10144,6 +10350,20 @@ function seedSidOwnerFromBoard() {
 // provable owner, so value-destroying ops on it are refused outright (a stranger can't strand an
 // as-yet-unbound seller's proceeds, and a legit owner is always bound at /verify before they trade).
 function opAuthOk(sid, b) { const owner = sidOwner[sid]; return !!owner && mktWallet(b) === owner; }
+// ADMIN: revoke a wallet's market token. The token is minted once per wallet and never rotates, so a
+// copy captured once (shared machine, logged response, stale cache) is a permanent bearer credential
+// and this is the ONLY answer to one. NON-DESTRUCTIVE: it clears a CREDENTIAL, never an asset — the
+// owner's next /verify mints a fresh one (mintMarketToken only mints `if (!marketTokens[wallet])`),
+// and nothing they hold is touched.
+app.post("/market/token/revoke", (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  const w = String(req.body?.wallet || req.query?.wallet || "");
+  if (!isPubkey(w)) return res.status(400).json({ error: "valid wallet required" });
+  const had = !!marketTokens[w];
+  delete marketTokens[w];
+  store.kvSet("market_tokens", marketTokens).catch(() => {});
+  res.json({ ok: true, wallet: w, had, note: "the owner gets a fresh token by signing in again — nothing they own was touched" });
+});
 
 // Can this wallet put this species on the board? Returns an error string, or "" to allow.
 //
@@ -10312,7 +10532,17 @@ app.post("/market/op", async (req, res) => {
   // OWN bound sid — so the public `sid`/`wallet` fields on the board can't be poisoned to hijack the
   // sid->wallet binding, and proceeds can never accrue under an unbound (seizable) sid. The binding is
   // established ONLY from the owner's own proven identity (at /verify, seeded from the board at boot).
-  const _AUTH_OPS = new Set(["list", "order_post", "auction_post", "sales_ack", "fills_ack", "refunds_ack", "cancel", "sold", "auction_cancel", "order_cancel", "order_decline", "order_undeliver", "auction_bid"]);
+  //
+  // "buy" WAS MISSING FROM THIS SET and it is the op that DESTROYS a listing. Measured on the
+  // default config (MARKET_ONCHAIN off — the kill-switch position): a body with no wallet and no
+  // token answered 200, removed the row, wrote the seller a receipt they can never collect, and left
+  // cancel answering cancelled=false and a re-list of the same id 409 — six listings wiped by six
+  // curl calls in the sim's F3-e. The same hole was the soft-$CHIKI MINT: a second sid presenting the
+  // SELLER'S OWN token bought the seller's own 1-wood listing at the 9,999,999 price ceiling and
+  // credited 7,499,999.25 soft $CHIKI, which lands in `trade_in` and lifts that wallet's own earn
+  // ceiling so no clamp claws it back. MARKET_ONCHAIN=1 shuts both branches, but it is the documented
+  // kill-switch — it is exactly what gets flipped off in an incident, so it cannot be the gate.
+  const _AUTH_OPS = new Set(["list", "order_post", "auction_post", "sales_ack", "fills_ack", "refunds_ack", "cancel", "sold", "auction_cancel", "order_cancel", "order_decline", "order_undeliver", "auction_bid", "buy"]);
   if (_AUTH_OPS.has(op) && !opAuthOk(sid, b)) return res.status(401).json({ error: "market sign-in required to list, trade, or manage your proceeds" });
   if (op === "list") {
     const lid = stripTags(String(l.id || ("S" + Date.now() + Math.floor(Math.random() * 1e4)))).slice(0, 40);
@@ -10409,6 +10639,14 @@ app.post("/market/op", async (req, res) => {
   } else if (op === "buy") {
     const id = stripTags(String(l.id || "")).slice(0, 40);
     const row = marketListings.find(x => x.id === id);
+    // NOBODY BUYS THEIR OWN GOODS. The soft rail cannot debit the buyer (the purse is client-side),
+    // so a self-buy is pure issuance: it turns a listing the seller still owns into 75% of whatever
+    // price they wrote on it. The `row.sid !== sid` test below only decides whether a RECEIPT is
+    // written, which is precisely what a second sid under the same wallet was used to satisfy — so
+    // the comparison that matters is the WALLET's, and it is checked before anything is consumed.
+    if (row && isPubkey(String(row.wallet || "")) && mktWallet(b) === row.wallet) {
+      return res.status(409).json({ error: "that's your own listing — cancel it to put the goods back in your bag" });
+    }
     // SECURITY: when on-chain trading is live, a wallet-backed listing MUST settle through the
     // verified /market/buy-onchain path — never through this unauthenticated soft op:buy, or a
     // seller could POST a fake buy against their own listing to mint soft $CHIKI for nothing.
