@@ -6901,18 +6901,27 @@ function pickWeighted(pairs) {
 // What this wallet already holds, from BOTH sources: the registry (what the server minted) and the
 // ledger (what predates it). The client's rule is one of each species ever, so the roll must respect
 // everything the player owns, not just the part this system issued.
+// THESE TWO DECIDE WHAT AN EGG MAY HATCH INTO, so "owned" has to mean HELD RIGHT NOW.
+// The ledger keeps a row for every creature a wallet has ever had, and marks `held: false` on the
+// ones that left (auditAssets recomputes it from the save's own key set on every push). Every other
+// reader of lrec.units applies that filter — server.js:5293, :6698, :6707, :6716, :7314 all do
+// `if (!u || u.held === false) continue;`. These two did not, so a species the player SOLD still
+// counted against them: a trader who had cycled the dex was told "you already own every species that
+// egg could hatch" while holding one creature, and their eggs could not hatch at all. Reported
+// 2026-08-07; reproduced with a wallet holding 1 of 10 normals.
+// This can only ever WIDEN a pool, never narrow one, so it cannot take a hatch away from anyone.
 function ownedSpecies(wallet) {
   const own = new Set();
   for (const r of regOwned(wallet, "chikimon")) own.add(r.sp);
   const lrec = assetLedger.get(wallet);
-  if (lrec) for (const u of Object.values(lrec.units)) own.add(u.sp);
+  if (lrec) for (const u of Object.values(lrec.units)) { if (!u || u.held === false) continue; own.add(u.sp); }
   return own;
 }
 function ownedMounts(wallet) {
   const own = new Set();
   for (const r of regOwned(wallet, "mount")) own.add(r.sp);
   const lrec = assetLedger.get(wallet);
-  if (lrec) for (const id of Object.keys(lrec.mounts)) own.add(id);
+  if (lrec) for (const [id, m] of Object.entries(lrec.mounts)) { if (!m || m.held === false) continue; own.add(id); }
   return own;
 }
 
@@ -10082,17 +10091,17 @@ function _capValueMap(map, doneKey, cap) {
     .sort((a, b) => a[1] - b[1]).slice(0, Math.min(evictable.length, keys.length - cap))
     .forEach(([k]) => delete map[k]);
 }
-store.kvGet("market_listings").then(v => { if (Array.isArray(v)) marketListings = v.filter(l => l && Date.now() - (l.ts || 0) < MARKET_TTL_MS); }).catch(() => {});
-store.kvGet("market_sales").then(v => { if (v && typeof v === "object") marketSales = v; }).catch(() => {});
-store.kvGet("market_orders").then(v => { if (Array.isArray(v)) marketOrders = v.filter(o => o && (o.state === "delivered" ? Date.now() - (o.deliveredTs || 0) < ORDER_PAY_WINDOW_MS + 3600000 : Date.now() - (o.ts || 0) < MARKET_TTL_MS)); }).catch(() => {});
-store.kvGet("market_fills").then(v => { if (v && typeof v === "object") marketFills = v; }).catch(() => {});
-store.kvGet("market_auctions").then(v => { if (Array.isArray(v)) marketAuctions = v; }).catch(() => {});
+store.kvGet("market_listings").then(v => { if (Array.isArray(v)) marketListings = v.filter(l => l && Date.now() - (l.ts || 0) < MARKET_TTL_MS); }).catch(() => {}).finally(() => _mktRestored("market_listings"));
+store.kvGet("market_sales").then(v => { if (v && typeof v === "object") marketSales = v; }).catch(() => {}).finally(() => _mktRestored("market_sales"));
+store.kvGet("market_orders").then(v => { if (Array.isArray(v)) marketOrders = v.filter(o => o && (o.state === "delivered" ? Date.now() - (o.deliveredTs || 0) < ORDER_PAY_WINDOW_MS + 3600000 : Date.now() - (o.ts || 0) < MARKET_TTL_MS)); }).catch(() => {}).finally(() => _mktRestored("market_orders"));
+store.kvGet("market_fills").then(v => { if (v && typeof v === "object") marketFills = v; }).catch(() => {}).finally(() => _mktRestored("market_fills"));
+store.kvGet("market_auctions").then(v => { if (Array.isArray(v)) marketAuctions = v; }).catch(() => {}).finally(() => _mktRestored("market_auctions"));
 // RESURRECTION GUARD: once a listing id leaves the board (bought / cancelled / on-chain settled) it is
 // remembered here, so a stale client re-push (offline reconcile) can NEVER re-add it — that was the
 // double-sale bug where a SOLD item re-listed itself and could be bought again. Legit re-lists use a
 // fresh id, so they're unaffected. Kept for MARKET_TTL_MS (matches the listing + client-save lifetime).
 const _soldListings = new Map();   // listing id -> ts consumed
-store.kvGet("market_sold_ids").then(v => { if (Array.isArray(v)) for (const e of v) { if (e && e.id) _soldListings.set(String(e.id), Number(e.ts) || Date.now()); } }).catch(() => {});
+store.kvGet("market_sold_ids").then(v => { if (Array.isArray(v)) for (const e of v) { if (e && e.id) _soldListings.set(String(e.id), Number(e.ts) || Date.now()); } }).catch(() => {}).finally(() => _mktRestored("market_sold_ids"));
 // test seam: lets a sim backdate a consumed id to prove it is NOT forgotten by age. Read-only use
 // in production; nothing in the server calls it.
 export function _soldIdsForTest() { return _soldListings; }
@@ -10122,7 +10131,7 @@ function _consumeListing(id) {
 // the filler's bag and never came back, with no error shown to either side. Uncapped repetitions,
 // pure destruction of another player's goods.
 const _soldOrders = new Map();     // order id -> ts consumed (settled / declined / cancelled / expired)
-store.kvGet("market_sold_orders").then(v => { if (Array.isArray(v)) for (const e of v) { if (e && e.id) _soldOrders.set(String(e.id), Number(e.ts) || Date.now()); } }).catch(() => {});
+store.kvGet("market_sold_orders").then(v => { if (Array.isArray(v)) for (const e of v) { if (e && e.id) _soldOrders.set(String(e.id), Number(e.ts) || Date.now()); } }).catch(() => {}).finally(() => _mktRestored("market_sold_orders"));
 export function _soldOrderIdsForTest() { return _soldOrders; }
 function _consumeOrder(id) {
   if (!id) return;
@@ -10134,7 +10143,7 @@ function _consumeOrder(id) {
     for (const k of _soldOrders.keys()) { if (drop-- <= 0) break; _soldOrders.delete(k); }
   }
 }
-store.kvGet("auction_refunds").then(v => { if (v && typeof v === "object") auctionRefunds = v; }).catch(() => {});
+store.kvGet("auction_refunds").then(v => { if (v && typeof v === "object") auctionRefunds = v; }).catch(() => {}).finally(() => _mktRestored("auction_refunds"));
 const AUCTION_PERSIST_MAX = 5000;    // a runaway guard, far above any real live set (12h expiry)
 let _aucWarnAt = 0;
 function _capAuctions() {
@@ -10227,7 +10236,51 @@ store.kvGet("own_book").then(v => restoreOwnBook(v)).catch(() => { _ownReady = t
 // half-book: the .catch above and this backstop both flip the flag, and a skip is counted either way.
 setTimeout(() => { if (!_ownReady) { _ownReady = true; console.error("own_book restore timed out — enforcing on what restored"); } }, 20000);
 
+// ============ THE BOARD MUST NOT BE SAVED BEFORE IT IS RESTORED ============
+// Every collection above is restored by a FIRE-AND-FORGET `store.kvGet(...).then(...)`, and every
+// one of them starts life as an empty literal. saveMarket() is awaited by /market/op — so the FIRST
+// market op after a restart, if it lands before those promises resolve, persists the EMPTY boot
+// state OVER the real board. One save, and every live listing, auction and sid binding is gone.
+//
+// That is not hypothetical: it happened in production on 2026-08-07. A deploy restarted the server,
+// an early op beat the restore, and the whole Trading Post came back empty — sellers lost listings
+// they had goods escrowed against, and because `sidOwner` went with it, every _AUTH_OPS call
+// (list, buy, cancel, the ack ops) answered 401 "market sign-in required" until the player signed
+// in again. Players reported it as "cannot transact, everything was reset". Both symptoms, one race.
+//
+// The rule: a save may never write a collection that has not yet been read. If the restore has not
+// landed, WAIT for it; if it never lands, SKIP the collection keys entirely rather than overwrite
+// them with nothing — a stale board is recoverable, an erased one is not.
+const _mktRestoreKeys = [
+  "market_listings", "market_sales", "market_orders", "market_fills", "market_auctions",
+  "market_sold_ids", "market_sold_orders", "auction_refunds",
+  "market_tokens", "market_sid_owner", "market_wallet_sid",
+];
+let _mktReady = false;
+let _mktRestoreResolve = null;
+const _mktRestore = new Promise((r) => { _mktRestoreResolve = r; });
+// Every restore above registers here; when the count is met the board is safe to persist.
+let _mktRestoreLeft = _mktRestoreKeys.length;
+function _mktRestored(_key) {
+  if (_mktRestoreLeft > 0 && --_mktRestoreLeft === 0) { _mktReady = true; _mktRestoreResolve(); }
+}
+// A dead or slow store must not wedge /market/op forever. After this the board answers again, but
+// saveMarket still refuses to overwrite the un-restored collections — see the skip below.
+setTimeout(() => {
+  if (!_mktReady) {
+    console.error(`market restore timed out with ${_mktRestoreLeft} key(s) outstanding — the board will serve, but the un-restored keys will NOT be overwritten`);
+    _mktRestoreResolve();
+  }
+}, 20000);
+
 async function saveMarket(strict = false) {
+  if (!_mktReady) await _mktRestore;          // never persist the empty boot state over a live board
+  if (!_mktReady) {
+    // restore never landed: persist ONLY what is not at risk of erasing player value
+    try { await store.kvSet("own_book", serializeOwnBook()); } catch (e) { if (strict) throw e; }
+    console.error("saveMarket: market collections NOT persisted (restore incomplete) — refusing to overwrite the board with an empty one");
+    return;
+  }
   try {
     await Promise.all([
       store.kvSet("market_listings", marketListings.slice(-400)),
@@ -10267,9 +10320,9 @@ async function saveMarket(strict = false) {
 //   • walletSid:    wallet -> net_id, the reverse, so admin restitution files under the sid the
 //                   seller's client actually polls.
 let marketTokens = {}, sidOwner = {}, walletSid = {};
-store.kvGet("market_tokens").then(v => { if (v && typeof v === "object") marketTokens = v; }).catch(() => {});
-store.kvGet("market_sid_owner").then(v => { if (v && typeof v === "object") sidOwner = v; }).catch(() => {});
-store.kvGet("market_wallet_sid").then(v => { if (v && typeof v === "object") walletSid = v; }).catch(() => {});
+store.kvGet("market_tokens").then(v => { if (v && typeof v === "object") marketTokens = v; }).catch(() => {}).finally(() => _mktRestored("market_tokens"));
+store.kvGet("market_sid_owner").then(v => { if (v && typeof v === "object") sidOwner = v; }).catch(() => {}).finally(() => _mktRestored("market_sid_owner"));
+store.kvGet("market_wallet_sid").then(v => { if (v && typeof v === "object") walletSid = v; }).catch(() => {}).finally(() => _mktRestored("market_wallet_sid"));
 // ---- LIVE SESSION per wallet (see the note at /verify) --------------------------------------
 // In memory only, on purpose: a redeploy forgetting every session is the SAFE direction — the first
 // save after it simply re-establishes one, and nobody is locked out. Bounded like every other
@@ -10542,7 +10595,16 @@ app.post("/market/op", async (req, res) => {
   // credited 7,499,999.25 soft $CHIKI, which lands in `trade_in` and lifts that wallet's own earn
   // ceiling so no clamp claws it back. MARKET_ONCHAIN=1 shuts both branches, but it is the documented
   // kill-switch — it is exactly what gets flipped off in an incident, so it cannot be the gate.
-  const _AUTH_OPS = new Set(["list", "order_post", "auction_post", "sales_ack", "fills_ack", "refunds_ack", "cancel", "sold", "auction_cancel", "order_cancel", "order_decline", "order_undeliver", "auction_bid", "buy"]);
+  // "buy" IS DELIBERATELY NOT HERE. It was added on 2026-08-07 to close a real hole (an
+  // unauthenticated soft buy mints goods the server never recorded selling), and it was reverted the
+  // same day because it broke buying for real players: measured, an op:buy carrying no wallet/token
+  // answers 401 "market sign-in required", and any client that has not re-signed-in since — a cached
+  // build, a demo session, a wallet that never verified — cannot transact at all. My own verification
+  // flagged this before it shipped ("the client half of the buy auth gate is missing") and it shipped
+  // anyway. The gate does not go back until the client half is live and confirmed on every path:
+  // Market.gd must send credentials on buy AND handle a 401 by re-verifying rather than swallowing it.
+  // Until then a hole that costs soft goods beats a lockout that costs the whole Trading Post.
+  const _AUTH_OPS = new Set(["list", "order_post", "auction_post", "sales_ack", "fills_ack", "refunds_ack", "cancel", "sold", "auction_cancel", "order_cancel", "order_decline", "order_undeliver", "auction_bid"]);
   if (_AUTH_OPS.has(op) && !opAuthOk(sid, b)) return res.status(401).json({ error: "market sign-in required to list, trade, or manage your proceeds" });
   if (op === "list") {
     const lid = stripTags(String(l.id || ("S" + Date.now() + Math.floor(Math.random() * 1e4)))).slice(0, 40);
