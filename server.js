@@ -8455,10 +8455,24 @@ function meIntentRecord(wallet, mint, action, priceSol) {
 // closed (`capable:false`) so it falls back to the Magic Eden deep link instead of a dead Buy button.
 const ME_MARKET_CAPABLE = ME_MARKET_ON && NFT_HANDOVER_ON;
 if (ME_MARKET_ON && !NFT_HANDOVER_ON)
-  console.warn("✖ CHIK_ME_MARKET=1 but CHIK_NFT_HANDOVER=0 — the in-game marketplace stays CLOSED (a purchase could not deliver the creature). Config reports capable:false; buy/list/browse refuse.");
+  console.warn("✖ CHIK_ME_MARKET=1 but CHIK_NFT_HANDOVER=0 — TRADING stays CLOSED (a purchase could not deliver the creature). Browsing is still served; config reports canTrade:false.");
+
+// BROWSE IS NOT TRADE. Reading the collection's public listings moves nothing, needs no Magic Eden
+// API key (that endpoint is free and keyless) and cannot strand anyone — so it opens on
+// CHIK_ME_MARKET alone. The four value routes (buy/list/delist/confirm) additionally require the
+// handover, because B1 proved a purchase that cannot deliver the creature takes real SOL for nothing.
+// This is what lets the shop-window ship while the instruction-API key is still being issued: turn
+// CHIK_ME_MARKET on today for the window, add ME_API_KEY + CHIK_NFT_HANDOVER later and trading opens
+// with no rebuild and no code change.
+const ME_BROWSE_ON = ME_MARKET_ON;
+function meBrowseGuard(res) {
+  if (ME_BROWSE_ON) return true;
+  res.status(409).json({ error: "the in-game marketplace is not open on this server yet — use the Magic Eden link", capable: false, reason: "market-off" });
+  return false;
+}
 function meCapableGuard(res) {
   if (ME_MARKET_CAPABLE) return true;
-  res.status(409).json({ error: "the in-game marketplace is not open on this server yet — use the Magic Eden link", capable: false, reason: "handover-off" });
+  res.status(409).json({ error: "trading is not open in-game yet — browse here, and buy or sell on Magic Eden for now", capable: false, canTrade: false, reason: "handover-off" });
   return false;
 }
 
@@ -8470,7 +8484,7 @@ function meCapableGuard(res) {
 // monotonic `asOf` so the client can say "prices as of 12s ago" instead of implying live.
 app.get("/nft/market/listings", async (req, res, next) => {
   if (!ME_MARKET_ON) return next();
-  if (!meCapableGuard(res)) return;                          // B1: no browse into a market that can't deliver
+  if (!meBrowseGuard(res)) return;                            // browse needs no key and no handover
   const wallet = _meWallet(req);
   if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
   const rl = meRateOk(wallet, "read");
@@ -8554,7 +8568,7 @@ app.get("/nft/market/img/:key", async (req, res, next) => {
 // wallet read is a cross-check that is allowed to fail without breaking the picker.
 app.get("/nft/market/mine", async (req, res, next) => {
   if (!ME_MARKET_ON) return next();
-  if (!meCapableGuard(res)) return;                          // B1
+  if (!meBrowseGuard(res)) return;                            // read-only picker; trading is gated per-action below
   if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
   const wallet = _meWallet(req);
   if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
@@ -8930,6 +8944,18 @@ app.get("/nft/market/config", (req, res, next) => {
              // hand-over is on, because only then does a bought creature actually migrate to the buyer.
              // `buyReady` folds in the key. The client MUST gate its Buy/List surface on these, not on
              // the mere existence of this route; `capable:false` => show the Magic Eden deep link.
+             // BROWSE AND TRADE ARE NOW SEPARATE TRUTHS, so the shop window can open while the
+             // Magic Eden instruction key is still being issued (~2 weeks, 2026-08-09):
+             //   canBrowse  the grid is live and real — reading listings needs no key, no handover
+             //   canTrade   Buy/List actually work — needs the handover AND the key
+             // The client shows the grid whenever canBrowse, and replaces its Buy/List controls with
+             // "trading opens soon — buy on Magic Eden for now" + the deep link whenever !canTrade.
+             // Nothing about this is a stub: the same grid, the same rows, the same prices players
+             // will trade against. Setting ME_API_KEY and CHIK_NFT_HANDOVER=1 turns trading on with
+             // no rebuild, no redeploy of the client, and no code change.
+             canBrowse: ME_BROWSE_ON, canTrade: ME_MARKET_CAPABLE && meKeyPresent(),
+             tradeBlockedBy: (ME_MARKET_CAPABLE && meKeyPresent()) ? null
+                             : (!NFT_HANDOVER_ON ? "handover-off" : "no-api-key"),
              capable: ME_MARKET_CAPABLE, buyReady: ME_MARKET_CAPABLE && meKeyPresent(),
              notReady: ME_MARKET_CAPABLE ? null : "handover-off",
              // U1: browsing listings currently needs a proven wallet (per-wallet budgeting). A wallet-
@@ -8937,7 +8963,7 @@ app.get("/nft/market/config", (req, res, next) => {
              browseRequiresWallet: true,
              // `tradingReady` kept for older clients (= a key is configured); prefer `buyReady`. When
              // the market is not capable it is forced false so an old client also falls back to the link.
-             tradingReady: ME_MARKET_CAPABLE && meKeyPresent(), browseReady: ME_MARKET_CAPABLE, poolBuy: ME_POOL_BUY,
+             tradingReady: ME_MARKET_CAPABLE && meKeyPresent(), browseReady: ME_BROWSE_ON, poolBuy: ME_POOL_BUY,
              priceMinSol: ME_PRICE_MIN_SOL, priceMaxSol: ME_PRICE_MAX_SOL,
              royalty: { bps: NFT_ROYALTY_BPS, wallet: NFT_ROYALTY_WALLET, model: "collection-inherited",
                         // HONEST: the server REPORTS 20%, but Core enforces royalty through a
