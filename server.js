@@ -6933,18 +6933,73 @@ function pickWeighted(pairs) {
 // egg could hatch" while holding one creature, and their eggs could not hatch at all. Reported
 // 2026-08-07; reproduced with a wallet holding 1 of 10 normals.
 // This can only ever WIDEN a pool, never narrow one, so it cannot take a hatch away from anyone.
+//
+// 2026-08-09 — THAT FIX WAS INERT, and the stuck eggs it was meant to free were still stuck.
+// It corrected the LEDGER arm only. The REGISTRY arm re-supplies every species it drops, because:
+//   • /assets/chikimon/sync (:7333) and /assets/mounts/sync mint a permanent row for every held
+//     creature, and Chain.sync_chikimon POSTs them on EVERY sign-in — so a veteran's registry arm
+//     holds their whole dex, and
+//   • nothing ever moves or retires that row when the creature leaves. transferAsset (:6896) has
+//     exactly ONE production caller — the NFT hand-off at :6428 — so an ordinary Trading Post sale
+//     removes the unit from the save (ledger: held:false) and leaves the row ACTIVE and OWNED.
+// So `own` grew monotonically for the life of an account and could reach the whole pool while the
+// player's satchel was nearly empty. Measured on the real routes by eggstuck_repro.mjs: a veteran
+// who synced 10 normals, sold 8 and pressed HATCH on a completed 3h egg got
+//   HTTP 409 {"error":"you already own every species that egg could hatch","poolEmpty":true}
+// with two creatures in their satchel — permanently (thirty more days changed nothing), and the
+// mount version answered "your stable is already full — every chikimount is yours" with an EMPTY
+// stable. The client (Chain.gd:_hatch_verdict) treats every 409 that is not "already hatched" as a
+// refusal: the egg stays in the nest and the player is shown that sentence.
+//
+// THE TIEBREAK IS THE WALLET'S OWN LAST SAVE, and only where that save has an opinion. A registry
+// row is skipped ONLY when the ledger has actually recorded that species for this wallet and the
+// latest save no longer carries it — i.e. the player themselves reported letting it go. A species
+// the ledger has never seen (a server roll whose save has not been pushed back yet) still counts,
+// which is the safe direction: the CLIENT drops a hatch of a species it already owns on the floor
+// (Profile.own_chiki:1636 returns early, and hatch_egg erases the egg regardless), so a pool that
+// is too WIDE turns a stuck egg into a lost one. Nothing here deletes, retires or re-owns a row;
+// the census, the sale gate, provenance and NFT eligibility all read regOwned directly and are
+// byte-identical.
 function ownedSpecies(wallet) {
   const own = new Set();
-  for (const r of regOwned(wallet, "chikimon")) own.add(r.sp);
   const lrec = assetLedger.get(wallet);
-  if (lrec) for (const u of Object.values(lrec.units)) { if (!u || u.held === false) continue; own.add(u.sp); }
+  // what this wallet's save has EVER recorded, and what its latest push still holds
+  const everSp = new Set(), heldSp = new Set();
+  if (lrec) for (const u of Object.values(lrec.units)) {
+    if (!u) continue;
+    const sp = String(u.sp || "");
+    if (!sp || sp === "?") continue;
+    everSp.add(sp);
+    if (u.held !== false) heldSp.add(sp);
+  }
+  for (const r of regOwned(wallet, "chikimon")) {
+    if (everSp.has(r.sp) && !heldSp.has(r.sp)) continue;   // recorded, then let go — not held now
+    own.add(r.sp);
+  }
+  for (const sp of heldSp) own.add(sp);
   return own;
 }
 function ownedMounts(wallet) {
   const own = new Set();
-  for (const r of regOwned(wallet, "mount")) own.add(r.sp);
   const lrec = assetLedger.get(wallet);
-  if (lrec) for (const [id, m] of Object.entries(lrec.mounts)) { if (!m || m.held === false) continue; own.add(id); }
+  // `rec.mounts[id].held` is READ here and in buildCensus (:6730) and has never been WRITTEN
+  // anywhere in this file, so both tests are dead and a sold steed counted forever. Writing `held`
+  // would also move the world census (a sold steed would leave the count and free a cap slot),
+  // which is a supply decision and not this fix — so auditAssets records the current stable in its
+  // own additive field (`mtNow`) and every existing reader sees exactly what it saw before.
+  // Absent when the save declared no `mounts` key at all, and then this falls back to the old
+  // behaviour rather than reading a partial body as "they sold everything".
+  const stable = Array.isArray(lrec?.mtNow) ? new Set(lrec.mtNow) : null;
+  const everMt = lrec ? new Set(Object.keys(lrec.mounts || {})) : new Set();
+  for (const r of regOwned(wallet, "mount")) {
+    if (stable && everMt.has(r.sp) && !stable.has(r.sp)) continue;
+    own.add(r.sp);
+  }
+  if (lrec) for (const [id, m] of Object.entries(lrec.mounts)) {
+    if (!m || m.held === false) continue;
+    if (stable && !stable.has(id)) continue;               // recorded, then let go — not in the stable
+    own.add(id);
+  }
   return own;
 }
 
@@ -7097,7 +7152,7 @@ app.post("/assets/egg/hatch", (req, res) => {
   const id = String(req.body?.id || "").slice(0, 64);
   const row = assetReg.get(id);
   if (!row || row.type !== "egg" || row.owner !== wallet) return res.status(404).json({ error: "no such egg" });
-  if (row.state !== "active") return res.status(409).json({ error: "that egg has already hatched" });
+  if (row.state !== "active") return res.status(409).json(_alreadyHatched(row));
   const ready = eggReadyAt(row);
   if (Date.now() < ready) return res.status(425).json({ error: "still incubating", readyIn: ready - Date.now() });
 
@@ -7192,7 +7247,7 @@ app.post("/assets/egg/consume", (req, res) => {
   const id = String(req.body?.id || "").slice(0, 64);
   const row = assetReg.get(id);
   if (!row || row.type !== "egg" || row.owner !== wallet) return res.status(404).json({ error: "no such egg" });
-  if (row.state !== "active") return res.status(409).json({ error: "that egg has already hatched" });
+  if (row.state !== "active") return res.status(409).json(_alreadyHatched(row));
   // the same incubation floor the server-rolled hatch enforces — a registered egg cannot be
   // reported as hatched before it could possibly have finished
   const ready = eggReadyAt(row);
@@ -8986,8 +9041,19 @@ export function restoreAssetReg(v) {
     // restart even under a DAS outage that stops the reconcile from re-burning it. Record KEPT,
     // dormant, never restored to anyone — grandfathering absolute (nothing deleted).
     const retired = src.state === "burned" || chain.some(c => c && c.what === "burned");
+    // BORN MUST NEVER MOVE FORWARD. `Number(src.born) || Date.now()` restarted the clock whenever the
+    // field did not survive the round trip, and for an EGG that is a permanent refusal: the incubation
+    // floor re-arms in full and /assets/egg/hatch answers 425, which the client treats as a refusal —
+    // the egg stays in the nest and the player is told "still incubating" forever (measured
+    // 2026-08-09, eggstuck_enum.mjs R4b: a ready 3h egg came back readyIn=3.00h). The row's own
+    // append-only chain already carries the truth — its first event is `minted`, stamped `at` the
+    // instant the row was created — so fall back to that before inventing a new birthday. It can only
+    // ever place a clock EARLIER than the old fallback did, never later, so it cannot refuse anyone.
+    const _bornSrc = Number(src.born), _bornChain = Number(_rawChain[0] && _rawChain[0].at);
+    const _born = (Number.isFinite(_bornSrc) && _bornSrc > 0) ? _bornSrc
+                : ((Number.isFinite(_bornChain) && _bornChain > 0) ? _bornChain : Date.now());
     const row = { id, type, owner, sp: String(src.sp || "").slice(0, 24), kind: String(src.kind || "").slice(0, 12),
-                  born: Number(src.born) || Date.now(), origin: String(src.origin || "issued").slice(0, 16),
+                  born: _born, origin: String(src.origin || "issued").slice(0, 16),
                   state: retired ? "burned" : ((src.state === "consumed" || spent) ? "consumed" : "active"),
                   parent: src.parent ? String(src.parent).slice(0, 64) : null,
                   hatchedTo, lvl: Number(src.lvl) || undefined, chain,
@@ -9412,6 +9478,16 @@ function auditAssets(wallet, mmo, walletFirstSeen = 0) {
     rec.mounts[id] = { ts: now, origin };
     if (origin === "unverified") flag(`mount:${id}`);
   }
+  // WHICH STEEDS THIS SAVE IS ACTUALLY CARRYING — the mount half of the `held` recompute below.
+  // `rec.mounts` is append-only (a steed is recorded once and never removed) and nothing in this
+  // file has ever written `rec.mounts[id].held`, so the two readers that test it (buildCensus :6730
+  // and ownedMounts :6947) were dead code and a SOLD steed counted against its owner's mount-egg
+  // pool forever. Recorded in its own field rather than as `held` on purpose: `held` would also move
+  // the world census and free a cap slot, which is a supply decision, not a bug fix. Written ONLY
+  // when the save declared a `mounts` array, so a partial body leaves the previous answer standing
+  // instead of reading as "they sold the stable". Additive: absent on every pre-existing record and
+  // every reader other than ownedMounts ignores it.
+  if (Array.isArray(mmo.mounts)) rec.mtNow = mounts.map((m) => String(m).slice(0, 24));
   // AVATARS — CENSUS ONLY, never flagged. Recorded so the dex can report how many of each look are
   // actually out there; deliberately NOT graded into origins and NOT capable of raising a flag.
   // An avatar is cosmetic (its perk converts to materials, but it cannot itself be listed or sold),
@@ -9513,6 +9589,11 @@ export function restoreAssetLedger(v) {
       rec.mounts[String(id).slice(0, 24)] = { ts: Number(m.ts) || rec.first, origin };
       if (origin === "unverified") rec.unverified++;
     }
+    // The current stable, re-typed and clamped like everything else (see auditAssets `mtNow`).
+    // ADDITIVE: absent from every blob written before 2026-08-09, and absent here leaves ownedMounts
+    // on its pre-fix behaviour until the wallet's next save re-records it — a restart can never
+    // widen or narrow a pool on its own.
+    if (Array.isArray(src.mtNow)) rec.mtNow = src.mtNow.slice(0, 40).map((m) => String(m).slice(0, 24));
     // avatars are census-only, so there is no origin to re-type and nothing here can raise a flag
     const sa = (src.avatars && typeof src.avatars === "object") ? src.avatars : {};
     for (const id of Object.keys(sa).filter(k => has(sa, k)).slice(0, 40)) {
@@ -10822,10 +10903,45 @@ const MARKET_SELLER_SHARE = 0.75, MARKET_TEAM_TAX = 0.20, MARKET_BURN = 0.05;
 //   >= 75% to the seller, >= 20% to the reward-pool (treasury) wallet, and the full price left
 //   the buyer (the missing 5% is burned/removed from circulation). Balance-delta based, so it
 //   can't be spoofed by memo/instruction shape. Never moves money itself.
+// SAY WHAT CAME OUT. A re-hatch of a spent egg used to answer a bare "that egg has already hatched",
+// and the client then had to GUESS which creature it was: Chain._pick_recovered asks the registry for
+// this wallet's species and adopts the one the save lacks — but ONLY if there is exactly one. Because
+// the registry never releases a sold creature, any player who has ever traded has several, the guess
+// is ambiguous, and the client shows "reload to collect what came out" — which can never help,
+// because the ambiguity is permanent. Reported live 2026-08-09: eggs stayed unhatched and the
+// creature, already minted, sat in the registry unclaimed.
+// The server knows exactly which one it was: row.hatchedTo. Tell the client instead of making it
+// guess. Older rows may have no hatchedTo (or a dangling one) — say so explicitly with hatched:null
+// so the client can fall back to its old elimination path rather than silently inventing a creature.
+function _alreadyHatched(row) {
+  const out = { error: "that egg has already hatched", hatchedTo: row.hatchedTo || null, hatched: null };
+  const born = row.hatchedTo ? assetReg.get(String(row.hatchedTo)) : null;
+  if (born && born.sp) out.hatched = { id: born.id, sp: born.sp, kind: born.kind || "", lvl: Number(born.lvl) || 1 };
+  return out;
+}
+
+// THE RPC LAGS ITS OWN CONFIRMATION. A single getParsedTransaction right after the buyer submits
+// very often answers null — the cluster HAS the transaction, the node we asked has not indexed it yet.
+// This used to read ONCE and, on that null, tell the buyer "transaction not confirmed". They had
+// already SIGNED and their $CHIKI had already moved, so they paid and got nothing (reported live
+// 2026-08-08: "after signing, after many seconds, the purchase fails"). Same trap as the delegate-grant
+// and mint read-backs earlier in this codebase; same answer: poll, never race. Only still-empty after
+// the whole window is "not there". The caller deletes the sig from _usedTxSigs on failure, so a retry
+// with the SAME signature is safe and idempotent — the buyer never pays twice.
+const TXCONF_TRIES = 8, TXCONF_GAP_MS = 1500;
+async function _txConfirmed(sig) {
+  for (let i = 0; i < TXCONF_TRIES; i++) {
+    try { const tx = await conn.getParsedTransaction(sig, { commitment: "confirmed", maxSupportedTransactionVersion: 0 }); if (tx) return tx; }
+    catch (e) { /* transient RPC error — keep polling */ }
+    if (i < TXCONF_TRIES - 1) await new Promise(r => setTimeout(r, TXCONF_GAP_MS));
+  }
+  return null;
+}
 async function txMarketSplit(sig, buyer, seller, price) {
   try {
-    const tx = await conn.getParsedTransaction(sig, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
-    if (!tx || (tx.meta && tx.meta.err)) return { ok: false, reason: "transaction not confirmed" };
+    const tx = await _txConfirmed(sig);
+    if (!tx) return { ok: false, reason: "transaction not confirmed yet — it may still be settling; retry in a moment", pending: true };
+    if (tx.meta && tx.meta.err) return { ok: false, reason: "the transaction failed on-chain" };
     const mint = MINT.toBase58(), teamStr = TEAM_WALLET;
     const pre = (tx.meta && tx.meta.preTokenBalances) || [], post = (tx.meta && tx.meta.postTokenBalances) || [];
     const amt = (arr, owner) => { const e = arr.find(b => b.owner === owner && b.mint === mint); return e ? Number((e.uiTokenAmount && e.uiTokenAmount.uiAmount) || 0) : 0; };
