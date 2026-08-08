@@ -10016,7 +10016,33 @@ let marketOrders = [];                       // WTB craft orders: {id, buyer, si
 let marketFills = {};                        // buyer sid -> [ {id,item,kind,qty,price,fillerName,ts} ] — goods owed to the buyer
 let marketAuctions = [];                     // 🔨 chikimon auctions: {id, seller, sid, species, lvl, xp, minBid, curBid, curSid, curName, ts, endsAt}
 let auctionRefunds = {};                     // sid -> [ {rid,id,amt,ts} ] — outbid escrow going home
-const MARKET_TTL_MS = 24 * 60 * 60 * 1000;   // listings expire after a day
+// ---- HOW LONG A LISTING STANDS ON THE BOARD ---------------------------------------------------
+// WAS 24 h, and that fuse is what emptied the Trading Post on 2026-08-07. Measured on the live board
+// that day: 11 of 14 rows carried CREATION epochs of 2026-07-28..07-30 inside their ids (Market.gd
+// mints "L%08x%d%03d" from a hash + Date.now()) but `ts` values 191 ms apart. So `ts` is when a row
+// was last INSERTED, not when it was made — and a cohort of re-inserted rows therefore all dies in
+// the same instant. Two things made that fatal:
+//   1. an expiring row was dropped SILENTLY — no goods back, no receipt, nothing said to the seller;
+//   2. a dropped row is re-pushed by its owner's client on the next sync (Market.gd's mine-reconcile),
+//      which re-inserts the whole cohort under one shared timestamp — so the wipe repeats every 24 h.
+// Both halves are closed below: expiry now hands the goods back and RETIRES the id (retireListing),
+// so no row is ever silently dropped and no synchronised cohort can re-form. A week is the horizon a
+// seller can plausibly be away for without the board pretending they never listed anything.
+const MARKET_TTL_MS = 7 * 24 * 60 * 60 * 1000;   // a listing stands for a week, then the goods walk home
+// ORDERS KEEP THE OLD 24 h HORIZON, deliberately. An order is a promise to pay real $CHIKI and the
+// poster's balance was only checked at post time; stretching that promise to a week would let a
+// filler stake goods against a wallet that emptied days ago. Split out so the listing horizon can
+// move without touching the order book — order behaviour is byte-for-byte what it was.
+const ORDER_TTL_MS = 24 * 60 * 60 * 1000;
+// ---- ONE NUMBER FOR THE BOARD, BECAUSE TWO WAS A BUG ------------------------------------------
+// The board held 400 rows, persisted 400 — and SERVED 300. Rows 301-400 from the end were on the
+// board, in the database, with their sellers' goods escrowed against them, and invisible to every
+// player including their owner (Market.gd builds its "have" set from what /market/list returns).
+// Found by mkt_fix_sim §E, which measured 12 of seller 0's rows missing from a board that had only
+// evicted 8. Cap, persist window and served window are now the same number, so a row is either on
+// the board and visible, or it has been retired with its goods handed back — never a third state.
+// If the real board ever approaches this, the answer is paging, not silent invisibility.
+const MARKET_BOARD_MAX = 400;
 // ---- A LISTING'S QUANTITY MUST BE A QUANTITY THE GAME CAN ACTUALLY HOLD ----
 // A listing settles through /market/buy-onchain into a real 75/20/5 $CHIKI transfer, so a listing IS
 // a claim on a stranger's money. The qty was clamped to 999999 — 908x the most of one material any
@@ -10091,9 +10117,14 @@ function _capValueMap(map, doneKey, cap) {
     .sort((a, b) => a[1] - b[1]).slice(0, Math.min(evictable.length, keys.length - cap))
     .forEach(([k]) => delete map[k]);
 }
-store.kvGet("market_listings").then(v => { if (Array.isArray(v)) marketListings = v.filter(l => l && Date.now() - (l.ts || 0) < MARKET_TTL_MS); }).catch(() => {}).finally(() => _mktRestored("market_listings"));
+// RESTORE EVERY ROW, EXPIRED OR NOT. This used to drop over-TTL rows here, silently, before anything
+// could act on them — which is the other half of the cohort machine: the seller's client saw the row
+// missing, re-pushed it, and a whole boot's worth of rows got one shared `ts` and one shared death
+// date. Nothing is dropped here any more; pruneMarket (below) is now the ONLY place a listing leaves
+// the board, and it hands the goods back on the way out. A row with no usable shape is still skipped.
+store.kvGet("market_listings").then(v => { if (Array.isArray(v)) marketListings = v.filter(l => l && typeof l === "object" && l.id); }).catch(() => {}).finally(() => _mktRestored("market_listings"));
 store.kvGet("market_sales").then(v => { if (v && typeof v === "object") marketSales = v; }).catch(() => {}).finally(() => _mktRestored("market_sales"));
-store.kvGet("market_orders").then(v => { if (Array.isArray(v)) marketOrders = v.filter(o => o && (o.state === "delivered" ? Date.now() - (o.deliveredTs || 0) < ORDER_PAY_WINDOW_MS + 3600000 : Date.now() - (o.ts || 0) < MARKET_TTL_MS)); }).catch(() => {}).finally(() => _mktRestored("market_orders"));
+store.kvGet("market_orders").then(v => { if (Array.isArray(v)) marketOrders = v.filter(o => o && (o.state === "delivered" ? Date.now() - (o.deliveredTs || 0) < ORDER_PAY_WINDOW_MS + 3600000 : Date.now() - (o.ts || 0) < ORDER_TTL_MS)); }).catch(() => {}).finally(() => _mktRestored("market_orders"));
 store.kvGet("market_fills").then(v => { if (v && typeof v === "object") marketFills = v; }).catch(() => {}).finally(() => _mktRestored("market_fills"));
 store.kvGet("market_auctions").then(v => { if (Array.isArray(v)) marketAuctions = v; }).catch(() => {}).finally(() => _mktRestored("market_auctions"));
 // RESURRECTION GUARD: once a listing id leaves the board (bought / cancelled / on-chain settled) it is
@@ -10242,11 +10273,20 @@ setTimeout(() => { if (!_ownReady) { _ownReady = true; console.error("own_book r
 // market op after a restart, if it lands before those promises resolve, persists the EMPTY boot
 // state OVER the real board. One save, and every live listing, auction and sid binding is gone.
 //
-// That is not hypothetical: it happened in production on 2026-08-07. A deploy restarted the server,
-// an early op beat the restore, and the whole Trading Post came back empty — sellers lost listings
-// they had goods escrowed against, and because `sidOwner` went with it, every _AUTH_OPS call
-// (list, buy, cancel, the ack ops) answered 401 "market sign-in required" until the player signed
-// in again. Players reported it as "cannot transact, everything was reset". Both symptoms, one race.
+// CORRECTED 2026-08-08 — the earlier text here claimed as established fact that this race fired in
+// production on 2026-08-07 and took `sidOwner` with it. THE EVIDENCE SAYS OTHERWISE, and leaving the
+// claim standing would send the next responder down the wrong path. Measured against the live board:
+// a seller in session since before 14:53Z re-pushed successfully at 14:57:58Z through the _AUTH_OPS
+// gate (so sidOwner was intact), and three `ffish` rows re-listed at 15:25:48Z — a kind whose
+// ownAvailable() allowance is exactly 0, so own_book was intact too. Had this race fired, saveMarket
+// would have persisted both empty and neither of those could have answered 200.
+// What IS measured: this is a live, UNFIRED hazard. Driven against a real Postgres behind a 2.5 s/hop
+// latency proxy on the then-deployed commit, ONE `{"op":"noop"}` during the restore window took kv
+// market_listings 8 -> 0, own_book 1 -> 0 and market_sold_ids 1 -> 0; a SIGTERM at t+416 ms did the
+// same and took market_sid_owner 8 -> 0 with it. The board's actual emptying is explained by the
+// listing TTL (see MARKET_TTL_MS), and the 401s by the session maps that wrote past this gate (see
+// saveMarketSessions). All three are closed; keep this gate regardless — it is cheap and it is the
+// only thing standing between a slow database and a one-write erasure of every live listing.
 //
 // The rule: a save may never write a collection that has not yet been read. If the restore has not
 // landed, WAIT for it; if it never lands, SKIP the collection keys entirely rather than overwrite
@@ -10268,11 +10308,40 @@ function _mktRestored(_key) {
 // saveMarket still refuses to overwrite the un-restored collections — see the skip below.
 setTimeout(() => {
   if (!_mktReady) {
-    console.error(`market restore timed out with ${_mktRestoreLeft} key(s) outstanding — the board will serve, but the un-restored keys will NOT be overwritten`);
+    console.error(`market restore timed out with ${_mktRestoreLeft} key(s) outstanding — the board will SERVE, but nothing will be PRUNED (no expiry, no auction sweep) and no market key will be overwritten. Everything is frozen exactly as it restored. Fix the store and restart; do not expect listings to age out until you do.`);
     _mktRestoreResolve();
   }
 }, 20000);
 
+// ---- THE BOARD HAD NO HISTORY. GIVE IT ONE. ---------------------------------------------------
+// kv `market_listings` is ONE Postgres JSONB row, written with INSERT … ON CONFLICT DO UPDATE SET
+// v=$2 — every save overwrites it wholesale. No journal, no per-listing table, no previous version.
+// That is the reason the board as it stood before 2026-08-07T~14:57Z cannot be read back out of the
+// database at all, and why this incident's recovery had to lean on the sellers' own clients.
+// One extra key fixes that for next time: the last board we persisted, under `market_listings_bak`,
+// refreshed at most every MKT_BAK_EVERY_MS and ALWAYS written immediately before a save that would
+// shrink the board sharply — precisely the moment the old contents are about to become unreadable.
+// It is a RECOVERY SOURCE for an operator (/admin/market-audit, /admin/market-restore), never
+// something the server reads back by itself: an automatic restore would resurrect rows that players
+// have since cancelled, and this file's whole lesson is that silent writes are how value dies.
+const MKT_BAK_EVERY_MS = 60 * 1000;
+let _mktBakAt = 0, _mktBakN = 0;
+let _mktLastPersisted = null;      // the exact array last written to market_listings
+async function _mktBackupBeforeWrite(next) {
+  const now = Date.now();
+  const prev = _mktLastPersisted;
+  const nOld = prev ? prev.length : next.length;
+  const collapsed = nOld >= 3 && next.length < Math.ceil(nOld / 2);
+  // Refresh on a collapse (the only moment that matters), whenever the board has GROWN past what the
+  // backup holds (so the backup is never smaller than the board it protects — a new listing is new
+  // value and must not wait out a timer), and otherwise on a slow timer.
+  if (!collapsed && next.length <= _mktBakN && now - _mktBakAt < MKT_BAK_EVERY_MS) return;
+  const snap = (collapsed && prev) ? prev : next;
+  if (!snap.length) return;        // never overwrite a good backup with an empty one
+  if (collapsed) console.error(`saveMarket: BOARD SHRANK ${nOld} -> ${next.length} IN ONE WRITE — the ${snap.length}-row board from before it is now in kv market_listings_bak (inspect /admin/market-audit, restore with /admin/market-restore)`);
+  _mktBakAt = now; _mktBakN = snap.length;
+  try { await store.kvSet("market_listings_bak", { ts: now, n: snap.length, collapsed, listings: snap }); } catch (e) { console.warn("market backup failed:", String(e?.message || e)); }
+}
 async function saveMarket(strict = false) {
   if (!_mktReady) await _mktRestore;          // never persist the empty boot state over a live board
   if (!_mktReady) {
@@ -10281,9 +10350,11 @@ async function saveMarket(strict = false) {
     console.error("saveMarket: market collections NOT persisted (restore incomplete) — refusing to overwrite the board with an empty one");
     return;
   }
+  const _boardOut = marketListings.slice(-MARKET_BOARD_MAX);
+  await _mktBackupBeforeWrite(_boardOut);
   try {
     await Promise.all([
-      store.kvSet("market_listings", marketListings.slice(-400)),
+      store.kvSet("market_listings", _boardOut),
       store.kvSet("market_sales", marketSales),
       store.kvSet("market_orders", marketOrders.slice(-200)),
       store.kvSet("market_fills", marketFills),
@@ -10303,6 +10374,7 @@ async function saveMarket(strict = false) {
       // awaits this on every op, including list.
       store.kvSet("own_book", serializeOwnBook()),
     ]);
+    _mktLastPersisted = _boardOut;   // what is actually in the database now — the backup compares to this
   } catch (e) { console.warn("saveMarket persist failed:", String(e?.message || e)); if (strict) throw e; }
 }
 // ---- MARKET SESSION AUTH ----
@@ -10320,9 +10392,42 @@ async function saveMarket(strict = false) {
 //   • walletSid:    wallet -> net_id, the reverse, so admin restitution files under the sid the
 //                   seller's client actually polls.
 let marketTokens = {}, sidOwner = {}, walletSid = {};
-store.kvGet("market_tokens").then(v => { if (v && typeof v === "object") marketTokens = v; }).catch(() => {}).finally(() => _mktRestored("market_tokens"));
-store.kvGet("market_sid_owner").then(v => { if (v && typeof v === "object") sidOwner = v; }).catch(() => {}).finally(() => _mktRestored("market_sid_owner"));
-store.kvGet("market_wallet_sid").then(v => { if (v && typeof v === "object") walletSid = v; }).catch(() => {}).finally(() => _mktRestored("market_wallet_sid"));
+// ---- THE RESTORE MERGES; IT DOES NOT REPLACE ----------------------------------------------------
+// The port is open before store.init() is even called, so a /verify can land while these three reads
+// are still in flight. It used to be a bare `marketTokens = v`, which THREW AWAY the token that
+// sign-in had just minted and handed to the player — their client then carried a credential the
+// server had no record of, and every mutating market op answered 401 "market sign-in required" for
+// the rest of that session. That is the exact symptom the owner reported, and it needs no SIGTERM
+// and no stray op: an ordinary redeploy plus one player signing in inside the restore window does it.
+//   • marketTokens: the value minted THIS BOOT wins — it is the one the player is actually holding.
+//   • sidOwner / walletSid: the PERSISTED value wins. These are ownership bindings under a
+//     first-writer-wins rule, and bindSid's anti-hijack check (_sidBoardWallet) is toothless while
+//     the board is empty — so an in-window binding must never be allowed to displace a stored one.
+store.kvGet("market_tokens").then(v => { if (v && typeof v === "object") marketTokens = Object.assign({}, v, marketTokens); }).catch(() => {}).finally(() => _mktRestored("market_tokens"));
+store.kvGet("market_sid_owner").then(v => { if (v && typeof v === "object") sidOwner = Object.assign({}, sidOwner, v); }).catch(() => {}).finally(() => _mktRestored("market_sid_owner"));
+store.kvGet("market_wallet_sid").then(v => { if (v && typeof v === "object") walletSid = Object.assign({}, walletSid, v); }).catch(() => {}).finally(() => _mktRestored("market_wallet_sid"));
+// ---- ...AND THE WRITE SIDE OBEYS THE SAME GATE AS THE BOARD -------------------------------------
+// market_tokens / market_sid_owner / market_wallet_sid were written by FIVE direct store.kvSet calls
+// (mintMarketToken, bindSid x2, seedSidOwnerFromBoard, the revoke route) plus three more in
+// flushDurableState — none of which consulted the restore gate, even though all three keys are listed
+// in _mktRestoreKeys. Measured on the committed code with a 2.5 s/hop latency proxy: a SIGTERM at
+// t+416 ms took market_sid_owner 8 -> 0 and market_tokens 1 -> 0 while the board itself survived,
+// because saveMarket's gate covered the board and nothing covered these. Everyone's sign-in gone in
+// one write. One funnel now, and it refuses exactly as saveMarket does.
+async function saveMarketSessions(strict = false) {
+  if (!_mktReady) await _mktRestore;
+  if (!_mktReady) {
+    console.error("saveMarketSessions: market sign-ins NOT persisted (restore incomplete) — refusing to overwrite every player's session binding with an empty set");
+    return;
+  }
+  try {
+    await Promise.all([
+      store.kvSet("market_tokens", marketTokens),
+      store.kvSet("market_sid_owner", sidOwner),
+      store.kvSet("market_wallet_sid", walletSid),
+    ]);
+  } catch (e) { console.warn("saveMarketSessions persist failed:", String(e?.message || e)); if (strict) throw e; }
+}
 // ---- LIVE SESSION per wallet (see the note at /verify) --------------------------------------
 // In memory only, on purpose: a redeploy forgetting every session is the SAFE direction — the first
 // save after it simply re-establishes one, and nobody is locked out. Bounded like every other
@@ -10351,7 +10456,7 @@ export function _liveSessionFor(w) { return liveSession.get(w) || null; }
 export function _clearSessions() { liveSession.clear(); }
 function mintMarketToken(wallet) {
   if (!isPubkey(wallet)) return "";
-  if (!marketTokens[wallet]) { marketTokens[wallet] = crypto.randomBytes(24).toString("hex"); store.kvSet("market_tokens", marketTokens).catch(() => {}); }
+  if (!marketTokens[wallet]) { marketTokens[wallet] = crypto.randomBytes(24).toString("hex"); saveMarketSessions().catch(() => {}); }
   return marketTokens[wallet];
 }
 // the wallet a request has PROVEN it controls via its market token (or "" if unproven)
@@ -10386,8 +10491,7 @@ function bindSid(sid, wallet) {
   const boardW = _sidBoardWallet(sid);
   if (boardW && boardW !== wallet) return;
   sidOwner[sid] = wallet; walletSid[wallet] = sid;
-  store.kvSet("market_sid_owner", sidOwner).catch(() => {});
-  store.kvSet("market_wallet_sid", walletSid).catch(() => {});
+  saveMarketSessions().catch(() => {});
 }
 // seed sid->wallet from the persisted board so pre-deploy listings can't be seized before their owner
 // next signs in (each row carries its owner wallet; first-writer-wins, so a live /verify never loses).
@@ -10397,7 +10501,7 @@ function seedSidOwnerFromBoard() {
   for (const l of marketListings) take(l.sid, l.wallet);
   for (const o of marketOrders) take(o.sid, o.wallet);
   for (const a of marketAuctions) { take(a.sid, a.wallet); take(a.curSid, a.curWallet); }
-  if (dirty) { store.kvSet("market_sid_owner", sidOwner).catch(() => {}); store.kvSet("market_wallet_sid", walletSid).catch(() => {}); }
+  if (dirty) saveMarketSessions().catch(() => {});
 }
 // gate a mutating op: the caller must PROVE the wallet that owns this sid. An unbound sid has no
 // provable owner, so value-destroying ops on it are refused outright (a stranger can't strand an
@@ -10414,7 +10518,7 @@ app.post("/market/token/revoke", (req, res) => {
   if (!isPubkey(w)) return res.status(400).json({ error: "valid wallet required" });
   const had = !!marketTokens[w];
   delete marketTokens[w];
-  store.kvSet("market_tokens", marketTokens).catch(() => {});
+  saveMarketSessions().catch(() => {});
   res.json({ ok: true, wallet: w, had, note: "the owner gets a fresh token by signing in again — nothing they own was touched" });
 });
 
@@ -10444,6 +10548,30 @@ function reserveUnit(wallet, uid, rowId) {
 function releaseUnitFor(rowId) {
   if (!rowId) return;
   for (const [k, v] of unitReserved) if (v === rowId) unitReserved.delete(k);
+}
+
+// ================= THE NFT TIERS DO NOT TRADE IN-GAME =================
+// Owner rule: mounts, LEGENDARY chikimon and MEME DYNASTY chikimon are the NFT tiers — exactly the
+// set nftMintableKind (:6260) will certify — and a certified creature changes hands as a certificate
+// on the NFT marketplace, never on the Trading Post and never under the auction hammer. Selling one
+// in-game is two owners for one asset: the registry/collection still names the old wallet while the
+// game hands the creature to a new one. Normal chikimon are the in-game trade good, and they are the
+// only chikimon that trade here.
+//
+// THE SPECIES STRING IS THE WHOLE TEST. SPECIES_NORMAL / SPECIES_LEGEND / SPECIES_MEME (:6061-6064)
+// are disjoint frozen tables, so the tier is a property of the name — no roster lookup, no registry
+// read, nothing the caller can shape, and nothing that can fail open on un-restored state. (Mounts
+// never had a market op at all: op:list's kind whitelist is mat/chikimon/ffish/pot and auction_post
+// is chikimon-only, so the mount half of the rule is already structural.)
+//
+// GRANDFATHERING: this is a CREATE-time gate and nothing else. It sits inside op:list's `!listingClash`
+// branch and auction_post's `!already-posted` branch, so it can only ever refuse a NEW row. Every row
+// already on the board keeps working end to end — buy, cancel, bid, the 12h hammer, the no-bid walk
+// home — because not one of those paths consults it. Proven in mkt_tier_sim.mjs §C.
+const NFT_TIER_SPECIES = new Set([...SPECIES_LEGEND, ...SPECIES_MEME]);
+const NFT_TIER_MSG = "This one is certified — legendary and Meme Dynasty chikimon are NFTs, so trade it as an NFT on the marketplace, not here. Normal chikimon trade here.";
+function chikimonTierBlocked(sp) {
+  return NFT_TIER_SPECIES.has(String(sp)) ? NFT_TIER_MSG : "";
 }
 
 function chikimonSaleBlocked(wallet, sp, uid, rowId) {
@@ -10521,12 +10649,72 @@ function returnOrderGoods(row, why) {
   if (!arr.some(f => f.id === row.id))
     arr.push({ id: row.id, item: row.item, kind: row.kind, qty: row.qty, price: row.price, fillerName: row.buyer, returned: true, why, ts: Date.now() });
 }
+// ============ A LISTING NEVER LEAVES THE BOARD WITHOUT THE GOODS GOING HOME ============
+// When a seller lists, Market.gd takes the goods OUT OF THEIR BAG immediately (the listing IS the
+// escrow) and keeps its own copy of the row in the save. So every way a row can leave the board is
+// either a SALE (the seller is paid, and the sale receipt is what makes their client drop its copy)
+// or a DESTRUCTION — and until now, expiry and the board-cap eviction were destructions: the row
+// vanished, nothing was returned, nothing was recorded, and the seller's client re-pushed it forever.
+//
+// This is the one path for "it left the board and nobody bought it". It does three things, and it
+// needs ALL three, because two of them are what the ALREADY-DEPLOYED client understands:
+//   1. FILLS: the goods walk home through the queue the client already polls (/market/fills), the
+//      same channel an unpaid order delivery and a no-bid auction use. Market.gd's _on_fills sees
+//      `returned:true` and grants them back with a toast. Nothing new has to ship for this to work.
+//   2. SALES: a receipt with price 0. Market.gd's _on_sales erases the seller's own local copy of
+//      the listing BEFORE it looks at the price, then `continue`s on `price <= 0` — so a zero-price
+//      row is precisely "forget this listing", with no payment, no toast and no receipt written.
+//      Without it the client keeps re-pushing a row whose id is now retired and toasts a 409 at 1 Hz.
+//   3. RETIRE the id, so a stale re-push can never resurrect a row whose goods are already back in
+//      the seller's bag. That ordering matters: the goods are queued FIRST, then the id is closed.
+// Idempotent by id on both queues, so calling it twice for one row cannot double-return.
+function retireListing(row, why) {
+  if (!row || !row.id) return false;
+  const sid = String(row.sid || "");
+  const id = String(row.id);
+  if (sid) {
+    const farr = marketFills[sid] || (marketFills[sid] = []);
+    if (!farr.some(f => f.id === id))
+      farr.push({ id, item: row.item, kind: row.kind, qty: row.qty, price: row.price,
+                  lvl: row.lvl, xp: row.xp, fillerName: row.seller, returned: true, why, ts: Date.now() });
+    const sarr = marketSales[sid] || (marketSales[sid] = []);
+    // price 0 = "drop your copy", never a payment. Capped like the buy path's receipt push.
+    if (!sarr.some(s => s.id === id) && sarr.length < 200)
+      sarr.push({ id, item: row.item, kind: row.kind, qty: row.qty, price: 0, retired: true, why, ts: Date.now() });
+    _consumeListing(id);   // also releaseUnitFor: a retired chikimon row frees its creature again
+  } else {
+    // NO SID: the goods have NOT been returned — there is no queue to return them to. Consuming the
+    // id here would ALSO switch off the cancel self-heal (op:cancel refuses once _soldListings has
+    // the id), leaving the seller with the goods missing from their bag and no route to get them
+    // back. Measured head-to-head on a sid-less row aged past the TTL: consuming it gave
+    // cancelled=FALSE and 25x wood stranded; leaving it reachable gives cancelled=TRUE and the
+    // client puts the goods back. An id we could not settle stays claimable, by design.
+    console.warn(`retireListing: listing ${id} has no sid — goods could not be returned (${why}); leaving the id claimable so the seller's cancel can still self-heal`);
+  }
+  return true;
+}
 let _sidSeeded = false;
+let _retiredExpired = 0, _retiredCap = 0;   // operator counters: how much walked home, and why
+export function _retireStatsForTest() { return { expired: _retiredExpired, cap: _retiredCap }; }
 function pruneMarket() {
   const now = Date.now();
+  // NEVER PRUNE A BOARD THAT HAS NOT FINISHED RESTORING. pruneMarket mutates every market collection
+  // (and now RETIRES rows, which writes into marketFills/marketSales — collections that are still
+  // being read back from the store at boot). Running it early meant reaping rows that had not loaded
+  // yet, and queueing returns into maps the restore was about to overwrite wholesale. /market/list
+  // simply serves the board un-pruned for the sub-second the restore takes.
+  if (!_mktReady) return;
   if (!_sidSeeded) { _sidSeeded = true; seedSidOwnerFromBoard(); }   // one-time: protect pre-deploy rows from seizure
   sweepAuctions(now);
-  marketListings = marketListings.filter(l => now - (l.ts || 0) < MARKET_TTL_MS);
+  marketListings = marketListings.filter(l => {
+    if (now - (l.ts || 0) < MARKET_TTL_MS) return true;
+    // EXPIRY IS NOT A DELETION. The goods go back to the seller and the id is retired — see
+    // retireListing. This is the line that used to read `filter(l => ... < MARKET_TTL_MS)` and
+    // quietly threw a week of other people's escrow on the floor.
+    retireListing(l, "expired");
+    _retiredExpired++;
+    return false;
+  });
   // NOTE: _soldListings is deliberately NOT pruned by age here. The seller's client keeps its own
   // copy of a listing forever (it rides in the signed save and is rehydrated unconditionally), and
   // on login it re-pushes any "mine" listing the board lacks BEFORE the sales poll clears the sold
@@ -10546,7 +10734,7 @@ function pruneMarket() {
       _consumeOrder(o.id);                                   // spent id — never postable again
       return false;
     }
-    if (now - (o.ts || 0) >= MARKET_TTL_MS) { _consumeOrder(o.id); return false; }
+    if (now - (o.ts || 0) >= ORDER_TTL_MS) { _consumeOrder(o.id); return false; }
     return true;
   });
   _pruneValueMap(marketFills, "granted", now);    // owed goods survive 60d, not 7
@@ -10556,7 +10744,7 @@ function pruneMarket() {
   _capValueMap(marketSales, "credited", 5000);
   _capValueMap(auctionRefunds, "refunded", 5000);   // same content-based backstop as its siblings
 }
-app.get("/market/list", (_q, res) => { pruneMarket(); res.json({ listings: marketListings.slice(-300), orders: marketOrders.slice(-200), auctions: marketAuctions.slice(-100) }); });
+app.get("/market/list", (_q, res) => { pruneMarket(); res.json({ listings: marketListings.slice(-MARKET_BOARD_MAX), orders: marketOrders.slice(-200), auctions: marketAuctions.slice(-100) }); });
 // pending order FILLS for one buyer — client receives the goods then acks with the ids
 app.get("/market/fills", (req, res) => {
   const sid = stripTags(String(req.query?.sid || "")).slice(0, 40);
@@ -10576,6 +10764,19 @@ app.post("/market/op", async (req, res) => {
   const op = String(b.op || "");
   const l = b.listing || {};
   if (!sid) return res.status(400).json({ error: "sid required" });
+  // ---- AN OP THIS SERVER DOES NOT IMPLEMENT MUST NOT REACH THE PERSIST ----
+  // The handler is one long if/else-if chain that ends in an UNCONDITIONAL `await saveMarket()`. An
+  // unrecognised op matched no branch and fell straight through to it — no wallet, no token, no rate
+  // limit, one POST. Measured on the deployed commit, against a real Postgres behind a 2.5 s/hop
+  // latency proxy: a single `{"op":"noop","sid":"x"}` during the boot restore took kv market_listings
+  // 8 -> 0, own_book 1 -> 0 and market_sold_ids 1 -> 0. The restore gate in saveMarket is the belt;
+  // this is the braces, and it also stops an unknown op from being a free full-board write.
+  // Every op the client has ever sent is in this set — including the two the CURRENT client no longer
+  // sends ("sold", "order_fill"), because a cached build in someone's browser still might.
+  const _KNOWN_OPS = new Set(["list", "buy", "cancel", "sold", "order_post", "order_fill",
+    "order_deliver", "order_undeliver", "order_decline", "order_cancel",
+    "auction_post", "auction_bid", "auction_cancel", "refunds_ack", "fills_ack", "sales_ack"]);
+  if (!_KNOWN_OPS.has(op)) return res.status(400).json({ error: "unknown market op" });
   let cancelled;                                 // set by the cancel op → tells the seller's client whether to reclaim
   let returned;                                  // auction_cancel: the SERVER's record of the creature coming back
   pruneMarket();
@@ -10616,7 +10817,17 @@ app.post("/market/op", async (req, res) => {
     const listingClash = marketListings.find(x => x.id === lid);
     if (listingClash && listingClash.sid !== sid) {
       return res.status(409).json({ error: "Listing id collision — cancel and re-list with a fresh id." });
-    } else if (!listingClash) {
+    } else if (listingClash) {
+      // MY OWN ROW, RE-PUSHED (the offline reconcile). This used to do nothing at all, so `ts` was
+      // frozen at first insertion and the row died exactly MARKET_TTL_MS later however often its
+      // owner announced it was still there. Measured before this change: first list ts=…945627, a
+      // re-push 1.5 s later left ts=…945627 — delta 0 ms. Now the row's clock restarts, so a seller
+      // who is present cannot have a listing quietly expire under them.
+      // NOTHING ELSE IS TAKEN FROM THE RE-PUSH: not price, not qty, not item. A re-push is a
+      // liveness signal, not an edit — letting it rewrite the row would be a way to change the deal
+      // under a buyer who is mid-purchase.
+      listingClash.ts = Date.now();
+    } else {
       if (marketListings.filter(x => x.sid === sid).length >= 12) return res.status(429).json({ error: "too many listings" });
       // IMPOSSIBLE QUANTITY. Checked BEFORE the row is built, so an absurd listing never reaches the
       // board and never becomes something a real buyer can pay for on-chain. See LIST_QTY_MAX.
@@ -10677,6 +10888,12 @@ app.post("/market/op", async (req, res) => {
       // ledger, or restored mid-flight) is allowed through — a false refusal would strand a real
       // player's asset, and grandfathering is the standing policy for everything predating this.
       if (String(l.kind) === "chikimon") {
+        // THE NFT TIERS DO NOT TRADE HERE (chikimonTierBlocked, above). Checked BEFORE
+        // chikimonSaleBlocked deliberately: that call RESERVES the unit (reserveUnit -> unitReserved)
+        // as a side effect, so refusing after it would leave the creature marked "already up for
+        // sale" with no listing to cancel — the seller could then never list it anywhere.
+        const tierBad = chikimonTierBlocked(stripTags(String(l.item || "")).slice(0, 24));
+        if (tierBad) return res.status(409).json({ error: tierBad, tier: "nft" });
         const bad = chikimonSaleBlocked(mktWallet(b), stripTags(String(l.item || "")).slice(0, 24),
                                         stripTags(String(l.uid || "")).slice(0, 40), lid);
         if (bad) return res.status(409).json({ error: bad });
@@ -10696,7 +10913,16 @@ app.post("/market/op", async (req, res) => {
         qty: clampF(l.qty, 1, 999999, 1) | 0, price: clampF(l.price, 1, 9999999, 1) | 0,
         lvl: clampF(l.lvl, 1, 50, 1) | 0, xp: clampF(l.xp, 0, 1e9, 0) | 0, ts: Date.now(),
       });
-      if (marketListings.length > 400) marketListings.shift();
+      // THE BOARD CAP IS AN EVICTION, AND AN EVICTION IS A DESTRUCTION UNLESS THE GOODS GO HOME.
+      // This was a bare `shift()`: the oldest listing on a full board was dropped on the floor, with
+      // its seller's escrowed goods still deducted client-side and no record anywhere that it had
+      // ever existed. Same treatment as expiry now — the goods walk home and the id is retired.
+      while (marketListings.length > MARKET_BOARD_MAX) {
+        const evicted = marketListings.shift();
+        retireListing(evicted, "expired");
+        _retiredCap++;
+        console.warn(`market board at cap (${MARKET_BOARD_MAX}): retired ${evicted.id} (seller sid ${String(evicted.sid || "").slice(0, 12)}) and returned ${evicted.qty}x ${evicted.item}`);
+      }
     }
   } else if (op === "buy") {
     const id = stripTags(String(l.id || "")).slice(0, 40);
@@ -10707,6 +10933,18 @@ app.post("/market/op", async (req, res) => {
     // written, which is precisely what a second sid under the same wallet was used to satisfy — so
     // the comparison that matters is the WALLET's, and it is checked before anything is consumed.
     if (row && isPubkey(String(row.wallet || "")) && mktWallet(b) === row.wallet) {
+      return res.status(409).json({ error: "that's your own listing — cancel it to put the goods back in your bag" });
+    }
+    // AND THE SID CASE, WHICH DESTROYED GOODS RATHER THAN MINTING THEM. The receipt below is only
+    // written when `row.sid !== sid`, but the removal underneath it is unconditional — so a buy
+    // whose sid MATCHES the seller's took the listing off the board, consumed the id forever, and
+    // wrote the seller nothing. The goods left the bag at list time and had no way back: re-push
+    // 409s on the consumed id and cancel answers false because the id is consumed. The wallet test
+    // above misses it whenever the row has no wallet (pre-fix rows) or the caller sends no token.
+    // Refusing costs nothing real — Market.gd never shows you your own listing in the buy tab (it
+    // skips rows whose sid is its own), so no honest client can reach this — and the listing stays
+    // on the board, still cancellable, goods intact.
+    if (row && row.sid && row.sid === sid) {
       return res.status(409).json({ error: "that's your own listing — cancel it to put the goods back in your bag" });
     }
     // SECURITY: when on-chain trading is live, a wallet-backed listing MUST settle through the
@@ -10812,7 +11050,7 @@ app.post("/market/op", async (req, res) => {
   } else if (op === "order_fill") {
     // LEGACY soft-settlement fill from a stale cached client — never allow it against the
     // real-$CHIKI book. filled:false makes the old client keep its goods and show "too late".
-    return res.json({ ok: true, filled: false, listings: marketListings.slice(-300) });
+    return res.json({ ok: true, filled: false, listings: marketListings.slice(-MARKET_BOARD_MAX) });
   } else if (op === "order_deliver") {
     // a filler stakes goods against an open order: the order LOCKS (one delivery at a time),
     // the goods leave the filler's bag client-side, and the poster is asked to pay real $CHIKI.
@@ -10914,6 +11152,13 @@ app.post("/market/op", async (req, res) => {
       // "legendary". A catalog check makes the echoed record mean something even for a wallet the
       // ledger has never seen.
       if (!CHIKIMON_IDS.has(aSpecies)) return res.status(400).json({ error: "that is not a chikimon" });
+      // THE NFT TIERS DO NOT GO UNDER THE HAMMER EITHER (chikimonTierBlocked, above). Same ordering
+      // rule as op:list: before chikimonSaleBlocked, whose reserveUnit side effect would otherwise
+      // strand the creature as "already up for sale". Only a NEW auction reaches here — the branch
+      // is `!marketAuctions.some(x => x.id === aid)` — so a legendary already under the hammer still
+      // takes bids, still settles, and is still cancellable while bid-less.
+      const tierBad = chikimonTierBlocked(aSpecies);
+      if (tierBad) return res.status(409).json({ error: tierBad, tier: "nft" });
       const bad = chikimonSaleBlocked(mktWallet(b), aSpecies,
                                       stripTags(String(l.uid || "")).slice(0, 40), aid);
       if (bad) return res.status(409).json({ error: bad });
@@ -10975,7 +11220,107 @@ app.post("/market/op", async (req, res) => {
     for (const s of (marketSales[sid] || [])) if (ids.includes(s.id)) s.credited = true;
   }
   await saveMarket();
-  res.json({ ok: true, cancelled, returned, listings: marketListings.slice(-300) });
+  res.json({ ok: true, cancelled, returned, listings: marketListings.slice(-MARKET_BOARD_MAX) });
+});
+
+// ============ OPERATOR TOOLS: SEE WHAT SURVIVED, AND PUT BACK ONLY WHAT IS SAFE ============
+// Written because on 2026-08-07 there was nothing to reach for. The board is a single overwritten
+// JSONB row, so when it emptied there was no way to see what had been on it, let alone put it back —
+// the recovery was "wait for each seller to log in and let their client re-push". These two routes
+// are the missing instrument. Both are ADMIN-gated, and NEITHER removes anything, ever.
+//
+//   GET  /admin/market-audit?key=…    — what is live, what is in the backup, and the disposition of
+//                                       every backed-up row: live / retired (already settled or
+//                                       returned — must NOT come back) / restorable.
+//   POST /admin/market-restore        — { key, dry (DEFAULT TRUE), source:"bak", rows:[…] }
+//                                       re-advertises restorable rows. Dry by default: you see the
+//                                       plan before anything is written.
+//
+// THE RESTORE CANNOT DOUBLE-GRANT. A row is only put back if its id is absent from the board AND
+// absent from _soldListings — and _soldListings holds every id that was bought, cancelled, settled
+// on-chain, or retired with its goods already returned. So the only rows this can re-advertise are
+// ones whose goods are still escrowed inside the seller's own save, exactly where a listing's goods
+// live. Every listing rule is re-applied on the way in (catalog, quantity ceiling, 12-per-seller),
+// because a restore must not be a way around the checks a live list has to pass.
+function _mktRestoreCandidate(raw, liveIds, perSid) {
+  const id = stripTags(String(raw?.id || "")).slice(0, 40);
+  const sid = stripTags(String(raw?.sid || "")).slice(0, 40);
+  if (!id) return { id: "", state: "skip", why: "no id" };
+  if (!sid) return { id, state: "skip", why: "no seller sid — nobody to advertise for" };
+  if (liveIds.has(id)) return { id, state: "skip", why: "already live on the board" };
+  if (_soldListings.has(id)) return { id, state: "skip", why: "id is retired (sold, cancelled or already returned) — resurrecting it would duplicate goods" };
+  const kind = (["chikimon", "ffish", "pot"].includes(String(raw?.kind)) ? String(raw.kind) : "mat");
+  const item = stripTags(String(raw?.item || "")).slice(0, 24);
+  if (!listItemOk(kind, item)) return { id, state: "skip", why: `not a real ${kind}: ${item}` };
+  const qty = clampF(raw?.qty, 1, 999999, 1) | 0;
+  if (Object.hasOwn(LIST_QTY_MAX, kind) && qty > LIST_QTY_MAX[kind]) return { id, state: "skip", why: `qty ${qty} over the ${kind} ceiling ${LIST_QTY_MAX[kind]}` };
+  if ((perSid.get(sid) || 0) >= 12) return { id, state: "skip", why: "seller already has 12 listings" };
+  const wallet = String(raw?.wallet || "");
+  return {
+    id, state: "restore", sid,
+    row: {
+      id, seller: stripTags(String(raw?.seller || "Trainer")).slice(0, 20), sid,
+      wallet: isPubkey(wallet) ? wallet : "",
+      kind, item, qty, price: clampF(raw?.price, 1, 9999999, 1) | 0,
+      lvl: clampF(raw?.lvl, 1, 50, 1) | 0, xp: clampF(raw?.xp, 0, 1e9, 0) | 0,
+      ts: Date.now(),                       // a restored row gets a full fresh horizon, not the old one
+      restored: true,
+    },
+    unpayable: !isPubkey(wallet) || undefined,   // no wallet = the on-chain rail can't settle it
+  };
+}
+app.get("/admin/market-audit", async (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  pruneMarket();
+  let bak = null;
+  try { bak = await store.kvGet("market_listings_bak"); } catch (e) { bak = { error: String(e?.message || e) }; }
+  const bakRows = Array.isArray(bak?.listings) ? bak.listings : [];
+  const liveIds = new Set(marketListings.map(l => String(l.id)));
+  const perSid = new Map();
+  for (const l of marketListings) perSid.set(l.sid, (perSid.get(l.sid) || 0) + 1);
+  const dispositions = bakRows.map(r => { const c = _mktRestoreCandidate(r, liveIds, perSid); return { id: c.id, state: c.state, why: c.why, item: r?.item, qty: r?.qty, sid: String(r?.sid || "").slice(0, 14) }; });
+  // goods currently walking home (a retired listing's return that its seller has not collected yet)
+  let owedRows = 0, owedSids = 0;
+  for (const k of Object.keys(marketFills)) {
+    const n = (marketFills[k] || []).filter(f => f.returned && !f.granted).length;
+    if (n) { owedRows += n; owedSids++; }
+  }
+  res.json({
+    ok: true,
+    live: { n: marketListings.length, oldestTsAgeH: marketListings.length ? +((Date.now() - Math.min(...marketListings.map(l => l.ts || 0))) / 3600000).toFixed(2) : 0 },
+    ttlHours: MARKET_TTL_MS / 3600000,
+    retired: { expired: _retiredExpired, boardCap: _retiredCap },
+    uncollectedReturns: { rows: owedRows, sellers: owedSids },
+    backup: bak ? { ts: bak.ts, iso: bak.ts ? new Date(bak.ts).toISOString() : null, n: bak.n, collapsed: !!bak.collapsed } : null,
+    restorable: dispositions.filter(d => d.state === "restore").length,
+    dispositions,
+  });
+});
+app.post("/admin/market-restore", async (req, res) => {
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
+  const dry = req.body?.dry !== false;          // DRY BY DEFAULT — you must ask for the write
+  let src = Array.isArray(req.body?.rows) ? req.body.rows : null;
+  if (!src) {
+    try { const bak = await store.kvGet("market_listings_bak"); src = Array.isArray(bak?.listings) ? bak.listings : []; }
+    catch (e) { return res.status(500).json({ error: "could not read market_listings_bak: " + String(e?.message || e) }); }
+  }
+  if (src.length > 1000) return res.status(400).json({ error: "refusing more than 1000 rows in one restore" });
+  pruneMarket();
+  const liveIds = new Set(marketListings.map(l => String(l.id)));
+  const perSid = new Map();
+  for (const l of marketListings) perSid.set(l.sid, (perSid.get(l.sid) || 0) + 1);
+  const plan = [];
+  for (const raw of src) {
+    const c = _mktRestoreCandidate(raw, liveIds, perSid);
+    plan.push({ id: c.id, state: c.state, why: c.why, item: c.row?.item, qty: c.row?.qty, unpayable: c.unpayable });
+    if (c.state !== "restore") continue;
+    liveIds.add(c.id);                                        // plan against itself: no duplicate ids
+    perSid.set(c.sid, (perSid.get(c.sid) || 0) + 1);
+    if (!dry) marketListings.push(c.row);
+  }
+  const restored = plan.filter(p => p.state === "restore").length;
+  if (!dry && restored) { await saveMarket(); console.log(`/admin/market-restore: re-advertised ${restored} listing(s)`); }
+  res.json({ ok: true, dry, considered: src.length, restored, board: marketListings.length, plan });
 });
 
 function shutdownDmSnapshot(now = Date.now()) {
@@ -11015,9 +11360,11 @@ async function flushDurableState() {
     ["world DMs", () => store.kvSet("world_dm", shutdownDmSnapshot())],
     ["parties", () => store.kvSet("world_parties", serializeParties())],
     ["market signatures", () => store.kvSet("market_used_sigs", shutdownMarketSigSnapshot())],
-    ["market tokens", () => store.kvSet("market_tokens", marketTokens)],
-    ["market sid owners", () => store.kvSet("market_sid_owner", sidOwner)],
-    ["market wallet sids", () => store.kvSet("market_wallet_sid", walletSid)],
+    // ONE GATED CALL, not three raw writes. These three keys are in _mktRestoreKeys, but the shutdown
+    // path wrote them straight past the gate — so a SIGTERM inside the restore window persisted an
+    // empty sign-in table over the real one and locked every player out of list/cancel/ack/bid until
+    // they signed in again. Measured at t+416 ms on the pre-fix code: sid_owner 8 -> 0, tokens 1 -> 0.
+    ["market sessions", () => saveMarketSessions(true)],
     ["market and ownership", () => saveMarket(true)],
     ["bans", () => store.kvSet("banned_wallets", [...bannedWallets])],
     ["pending gifts", () => store.kvSet("pending_gifts", pendingGifts)],

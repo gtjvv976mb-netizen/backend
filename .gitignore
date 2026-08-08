@@ -27,3 +27,4 @@ upload_image.mjs
 make_devnet_wallet.mjs
 devnet-authority.json
 mint_test.mjs
+mkt_restore_tool.mjs
