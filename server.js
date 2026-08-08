@@ -6055,6 +6055,10 @@ export function _gatheredFor(wallet) { return gatherCount.get(wallet) || null; }
 const assetReg = new Map();             // assetId -> row
 const assetsByOwner = new Map();        // wallet  -> Set(assetId)
 const ASSET_REG_MAX = 400000;
+// on-chain mint address -> assetId. Lazily built and invalidated from the three writers below; the
+// reader (meRowByMint) and its builder live in the MAGIC EDEN block further down. Declared here, with
+// the map it indexes, so those writers can null it without a temporal-dead-zone hazard.
+let _meMintIdx = null, _meMintIdxAt = 0;
 
 // Mirrors of the client's own tables (Econ.gd). The hatch rolls HERE, so these must match, and a
 // mismatch shows up as a species the client cannot render rather than as a silent exploit.
@@ -6130,6 +6134,13 @@ const NFT_MINT_PAUSED = String(process.env.NFT_MINT_PAUSED ?? "0") === "1";
 // decision from minting one and the owner must be able to take it separately. OFF => nothing here
 // runs, no field is written, no route exists, and the census reads exactly what it reads today.
 const NFT_HANDOVER_ON = String(process.env.CHIK_NFT_HANDOVER ?? "0") === "1";
+// ============ THE IN-GAME MAGIC EDEN MARKETPLACE — CHIK_ME_MARKET (default OFF) ============
+// Declared HERE, with its siblings, because two pre-existing functions above (nftApplyClassification,
+// nftSettleHandover) have to know whether a listing marker is OURS before they clear it. Everything
+// else about this feature — config, cache, proxy, routes — lives in one block further down, tagged
+// "MAGIC EDEN IN-GAME MARKETPLACE". OFF => no row can ever carry `meList`, so every guard that reads
+// it is dead code and the flag-off server behaves exactly as it does today.
+const ME_MARKET_ON = String(process.env.CHIK_ME_MARKET ?? "0") === "1";
 // Mintable ORIGINS — server-witnessed births ONLY. legacy/unverified/adopted rows were never vouched;
 // minting them would launder exactly what the mint is meant to prove. Widen via env without a deploy.
 const NFT_MINT_ORIGINS = new Set(String(process.env.NFT_MINT_ORIGINS || "hatched").split(",").map(s => s.trim()).filter(Boolean));
@@ -6429,6 +6440,11 @@ function nftSettleHandover(row, to, now, dormant) {
   // new owner still advertising "listed", read `busy` from nftEligibility until the NEXT reconcile
   // five minutes later, and carried that state across a restart. The sale is the end of the listing.
   if (row.listedOffchain) row.listedOffchain = false;
+  // ...and the same for OUR OWN record of that listing. `meList` is what /nft/market/confirm writes
+  // when the player lists through the in-game marketplace; a settled sale is the end of the order, so
+  // leaving it would keep the new owner's asset marked "on the order book" forever. Absent on every
+  // row a CHIK_ME_MARKET=0 server can produce, so this line is unreachable flag-off.
+  if (row.meList) delete row.meList;
   _nftHolderObs.delete(row.id);
   const what = row.type === "mount" ? "mount" : (row.kind || row.type);
   nftNewsPush(from, { kind: "sold", id: row.id, type: row.type, sp: row.sp, cls: row.kind || null,
@@ -6457,7 +6473,14 @@ function nftApplyClassification(row, cls, now) {
       return { applied: "retired" };
     case "same":
       row.holderSince = row.holderSince || now;
-      if (row.listedOffchain) { row.listedOffchain = false; _assetsDirty = true; }   // cleared ONLY here
+      // A MAGIC EDEN LISTING DOES NOT MOVE THE ASSET. Modern ME listings use a freeze/transfer
+      // DELEGATE, not an escrow transfer — measured on live ME data, `token.owner === seller` on both
+      // a Core M2 listing and a pNFT listing — so DAS keeps reporting the SELLER and this branch reads
+      // "same" for an asset that is genuinely on the order book. Clearing here would erase the marker
+      // our own /nft/market/confirm just set, one reconcile later. While `meList` stands, the listing
+      // is ours to end (a confirmed delist, or a settled sale), not the reconcile's to guess at.
+      // Flag-off nothing can write `meList`, so this is the same expression it has always been.
+      if (row.listedOffchain && !(ME_MARKET_ON && row.meList)) { row.listedOffchain = false; _assetsDirty = true; }   // cleared ONLY here
       // A pendingHandover whose destination IS the current owner is spent evidence — the move it was
       // waiting for has happened. Nothing anywhere else ever deleted it, so it sat on the row and made
       // the new owner read `busy` from nftEligibility permanently. Flag-gated: with the migration off
@@ -7741,6 +7764,7 @@ function _nftCommitMint(row, addr, sig) {
   if (!row.edition) row.edition = nftEditionFor(row);         // sequential, write-once
   row.hatcher = row.hatcher || row.owner;                     // birth-hatcher split from current owner
   row.mint = addr;                                            // write-once — the on-chain address
+  if (_meMintIdx) _meMintIdx.set(addr, row.id);               // keep the mint->row index warm
   row.holderSince = Date.now();
   delete row.mintPending;
   _nftPendingKeys.delete(row.id);
@@ -7937,6 +7961,961 @@ app.get("/assets/nft/meta/:id", (req, res, next) => {
   res.json(out);
 });
 
+// ================= MAGIC EDEN IN-GAME MARKETPLACE — CHIK_ME_MARKET (default OFF) =================
+// The owner's ask: browse, BUY and LIST Chiki Monsters NFTs without leaving the game. Today the
+// certificate pop-up deep-links out to magiceden.io; this replaces that link with a native tab.
+//
+// THE WHOLE REASON THIS IS A BACKEND FEATURE IS THE KEY. Magic Eden's READ endpoints (collection
+// listings, stats, a wallet's tokens) are free and keyless. Its INSTRUCTION endpoints — the ones that
+// build a buy / sell / cancel transaction — require `Authorization: Bearer <ME_API_KEY>`, and that key
+// MOVES MONEY: anyone holding it can have Magic Eden generate transactions, and it is rate-limited per
+// KEY across every player at once. A key shipped inside a client build is a key given away. So:
+//   * ME_API_KEY is read from process.env AT CALL TIME, is never assigned into any response object,
+//     and every outbound error string is run through _meScrub() before it leaves this process;
+//   * the client never talks to Magic Eden. It asks Chikoria; Chikoria asks Magic Eden;
+//   * the client cannot influence a single instruction parameter that decides money. It sends
+//     {wallet, mktToken, tokenMint} and, for a buy, the price it SHOWED the player — used ONLY as a
+//     ceiling the server refuses to exceed. Seller, price, tokenATA, expiry, sellerReferral and the
+//     auction house are all rebuilt from a FRESH read of that one token's live listing;
+//   * `buyerCreatorRoyaltyPercent` is HARDCODED to 100 and never accepted from a caller. It is the
+//     buyer's choice of how much creator royalty to pay, and the honest answer is all of it;
+//   * every route is behind CHIK_ME_MARKET and `next()`s when it is off, which reproduces today's 404
+//     for a URL that has never answered — the same discipline /assets/nft/meta/:id already uses.
+//
+// WHAT ONLY A REAL KEY CAN CONFIRM, stated plainly: no instruction call has ever been made from this
+// machine. The request shapes below come from Magic Eden's published OpenAPI and their own SDK; the
+// response handling covers BOTH documented envelopes (legacy `tx` and the SDK's `v0`) and sniffs the
+// transaction bytes rather than trusting the slot it arrived in. Everything else — auth, validation,
+// caching, rate limiting, key containment, flag-off identity — is verified against a local stub that
+// speaks those shapes (me_*.mjs).
+// `Number(x) || d` turns a deliberate 0 into the default — which would silently ignore an operator
+// who set a rate-limit gap to 0 on purpose. Parse once, honestly: a finite number wins, anything else
+// falls back.
+const _meNum = (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d; };
+const ME_API_BASE = String(process.env.ME_API_BASE || "https://api-mainnet.magiceden.dev").trim().replace(/\/+$/, "");
+const ME_SYMBOL = String(process.env.ME_COLLECTION_SYMBOL || "chiki_monsters").trim();
+// The default M2 auction house — hardcoded as AUCTION_HOUSE_ADDRESS in Magic Eden's own SDK and
+// present on every live M2 listing row sampled. PINNED rather than left to their default, but always
+// overridden by the value on the live listing row we are actually transacting against.
+const ME_AUCTION_HOUSE = String(process.env.ME_AUCTION_HOUSE || "E8cU1WiRWjanGxmn96ewBgk9vPTcL6AEZ1t6F6fkgUWe").trim();
+// AMM (MMM) pool listings need a DIFFERENT instruction endpoint and a pool object we have never
+// exercised. The code path exists below; it stays OFF until someone can run it against a real pool,
+// and until then a pool listing is refused with the true reason rather than a broken transaction.
+const ME_POOL_BUY = String(process.env.ME_POOL_BUY ?? "0") === "1";
+// A PRICE IS MONEY. Both ends clamped: a fat-fingered 0 lists a legendary for nothing, and a 1e9
+// mix-up (stats.floorPrice is LAMPORTS, listing.price is SOL — a 1e9x trap) asks a player to approve
+// a billion SOL. Lamport granularity is 1e-9, so anything finer is a rounding error waiting to happen.
+const ME_PRICE_MIN_SOL = Math.max(0.000000001, _meNum(process.env.ME_PRICE_MIN_SOL, 0.01));
+const ME_PRICE_MAX_SOL = Math.max(ME_PRICE_MIN_SOL, _meNum(process.env.ME_PRICE_MAX_SOL, 5000));
+const ME_TIMEOUT_MS = Math.max(2000, _meNum(process.env.ME_TIMEOUT_MS, 9000));
+// CACHING IS NOT AN OPTIMISATION HERE, IT IS THE OUTAGE FIX. Magic Eden's documented limit is 120 QPM
+// per key, SHARED by every player at once. A per-player passthrough on a popular tab is a guaranteed
+// outage: 40 players opening the Buy tab in one minute is already a third of the budget. One cached
+// copy serves everybody, and a stale copy beats an empty tab.
+const ME_CACHE_MS = Math.max(1000, _meNum(process.env.ME_CACHE_MS, 30000));
+const ME_STATS_CACHE_MS = Math.max(1000, _meNum(process.env.ME_STATS_CACHE_MS, 60000));
+const ME_MINE_CACHE_MS = Math.max(1000, _meNum(process.env.ME_MINE_CACHE_MS, 45000));
+// The ONE read that must not be cached hard: the anti-stale-buy re-read of a single token's listing.
+// Short enough that a re-priced listing cannot slip through, long enough that a double-click does not
+// cost two calls.
+const ME_TOKEN_CACHE_MS = Math.max(0, _meNum(process.env.ME_TOKEN_CACHE_MS, 3000));
+// How long a cached copy may still be SERVED once it is past its TTL, while a refresh runs behind it.
+const ME_STALE_MS = Math.max(ME_CACHE_MS, _meNum(process.env.ME_STALE_MS, 600000));
+
+// The key. Read at call time, never held in a module-scope binding a serializer could reach, never
+// returned, never logged. `meKeyPresent()` is the only thing about it any response may ever say.
+function meKey() { return String(process.env.ME_API_KEY || "").trim(); }
+function meKeyPresent() { return meKey().length > 0; }
+// DEFENCE IN DEPTH on top of "never put it in a response": every string that came from Magic Eden and
+// is about to be handed to a player passes through here first. If the key ever appears in an upstream
+// error body (or a future refactor puts it in a URL), it is redacted before it can leave.
+function _meScrub(s) {
+  s = String(s == null ? "" : s);
+  const k = meKey();
+  if (k && k.length >= 8 && s.includes(k)) s = s.split(k).join("***");
+  return s;
+}
+
+// ---- the proxy -------------------------------------------------------------------------------
+// Branch on STATUS BEFORE PARSING. Magic Eden's 429 body is PLAIN TEXT ("You have exceeded the
+// requests in 1 min limit! Please try again soon.") with no JSON envelope at all, so an unconditional
+// res.json() throws a SyntaxError and the player is told "something went wrong" instead of "busy".
+// Cloudflare and Kong sit in front of them too, so a 5xx that is not even Magic Eden's fault is normal.
+async function meFetch(path, opts) {
+  opts = opts || {};
+  let u;
+  try {
+    u = new URL(ME_API_BASE + path);
+    const q = opts.query || {};
+    for (const k of Object.keys(q)) {
+      const v = q[k];
+      if (v === undefined || v === null || v === "") continue;
+      u.searchParams.set(k, String(v));
+    }
+  } catch (e) { return { ok: false, status: 500, code: "url", error: "the marketplace is misconfigured on this server" }; }
+  const headers = { accept: "application/json" };
+  if (opts.auth) {
+    const k = meKey();
+    // FAIL CLOSED and say so honestly. Without a key there is no buy, no list and no delist — the
+    // client falls back to the Magic Eden deep link, which is exactly today's behaviour.
+    if (!k) return { ok: false, status: 503, code: "no-key", error: "in-game trading is not switched on for this server yet — use the Magic Eden link" };
+    headers.authorization = "Bearer " + k;
+  }
+  let r;
+  try { r = await fetch(u, { headers, signal: AbortSignal.timeout(ME_TIMEOUT_MS) }); }
+  catch (e) { return { ok: false, status: 504, code: "net", error: "Magic Eden did not answer — try again in a moment" }; }
+  let text = "";
+  try { text = await r.text(); } catch (e) { text = ""; }
+  if (r.status === 429) return { ok: false, status: 429, code: "rate", error: "Magic Eden is busy right now — try again in a few seconds", retryInMs: 15000 };
+  if (r.status === 401 || r.status === 403) {
+    // The one failure an operator MUST see, and the one that must never reach a player: it means the
+    // key is missing, wrong or revoked. The key itself is not in this line.
+    console.error(`✖ Magic Eden refused our API key (HTTP ${r.status}) — check ME_API_KEY`);
+    return { ok: false, status: 503, code: "auth", error: "in-game trading is unavailable right now — use the Magic Eden link" };
+  }
+  let body = null;
+  if (text) { try { body = JSON.parse(text); } catch (e) { body = null; } }
+  if (!r.ok) {
+    // Their SDK probes data.message, then data.error, then data.error.message — so at least three
+    // error shapes exist in the wild. Take whichever is a string, scrub it, and cap it.
+    let msg = "";
+    if (body && typeof body === "object") {
+      if (typeof body.message === "string") msg = body.message;
+      else if (typeof body.error === "string") msg = body.error;
+      else if (body.error && typeof body.error.message === "string") msg = body.error.message;
+    }
+    return { ok: false, status: r.status >= 500 ? 502 : 400, code: "me",
+             error: _meScrub(msg || "Magic Eden refused that request").slice(0, 200), upstream: r.status };
+  }
+  if (body === null) return { ok: false, status: 502, code: "shape", error: "Magic Eden returned something this server could not read" };
+  return { ok: true, status: 200, body };
+}
+
+// A refilling token bucket, the ONE limiter shape this file uses for anything SHARED (as opposed to
+// the per-wallet limiter further down, which caps a person). `cap` is the burst ceiling and `perMin`
+// the steady refill, chosen together so the worst case over any rolling 60 s is cap+perMin.
+function _meBucketTake(b, cap, perMin) {
+  const now = Date.now(), dt = now - b.ts;
+  if (dt > 0) { b.tokens = Math.min(cap, b.tokens + dt / 60000 * perMin); b.ts = now; }
+  if (b.tokens < 1) return false;
+  b.tokens -= 1; return true;
+}
+// D1 — THE GLOBAL UPSTREAM BUDGET. The per-wallet limiter caps a PERSON; it cannot cap the SHARED
+// thing. Magic Eden's free READ budget is ~120/min for the WHOLE server (one egress IP, no key on the
+// read endpoints), so N throwaway wallets each making ONE uncached read exhaust it for everyone —
+// measured before this fix: 151 upstream reads from 150 zero-cost identities in 57 ms (126% of a whole
+// minute's quota, instantly). This is the missing aggregate ceiling: a token bucket over EVERY upstream
+// read, sized to sit UNDER Magic Eden's limit (burst 30 + refill 90/min => at most 120 in any 60 s
+// window). When it is spent, meCached serves the last good copy (stale) rather than a call it cannot
+// afford, so the browse tab degrades to stale-cache and never becomes an outage for honest players.
+const ME_GLOBAL_READ_PER_MIN = Math.max(1, _meNum(process.env.ME_GLOBAL_READ_PER_MIN, 90));
+const ME_GLOBAL_READ_BURST   = Math.max(1, _meNum(process.env.ME_GLOBAL_READ_BURST, 30));
+const _meGlobalRead = { tokens: ME_GLOBAL_READ_BURST, ts: Date.now() };
+function meGlobalReadTake() { return _meBucketTake(_meGlobalRead, ME_GLOBAL_READ_BURST, ME_GLOBAL_READ_PER_MIN); }
+
+// One cache entry per key, shared by every player, with SINGLE-FLIGHT (a burst of N simultaneous
+// requests for the same page costs ONE upstream call) and STALE-WHILE-REVALIDATE (a rate-limited or
+// down upstream serves the last good copy and says how old it is, instead of emptying the tab).
+const _meCache = new Map();               // key -> { at, val, inflight }
+const ME_CACHE_MAX = 300;
+async function meCached(key, ttlMs, staleMs, fn) {
+  const now = Date.now();
+  let e = _meCache.get(key);
+  if (e && e.val !== null && e.val !== undefined && (now - e.at) < ttlMs) {
+    return { val: e.val, at: e.at, stale: false, cached: true, hit: "fresh" };
+  }
+  if (!e) {
+    e = { at: 0, val: null, inflight: null };
+    _meCache.set(key, e);
+    if (_meCache.size > ME_CACHE_MAX) { let d = 50; for (const k of _meCache.keys()) { if (d-- <= 0) break; if (k !== key) _meCache.delete(k); } }
+  }
+  if (!e.inflight) {
+    // D1: before spending one of the shared upstream budget's tokens, check it is affordable. If it is
+    // not, do NOT start a fetch — fall through to whatever cached copy we have (however stale). A burst
+    // of DISTINCT keys (the attack shape — unique offsets) each tries to take a token and is bounded;
+    // a burst of the SAME key still costs one token because single-flight coalesces it below.
+    if (!meGlobalReadTake()) {
+      if (e.val !== null && e.val !== undefined) return { val: e.val, at: e.at, stale: true, cached: true, hit: "budget-stale", budget: "spent" };
+      return { val: null, at: 0, stale: false, cached: false, hit: "budget-empty", err: { status: 429, code: "budget", error: "the marketplace is busy right now — try again in a few seconds", retryInMs: 5000 } };
+    }
+    const p = (async () => { const r = await fn(); if (r && r.ok) { e.at = Date.now(); e.val = r.body; } return r; })();
+    e.inflight = p;
+    const clear = () => { if (e.inflight === p) e.inflight = null; };
+    p.then(clear, clear);
+  }
+  const inflight = e.inflight;
+  // A usable copy exists: serve it NOW and let the refresh land behind us.
+  if (e.val !== null && e.val !== undefined && (now - e.at) < staleMs) {
+    inflight.catch(() => {});
+    return { val: e.val, at: e.at, stale: (now - e.at) >= ttlMs, cached: true, hit: "stale-while-revalidate" };
+  }
+  const r = await inflight;
+  if (r && r.ok) return { val: e.val !== null ? e.val : r.body, at: e.at || Date.now(), stale: false, cached: false, hit: "miss" };
+  if (e.val !== null && e.val !== undefined) return { val: e.val, at: e.at, stale: true, cached: true, hit: "stale-on-error", warn: r && r.error };
+  return { val: null, at: 0, stale: false, cached: false, hit: "fail", err: r };
+}
+
+// PER-WALLET, not per-request and not per-IP: the shared budget is spent by PEOPLE, and a wallet is
+// the only identity here that had to be proven. Two classes — browsing is cheap and cached, an
+// instruction call is a key-bearing upstream hit every single time.
+const _meRate = new Map();                // "kind:wallet" -> { win, n, last }
+const ME_RL = Object.freeze({
+  read:  { gapMs: Math.max(0, _meNum(process.env.ME_RL_READ_GAP_MS, 700)),   perMin: Math.max(1, _meNum(process.env.ME_RL_READ_PER_MIN, 40)) },
+  write: { gapMs: Math.max(0, _meNum(process.env.ME_RL_WRITE_GAP_MS, 2500)), perMin: Math.max(1, _meNum(process.env.ME_RL_WRITE_PER_MIN, 8)) },
+});
+function meRateOk(wallet, kind) {
+  const lim = ME_RL[kind] || ME_RL.write;
+  const now = Date.now();
+  const k = kind + ":" + wallet;
+  let r = _meRate.get(k);
+  if (!r || now - r.win >= 60000) r = { win: now, n: 0, last: r ? r.last : 0 };
+  if (r.last && now - r.last < lim.gapMs) { _meRate.set(k, r); return { ok: false, retryInMs: lim.gapMs - (now - r.last), why: "too fast — give it a second" }; }
+  if (r.n >= lim.perMin) { _meRate.set(k, r); return { ok: false, retryInMs: Math.max(0, 60000 - (now - r.win)), why: "you're browsing the marketplace faster than Magic Eden allows — pause a moment" }; }
+  r.n++; r.last = now; _meRate.set(k, r);
+  if (_meRate.size > 8000) { let d = 800; for (const kk of _meRate.keys()) { if (d-- <= 0) break; if (kk !== k) _meRate.delete(kk); } }
+  return { ok: true };
+}
+
+// PROVEN identity, on every route including the read ones. `mktWallet` is the market token minted at
+// /verify against a real Phantom signature — a bare wallet address is public and proves nothing. Reads
+// the body for a POST and the query for a GET, exactly like the other mixed routes in this file.
+function _meWallet(req) {
+  const b = req.body || {}, q = req.query || {};
+  const w = String(b.wallet || q.wallet || "");
+  const t = String(b.mktToken || q.mktToken || "");
+  return mktWallet({ wallet: w, mktToken: t });
+}
+
+// ---- OUR collection is the gate --------------------------------------------------------------
+// mint address -> registry row. `_meMintIdx` itself is declared up with `assetReg` (the registry it
+// indexes) so that the three places which invalidate it — _nftCommitMint, restoreAssetReg and
+// _clearAssetReg, all of which sit ABOVE this block — can assign it without a temporal-dead-zone
+// hazard. Built lazily; dropped whenever the whole registry is rebuilt. The alternative to an index
+// is a 400,000-row scan per request.
+function _meMintIdxBuild() {
+  const m = new Map();
+  for (const r of assetReg.values()) if (r && r.mint) m.set(String(r.mint), r.id);
+  _meMintIdx = m; _meMintIdxAt = Date.now();
+  return m;
+}
+function meRowByMint(addr) {
+  addr = String(addr || "");
+  if (!addr) return null;
+  let idx = _meMintIdx || _meMintIdxBuild();
+  let id = idx.get(addr);
+  // A miss on a stale index is rebuilt ONCE and retried, so no path that sets `mint` without telling
+  // this index can produce a false "not ours".
+  if (!id && Date.now() - _meMintIdxAt > 30000) { idx = _meMintIdxBuild(); id = idx.get(addr); }
+  if (!id) return null;
+  const row = assetReg.get(id);
+  return (row && String(row.mint || "") === addr) ? row : null;
+}
+// THE ANTI-RELAY GATE. Without this, /nft/market/buy is a free, key-bearing transaction generator for
+// every NFT on Solana: a hostile client names any mint, our key builds the transaction, and the shared
+// 120 QPM budget is spent until no honest player can buy anything. The registry is the authority —
+// every asset in this collection was minted by this server and carries a row, and minted rows are
+// exempt from registry truncation (_partitionAssetRows), so a genuine one can never age out.
+function meMintGate(mint) {
+  if (!isPubkey(mint)) return { ok: false, status: 400, error: "that is not a valid asset address" };
+  const row = meRowByMint(mint);
+  if (!row) return { ok: false, status: 403, error: "that asset is not part of the Chiki Monsters collection" };
+  if (row.state === "burned") return { ok: false, status: 409, error: "that asset has been retired" };
+  return { ok: true, row };
+}
+// The in-game board's half of "a listed asset is not tradeable here". Structurally the NFT tiers
+// already cannot reach the Trading Post at all (chikimonTierBlocked refuses every legendary and Meme
+// Dynasty species, and the listing `kind` whitelist has never accepted "mount"), so this is the belt
+// to that brace — and it reuses `listedOffchain`, the flag that already means exactly this, rather
+// than inventing a second one.
+function meBoardBlocked(wallet, uid) {
+  if (!ME_MARKET_ON || !wallet || !uid) return "";
+  const r = assetReg.get(String(uid));
+  if (!r || r.owner !== wallet) return "";
+  if (r.listedOffchain) return "That one is live on the NFT marketplace right now. Delist it there first, then it can trade here.";
+  return "";
+}
+
+// ---- transaction envelope --------------------------------------------------------------------
+// Magic Eden returns a Node Buffer serialised to JSON: {"type":"Buffer","data":[12,45,...]} — NOT
+// base64, NOT base58. We hand the client base64 instead, because a 1,200-byte transaction is ~5 KB of
+// JSON integers otherwise and base64 survives JSON.stringify into a JavaScriptBridge.eval string.
+function meBufB64(v) {
+  try {
+    if (v === null || v === undefined) return null;
+    if (typeof v === "string") return v.length ? v : null;                       // already base64
+    if (Array.isArray(v)) return v.length ? Buffer.from(v).toString("base64") : null;
+    if (typeof v === "object" && Array.isArray(v.data)) return v.data.length ? Buffer.from(v.data).toString("base64") : null;
+  } catch (e) {}
+  return null;
+}
+// WHICH SLOT DID IT ARRIVE IN, AND WHAT IS IT REALLY? The published OpenAPI declares `tx` (legacy)
+// REQUIRED and has no `v0` at all; Magic Eden's own SDK reads ONLY `v0`, prefers `v0.txSigned`, and
+// throws "only versioned transactions are supported" otherwise. Both cannot be right, and which one
+// they populate for a Core M2 buy decides whether the shipped client bundle can even deserialise it.
+// So: prefer the same slot their SDK prefers, and then SNIFF THE BYTES rather than trust the slot.
+// A cosigned transaction already carries Magic Eden's signature — any client path that rebuilds it
+// from its message destroys that, so `cosigned` is reported and must be preserved.
+function meTxSniff(buf) {
+  // compact-u16 signature count, then 64 bytes per signature, then the message's first byte. A v0
+  // message's first byte has the high bit set (0x80 | version); a legacy message's never does.
+  try {
+    let i = 0, n = 0, shift = 0;
+    for (; i < 3; i++) { const b = buf[i]; n |= (b & 0x7f) << shift; shift += 7; if ((b & 0x80) === 0) { i++; break; } }
+    const off = i + n * 64;
+    if (off >= buf.length) return null;
+    return (buf[off] & 0x80) ? "v0" : "legacy";
+  } catch (e) { return null; }
+}
+function meTxOut(body) {
+  if (!body || typeof body !== "object") return null;
+  const v0 = (body.v0 && typeof body.v0 === "object") ? body.v0 : null;
+  const cands = [];
+  if (v0) { cands.push([meBufB64(v0.txSigned), "v0", true]); cands.push([meBufB64(v0.tx), "v0", false]); }
+  cands.push([meBufB64(body.txSigned), "legacy", true]);
+  cands.push([meBufB64(body.tx), "legacy", false]);
+  const pick = cands.find(c => c && c[0]);
+  if (!pick) return null;
+  let raw;
+  try { raw = Buffer.from(pick[0], "base64"); } catch (e) { return null; }
+  // A transaction that is not even the right ORDER of magnitude is a shape error, not a transaction.
+  if (raw.length < 64 || raw.length > 4096) return null;
+  const sniffed = meTxSniff(raw);
+  return {
+    b64: pick[0], slot: pick[1], cosigned: !!pick[2],
+    ver: sniffed || pick[1],            // the BYTES decide, not the slot name
+    slotVer: pick[1], sniffed, bytes: raw.length,
+    hasV0: !!v0, hasLegacy: !!(body.tx || body.txSigned),
+  };
+}
+
+// ---- image proxy -----------------------------------------------------------------------------
+// The realm runs under Cross-Origin-Embedder-Policy: require-corp, so a cross-origin image with no
+// CORP header simply does not render — Magic Eden's art sits on IPFS gateways and their own CDN with
+// no such guarantee. Proxying is the fix, and it is written so it can NEVER be an SSRF: the client
+// does not send a URL at all. It sends a key for a URL WE served it from a Magic Eden listing row,
+// and the host must also be on a fixed allowlist. An unknown key is a 404, full stop.
+const _meImg = new Map();                 // key -> { url, at }
+const ME_IMG_MAX = 4000;
+// The BYTES, cached. Without this the proxy is an amplifier: anyone who knows a key can make us
+// re-fetch that upstream image on every request. The key space is ours and bounded, but the fetch
+// budget is not, so the fetch happens at most once per TTL per image.
+const _meImgBody = new Map();             // key -> { ct, buf, at }
+const ME_IMG_BODY_MAX = 64;               // entries; each capped at ME_IMG_BYTES_MAX below
+const ME_IMG_TTL_MS = 600000;
+const ME_IMG_BYTES_MAX = 6 * 1024 * 1024;
+// D2 — the image proxy is UNAUTHENTICATED (an <img> tag cannot carry a market token) and was otherwise
+// unbounded: with only a 64-entry body cache, an attacker cycling 65+ known keys thrashes it and forces
+// an upstream gateway fetch on EVERY request. Bounded GLOBALLY (per-IP is worthless here — Render
+// terminates TLS so every request shares one remoteAddress, and x-forwarded-for is client-writable):
+//   * a REQUEST bucket so the route cannot be hammered into a bandwidth sink / open image CDN, and
+//   * a separate UPSTREAM-FETCH bucket so cache-miss thrash cannot amplify against the IPFS/CDN hosts.
+const ME_IMG_REQ_PER_MIN   = Math.max(1, _meNum(process.env.ME_IMG_REQ_PER_MIN, 900));
+const ME_IMG_REQ_BURST     = Math.max(1, _meNum(process.env.ME_IMG_REQ_BURST, 200));
+const ME_IMG_FETCH_PER_MIN = Math.max(1, _meNum(process.env.ME_IMG_FETCH_PER_MIN, 90));
+const ME_IMG_FETCH_BURST   = Math.max(1, _meNum(process.env.ME_IMG_FETCH_BURST, 30));
+const _meImgReq   = { tokens: ME_IMG_REQ_BURST, ts: Date.now() };
+const _meImgFetch = { tokens: ME_IMG_FETCH_BURST, ts: Date.now() };
+const ME_IMG_HOSTS = new Set(String(process.env.ME_IMG_HOSTS ||
+  "me-lp.mypinata.cloud,img-cdn.magiceden.dev,bafybeigd.ipfs.nftstorage.link,nftstorage.link,ipfs.io,cloudflare-ipfs.com,arweave.net,gateway.irys.xyz,gateway.pinata.cloud")
+  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean));
+function meImgAllowedHost(h) {
+  h = String(h || "").toLowerCase();
+  if (ME_IMG_HOSTS.has(h)) return true;
+  for (const a of ME_IMG_HOSTS) if (a.startsWith("*.") && h.endsWith(a.slice(1))) return true;
+  if (h.endsWith(".ipfs.nftstorage.link") || h.endsWith(".ipfs.dweb.link")) return true;
+  return false;
+}
+function meImgRef(url) {
+  url = String(url || "");
+  if (!url || url.length > 512) return null;
+  let u;
+  try { u = new URL(url); } catch (e) { return null; }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+  if (!meImgAllowedHost(u.hostname)) return null;
+  const key = crypto.createHash("sha1").update(u.href).digest("hex").slice(0, 20);
+  if (!_meImg.has(key)) {
+    _meImg.set(key, { url: u.href, at: Date.now() });
+    if (_meImg.size > ME_IMG_MAX) { let d = 500; for (const k of _meImg.keys()) { if (d-- <= 0) break; if (k !== key) _meImg.delete(k); } }
+  }
+  return "/nft/market/img/" + key;
+}
+
+// ---- card + row shaping ----------------------------------------------------------------------
+// Only what the client needs to DRAW A CARD, plus the registry's own truth about the creature — which
+// is better than Magic Eden's metadata (it knows the species, the tier and the edition) and is the
+// reason a card can say "Legendary · Galador #3" rather than echoing a name string.
+function meCardFor(lrow) {
+  if (!lrow || typeof lrow !== "object") return null;
+  const tok = (lrow.token && typeof lrow.token === "object") ? lrow.token : {};
+  const mint = String(lrow.tokenMint || tok.mintAddress || "");
+  if (!isPubkey(mint)) return null;
+  const price = Number(lrow.price);
+  const src = String(lrow.listingSource || "M2");
+  const reg = meRowByMint(mint);
+  // extra.img is Magic Eden's own thumbnail and was an EMPTY STRING on a live sample — fall back to
+  // the token image rather than rendering a hole.
+  const img = String((lrow.extra && lrow.extra.img) || tok.image || "");
+  const lam = lrow.priceInfo && lrow.priceInfo.solPrice ? String(lrow.priceInfo.solPrice.rawAmount || "") : "";
+  return {
+    mint,
+    // priceSol is a SOL float; priceLamports is the exact integer. Both, deliberately: the 1e9
+    // confusion between these two is the single most expensive bug available in this feature.
+    priceSol: (Number.isFinite(price) && price > 0) ? price : null,
+    priceLamports: /^[0-9]{1,20}$/.test(lam) ? lam : null,
+    seller: isPubkey(String(lrow.seller || "")) ? String(lrow.seller) : null,
+    source: src,
+    // Honest per-card answer to "can the in-game Buy button do this one?"
+    buyable: (src === "M2" && !!String(lrow.auctionHouse || "")) || (ME_POOL_BUY && src === "MMM"),
+    img: img ? meImgRef(img) : null,
+    rank: (lrow.rarity && lrow.rarity.meInstant && Number(lrow.rarity.meInstant.rank)) || null,
+    name: String(tok.name || (reg ? nftAssetName(reg) : "")).slice(0, 64) || null,
+    // the registry's half — null when we do not know the asset, never invented
+    known: !!reg,
+    id: reg ? reg.id : null,
+    type: reg ? reg.type : null,
+    sp: reg ? reg.sp : null,
+    kind: reg ? (reg.kind || null) : null,
+    edition: reg ? (reg.edition || null) : null,
+    lvl: reg ? (reg.lvl || null) : null,
+    mine: null,   // filled per-caller below
+  };
+}
+
+// A small, bounded record of the transactions this server handed out, so /confirm can tell a claimed
+// signature apart from an invented one and an operator can see what the key was spent on. Memory only,
+// never persisted, never a source of truth about the chain.
+const _meIntents = new Map();             // "wallet:mint" -> { action, priceSol, at }
+function meIntentRecord(wallet, mint, action, priceSol) {
+  _meIntents.set(wallet + ":" + mint, { action, priceSol: priceSol || null, at: Date.now() });
+  if (_meIntents.size > 5000) { let d = 500; for (const k of _meIntents.keys()) { if (d-- <= 0) break; _meIntents.delete(k); } }
+}
+
+// B1 — THE CAPABILITY GATE. THE most important line in this feature: a market must never sell what it
+// cannot deliver. With CHIK_ME_MARKET on but CHIK_NFT_HANDOVER off (the staged-rollout DEFAULT), /buy
+// built a real SOL purchase for a creature that can NEVER migrate to the buyer in-game — the buyer paid
+// and the seller kept the creature forever (measured: buy -> 200 with a signable tx, then 6 reconcile
+// passes + the 60 s dwell and the creature never moved, zero notices). So the whole trading surface is
+// "capable" ONLY when BOTH flags are on. Every money/browse route refuses when it is not; the single
+// exception is GET /nft/market/config, which stays reachable precisely to TELL the client the market is
+// closed (`capable:false`) so it falls back to the Magic Eden deep link instead of a dead Buy button.
+const ME_MARKET_CAPABLE = ME_MARKET_ON && NFT_HANDOVER_ON;
+if (ME_MARKET_ON && !NFT_HANDOVER_ON)
+  console.warn("✖ CHIK_ME_MARKET=1 but CHIK_NFT_HANDOVER=0 — the in-game marketplace stays CLOSED (a purchase could not deliver the creature). Config reports capable:false; buy/list/browse refuse.");
+function meCapableGuard(res) {
+  if (ME_MARKET_CAPABLE) return true;
+  res.status(409).json({ error: "the in-game marketplace is not open on this server yet — use the Magic Eden link", capable: false, reason: "handover-off" });
+  return false;
+}
+
+// ---- routes ----------------------------------------------------------------------------------
+// Every one `next()`s when CHIK_ME_MARKET is off, which lands on Express's own finalhandler and
+// reproduces, byte for byte, the 404 these URLs return today.
+
+// BROWSE. One shared cached copy of the collection's live listings, plus the collection stats, with a
+// monotonic `asOf` so the client can say "prices as of 12s ago" instead of implying live.
+app.get("/nft/market/listings", async (req, res, next) => {
+  if (!ME_MARKET_ON) return next();
+  if (!meCapableGuard(res)) return;                          // B1: no browse into a market that can't deliver
+  const wallet = _meWallet(req);
+  if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
+  const rl = meRateOk(wallet, "read");
+  if (!rl.ok) return res.status(429).json({ error: rl.why, retryInMs: rl.retryInMs });
+  // Magic Eden does not reliably honour `limit` (limit=20 was observed returning 40 rows and 85 rows
+  // on different collections), so the page is re-sliced HERE and pagination never assumes rows<=limit.
+  const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 40));
+  const offset = Math.max(0, Math.min(10000, Number(req.query.offset) || 0));
+  const c = await meCached(`listings:${offset}:${limit}`, ME_CACHE_MS, ME_STALE_MS,
+    () => meFetch(`/v2/collections/${encodeURIComponent(ME_SYMBOL)}/listings`, { query: { offset, limit } }));
+  if (!c.val) {
+    const e = c.err || {};
+    return res.status(e.status === 429 ? 429 : 503).json({ error: e.error || "the marketplace is unreachable right now", retryInMs: e.retryInMs || 5000 });
+  }
+  // Stats are a NICE-TO-HAVE and must never fail the tab. floorPrice is in LAMPORTS and the key is
+  // ABSENT ENTIRELY when nothing is listed (our collection's live answer today is
+  // {"symbol":"chiki_monsters","listedCount":0}) — so it is has-key checked, never read as 0.
+  const s = await meCached("stats", ME_STATS_CACHE_MS, ME_STALE_MS,
+    () => meFetch(`/v2/collections/${encodeURIComponent(ME_SYMBOL)}/stats`, {}));
+  const stats = (s.val && typeof s.val === "object") ? s.val : null;
+  const floorSol = (stats && Object.hasOwn(stats, "floorPrice") && Number.isFinite(Number(stats.floorPrice)))
+    ? Number(stats.floorPrice) / 1e9 : null;
+  const raw = Array.isArray(c.val) ? c.val : [];
+  const rows = [];
+  for (const lr of raw.slice(0, limit)) {
+    const card = meCardFor(lr);
+    if (!card) continue;
+    card.mine = !!(card.seller && card.seller === wallet);
+    rows.push(card);
+  }
+  const now = Date.now();
+  res.json({
+    ok: true, symbol: ME_SYMBOL, rows, count: rows.length, offset, limit,
+    // `next` is only offered when the upstream actually filled the page — see the limit note above.
+    more: raw.length >= limit, asOf: c.at, ageMs: Math.max(0, now - c.at), stale: !!c.stale, cached: !!c.cached,
+    floorSol, listedCount: (stats && Number.isFinite(Number(stats.listedCount))) ? Number(stats.listedCount) : null,
+    statsAsOf: s.at || null,
+    // The honest one-word answer to "can the Buy button work at all right now".
+    tradingReady: meKeyPresent(), poolBuy: ME_POOL_BUY,
+  });
+});
+
+// The image behind a card. The client never sends a URL — only a key for one we served it.
+app.get("/nft/market/img/:key", async (req, res, next) => {
+  if (!ME_MARKET_ON) return next();
+  // D2: bound the unauthenticated proxy globally. Inert when the market is not capable — no card is
+  // ever built (listings is gated), so `_meImg` is empty and every key 404s anyway.
+  if (!_meBucketTake(_meImgReq, ME_IMG_REQ_BURST, ME_IMG_REQ_PER_MIN)) return res.status(429).json({ error: "too many image requests — slow down", retryInMs: 2000 });
+  const key = String(req.params?.key || "").slice(0, 40);
+  const rec = _meImg.get(key);
+  if (!rec) return res.status(404).json({ error: "no such image" });
+  // The reason this proxy exists at all: COEP:require-corp needs a CORP header on every subresource.
+  const serve = (ct, buf, cached) => {
+    res.set("content-type", ct);
+    res.set("cross-origin-resource-policy", "cross-origin");
+    res.set("cache-control", "public, max-age=86400");
+    res.set("x-chiki-img-cache", cached ? "hit" : "miss");
+    res.send(buf);
+  };
+  const hot = _meImgBody.get(key);
+  if (hot && Date.now() - hot.at < ME_IMG_TTL_MS) return serve(hot.ct, hot.buf, true);
+  // D2: a cache MISS is the only path that touches an upstream gateway, so bound those separately —
+  // body-cache thrash (65+ distinct keys against a 64-entry cache) cannot turn this into an amplifier.
+  if (!_meBucketTake(_meImgFetch, ME_IMG_FETCH_BURST, ME_IMG_FETCH_PER_MIN)) return res.status(503).json({ error: "image is warming up — try again", retryInMs: 2000 });
+  let r;
+  try { r = await fetch(rec.url, { signal: AbortSignal.timeout(ME_TIMEOUT_MS) }); }
+  catch (e) { return res.status(504).json({ error: "image is not available" }); }
+  if (!r.ok) return res.status(502).json({ error: "image is not available" });
+  const ct = String(r.headers.get("content-type") || "");
+  if (!/^image\//i.test(ct)) return res.status(415).json({ error: "that is not an image" });
+  let buf;
+  try { buf = Buffer.from(await r.arrayBuffer()); } catch (e) { return res.status(502).json({ error: "image is not available" }); }
+  if (buf.length > ME_IMG_BYTES_MAX) return res.status(413).json({ error: "image is too large" });
+  const ctype = ct.split(";")[0];
+  _meImgBody.set(key, { ct: ctype, buf, at: Date.now() });
+  if (_meImgBody.size > ME_IMG_BODY_MAX) { let d = 16; for (const k of _meImgBody.keys()) { if (d-- <= 0) break; if (k !== key) _meImgBody.delete(k); } }
+  serve(ctype, buf, false);
+});
+
+// WHAT CAN I LIST? The registry is the authority for what the game thinks a wallet owns; Magic Eden's
+// wallet read is a cross-check that is allowed to fail without breaking the picker.
+app.get("/nft/market/mine", async (req, res, next) => {
+  if (!ME_MARKET_ON) return next();
+  if (!meCapableGuard(res)) return;                          // B1
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const wallet = _meWallet(req);
+  if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
+  const rl = meRateOk(wallet, "read");
+  if (!rl.ok) return res.status(429).json({ error: rl.why, retryInMs: rl.retryInMs });
+  const rows = [];
+  for (const id of (assetsByOwner.get(wallet) || [])) {
+    const r = assetReg.get(id);
+    if (!r || r.state !== "active") continue;
+    if (!nftMintableKind(r)) continue;                     // only the tiers that can BE an NFT at all
+    const el = nftEligibility(r, wallet);
+    rows.push({
+      id: r.id, type: r.type, sp: r.sp, kind: r.kind || null, lvl: r.lvl || null,
+      edition: r.edition || null, mint: r.mint || null, minted: !!r.mint,
+      // "mintable" answers the certificate button; "listable" answers this tab's button.
+      mintable: el.code === "ok" && !r.mint, mintBlockedBy: (el.code === "ok" || r.mint) ? null : el.code,
+      listable: !!r.mint && !r.listedOffchain && !r.pendingHandover && (r.gameStatus ?? "good") === "good",
+      listed: !!r.listedOffchain,
+      priceSol: (r.meList && Number.isFinite(Number(r.meList.price))) ? Number(r.meList.price) : null,
+      listedAt: (r.meList && Number(r.meList.at)) || null,
+      pendingHandover: !!r.pendingHandover,
+    });
+  }
+  rows.sort((a, b) => (b.minted ? 1 : 0) - (a.minted ? 1 : 0) || String(a.sp).localeCompare(String(b.sp)));
+  // Magic Eden's own view of the wallet. Cached per wallet; `listStatus` lets the picker grey out an
+  // asset already listed from ME's website without a second call. NEVER authoritative — if this read
+  // fails the tab still works off the registry and says `meRead:false` rather than lying.
+  const c = await meCached(`mine:${wallet}`, ME_MINE_CACHE_MS, ME_STALE_MS,
+    () => meFetch(`/v2/wallets/${encodeURIComponent(wallet)}/tokens`, { query: { collection_symbol: ME_SYMBOL, limit: 500 } }));
+  const meRows = Array.isArray(c.val) ? c.val : null;
+  if (meRows) {
+    const byMint = new Map();
+    for (const t of meRows) if (t && isPubkey(String(t.mintAddress || ""))) byMint.set(String(t.mintAddress), t);
+    for (const row of rows) {
+      if (!row.mint) continue;
+      const t = byMint.get(row.mint);
+      row.onChainSeen = !!t;
+      if (t) {
+        row.meListed = String(t.listStatus || "") === "listed";
+        if (row.meListed && Number.isFinite(Number(t.price)) && Number(t.price) > 0 && !row.priceSol) row.priceSol = Number(t.price);
+        // ME's own row is where tokenAccount comes from for a sell — never derived, never guessed.
+        row.tokenAccount = isPubkey(String(t.tokenAddress || "")) ? String(t.tokenAddress) : null;
+      }
+    }
+  }
+  res.json({ ok: true, wallet, rows, count: rows.length, meRead: !!meRows,
+             asOf: c.at || Date.now(), ageMs: c.at ? Math.max(0, Date.now() - c.at) : null, stale: !!c.stale,
+             tradingReady: meKeyPresent(), priceMinSol: ME_PRICE_MIN_SOL, priceMaxSol: ME_PRICE_MAX_SOL });
+});
+
+// BUY. The client sends {wallet, mktToken, tokenMint, maxPriceSol} and NOTHING ELSE that touches money.
+app.post("/nft/market/buy", async (req, res, next) => {
+  if (!ME_MARKET_ON) return next();
+  if (!meCapableGuard(res)) return;                          // B1: THE headline — no buy the game can't deliver
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const wallet = _meWallet(req);
+  if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
+  const rl = meRateOk(wallet, "write");
+  if (!rl.ok) return res.status(429).json({ error: rl.why, retryInMs: rl.retryInMs });
+  const mint = String(req.body?.tokenMint || "").slice(0, 64);
+  const gate = meMintGate(mint);
+  if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+  if (gate.row.owner === wallet) return res.status(409).json({ error: "that one is already yours" });
+  // THE CEILING. A Phantom approval dialog is not a price display anybody reads carefully, so the
+  // price the player was SHOWN comes up with the request and the server refuses to build a purchase
+  // above it. It is never an input to the instruction — only a veto on one.
+  // B5: the ceiling is money — validate it as a REAL number (not Number()-coerced from a string or a
+  // one-element array), then bind it with the server's OWN independent ceiling regardless of what the
+  // client asserts. A modified client sending 1e12 is clamped to ME_PRICE_MAX_SOL; the client's claim
+  // can only ever LOWER the ceiling, never raise it past the server's, so it can never wave a runaway
+  // live price through.
+  const rawMax = req.body?.maxPriceSol;
+  if (typeof rawMax !== "number" || !Number.isFinite(rawMax) || rawMax <= 0) return res.status(400).json({ error: "the price you were shown is required (as a number), so the server can refuse to overpay" });
+  const maxSol = Math.min(rawMax, ME_PRICE_MAX_SOL);
+  // ANTI-STALE: re-read THIS token's live listing right now and rebuild every parameter from it.
+  // STALE IS NOT GOOD ENOUGH HERE. Everywhere else a cached copy beats an empty tab; on the buy path
+  // it is the difference between the price the player approves and the price they were quoted, so a
+  // read that could not be refreshed REFUSES rather than serving the last one it happened to hold.
+  const lr = await meCached(`tok:${mint}`, ME_TOKEN_CACHE_MS, ME_TOKEN_CACHE_MS,
+    () => meFetch(`/v2/tokens/${encodeURIComponent(mint)}/listings`, {}));
+  if (!lr.val || lr.stale) {
+    const e = lr.err || {};
+    return res.status(e.status === 429 ? 429 : 503).json({ error: e.error || "could not check that listing right now — try again", retryInMs: e.retryInMs || 5000, stale: !!lr.stale });
+  }
+  const live = (Array.isArray(lr.val) ? lr.val : [])
+    .filter(x => x && Number.isFinite(Number(x.price)) && Number(x.price) > 0)
+    .sort((a, b) => Number(a.price) - Number(b.price))[0];
+  if (!live) return res.status(409).json({ error: "that one is not on the marketplace any more" });
+  const priceSol = Number(live.price);
+  if (priceSol > ME_PRICE_MAX_SOL) return res.status(409).json({ error: "that listing's price is outside what this server will transact", priceSol });
+  // B7: symmetry with /list's floor. A dust listing (below the server minimum) is the shape of a scam
+  // or a mis-price — refuse to transact it rather than let a player click through something that looks
+  // free but is bait.
+  if (priceSol < ME_PRICE_MIN_SOL) return res.status(409).json({ error: `that listing is priced below what this server will transact (${ME_PRICE_MIN_SOL} SOL) — treat it as a scam`, priceSol, dust: true });
+  if (priceSol > maxSol + 1e-9) return res.status(409).json({ error: `the price changed — it is ${priceSol} SOL now`, priceSol, changed: true });
+  const seller = String(live.seller || "");
+  if (!isPubkey(seller)) return res.status(502).json({ error: "that listing is missing its seller — refresh and try again" });
+  if (seller === wallet) return res.status(409).json({ error: "that is your own listing" });
+  const src = String(live.listingSource || "M2");
+  const ah = String(live.auctionHouse || "");
+  let r;
+  if (src === "MMM" || !ah) {
+    // AN AMM POOL LISTING IS A DIFFERENT PURCHASE. buy_now cannot fulfil one — it would build a
+    // transaction against an auction house that holds nothing. Measured on live Metaplex Core
+    // collections: 40/40 and 85/85 rows listingSource="MMM" with auctionHouse=="". OFF by default
+    // because nobody here has ever executed one; refused with the true reason, not a broken tx.
+    if (!ME_POOL_BUY) return res.status(409).json({ error: "that one is listed in a Magic Eden pool — this build can't buy those in-game yet, use the Magic Eden link", source: src, pool: true });
+    const pool = String(live.pdaAddress || "");
+    if (!isPubkey(pool)) return res.status(409).json({ error: "that pool listing is missing its pool address", pool: true });
+    const pr = await meCached(`pool:${mint}`, ME_TOKEN_CACHE_MS, ME_TOKEN_CACHE_MS,
+      () => meFetch(`/v2/mmm/token/${encodeURIComponent(mint)}/pools`, { query: { limit: 1 } }));
+    const p0 = (pr.val && Array.isArray(pr.val.results)) ? pr.val.results[0] : null;
+    const bp = p0 && Number.isFinite(Number(p0.buysideCreatorRoyaltyBp)) ? Number(p0.buysideCreatorRoyaltyBp) : null;
+    if (bp === null) return res.status(503).json({ error: "could not read that pool's terms — use the Magic Eden link", pool: true });
+    r = await meFetch("/v2/instructions/mmm/sol-fulfill-sell", { auth: true, query: {
+      pool: String((p0 && p0.poolKey) || pool), assetAmount: 1,
+      maxPaymentAmount: Math.min(maxSol, priceSol),      // a curve-priced pool CAN move under us
+      buysideCreatorRoyaltyBp: bp, buyer: wallet, assetMint: mint,
+    } });
+  } else {
+    r = await meFetch("/v2/instructions/buy_now", { auth: true, query: {
+      buyer: wallet,
+      seller,
+      tokenMint: mint,
+      // FOR METAPLEX CORE THE "ATA" IS THE ASSET ADDRESS. Taken verbatim from Magic Eden's own listing
+      // row (tokenAddress == tokenMint on every live Core row sampled) — never derived as an ATA.
+      tokenATA: isPubkey(String(live.tokenAddress || "")) ? String(live.tokenAddress) : mint,
+      price: priceSol,                                    // SOL float, from the FRESH row
+      // Live rows carry expiry:-1 and their SDK sends `sellerExpiry: params.sellerExpiry || -1`.
+      // Echo the row; do NOT substitute 0, which means "no expiry" and is a different order.
+      sellerExpiry: Number.isFinite(Number(live.expiry)) ? Number(live.expiry) : -1,
+      auctionHouseAddress: ah || ME_AUCTION_HOUSE,
+      sellerReferral: isPubkey(String(live.sellerReferral || "")) ? String(live.sellerReferral) : undefined,
+      // HARDCODED, NEVER FROM THE CLIENT. This is the buyer choosing what fraction of the creator
+      // royalty to pay; a passthrough (or a lazy default of 0) pays the creator nothing.
+      buyerCreatorRoyaltyPercent: 100,
+    } });
+  }
+  if (!r.ok) return res.status(r.status).json({ error: r.error, retryInMs: r.retryInMs || undefined });
+  const tx = meTxOut(r.body);
+  if (!tx) return res.status(502).json({ error: "Magic Eden returned a transaction this server could not read" });
+  meIntentRecord(wallet, mint, "buy", priceSol);
+  res.json({ ok: true, action: "buy", tokenMint: mint, priceSol, seller, source: src,
+             tx: tx.b64, ver: tx.ver, cosigned: tx.cosigned, bytes: tx.bytes,
+             envelope: { slot: tx.slotVer, sniffed: tx.sniffed, hasV0: tx.hasV0, hasLegacy: tx.hasLegacy },
+             listingAsOf: lr.at || Date.now() });
+});
+
+// LIST. {wallet, mktToken, tokenMint, priceSol}
+app.post("/nft/market/list", async (req, res, next) => {
+  if (!ME_MARKET_ON) return next();
+  if (!meCapableGuard(res)) return;                          // B1
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const wallet = _meWallet(req);
+  if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
+  const rl = meRateOk(wallet, "write");
+  if (!rl.ok) return res.status(429).json({ error: rl.why, retryInMs: rl.retryInMs });
+  const mint = String(req.body?.tokenMint || "").slice(0, 64);
+  const gate = meMintGate(mint);
+  if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+  const row = gate.row;
+  // THE REGISTRY IS THE AUTHORITY on who owns what in this game. A caller cannot list somebody else's
+  // creature even with a perfectly valid market token of their own.
+  if (row.owner !== wallet) return res.status(403).json({ error: "the registry says this wallet does not own that asset" });
+  if (row.state !== "active") return res.status(409).json({ error: `that asset is ${row.state}` });
+  if ((row.gameStatus ?? "good") !== "good") return res.status(409).json({ error: "that asset is flagged and cannot be listed" });
+  if (row.pendingHandover) return res.status(409).json({ error: "that asset has a transfer settling — try again shortly" });
+  if (row.listedOffchain) return res.status(409).json({ error: "that one is already listed — delist it first", listed: true });
+  // A PRICE IS MONEY. Finite, positive, inside the clamp, and snapped to lamport granularity so a
+  // float tail cannot become a price nobody meant to type.
+  // B4: a price is money — it must be a REAL JS number, not a string or a one-element array that
+  // Number() would silently coerce (Number([1]) === 1 lists a legendary for 1 SOL; Number("0x10") === 16
+  // lists it at sixteen). Reject anything that is not `typeof === "number"` and finite BEFORE any
+  // coercion or clamp.
+  const asked = req.body?.priceSol;
+  if (typeof asked !== "number" || !Number.isFinite(asked) || asked <= 0) return res.status(400).json({ error: "give a price in SOL (a number)" });
+  const priceSol = Math.round(asked * 1e9) / 1e9;
+  if (priceSol < ME_PRICE_MIN_SOL) return res.status(400).json({ error: `the lowest price this server will list is ${ME_PRICE_MIN_SOL} SOL`, priceMinSol: ME_PRICE_MIN_SOL });
+  if (priceSol > ME_PRICE_MAX_SOL) return res.status(400).json({ error: `the highest price this server will list is ${ME_PRICE_MAX_SOL} SOL`, priceMaxSol: ME_PRICE_MAX_SOL });
+  // tokenAccount comes from Magic Eden's OWN row for this wallet, never from an ATA derivation. The
+  // same read doubles as an on-chain ownership cross-check; if it fails we proceed on the registry's
+  // word (the game's authority) and say which one we used.
+  const c = await meCached(`mine:${wallet}`, ME_MINE_CACHE_MS, ME_STALE_MS,
+    () => meFetch(`/v2/wallets/${encodeURIComponent(wallet)}/tokens`, { query: { collection_symbol: ME_SYMBOL, limit: 500 } }));
+  const meRows = Array.isArray(c.val) ? c.val : null;
+  // B6: FAIL CLOSED. The Magic Eden wallet read is our only INDEPENDENT confirmation that this wallet
+  // really holds the asset on chain. The old behaviour proceeded on the registry's word alone when the
+  // read failed (ownerCheck="registry-only", 200) — a compromised/desynced registry row could then list
+  // an asset the wallet does not hold. If we cannot confirm it, we do NOT build a list instruction; we
+  // degrade to an honest "can't confirm ownership right now, try again".
+  if (!meRows) return res.status(503).json({ error: "can't confirm you hold that asset on Magic Eden right now — try again in a moment", ownerCheck: "unconfirmed", retryInMs: 5000 });
+  let tokenAccount = mint, accSrc = "asset-address (Core)", ownerCheck = "magic-eden";
+  const t = meRows.find(x => x && String(x.mintAddress || "") === mint);
+  if (!t) return res.status(409).json({ error: "Magic Eden does not see that asset in your wallet yet — if it just arrived, give it a minute" });
+  if (String(t.listStatus || "") === "listed") return res.status(409).json({ error: "Magic Eden already has that one listed — delist it first", listed: true });
+  if (isPubkey(String(t.tokenAddress || ""))) { tokenAccount = String(t.tokenAddress); accSrc = "magic-eden row"; }
+  const r = await meFetch("/v2/instructions/sell", { auth: true, query: {
+    seller: wallet, tokenMint: mint, tokenAccount, price: priceSol,
+    auctionHouseAddress: ME_AUCTION_HOUSE,
+    expiry: -1,                                          // what their SDK sends, and what live rows read back
+  } });
+  if (!r.ok) return res.status(r.status).json({ error: r.error, retryInMs: r.retryInMs || undefined });
+  const tx = meTxOut(r.body);
+  if (!tx) return res.status(502).json({ error: "Magic Eden returned a transaction this server could not read" });
+  meIntentRecord(wallet, mint, "list", priceSol);
+  res.json({ ok: true, action: "list", tokenMint: mint, priceSol, id: row.id,
+             tx: tx.b64, ver: tx.ver, cosigned: tx.cosigned, bytes: tx.bytes,
+             envelope: { slot: tx.slotVer, sniffed: tx.sniffed, hasV0: tx.hasV0, hasLegacy: tx.hasLegacy },
+             tokenAccountSource: accSrc, ownerCheck });
+});
+
+// DELIST. A cancel is a cancel of ONE order, so the price, expiry and referral are part of that
+// order's identity — re-read them live and echo them, never a remembered price.
+app.post("/nft/market/delist", async (req, res, next) => {
+  if (!ME_MARKET_ON) return next();
+  if (!meCapableGuard(res)) return;                          // B1
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const wallet = _meWallet(req);
+  if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
+  const rl = meRateOk(wallet, "write");
+  if (!rl.ok) return res.status(429).json({ error: rl.why, retryInMs: rl.retryInMs });
+  const mint = String(req.body?.tokenMint || "").slice(0, 64);
+  const gate = meMintGate(mint);
+  if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+  const row = gate.row;
+  if (row.owner !== wallet) return res.status(403).json({ error: "the registry says this wallet does not own that asset" });
+  // Same rule as the buy path: a cancel names ONE order by its price, so a stale copy could cancel an
+  // order that no longer exists at that price. Refuse instead.
+  const lr = await meCached(`tok:${mint}`, ME_TOKEN_CACHE_MS, ME_TOKEN_CACHE_MS,
+    () => meFetch(`/v2/tokens/${encodeURIComponent(mint)}/listings`, {}));
+  if (!lr.val || lr.stale) {
+    const e = lr.err || {};
+    return res.status(e.status === 429 ? 429 : 503).json({ error: e.error || "could not check that listing right now — try again", retryInMs: e.retryInMs || 5000, stale: !!lr.stale });
+  }
+  const live = (Array.isArray(lr.val) ? lr.val : []).find(x => x && String(x.seller || "") === wallet && Number(x.price) > 0);
+  if (!live) {
+    // GRANDFATHERING / SELF-HEAL: nothing on the book means nothing to cancel. If our own marker says
+    // otherwise, the marker is what is wrong — clear it rather than leave the creature stuck.
+    if (row.listedOffchain || row.meList) {
+      row.listedOffchain = false; if (row.meList) delete row.meList;
+      regEvent(row, "me_delisted", { why: "not-on-book" });
+      _assetsDirty = true; try { await saveAssetLedger(true); } catch (e) {}
+      return res.json({ ok: true, action: "delist", tokenMint: mint, alreadyOff: true, tx: null,
+                        message: "That one is not on the marketplace — its in-game listing marker has been cleared." });
+    }
+    return res.status(409).json({ error: "you have no live listing for that one" });
+  }
+  const r = await meFetch("/v2/instructions/sell_cancel", { auth: true, query: {
+    seller: wallet, tokenMint: mint,
+    tokenAccount: isPubkey(String(live.tokenAddress || "")) ? String(live.tokenAddress) : mint,
+    price: Number(live.price),                            // the LIVE price — part of the order's identity
+    auctionHouseAddress: String(live.auctionHouse || "") || ME_AUCTION_HOUSE,
+    sellerReferral: isPubkey(String(live.sellerReferral || "")) ? String(live.sellerReferral) : undefined,
+    expiry: Number.isFinite(Number(live.expiry)) ? Number(live.expiry) : -1,
+  } });
+  if (!r.ok) return res.status(r.status).json({ error: r.error, retryInMs: r.retryInMs || undefined });
+  const tx = meTxOut(r.body);
+  if (!tx) return res.status(502).json({ error: "Magic Eden returned a transaction this server could not read" });
+  meIntentRecord(wallet, mint, "delist", Number(live.price));
+  res.json({ ok: true, action: "delist", tokenMint: mint, priceSol: Number(live.price), id: row.id,
+             tx: tx.b64, ver: tx.ver, cosigned: tx.cosigned, bytes: tx.bytes,
+             envelope: { slot: tx.slotVer, sniffed: tx.sniffed, hasV0: tx.hasV0, hasLegacy: tx.hasLegacy } });
+});
+
+// CONFIRM. The client broadcast a transaction; tell the server so the registry catches up promptly
+// instead of waiting up to five minutes for the reconcile.
+//
+// WHAT THIS ROUTE WILL NEVER DO: move an asset between wallets. A buyer's claim is not a settlement.
+// Ownership moves only through reconcileNftOwners' two-read + dwell evidence, exactly as it does
+// today; all a confirmed buy does here is ASK that loop to run sooner.
+const _meRpcAt = { last: 0 };
+async function meSigStatus(sig) {
+  // Best-effort chain read. A failure is "I cannot see yet", never "it did not happen".
+  try {
+    const r = await fetch(RPC_URL, { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: "mesig", method: "getSignatureStatuses", params: [[sig], { searchTransactionHistory: true }] }),
+      signal: AbortSignal.timeout(ME_TIMEOUT_MS) });
+    const j = await r.json();
+    const v = j && j.result && Array.isArray(j.result.value) ? j.result.value[0] : null;
+    if (!v) return { seen: false, ok: false };
+    return { seen: true, ok: !v.err, status: String(v.confirmationStatus || "") };
+  } catch (e) { return { seen: false, ok: false, unreadable: true }; }
+}
+app.post("/nft/market/confirm", async (req, res, next) => {
+  if (!ME_MARKET_ON) return next();
+  if (!meCapableGuard(res)) return;                          // B1
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const wallet = _meWallet(req);
+  if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
+  const rl = meRateOk(wallet, "write");
+  if (!rl.ok) return res.status(429).json({ error: rl.why, retryInMs: rl.retryInMs });
+  const mint = String(req.body?.tokenMint || "").slice(0, 64);
+  const gate = meMintGate(mint);
+  if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+  const row = gate.row;
+  const sig = String(req.body?.signature || "").slice(0, 96);
+  // A Solana signature is 64 bytes of base58. Validate the SHAPE before spending an RPC call on it.
+  let sigOk = false;
+  try { sigOk = bs58.decode(sig).length === 64; } catch (e) { sigOk = false; }
+  if (!sigOk) return res.status(400).json({ error: "that is not a transaction signature" });
+  const action = ["buy", "list", "delist"].includes(String(req.body?.action)) ? String(req.body.action) : "";
+  if (!action) return res.status(400).json({ error: "action must be buy, list or delist" });
+  if (action !== "buy" && row.owner !== wallet) return res.status(403).json({ error: "the registry says this wallet does not own that asset" });
+  const st = await meSigStatus(sig);
+  const intent = _meIntents.get(wallet + ":" + mint) || null;
+  let applied = "none";
+  if (action === "list") {
+    // The listing MARKER, not a lock. The owner's standing decision is that a listed creature is never
+    // locked: the player keeps playing with it, and only a SETTLED sale moves it. All this does is
+    // stop the same creature being sold twice (in-game board, second listing, certificate mint).
+    row.listedOffchain = true;
+    // The price is DISPLAY only (the tab's "listed at" line) — the money was decided when the
+    // instruction was built. Prefer what THIS server actually asked Magic Eden for; a client-supplied
+    // figure is a fallback for a restart mid-flow, and is clamped so it can only ever be a sane number.
+    const _claimed = Number(req.body?.priceSol);
+    const _price = (intent && intent.priceSol) ||
+                   ((Number.isFinite(_claimed) && _claimed > 0 && _claimed <= ME_PRICE_MAX_SOL) ? Math.round(_claimed * 1e9) / 1e9 : null);
+    row.meList = { price: _price, at: Date.now(), sig, verified: !!(st.seen && st.ok) };
+    regEvent(row, "me_listed", { price: row.meList.price, sig, verified: row.meList.verified });
+    applied = "listed";
+    _assetsDirty = true; try { await saveAssetLedger(true); } catch (e) {}
+  } else if (action === "delist") {
+    // B2/B3: clearing the listing marker UNBLOCKS the creature for every other disposal path (the
+    // in-game board, a certificate mint), so it is a value transition and a shape-valid signature is NOT
+    // evidence. It is applied ONLY when VERIFIED on chain, two independent checks both required:
+    //   (1) the chain SAW this signature and it SUCCEEDED (not merely "well-formed"), and
+    //   (2) Magic Eden's book no longer carries a live order for this seller+mint — which ties the
+    //       signature to THIS asset actually being delisted (a real but unrelated success sig fails here).
+    // If the chain is UNREADABLE we do NOT apply the transition: we record it PENDING and let the delist
+    // route's self-heal / the reconcile settle it. A forged sig fails (1); a delist claimed while the ME
+    // order is still live fails (2). The player is never stranded — POST /nft/market/delist re-reads the
+    // book and clears the marker itself once the order is genuinely gone.
+    if (!(st.seen && st.ok)) {
+      return res.status(202).json({ ok: true, action, tokenMint: mint, id: row.id, applied: "pending",
+        onChain: { seen: !!st.seen, succeeded: !!(st.seen && st.ok), status: st.status || null, unreadable: !!st.unreadable },
+        verified: false, reason: st.unreadable ? "chain-unreadable" : "signature-not-confirmed",
+        settlesVia: "on-chain reconcile", handoverOn: NFT_HANDOVER_ON, reconcileOn: NFT_MINT_ON });
+    }
+    const dl = await meCached(`tok:${mint}`, ME_TOKEN_CACHE_MS, ME_TOKEN_CACHE_MS,
+      () => meFetch(`/v2/tokens/${encodeURIComponent(mint)}/listings`, {}));
+    if (!dl.val || dl.stale) {
+      const e = dl.err || {};
+      return res.status(e.status === 429 ? 429 : 503).json({ error: e.error || "could not confirm the delist on Magic Eden — try again", retryInMs: e.retryInMs || 5000, applied: "pending", verified: false });
+    }
+    const stillLive = (Array.isArray(dl.val) ? dl.val : []).some(x => x && String(x.seller || "") === wallet && Number(x.price) > 0);
+    if (stillLive) return res.status(409).json({ error: "that listing is still live on Magic Eden — it was not delisted", applied: "none", verified: false, stillLive: true });
+    row.listedOffchain = false;
+    if (row.meList) delete row.meList;
+    regEvent(row, "me_delisted", { sig, verified: true });
+    applied = "delisted";
+    _assetsDirty = true; try { await saveAssetLedger(true); } catch (e) {}
+  } else {
+    // A BUY CHANGES NOTHING HERE. It nudges the reconcile — debounced, because a room full of buyers
+    // must not turn one confirmation each into a DAS storm — and the answer is honest about the wait.
+    if (NFT_MINT_ON && Date.now() - _meRpcAt.last > 20000) {
+      _meRpcAt.last = Date.now();
+      reconcileNftOwners().catch(() => {});
+      applied = "reconcile-requested";
+    } else applied = NFT_MINT_ON ? "reconcile-debounced" : "reconcile-off";
+  }
+  res.json({ ok: true, action, tokenMint: mint, id: row.id, applied,
+             onChain: { seen: !!st.seen, succeeded: !!(st.seen && st.ok), status: st.status || null, unreadable: !!st.unreadable },
+             // Say the true settlement story rather than implying the creature arrives instantly.
+             settlesVia: action === "buy" ? "on-chain ownership reconcile" : "immediate",
+             handoverOn: NFT_HANDOVER_ON, reconcileOn: NFT_MINT_ON });
+});
+
+// Public config for the tab (behind the flag). Says what is switched on WITHOUT ever saying the key.
+app.get("/nft/market/config", (req, res, next) => {
+  if (!ME_MARKET_ON) return next();
+  res.json({ ok: true, symbol: ME_SYMBOL, collection: NFT_COLLECTION,
+             // B1: `capable` is the load-bearing truth — the in-game market only FUNCTIONS when the
+             // hand-over is on, because only then does a bought creature actually migrate to the buyer.
+             // `buyReady` folds in the key. The client MUST gate its Buy/List surface on these, not on
+             // the mere existence of this route; `capable:false` => show the Magic Eden deep link.
+             capable: ME_MARKET_CAPABLE, buyReady: ME_MARKET_CAPABLE && meKeyPresent(),
+             notReady: ME_MARKET_CAPABLE ? null : "handover-off",
+             // U1: browsing listings currently needs a proven wallet (per-wallet budgeting). A wallet-
+             // less client must show a "connect your wallet to browse" state, NOT the empty-book state.
+             browseRequiresWallet: true,
+             // `tradingReady` kept for older clients (= a key is configured); prefer `buyReady`. When
+             // the market is not capable it is forced false so an old client also falls back to the link.
+             tradingReady: ME_MARKET_CAPABLE && meKeyPresent(), browseReady: ME_MARKET_CAPABLE, poolBuy: ME_POOL_BUY,
+             priceMinSol: ME_PRICE_MIN_SOL, priceMaxSol: ME_PRICE_MAX_SOL,
+             royalty: { bps: NFT_ROYALTY_BPS, wallet: NFT_ROYALTY_WALLET, model: "collection-inherited",
+                        // HONEST: the server REPORTS 20%, but Core enforces royalty through a
+                        // COLLECTION-level Royalties plugin and this repo's own note records that the
+                        // live collection carried none. Until that plugin exists a marketplace sale
+                        // routes 0 to the royalty wallet whatever this number says.
+                        enforcedOnChain: null },
+             cacheMs: ME_CACHE_MS, deepLink: `https://magiceden.io/marketplace/${ME_SYMBOL}`,
+             handoverOn: NFT_HANDOVER_ON, reconcileOn: NFT_MINT_ON });
+});
+
+// ---- test seams. Never a key, never a chain, never a real Magic Eden call. --------------------
+export function _meFlagsForTest() {
+  return { on: ME_MARKET_ON, base: ME_API_BASE, symbol: ME_SYMBOL, keyPresent: meKeyPresent(),
+           poolBuy: ME_POOL_BUY, priceMinSol: ME_PRICE_MIN_SOL, priceMaxSol: ME_PRICE_MAX_SOL,
+           cacheMs: ME_CACHE_MS, rl: ME_RL, auctionHouse: ME_AUCTION_HOUSE,
+           // B1 + D1/D2 knobs, so a sim can assert the SHIPPED defaults it is measuring against.
+           capable: ME_MARKET_CAPABLE, handoverOn: NFT_HANDOVER_ON,
+           globalReadPerMin: ME_GLOBAL_READ_PER_MIN, globalReadBurst: ME_GLOBAL_READ_BURST,
+           imgReqPerMin: ME_IMG_REQ_PER_MIN, imgReqBurst: ME_IMG_REQ_BURST,
+           imgFetchPerMin: ME_IMG_FETCH_PER_MIN, imgFetchBurst: ME_IMG_FETCH_BURST };
+}
+export function _meCacheClearForTest() { _meCache.clear(); _meRate.clear(); _meIntents.clear(); _meImg.clear(); _meImgBody.clear(); _meMintIdx = null; }
+export function _meTxOutForTest(body) { return meTxOut(body); }
+export function _meScrubForTest(s) { return _meScrub(s); }
+export function _meBoardBlockedForTest(w, uid) { return meBoardBlocked(w, uid); }
+export function _meSetMintForTest(id, addr) {
+  const r = assetReg.get(id);
+  if (!r) return null;
+  r.mint = String(addr); r.edition = r.edition || 1; _meMintIdx = null;
+  return r.mint;
+}
+
 // Partition for persistence: rows carrying an on-chain `mint` are truncation-EXEMPT — dropping the
 // earliest rows at capacity would delete the FIRST-minted NFTs. Keep every minted row, then fill the
 // remainder to `max` with the NEWEST unminted rows. Under capacity this returns `all` unchanged, so a
@@ -8023,6 +9002,17 @@ export function restoreAssetReg(v) {
     if (src.hatcher && isPubkey(String(src.hatcher))) row.hatcher = String(src.hatcher).slice(0, 64);
     if (String(src.gameStatus || "") === "restricted") { row.gameStatus = "restricted"; if (src.statusReason) row.statusReason = String(src.statusReason).slice(0, 120); if (Number(src.statusAt) > 0) row.statusAt = Number(src.statusAt); }
     if (src.listedOffchain) row.listedOffchain = true;
+    // OUR OWN Magic Eden listing record (CHIK_ME_MARKET). Additive and re-typed like everything else:
+    // absent from `src` — which is every row a flag-off server can ever write — leaves the restored row
+    // byte-identical to a pre-marketplace restore. It has to survive a restart or a reconcile would
+    // clear `listedOffchain` for an asset that is genuinely still on the order book.
+    if (src.meList && typeof src.meList === "object") {
+      const _p = Number(src.meList.price);
+      row.meList = { price: (Number.isFinite(_p) && _p > 0) ? _p : null,
+                     at: Number(src.meList.at) || Date.now(),
+                     sig: String(src.meList.sig || "").slice(0, 96) || null,
+                     verified: !!src.meList.verified };
+    }
     if (Number(src.holderSince) > 0) row.holderSince = Number(src.holderSince);
     if (src.pendingHandover && typeof src.pendingHandover === "object" && isPubkey(String(src.pendingHandover.to || "")))
       row.pendingHandover = { to: String(src.pendingHandover.to).slice(0, 64), at: Number(src.pendingHandover.at) || Date.now(), dormant: !!src.pendingHandover.dormant };
@@ -8054,6 +9044,9 @@ export function restoreAssetReg(v) {
     if (row.edition) { const k = _censusKey(row.type, row.sp); if ((nftEdition[k] || 0) < row.edition) nftEdition[k] = row.edition; }
     assetReg.set(id, row); ownerSet(owner).add(id); n++;
   }
+  // Every `mint` this pass restored is a key the mint->row index does not have. Drop it; the next
+  // lookup rebuilds it in one scan. (Cheaper and far harder to get wrong than incremental upkeep.)
+  _meMintIdx = null;
   // The persisted edition counter — floored, never lowered — so a truncated prepared row can't reset it.
   if (v.nftEdition && typeof v.nftEdition === "object") {
     for (const [k, cnt] of Object.entries(v.nftEdition)) { const c = Number(cnt); if (Number.isInteger(c) && c > 0 && (nftEdition[k] || 0) < c) nftEdition[k] = c; }
@@ -8107,7 +9100,7 @@ export function _mintHatchedForTest(type, wallet, fields) {
   return born;
 }
 export function _setMemeMintedForTest(key, n) { memeMinted[key] = n; censusInvalidate(); }
-export function _clearAssetReg() { assetReg.clear(); assetsByOwner.clear(); eggRestitutionDone.clear(); nftNews.clear(); nftHandDebit.clear(); _nftNewsSeq = 0; censusInvalidate(); }
+export function _clearAssetReg() { assetReg.clear(); assetsByOwner.clear(); eggRestitutionDone.clear(); nftNews.clear(); nftHandDebit.clear(); _nftNewsSeq = 0; _meMintIdx = null; censusInvalidate(); }
 // the WHOLE truth about one species: the consolidated count and where every number came from
 export function _trueIssued(type, sp) { return trueIssued(type, sp); }
 export function _censusStats() { return { builds: _censusBuilds, keys: censusAll().size }; }
@@ -10887,6 +11880,18 @@ app.post("/market/op", async (req, res) => {
       // has no clean unit of this species. A wallet with no record yet (never saved under the
       // ledger, or restored mid-flight) is allowed through — a false refusal would strand a real
       // player's asset, and grandfathering is the standing policy for everything predating this.
+      // A LISTING ON THE NFT MARKETPLACE IS NOT A LISTING HERE. `listedOffchain` is the flag that
+      // already means "this asset is live on an order book"; while it stands the same creature must
+      // not also be sellable on the in-game board. Structurally the NFT tiers cannot reach this line
+      // anyway (chikimonTierBlocked refuses every legendary and Meme Dynasty species below, and the
+      // `kind` whitelist has never accepted "mount"), so this is the belt to that brace. It runs
+      // BEFORE chikimonSaleBlocked deliberately — that call RESERVES the unit as a side effect, and a
+      // refusal after it would strand the creature as "already up for sale" with no listing to cancel.
+      // With CHIK_ME_MARKET off it is a single `false` test on a flag no row can carry.
+      if (ME_MARKET_ON) {
+        const _meBad = meBoardBlocked(mktWallet(b), stripTags(String(l.uid || "")).slice(0, 64));
+        if (_meBad) return res.status(409).json({ error: _meBad, listedOffchain: true });
+      }
       if (String(l.kind) === "chikimon") {
         // THE NFT TIERS DO NOT TRADE HERE (chikimonTierBlocked, above). Checked BEFORE
         // chikimonSaleBlocked deliberately: that call RESERVES the unit (reserveUnit -> unitReserved)

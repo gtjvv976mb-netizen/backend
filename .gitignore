@@ -28,3 +28,6 @@ make_devnet_wallet.mjs
 devnet-authority.json
 mint_test.mjs
 mkt_restore_tool.mjs
+meh_*
+me_*sim*
+me_head_baseline.mjs
