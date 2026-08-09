@@ -6144,6 +6144,29 @@ const ME_MARKET_ON = String(process.env.CHIK_ME_MARKET ?? "0") === "1";
 // Mintable ORIGINS — server-witnessed births ONLY. legacy/unverified/adopted rows were never vouched;
 // minting them would launder exactly what the mint is meant to prove. Widen via env without a deploy.
 const NFT_MINT_ORIGINS = new Set(String(process.env.NFT_MINT_ORIGINS || "hatched").split(",").map(s => s.trim()).filter(Boolean));
+// ============ EGGS AS SELLABLE NFTs — dormant behind the MARKETPLACE flags ============
+// The owner's feature (2026-08-09): an egg becomes a mintable/sellable NFT, and HATCHING removes that
+// NFT's value so a player can never be paid for BOTH the egg and the creature it becomes. An egg can
+// only become a token while the in-game marketplace (CHIK_ME_MARKET) AND the on-chain handover
+// (CHIK_NFT_HANDOVER) are BOTH live — because a SOLD egg MUST be able to leave the seller, and that is
+// exactly what the handover machinery does. Without handover a minted egg could be listed and hatched
+// while the seller still holds the row, keeping both the payout and the hatchling — the whole exploit.
+// So egg mintability is COUPLED to the machinery that removes it on sale. With either flag off,
+// nftMintableKind refuses every egg exactly as today (code "kind"), so a CHIK_NFT_MINT-only server
+// (creatures mintable, marketplace dormant) is byte-identical to HEAD on every egg surface.
+const EGG_NFT_ON = ME_MARKET_ON && NFT_HANDOVER_ON;
+// Which egg KINDS may be minted. OWNER RULING 2026-08-09: ALL FOUR, normal included. This DIVERGES
+// from the creature rule (rare tiers only, normals trade in-game) and the divergence is deliberate and
+// owner-chosen — the owner was shown the rare-tiers-only default alongside the consequence ("normal
+// eggs are the common, cheap egg; much larger supply, lower floor") and chose all four anyway. Do not
+// "correct" this back to the creature lock. Narrowable without a deploy via the env var.
+const EGG_NFT_KINDS = new Set(String(process.env.EGG_NFT_KINDS || "normal,legendary,meme,mount").split(",").map(s => s.trim()).filter(Boolean));
+// The WITNESS an egg mint accepts in place of the creature path's unforgeable parent link. A creature
+// proves a witnessed birth through `parent`; an egg IS the lineage root (parent=null) so it proves
+// instead that the SERVER ISSUED it: origin "issued" (Mithra's barter) or "restitution" (a server
+// make-good — owner decision 2026-08-09: INCLUDED, these are server-issued rows, not client claims),
+// and NOT a client-synced adoption (`luid`, set only by the two sync routes). Widenable without a deploy.
+const EGG_NFT_ORIGINS = new Set(String(process.env.EGG_NFT_ORIGINS || "issued,restitution").split(",").map(s => s.trim()).filter(Boolean));
 // Royalty (owner lock D7 — set to the LIVE Metaplex Core collection's rate): 20%, routed to the POOL
 // wallet (the market's tax destination, TEAM_WALLET). Core enforces royalty via a COLLECTION-level
 // Royalties plugin every member INHERITS — NOT a WNS transfer hook. The live collection carries no such
@@ -6223,7 +6246,10 @@ function nftDelegate() {
   }
   return _nftDelegate;
 }
-const nftAssetName = (row) => `${_nftCap(row.sp)} #${row.edition}`;
+// An egg has no species (row.sp equals its KIND), so name it "<Kind> Egg #N" — distinct from the
+// hatchling's "<Species> #N", and keyed on a different edition counter (egg:<kind> vs chikimon:<sp>),
+// so egg editions can never collide with or seed a creature's. Only ever differs for type "egg".
+const nftAssetName = (row) => (row.type === "egg" ? `${_nftCap(row.kind)} Egg #${row.edition}` : `${_nftCap(row.sp)} #${row.edition}`);
 const nftMetaUri = (row) => (NFT_META_BASE ? `${NFT_META_BASE}/assets/nft/meta/${encodeURIComponent(row.id)}` : "");
 // The provenance, pinned ON CHAIN as a Core Attributes plugin — so the certificate outlives the
 // metadata host. Same facts /assets/cert serves; strings only (the plugin's type is {key,value}).
@@ -6267,10 +6293,16 @@ function nftMintBoundTo(addr, exceptId) {
 
 const _nftCap = (s) => { s = String(s || ""); return s ? s[0].toUpperCase() + s.slice(1) : s; };
 function _isOnCurve(addr) { try { return PublicKey.isOnCurve(new PublicKey(addr).toBytes()); } catch { return false; } }
-// Rare tiers only (owner lock): mounts + legendary/meme chikimon. NO normals, NO avatars, NO eggs.
+// Rare tiers only (owner lock): mounts + legendary/meme chikimon. NO normals, NO avatars.
+// EGGS join ONLY while EGG_NFT_ON (marketplace + handover both live) and only for the kinds in
+// EGG_NFT_KINDS (default legendary/meme/mount — normal OFF). An egg is mintable ONLY as an ACTIVE,
+// unconsumed row: nftEligibility's state gate refuses a consumed/hatched egg (`not-active`) long
+// before reaching the hatched-egg case, so this never certifies a spent egg. With either marketplace
+// flag off, EGG_NFT_ON is false and every egg is refused exactly as today (code "kind").
 function nftMintableKind(row) {
   if (!row) return false;
   if (row.type === "mount") return true;
+  if (row.type === "egg") return EGG_NFT_ON && EGG_NFT_KINDS.has(String(row.kind));
   return row.type === "chikimon" && (row.kind === "legendary" || row.kind === "meme");
 }
 // The airtight gate, in order. Pure (row + wallet) so a sim drives it directly. code "ok" == mintable.
@@ -6280,6 +6312,23 @@ function nftEligibility(row, wallet) {
   if (row.state !== "active") return { code: "not-active", status: 409, error: `asset is ${row.state}, not mintable` };
   if (row.type === "avatar") return { code: "avatar", status: 403, error: "avatars are not mintable in this increment" };
   if (!nftMintableKind(row)) return { code: "kind", status: 403, error: "only legendaries, Meme Dynasty and mounts can be minted" };
+  // THE EGG WITNESS. Everything below this branch — the origin-in-NFT_MINT_ORIGINS gate and the
+  // unforgeable `parent`-link/no-`luid` gate — is built for a hatched CREATURE that has a birth to
+  // vouch. An egg is the lineage ROOT: parent is null and origin is "issued"/"restitution", never
+  // "hatched", so those gates would refuse every honest egg (measured today: code "origin", then
+  // "no-lineage"). An egg proves witness a DIFFERENT way — that this SERVER issued the row: origin in
+  // EGG_NFT_ORIGINS (issued|restitution) AND not a client-synced adoption (no `luid`, the flag only the
+  // two sync routes set). That is the exact analogue of the creature path's parent link. The state
+  // gate above already refused a consumed/hatched egg, so only an ACTIVE egg reaches here — the egg is
+  // the ONLY sellable token of its lineage until hatch consumes it. gameStatus + listed/pending are
+  // re-checked here identically to the creature path so a flagged or already-listed egg is refused too.
+  if (row.type === "egg") {
+    if (!EGG_NFT_ORIGINS.has(String(row.origin)) || row.luid)
+      return { code: "origin", status: 403, error: "only a server-issued egg can be certified" };
+    if ((row.gameStatus ?? "good") !== "good") return { code: "flagged", status: 409, error: "asset is flagged and cannot be minted" };
+    if (row.listedOffchain || row.pendingHandover) return { code: "busy", status: 409, error: "asset is listed on-chain or has a pending transfer" };
+    return { code: "ok", status: 200 };
+  }
   if (!NFT_MINT_ORIGINS.has(String(row.origin))) return { code: "origin", status: 403, error: "only server-witnessed births can be minted" };
   // AN ORIGIN STRING IS NOT PROVENANCE. Two completely different writers produce the seven characters
   // "hatched", and the origin field cannot tell them apart:
@@ -7071,6 +7120,53 @@ function eggPoolEmptyMsg(wallet, kind) {
     : "you already own every species that egg could hatch";
 }
 
+// ============ EGGS AS NFTs — the hatch-time contract ============
+// THE INVARIANT: an egg and the creature it hatches can never both be a live, sellable NFT at the same
+// instant. The egg row is the ONLY sellable token of its lineage until hatch atomically consumes it
+// (state -> "consumed", which the mint/list/transfer/handover gates all already refuse); after that the
+// hatchling is the one carried-forward token. Two things enforce that at the moment an egg is SPENT
+// (hatch / consume / discard):
+//
+//   (1) eggNftHatchBlock — REFUSE the spend while the egg's token is live-and-listed or a sale is
+//       settling. A listing is a promise to a buyer that still conveys a HATCHABLE egg, so the seller
+//       must delist BEFORE hatching. Auto-retiring on hatch instead would strand a mid-listing buyer
+//       filling an order for a now-worthless token — the server cannot synchronously cancel a Magic
+//       Eden delegate order. (truth: THE CORE RACE — refuse-while-listed is the buyer-safe choice.)
+//
+//   (2) eggNftRetire — POSITIVELY remove the egg NFT's value when a MINTED egg is spent. Hatch touches
+//       none of the NFT fields today, so a minted+hatched egg kept mint:true / listedOffchain:true /
+//       gameStatus:good and was only INCIDENTALLY unmintable via the state gate. This clears
+//       listedOffchain / meList, resolves any spent pendingHandover, drops the holder-observation, and
+//       stamps `nftRetired` + a provenance event so the spent token reads as retired everywhere. It
+//       does NOT burn the on-chain token (owner decision pending — "in-game worthless" vs a scoped
+//       server burn). Enforcement of "can never re-mint/re-list/hand-over/count" rides the SAME
+//       state="consumed" write the hatch already makes (nftEligibility -> not-active; the market
+//       list/transfer/settle gates all refuse a non-active row; buildCensus counts only active rows).
+//
+// EVERY line here is a NO-OP for a never-minted egg — it carries no mint / listedOffchain /
+// pendingHandover — which is every egg a marketplace-off server can produce. So grandfathering is
+// absolute and, with the marketplace flags off, these are byte-identical to HEAD. Both key on the
+// row's OWN mint state, never on the current flag, so a token minted while the flags were on is still
+// protected if a flag is later flipped off.
+function eggNftHatchBlock(row) {
+  if (!row || !row.mint) return null;                    // never minted -> nothing to protect
+  if (row.pendingHandover)
+    return { status: 409, body: { error: "this egg's NFT sale is still settling — it cannot hatch until the transfer completes; once it settles, only the new owner can hatch it", nftBusy: true } };
+  if (row.listedOffchain)
+    return { status: 409, body: { error: "this egg is listed on the NFT marketplace — delist it there first, then it can hatch", nftListed: true } };
+  return null;
+}
+function eggNftRetire(row, born) {
+  if (!row || !row.mint) return;                         // never minted -> no NFT value to remove
+  row.nftRetired = { at: Date.now(), hatchedTo: born ? born.id : (row.hatchedTo || null) };
+  if (row.listedOffchain) row.listedOffchain = false;    // the token is spent — end any listing marker
+  if (row.meList) delete row.meList;                     // ...and our own record of that listing
+  if (row.pendingHandover) delete row.pendingHandover;   // a spent egg conveys nothing to a pending buyer
+  _nftHolderObs.delete(row.id);                          // drop the two-read handover evidence
+  regEvent(row, "nft_retired", { reason: born ? "hatched" : "discarded", hatchedTo: row.nftRetired.hatchedTo });
+  _assetsDirty = true;
+}
+
 // Issue an egg. The client has already taken the barter from the player's own inventory; what the
 // server adds — and what the client cannot fake — is the identity and the clock.
 app.post("/assets/egg/claim", (req, res) => {
@@ -7155,6 +7251,11 @@ app.post("/assets/egg/hatch", (req, res) => {
   if (row.state !== "active") return res.status(409).json(_alreadyHatched(row));
   const ready = eggReadyAt(row);
   if (Date.now() < ready) return res.status(425).json({ error: "still incubating", readyIn: ready - Date.now() });
+  // THE CORE RACE: a minted egg that is listed on the marketplace (or has a sale settling) cannot hatch
+  // — the seller must delist first, so a live listing always conveys a still-hatchable egg and a buyer
+  // is never left holding an order for a token the seller already turned into a creature. No-op for a
+  // never-minted egg (every egg a marketplace-off server can produce), so flag-off this changes nothing.
+  { const _nb = eggNftHatchBlock(row); if (_nb) return res.status(_nb.status).json(_nb.body); }
 
   let born;
   try {
@@ -7183,6 +7284,10 @@ app.post("/assets/egg/hatch", (req, res) => {
   // creature's lineage is readable forever — and the egg can never vouch a second hatch.
   row.state = "consumed";
   row.hatchedTo = born.id;
+  // REMOVE THE EGG NFT'S VALUE. If this egg was minted, delist it and stamp it retired so its token can
+  // never be re-minted, re-listed or handed over in-game — the hatchling (a fresh row, parent=egg.id)
+  // is the one live NFT from here on. No-op for a never-minted egg. (attack table: retire-on-hatch)
+  eggNftRetire(row, born);
   censusInvalidate();      // a consumed egg leaves the live count; the creature it became joins it
   regEvent(row, "hatched", { into: born.id, sp: born.sp });
   // the world feed carries ONLY server-rolled hatches (the /assets/egg/consume halfway house is a
@@ -7224,6 +7329,10 @@ app.post("/assets/egg/discard", (req, res) => {
   const row = assetReg.get(id);
   if (!row || row.type !== "egg" || row.owner !== wallet) return res.status(404).json({ error: "no such egg" });
   if (row.state !== "active") return res.status(409).json({ error: "that egg is already spent" });
+  // A minted egg that is listed / settling must be delisted before it can be discarded, for the same
+  // buyer-safety reason as hatch: destroying the row while a buyer could still fill the order would
+  // convey a worthless token. No-op for a never-minted egg. (truth unknown #5: discard needs the freeze too)
+  { const _nb = eggNftHatchBlock(row); if (_nb) return res.status(_nb.status).json(_nb.body); }
   if (eggPoolFor(wallet, row.kind).length) {
     return res.status(409).json({ error: "that egg can still hatch — let it finish", canHatch: true });
   }
@@ -7233,6 +7342,7 @@ app.post("/assets/egg/discard", (req, res) => {
   const _fish = Object.hasOwn(EGG_RECIPE_FISH, row.kind) ? EGG_RECIPE_FISH[row.kind] : null;
   if (_ffishAuth && _fish) { const n = ownRefund(wallet, "ffish", _fish.sp, _fish.n); if (n) refunded[_fish.sp] = n; }
   row.state = "consumed";
+  eggNftRetire(row, null);   // a discarded minted egg has its NFT value removed too (no-op if never minted)
   regEvent(row, "discarded", { why: "pool-empty", refunded });
   censusInvalidate();      // a discarded egg leaves the live count
   _assetsDirty = true;
@@ -7252,6 +7362,9 @@ app.post("/assets/egg/consume", (req, res) => {
   // reported as hatched before it could possibly have finished
   const ready = eggReadyAt(row);
   if (Date.now() < ready) return res.status(425).json({ error: "still incubating", readyIn: ready - Date.now() });
+  // Same NFT freeze as the server-rolled hatch: a minted egg that is listed / settling cannot be
+  // consumed until it is delisted. No-op for a never-minted egg. (attack table: THE CORE RACE)
+  { const _nb = eggNftHatchBlock(row); if (_nb) return res.status(_nb.status).json(_nb.body); }
 
   const sp = String(req.body?.sp || "").slice(0, 24);
   const isMount = row.kind === "mount";
@@ -7294,6 +7407,7 @@ app.post("/assets/egg/consume", (req, res) => {
   }
   row.state = "consumed";
   row.hatchedTo = born.id;
+  eggNftRetire(row, born);   // remove the egg NFT's value on hatch (no-op for a never-minted egg)
   censusInvalidate();      // same as the server-rolled hatch: the egg leaves the live count
   regEvent(row, "hatched", { into: born.id, sp });
   _assetsDirty = true;
@@ -7671,7 +7785,20 @@ app.get("/assets/mine", (req, res) => {
       card.mintWhy = r.mint ? null : (el.error || null);
       card.mintable = !r.mint && el.code === "ok" && !_nftBoardListed(r);
     }
-    if (r.type === "egg") { card.readyAt = eggReadyAt(r); card.hatchedTo = r.hatchedTo || null; out.eggs.push(card); }
+      if (r.type === "egg") {
+      card.readyAt = eggReadyAt(r); card.hatchedTo = r.hatchedTo || null;
+      // ESCROW, TOLD TO THE CLIENT (owner ruling 2026-08-09). While an egg's NFT is listed or a sale
+      // is settling, the egg is NOT the lister's to act on: they may not use, tend, hatch, discard —
+      // or even SEE it in their nest. The server already refuses the mutating routes
+      // (eggNftHatchBlock on hatch/discard/consume); the nest is a CLIENT render, so the client has
+      // to be told. One field, so the client has a single thing to branch on rather than inferring
+      // escrow from a combination — and so a future egg action cannot forget to check.
+      // It returns to them intact on delist, and moves to the buyer on settle.
+      card.escrowed = !!(r.mint && (r.listedOffchain || r.pendingHandover));
+      if (card.escrowed) card.escrowWhy = r.pendingHandover ? "selling" : "listed";
+      card.nftRetired = r.nftRetired ? true : false;   // spent by hatching — no NFT value remains
+      out.eggs.push(card);
+    }
     else if (r.type === "chikimon") { card.lvl = r.lvl; out.chikimon.push(card); }
     else if (r.type === "mount") out.mounts.push(card);
     else if (r.type === "avatar") out.avatars.push(card);
@@ -7993,7 +8120,10 @@ app.get("/assets/nft/config", (req, res) => {
     // half never leaves the environment.
     ready: !!(NFT_COLLECTION && nftDelegate() && !NFT_MINT_PAUSED), mintAuthority: nftDelegate() ? nftDelegate().pubkey : null,
     metaBase: NFT_META_BASE || null, explorerBase: NFT_EXPLORER_BASE,
-    mintableKinds: { mount: true, chikimon: ["legendary", "meme"] }, origins: [...NFT_MINT_ORIGINS] });
+    // eggs appear here ONLY while EGG_NFT_ON (marketplace + handover live); dormant, this key is absent
+    // and the object is byte-identical to HEAD. The client's egg case-art resolver keys on this `egg` kind list.
+    mintableKinds: Object.assign({ mount: true, chikimon: ["legendary", "meme"] }, EGG_NFT_ON ? { egg: [...EGG_NFT_KINDS] } : {}),
+    origins: [...NFT_MINT_ORIGINS], eggOrigins: EGG_NFT_ON ? [...EGG_NFT_ORIGINS] : undefined });
 });
 
 // The metadata JSON every minted asset's on-chain `uri` points at (public — a certificate nobody can
@@ -8275,6 +8405,14 @@ function meMintGate(mint) {
   const row = meRowByMint(mint);
   if (!row) return { ok: false, status: 403, error: "that asset is not part of the Chiki Monsters collection" };
   if (row.state === "burned") return { ok: false, status: 409, error: "that asset has been retired" };
+  // A HATCHED (consumed) EGG'S TOKEN IS SPENT. Before eggs were mintable no row that reached this gate
+  // could be "consumed" (only eggs consume, and eggs had no mint), so refusing non-active is a NO-OP for
+  // creatures/mounts and closes the new spent-egg re-list surface: a minted egg keeps its on-chain token
+  // after hatch, and without this an attacker naming that token could re-arm listedOffchain via /confirm
+  // or build a buy/list instruction for a token whose registry row can never convey again (nftSettleHandover
+  // refuses a non-active row). The listing/mine surfaces already skip non-active rows; this hardens the
+  // four ME instruction routes to match. (attack table row 8)
+  if (row.state !== "active") return { ok: false, status: 409, error: "that asset has hatched and is no longer tradeable" };
   return { ok: true, row };
 }
 // The in-game board's half of "a listed asset is not tradeable here". Structurally the NFT tiers
@@ -9120,6 +9258,14 @@ export function restoreAssetReg(v) {
                        at: Number(src.handover.at) || Date.now(),
                        mint: isPubkey(String(src.handover.mint || "")) ? String(src.handover.mint).slice(0, 64) : null };
     if (Number(src.arrivedAt) > 0) row.arrivedAt = Number(src.arrivedAt);
+    // THE RETIRED-EGG MARKER, re-typed like everything else: set when a MINTED egg hatched/discarded, it
+    // records that this egg's NFT value was removed (the token is in-game worthless). Enforcement rides on
+    // `state:"consumed"` (derived+restored above) and the cleared `listedOffchain`/`meList` (absent from a
+    // retired row, so not restored) — this field is the human-readable half and the belt to that brace. A
+    // `nft_retired` chain event also survives in the recent half of `chain`. Additive: absent from `src` —
+    // every row a marketplace-off server writes — leaves the restored row byte-identical to a pre-egg-NFT one.
+    if (src.nftRetired && typeof src.nftRetired === "object")
+      row.nftRetired = { at: Number(src.nftRetired.at) || _born, hatchedTo: src.nftRetired.hatchedTo ? String(src.nftRetired.hatchedTo).slice(0, 64) : (hatchedTo || null) };
     // THE CENSUS DEBIT IS DERIVED, NEVER STORED. Every settled hand-off left an append-only
     // `transferred{why:"nft-handover"}` event on this row, so rebuilding the seller debits from the
     // chain means the census can never disagree with the provenance — no second source to drift, and a
