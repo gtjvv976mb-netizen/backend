@@ -9,6 +9,7 @@ import pg from "pg";
 import WS from "ws";               // WebSocket world transport — a SECOND transport beside /world/move polling, never a replacement
 import {
   Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL,
+  TransactionInstruction, VersionedTransaction, TransactionMessage,   // mint-at-sale tx composition only
 } from "@solana/web3.js";
 import { createCup } from "./cup-live.js";   // Chikoria Cup live orchestrator (double-elim, deterministic resolver)
 import { createMatch as pvpCreate, submit as pvpSubmit, tick as pvpTick, viewFor as pvpView, forfeit as pvpForfeit, spectatorView as pvpSpectate } from "./pvp-engine.js";   // live PvP battles
@@ -6141,6 +6142,28 @@ const NFT_HANDOVER_ON = String(process.env.CHIK_NFT_HANDOVER ?? "0") === "1";
 // "MAGIC EDEN IN-GAME MARKETPLACE". OFF => no row can ever carry `meList`, so every guard that reads
 // it is dead code and the flag-off server behaves exactly as it does today.
 const ME_MARKET_ON = String(process.env.CHIK_ME_MARKET ?? "0") === "1";
+// Declared HERE with its sibling flags — and NOT beside `meBookGuardOn()` where it is read — because
+// the boot-time configuration warning below calls that function while this module is still evaluating,
+// and a `const` further down the file is in its temporal dead zone at that moment. (Same reason
+// NFT_HANDOVER_ON and ME_MARKET_ON live up here rather than in the marketplace block.)
+const ME_GUARD_MODE = String(process.env.CHIK_EGG_MEGUARD ?? "auto").trim();
+// ============ MINT AT FIRST SALE — CHIK_MINT_AT_SALE (default OFF) ============
+// THE OWNER RULINGS (2026-08-10, final — these replaced the same-day "auto-mint at hatch" direction):
+//   1. EVERY asset is sellable as an NFT, every rarity — normals AND avatars included. No player-
+//      facing Mint button: an asset shows its registry certificate from issuance; players VIEW or SELL.
+//   2. MINT AT FIRST SALE, PLAYER PAYS. Nothing touches the chain until the player sells. The FIRST
+//      listing of an unminted asset carries mint + list ATOMICALLY in one transaction: the player is
+//      fee payer, owner and signer (Phantom); the delegate co-signs ONLY as collection authority and
+//      NEVER pays. Already-minted assets list through the existing tokenMint path unchanged.
+//   3. AVATAR SALE = FULL HANDOVER; seller reverts to the Wanderer (granted first if missing). A
+//      LISTED avatar stays USABLE until SOLD — the escrow freeze is an EGG rule, never an avatar one.
+//   4. RARITY COUNTS EVERY CREATURE, MINTED OR NOT: caps enforce at ISSUANCE, editions are assigned
+//      at ISSUANCE from the registry census, and on-chain metadata carries "Edition N of <cap>" for a
+//      capped kind — never "N of <minted count>". Normals stay uncapped and say so honestly.
+// OFF (the default) => every branch below is unreachable and the server is byte-identical to today.
+// Composes with CHIK_NFT_MINT / CHIK_ME_MARKET / CHIK_NFT_HANDOVER / ME_API_KEY — the id-keyed listing
+// path lives inside /nft/market/list, so it inherits every gate that route already has.
+const MINT_AT_SALE_ON = String(process.env.CHIK_MINT_AT_SALE ?? "0") === "1";
 // Mintable ORIGINS — server-witnessed births ONLY. legacy/unverified/adopted rows were never vouched;
 // minting them would launder exactly what the mint is meant to prove. Widen via env without a deploy.
 const NFT_MINT_ORIGINS = new Set(String(process.env.NFT_MINT_ORIGINS || "hatched").split(",").map(s => s.trim()).filter(Boolean));
@@ -6251,13 +6274,44 @@ function nftDelegate() {
 // so egg editions can never collide with or seed a creature's. Only ever differs for type "egg".
 const nftAssetName = (row) => (row.type === "egg" ? `${_nftCap(row.kind)} Egg #${row.edition}` : `${_nftCap(row.sp)} #${row.edition}`);
 const nftMetaUri = (row) => (NFT_META_BASE ? `${NFT_META_BASE}/assets/nft/meta/${encodeURIComponent(row.id)}` : "");
+// ---- mint-at-sale helpers (every one inert while CHIK_MINT_AT_SALE is off) ---------------------
+// Which ORIGINS may sell under owner ruling 1. ORIGIN_CLEAN (declared below with the ledger — read at
+// call time, never at module scope) plus "scroll", the server-rolled avatar origin the clean set
+// predates. "unverified" is exactly what stays out: a quarantined row is HELD, never burned — it
+// remains the wallet's property and simply cannot be certified or sold.
+function masOriginClean(origin) { origin = String(origin || ""); return origin === "scroll" || ORIGIN_CLEAN.has(origin); }
+// RULING 4's DENOMINATOR: the number after "of" is the REGISTRY's law, never the chain's sparse
+// count. A capped kind states its cap ("Edition N of 5"); an uncapped kind (normal chikimon above
+// all) does NOT invent one — it states the open edition truthfully.
+function masEditionOf(row) {
+  const cap = supplyOf(row.type, row.sp);
+  return cap > 0 ? String(cap) : "open";
+}
+// THE WITNESS, stated on-chain rather than laundered. The old gate simply refused everything it had
+// not witnessed; ruling 1 makes every clean asset sellable, so the metadata now SAYS which kind of
+// record backs it instead of pretending they are all the same:
+//   server-hatched   an unforgeable parent link, no luid — this server rolled the birth
+//   server-issued    a row this server created itself (egg barter, scroll, restitution, grants)
+//   player-reported  a ledger adoption / backfill — an honest record of a client-declared holding
+function masWitness(row) {
+  if (row.parent && !row.luid) return "server-hatched";
+  if (!row.luid && (row.origin === "issued" || row.origin === "scroll" || row.origin === "restitution")) return "server-issued";
+  return "player-reported";
+}
 // The provenance, pinned ON CHAIN as a Core Attributes plugin — so the certificate outlives the
 // metadata host. Same facts /assets/cert serves; strings only (the plugin's type is {key,value}).
 function nftAttributes(row) {
-  return [{ key: "registryId", value: String(row.id) }, { key: "species", value: String(row.sp || "") },
+  const a = [{ key: "registryId", value: String(row.id) }, { key: "species", value: String(row.sp || "") },
           { key: "kind", value: String(row.kind || "") }, { key: "origin", value: String(row.origin || "") },
           { key: "edition", value: String(row.edition || "") }, { key: "born", value: String(row.born || "") },
           { key: "hatcher", value: String(row.hatcher || row.owner || "") }];
+  // Ruling 4: "Edition N of <cap>" — the registry census total, NEVER the minted count — plus the
+  // honest witness class. Added ONLY under the flag so a flag-off mint/meta is byte-identical.
+  if (MINT_AT_SALE_ON) {
+    a.push({ key: "editionOf", value: masEditionOf(row) });
+    a.push({ key: "witness", value: masWitness(row) });
+  }
+  return a;
 }
 // Build + submit the Core create. The SDK is imported LAZILY inside this function so a flag-off boot
 // never loads @metaplex-foundation at all (cold start + flag-off byte-identity). Sims replace the whole
@@ -6283,6 +6337,88 @@ async function nftCoreCreate(args) {
   }).sendAndConfirm(umi, { confirm: { commitment: "confirmed" } });
   return { address: assetSigner.publicKey.toString(), signature: r && r.signature ? bs58.encode(r.signature) : null };
 }
+// ============ THE ATOMIC MINT+LIST COMPOSITION (CHIK_MINT_AT_SALE) ============
+// Owner ruling 2: the FIRST listing of an unminted asset carries mint + list in ONE transaction —
+// the PLAYER is fee payer, owner and signer; the delegate co-signs ONLY as collection authority and
+// NEVER pays; the server-ephemeral asset keypair co-signs as the new account. Unlike nftCoreCreate
+// this NEVER submits: it builds, partial-signs, and hands the bytes to the client for Phantom.
+//
+// HOW THE LIST HALF GETS IN: Magic Eden's /v2/instructions/sell builds the listing transaction (the
+// same call the minted path makes). Its instructions are DECOMPILED and appended after the CreateV2
+// instructions in one legacy transaction. Two structural refusals, both honest and both leaving the
+// registry row unminted-unlisted so a rebuild is always safe:
+//   * a COSIGNED sell tx cannot be merged — rebuilding its message destroys Magic Eden's signature
+//     (see meTxOut) — so composition refuses with code "cosigned" rather than shipping a broken tx;
+//   * a v0 sell tx that uses address-lookup tables cannot be decompiled without fetching the tables,
+//     so it refuses with code "alt" rather than guessing at accounts.
+// UNMEASURED, stated plainly: no instruction call has ever been made from this machine (no key), so
+// whether Magic Eden will build a sell for a not-yet-indexed asset, and which envelope it uses for a
+// Core M2 sell, are unverified. Every refusal above fails CLOSED into "row stays clean, retry later";
+// the reservation TTL (NFT_PENDING_TTL_MS + DAS `absent`) reclaims a composition that never lands.
+// Sims replace this whole function via `_masComposeStub`, so no sim touches a network, chain or key.
+let _masComposeStub = null;               // test seam: (args) -> { ok, b64, ver, ... }
+async function masComposeMintList(args) {
+  if (_masComposeStub) return await _masComposeStub(args);
+  const d = nftDelegate();
+  if (!d) return { ok: false, status: 503, code: "no-delegate", error: "minting is not configured" };
+  if (!NFT_COLLECTION) return { ok: false, status: 503, code: "no-collection", error: "the NFT collection is not configured" };
+  // ---- the LIST half: Magic Eden builds the sell for the reserved asset address -----------------
+  const sell = await meFetch("/v2/instructions/sell", { auth: true, query: {
+    seller: args.owner, tokenMint: args.assetAddr, tokenAccount: args.assetAddr,   // Core: the "ATA" IS the asset
+    price: args.priceSol, auctionHouseAddress: ME_AUCTION_HOUSE, expiry: -1,
+  } });
+  if (!sell.ok) return { ok: false, status: sell.status, code: "me", error: sell.error, retryInMs: sell.retryInMs };
+  const sellTx = meTxOut(sell.body);
+  if (!sellTx) return { ok: false, status: 502, code: "shape", error: "Magic Eden returned a transaction this server could not read" };
+  if (sellTx.cosigned) return { ok: false, status: 501, code: "cosigned", error: "Magic Eden pre-signed that listing — it cannot be merged with a mint in one transaction on this rail" };
+  // ---- the MINT half: compose-only CreateV2, player as payer ------------------------------------
+  try {
+    const [umiMod, bundle, core] = await Promise.all([
+      import("@metaplex-foundation/umi"), import("@metaplex-foundation/umi-bundle-defaults"), import("@metaplex-foundation/mpl-core"),
+    ]);
+    const umi = bundle.createUmi(RPC_URL);
+    // THE PAYER IS THE PLAYER — a noop signer, so the builder marks the fee-payer slot without this
+    // server ever holding (or needing) the player's key. Phantom supplies that signature.
+    umi.use(umiMod.signerIdentity(umiMod.createNoopSigner(umiMod.publicKey(args.owner))));
+    const delegateSigner = umiMod.createSignerFromKeypair(umi, umi.eddsa.createKeypairFromSecretKey(d.secret));
+    const assetSigner = umiMod.createSignerFromKeypair(umi, umi.eddsa.createKeypairFromSecretKey(args.assetSecret));
+    const collection = await core.fetchCollection(umi, umiMod.publicKey(NFT_COLLECTION));
+    const builder = core.create(umi, {
+      asset: assetSigner, collection, authority: delegateSigner, owner: umiMod.publicKey(args.owner),
+      name: args.name, uri: args.uri, plugins: args.plugins,
+    });
+    // umi instruction -> web3.js instruction, hand-rolled (the adapters package is not a dependency).
+    const mintIxs = builder.getInstructions().map((ix) => new TransactionInstruction({
+      programId: new PublicKey(String(ix.programId)),
+      keys: ix.keys.map((k) => ({ pubkey: new PublicKey(String(k.pubkey)), isSigner: !!k.isSigner, isWritable: !!k.isWritable })),
+      data: Buffer.from(ix.data),
+    }));
+    // ---- decompile the sell tx and merge --------------------------------------------------------
+    const raw = Buffer.from(sellTx.b64, "base64");
+    let sellIxs, blockhash;
+    if (sellTx.ver === "legacy") {
+      const t = Transaction.from(raw);
+      sellIxs = t.instructions; blockhash = t.recentBlockhash;
+    } else {
+      const vt = VersionedTransaction.deserialize(raw);
+      if (vt.message.addressTableLookups && vt.message.addressTableLookups.length)
+        return { ok: false, status: 501, code: "alt", error: "that listing uses address-lookup tables — it cannot be merged with a mint in one transaction" };
+      const msg = TransactionMessage.decompile(vt.message);
+      sellIxs = msg.instructions; blockhash = vt.message.recentBlockhash;
+    }
+    const tx = new Transaction();
+    tx.feePayer = new PublicKey(args.owner);                     // the player pays rent AND fees
+    tx.recentBlockhash = blockhash || (await conn.getLatestBlockhash("confirmed")).blockhash;
+    tx.add(...mintIxs, ...sellIxs);
+    // Partial-sign: collection authority + the new asset account. NEVER the player; NEVER a payer.
+    tx.partialSign(Keypair.fromSecretKey(Uint8Array.from(d.secret)), Keypair.fromSecretKey(Uint8Array.from(args.assetSecret)));
+    const b64 = tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString("base64");
+    return { ok: true, b64, ver: "legacy", cosigned: false, bytes: b64.length, sellEnvelope: { slot: sellTx.slotVer, sniffed: sellTx.sniffed } };
+  } catch (e) {
+    // nothing about the failure is echoed back (it can carry key material); the reservation stands
+    return { ok: false, status: 502, code: "compose", error: "could not compose the mint+list transaction — try again in a moment" };
+  }
+}
 // ONE certificate per creature, and one creature per certificate: an on-chain address already bound to
 // another registry row can never be adopted by a second one. `nftEligibility` guards the first
 // direction (row.mint is write-once); this guards the second, which a format check alone left open.
@@ -6303,6 +6439,9 @@ function nftMintableKind(row) {
   if (!row) return false;
   if (row.type === "mount") return true;
   if (row.type === "egg") return EGG_NFT_ON && EGG_NFT_KINDS.has(String(row.kind));
+  // OWNER RULING 1 (2026-08-10): every rarity sells — normals AND avatars included. This reverses the
+  // rare-tiers-only lock above deliberately; flag-off keeps the old lock byte-identical.
+  if (MINT_AT_SALE_ON && (row.type === "chikimon" || row.type === "avatar")) return true;
   return row.type === "chikimon" && (row.kind === "legendary" || row.kind === "meme");
 }
 // The airtight gate, in order. Pure (row + wallet) so a sim drives it directly. code "ok" == mintable.
@@ -6310,7 +6449,7 @@ function nftEligibility(row, wallet) {
   if (!row) return { code: "no-asset", status: 404, error: "no such asset" };
   if (!wallet || row.owner !== wallet) return { code: "not-owner", status: 403, error: "the registry says this wallet does not own that asset" };
   if (row.state !== "active") return { code: "not-active", status: 409, error: `asset is ${row.state}, not mintable` };
-  if (row.type === "avatar") return { code: "avatar", status: 403, error: "avatars are not mintable in this increment" };
+  if (row.type === "avatar" && !MINT_AT_SALE_ON) return { code: "avatar", status: 403, error: "avatars are not mintable in this increment" };
   if (!nftMintableKind(row)) return { code: "kind", status: 403, error: "only legendaries, Meme Dynasty and mounts can be minted" };
   // THE EGG WITNESS. Everything below this branch — the origin-in-NFT_MINT_ORIGINS gate and the
   // unforgeable `parent`-link/no-`luid` gate — is built for a hatched CREATURE that has a birth to
@@ -6325,6 +6464,18 @@ function nftEligibility(row, wallet) {
   if (row.type === "egg") {
     if (!EGG_NFT_ORIGINS.has(String(row.origin)) || row.luid)
       return { code: "origin", status: 403, error: "only a server-issued egg can be certified" };
+    if ((row.gameStatus ?? "good") !== "good") return { code: "flagged", status: 409, error: "asset is flagged and cannot be minted" };
+    if (row.listedOffchain || row.pendingHandover) return { code: "busy", status: 409, error: "asset is listed on-chain or has a pending transfer" };
+    return { code: "ok", status: 200 };
+  }
+  // ============ MINT AT SALE (owner ruling 1) — every CLEAN-origin creature/mount/avatar sells ====
+  // The witness question does not disappear; it moves into the metadata (masWitness), which states
+  // "server-hatched" vs "player-reported" instead of refusing the honest majority of the registry.
+  // What still refuses, exactly as before: unverified origin (quarantined — HELD, never burned),
+  // a flagged row, and anything already listed or mid-transfer. Flag-off, this block does not exist
+  // and the strict witness gates below answer byte-identically to today.
+  if (MINT_AT_SALE_ON) {
+    if (!masOriginClean(row.origin)) return { code: "origin", status: 403, error: "this one's record is unverified — it stays yours, but it cannot be certified or sold" };
     if ((row.gameStatus ?? "good") !== "good") return { code: "flagged", status: 409, error: "asset is flagged and cannot be minted" };
     if (row.listedOffchain || row.pendingHandover) return { code: "busy", status: 409, error: "asset is listed on-chain or has a pending transfer" };
     return { code: "ok", status: 200 };
@@ -6372,7 +6523,11 @@ function nftMintIntent(row, previewEdition) {
   const ed = row.edition || previewEdition || null;
   return {
     id: row.id, standard: "core", program: "mpl-core", instruction: "CreateV2", mintModel: "server-mints",
-    name: `${_nftCap(row.sp)} #${ed}`, collection: NFT_COLLECTION,
+    // ONE NAMING FUNCTION. This preview used to build the name itself — `${sp} #${ed}` — while the mint
+    // uses nftAssetName, which has an egg branch. For an egg the two disagreed: the confirmation screen
+    // said "Legendary #1" and the wallet then showed "Legendary Egg #1". A permanent record's preview has
+    // to name the record. (A1-EGGNAME)
+    name: nftAssetName(Object.assign({}, row, { edition: ed })), collection: NFT_COLLECTION,
     royaltyModel: "collection-inherited", sellerFeeBasisPoints: NFT_ROYALTY_BPS, royaltyWallet: NFT_ROYALTY_WALLET,
     signers: { assetKeypair: "server-ephemeral", payer: "mint-delegate", owner: "player-wallet", collectionAuthority: "mint-delegate-scoped-non-treasury" },
     immutable: { registryId: row.id, species: row.sp, kind: row.kind, origin: row.origin,
@@ -6495,6 +6650,10 @@ function nftSettleHandover(row, to, now, dormant) {
   // row a CHIK_ME_MARKET=0 server can produce, so this line is unreachable flag-off.
   if (row.meList) delete row.meList;
   _nftHolderObs.delete(row.id);
+  // BOTH wallets' Magic Eden reads are now wrong: the seller no longer holds it and the buyer does. This
+  // is the exact moment the buyer opens the collection tab, and a cached pre-sale answer is what made
+  // their new creature invisible — and unlistable — for up to 45 s. (see meCacheDrop)
+  meWalletCacheDrop(from, to); meTokenCacheDrop(row.mint);
   const what = row.type === "mount" ? "mount" : (row.kind || row.type);
   nftNewsPush(from, { kind: "sold", id: row.id, type: row.type, sp: row.sp, cls: row.kind || null,
     lvl: row.lvl || null, mint: row.mint, other: to, dormant: !!dormant,
@@ -6502,6 +6661,24 @@ function nftSettleHandover(row, to, now, dormant) {
   nftNewsPush(to, { kind: "arrived", id: row.id, type: row.type, sp: row.sp, cls: row.kind || null,
     lvl: row.lvl || null, mint: row.mint, other: from, dormant: !!dormant,
     text: `${row.sp} (${what}) has arrived from its previous owner — it is yours to play.` });
+  // ============ AVATAR HANDOVER (owner ruling 3, CHIK_MINT_AT_SALE) ============
+  // The buyer received avatar+edition through the transfer above like any asset (the perk is derived
+  // client-side from the species — Econ.AVATAR_PERK — so it travels with the row for free). The
+  // SELLER may never be left avatar-less: if the registry now records no look for them, the server
+  // grants the Wanderer ("classic") — the ceremony look every player is awarded — covering accounts
+  // that predate the universal grant. luid:"classic" makes the grant cap-EXEMPT (a make-good must
+  // never be refused at a ceiling) and dedups it against the seller's own ledger entry for the look.
+  // Materialises exactly like a hand-off arrival: arrivedAt + a pull-and-ack notice.
+  if (MINT_AT_SALE_ON && row.type === "avatar" && !regOwned(from, "avatar").length) {
+    try {
+      const wnd = mintAsset("avatar", from, { sp: "classic", kind: "avatar", luid: "classic" }, "issued");
+      regEvent(wnd, "wanderer_grant", { after: row.id });
+      wnd.arrivedAt = now;
+      nftNewsPush(from, { kind: "arrived", id: wnd.id, type: "avatar", sp: "classic", cls: "avatar",
+        lvl: null, mint: null, other: null, dormant: false,
+        text: "The Wanderer's cloak returns to you — no traveller of Chikoria walks without a look." });
+    } catch (e) { /* registry at capacity — the seller keeps playing; the client's own look is untouched */ }
+  }
   _assetsDirty = true;
   return { ok: true, from, to, id: row.id, sp: row.sp, type: row.type };
 }
@@ -6639,6 +6816,40 @@ async function reconcileNftOwners() {
       nftApplyClassification(row, nftClassifyHolder(row, obs));
       if (_nftDasUnsupported) break;                               // structural outage — stop the whole loop
     }
+    // ...AND THE HALF THE CHAIN CANNOT TELL US. A Magic Eden listing on a Core asset is a freeze/transfer
+    // DELEGATE, not an escrow: the asset never moves, so DAS keeps naming the seller and every read
+    // above classifies it "same". That is why `listedOffchain` used to mean "listed THROUGH US" while
+    // every rule that reads it means "listed ANYWHERE" — and why an egg listed on magiceden.io could be
+    // hatched out from under a live order. This sweep is the braces to the hatch-time belt: it asks
+    // Magic Eden's own wallet read and writes the marker down, so the freeze holds even for a player who
+    // never opens a tab, and the exposure is bounded by THIS LOOP'S PERIOD (5 min) instead of forever.
+    // Scoped to MINTED, ACTIVE EGGS on purpose: an egg is the only asset an in-game action can destroy,
+    // so it is the only one where a stale marker costs a buyer real money rather than costing the holder
+    // one refusal. One read per distinct wallet, on the cache key the collection tab already warms.
+    // (A1-MEWEB-HATCH-RACE, the "shrink the window to the reconcile period" half)
+    if (meBookGuardOn()) {
+      const byWallet = new Map();
+      for (const row of assetReg.values()) {
+        if (row.type !== "egg" || !row.mint || row.state !== "active" || !row.owner) continue;
+        if (!byWallet.has(row.owner)) byWallet.set(row.owner, []);
+        byWallet.get(row.owner).push(row);
+      }
+      for (const [w, eggs] of byWallet) {
+        let c = null;
+        try {
+          c = await meCached(`mine:${w}`, ME_MINE_CACHE_MS, ME_STALE_MS,
+            () => meFetch(`/v2/wallets/${encodeURIComponent(w)}/tokens`, { query: { collection_symbol: ME_SYMBOL, limit: 500 } }));
+        } catch (e) { c = null; }
+        const toks = (c && Array.isArray(c.val)) ? c.val : null;
+        if (!toks) continue;                                       // unreadable -> change nothing, ever
+        const byMint = new Map();
+        for (const t of toks) if (t && t.mintAddress) byMint.set(String(t.mintAddress), t);
+        for (const row of eggs) {
+          const t = byMint.get(String(row.mint));
+          if (t) meMarkListedFromBook(row, t);
+        }
+      }
+    }
     if (_assetsDirty) { try { await saveAssetLedger(true); } catch (e) {} }
   } finally { _nftSyncBusy = false; _nftSyncAt = Date.now(); }
 }
@@ -6653,6 +6864,13 @@ if (NFT_MINT_ON) {
 // one flag without the other is a silent no-op, which is the worst way for an operator to find out.
 if (NFT_HANDOVER_ON && !NFT_MINT_ON)
   console.warn("✖ CHIK_NFT_HANDOVER=1 but CHIK_NFT_MINT=0 — the reconcile loop is off, so NO hand-off can ever settle");
+// The other silent-no-op pairing, and the one that costs a BUYER money rather than costing nobody
+// anything: minting eggs into a browsable marketplace with the book guard off means a player can list an
+// egg on magiceden.io and still hatch it, because nothing on this server ever asks the book. The guard
+// turns itself on when ME_API_KEY lands (see meBookGuardOn); until then an operator who mints eggs
+// anyway must be told, once, at boot.
+if (NFT_MINT_ON && ME_MARKET_ON && !meBookGuardOn())
+  console.warn("✖ CHIK_NFT_MINT=1 and CHIK_ME_MARKET=1 but the Magic Eden book guard is OFF (no ME_API_KEY, or CHIK_EGG_MEGUARD=0) — an egg listed on magiceden.io can still be hatched. Set CHIK_EGG_MEGUARD=1 to close it.");
 
 // ============ RARITY IS A LAW, NOT A LABEL ============
 // Advertised scarcity used to be enforced NOWHERE for avatars, and for mounts the "supply" numbers
@@ -6925,12 +7143,45 @@ function mintAsset(type, wallet, fields, origin, parent) {
     id, type, owner: wallet, born: Date.now(), origin, state: "active",
     parent: parent || null, chain: [],
   }, fields || {});
+  // RULING 4(b): the edition/serial is assigned AT ISSUANCE from the registry census counter — an
+  // unminted creature occupies its numbered slot exactly like a minted one, so the on-chain series
+  // can never misrepresent scarcity. O(1) (one counter bump, no census build, no chain read), so the
+  // hatch/grant paths gain zero latency — measured in mas_sim.mjs. Write-once: an edition once seen
+  // by a player is never renumbered (nftEditionFor only ever increments; restore floors the counter).
+  // Flag-off this line does not run and every issued row is byte-identical to today's.
+  if (MINT_AT_SALE_ON && !row.edition) row.edition = nftEditionFor(row);
   regEvent(row, "minted", { to: wallet, origin });
   assetReg.set(id, row);
   ownerSet(wallet).add(id);
   _assetsDirty = true;
   censusInvalidate();      // the count this row belongs to is now stale — the cap must never read it stale
   return row;
+}
+
+// ============ RULING 4 HEAL — editions for rows issued before edition-at-issuance ============
+// Every ACTIVE row that lacks an edition gets one, deterministically by ISSUANCE ORDER (born asc,
+// then id asc — ids embed a monotonic clock+sequence, so ties break stably), continuing each series
+// from the persisted nftEdition counter. NOTHING is ever renumbered: a row that already carries an
+// edition — every minted asset above all — keeps it forever (write-once, exactly as _nftCommitMint
+// treats it), so no number a player has already seen can move. Runs once per boot under the flag;
+// re-running is a no-op because healed editions persist with the rows.
+function masHealEditions() {
+  if (!MINT_AT_SALE_ON) return 0;
+  const byKey = new Map();
+  for (const r of assetReg.values()) {
+    if (!r || r.edition || r.state !== "active") continue;
+    if (!["egg", "chikimon", "mount", "avatar"].includes(r.type)) continue;
+    const k = _censusKey(r.type, r.sp);
+    if (!byKey.has(k)) byKey.set(k, []);
+    byKey.get(k).push(r);
+  }
+  let healed = 0;
+  for (const rows of byKey.values()) {
+    rows.sort((a, b) => (a.born - b.born) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    for (const r of rows) { r.edition = nftEditionFor(r); healed++; }
+  }
+  if (healed) _assetsDirty = true;
+  return healed;
 }
 
 // Ownership moves ONLY through here, and the old owner's claim is removed in the same step — which
@@ -7149,6 +7400,13 @@ function eggPoolEmptyMsg(wallet, kind) {
 // row's OWN mint state, never on the current flag, so a token minted while the flags were on is still
 // protected if a flag is later flipped off.
 function eggNftHatchBlock(row) {
+  // MINT AT SALE: a composed mint+list transaction may be sitting in the seller's Phantom right
+  // now — hatching the egg in that window would let the tx land AFTER the egg is spent, minting a
+  // certificate for something that no longer exists. The reservation (mintPending) is the marker;
+  // it clears on confirm, and the TTL+absent abandon reclaims a tx that is never submitted, so the
+  // egg is never stuck for good. Flag-gated: flag-off, this branch does not exist.
+  if (MINT_AT_SALE_ON && row && !row.mint && row.mintPending)
+    return { status: 409, body: { error: "this egg's first-sale listing is being signed — finish or abandon that sale first, then it can hatch", nftBusy: true } };
   if (!row || !row.mint) return null;                    // never minted -> nothing to protect
   if (row.pendingHandover)
     return { status: 409, body: { error: "this egg's NFT sale is still settling — it cannot hatch until the transfer completes; once it settles, only the new owner can hatch it", nftBusy: true } };
@@ -7166,6 +7424,96 @@ function eggNftRetire(row, born) {
   regEvent(row, "nft_retired", { reason: born ? "hatched" : "discarded", hatchedTo: row.nftRetired.hatchedTo });
   _assetsDirty = true;
 }
+// (3) THE SAME FREEZE, READ OFF THE MARKETPLACE ITSELF — because eggNftHatchBlock above can only see
+// markers THIS server wrote. A modern Magic Eden listing is a freeze/transfer DELEGATE, not an escrow:
+// DAS keeps reporting the seller, so the reconcile classifies it "same" (nftApplyClassification says so
+// in its own comment) and `listedOffchain` is never set. Measured with a live order standing on
+// magiceden.io: the egg hatched (200, sp=adalor), the row went state=consumed nftRetired=true, and the
+// buyer's later fill was refused "state-consumed" with ZERO notices — the buyer paid for a token the
+// game had already declared worthless. `listedOffchain` meant "listed THROUGH US"; every rule that reads
+// it means "listed ANYWHERE". Magic Eden's own wallet read carries the answer (`listStatus`), it is the
+// SAME cached read /nft/market/list already makes on every list, and the hatch path simply never asked.
+// (A1-MEWEB-HATCH-RACE)
+//   * NEVER MINTED   -> null before any await. Every egg a marketplace-off server can produce is
+//     never-minted, so this is a no-op flag-off and for every legacy egg in a real nest today.
+//   * GUARD OFF      -> null. No outbound call at all; a minted egg keeps exactly the marker-only
+//     freeze it has today. That is the shipped default (see meBookGuardOn) and it is stated, not hidden.
+//   * READ SAYS LISTED -> refuse, AND write the marker down so the rest of the server agrees.
+//   * READ CANNOT SEE THE TOKEN AT ALL — the wallet does not appear to hold it. That is either Magic
+//     Eden's index lagging, or a listing model that MOVES the token (a real escrow, as opposed to the
+//     delegate model M2 uses today). The first is harmless, the second is the race wearing a different
+//     hat, so this asks the TOKEN's own order book once before deciding. Only in this anomalous case;
+//     the ordinary hatch costs one shared wallet read or nothing at all.
+//   * UNREADABLE     -> the honest question is "how old is the newest thing we know". Refusing every
+//     hatch the moment Magic Eden hiccups would strand a player whose minted egg is not listed anywhere
+//     — the audit's own constraint — so a last-good answer younger than ME_EGG_GUARD_MAXAGE_MS is
+//     ACCEPTED and says so; older than that, the spend is HELD with a retry rather than guessed at.
+//     That is the whole trade, in one number: the race window is ME_EGG_GUARD_TTL_MS while Magic Eden
+//     answers, and ME_EGG_GUARD_MAXAGE_MS while it does not.
+async function eggNftMarketBlock(row, wallet) {
+  if (!row || !row.mint) return null;                    // never minted -> nothing to protect
+  if (!meBookGuardOn()) return null;                     // guard off -> no outbound call, no change
+  const HELD = (why) => ({ status: 503, body: {
+    error: "we can't reach Magic Eden to check this egg isn't listed there — it'll clear on its own, try again in a moment",
+    nftUnreadable: true, why, retryInMs: 5000 } });
+  let c = null;
+  try {
+    c = await meCached(`mine:${wallet}`, ME_EGG_GUARD_TTL_MS, ME_STALE_MS,
+      () => meFetch(`/v2/wallets/${encodeURIComponent(wallet)}/tokens`, { query: { collection_symbol: ME_SYMBOL, limit: 500 } }));
+  } catch (e) { c = null; }
+  const rows = (c && Array.isArray(c.val)) ? c.val : null;
+  if (!rows) return HELD("no-wallet-read");
+  const ageMs = (c && c.at) ? Math.max(0, Date.now() - c.at) : Infinity;
+  if (ageMs > ME_EGG_GUARD_MAXAGE_MS) return HELD("wallet-read-stale");
+  const t = rows.find(x => x && String(x.mintAddress || "") === String(row.mint));
+  if (t && String(t.listStatus || "") === "listed") {
+    meMarkListedFromBook(row, t);                        // our marker was behind the book — write it down
+    return { status: 409, body: { error: "this egg is listed on Magic Eden — delist it there first, then it can hatch", nftListed: true, source: "magic-eden" } };
+  }
+  if (t) return null;                                    // held, and not on sale — the ordinary answer
+  // The wallet read cannot see this token. Ask the token itself before spending it.
+  let b = null;
+  try {
+    b = await meCached(`tok:${row.mint}`, ME_TOKEN_CACHE_MS, ME_TOKEN_CACHE_MS,
+      () => meFetch(`/v2/tokens/${encodeURIComponent(row.mint)}/listings`, {}));
+  } catch (e) { b = null; }
+  const book = (b && Array.isArray(b.val)) ? b.val : null;
+  if (!book) return HELD("token-book-unreadable");
+  if (book.some(x => x && Number(x.price) > 0)) {
+    meMarkListedFromBook(row, { listStatus: "listed", price: Number(book[0] && book[0].price) || null });
+    return { status: 409, body: { error: "this egg is listed on Magic Eden — delist it there first, then it can hatch", nftListed: true, source: "magic-eden" } };
+  }
+  return null;
+}
+// "NO SUCH EGG" AND "NOT YOURS ANY MORE" ARE DIFFERENT FACTS, and a client acts on the difference:
+// Chain.gd maps a 404 from these routes to "unregistered egg — roll the hatch LOCALLY", which is true
+// for a legacy egg the registry never saw and FALSE for a registered egg that migrated to an NFT buyer.
+// That is how a seller who had already been PAID could press HATCH and still get the creature (the
+// double-sell, arriving through the client rather than through a route).
+//
+// THE STATUS STAYS 404 AND THE BODY GAINS THE FACT. Two reasons the code is not changed to 409:
+//   * the refusal is identical either way — no server route grants anything on this path, before or
+//     after; the double-sell is decided ENTIRELY by what the client does with the answer, and
+//   * the contract "the seller can no longer hatch — 404" is asserted in the existing suite
+//     (egn_attacktable E), and moving it would trade a green gate for nothing the server enforces.
+// So the body now carries `notYours` + `registered` and the client contract is named explicitly:
+//   CLIENT CONTRACT (Chain.gd `_hatch_verdict`, not this file's to change): a 404 from
+//   /assets/egg/{hatch,consume,discard} may fall back to a LOCAL roll only when the body is EMPTY.
+//   A body at all — and `notYours:true` in particular — means the registry knows this egg and it is
+//   not this wallet's. That must be "refuse", never "local". The shipped client already does exactly
+//   this (`return "local" if err.strip_edges() == "" else "refuse"`); these fields let any future
+//   reader be certain rather than inferring it from a string being non-empty.
+// Only a MINTED egg can legitimately change wallets (nftSettleHandover requires row.mint), so the extra
+// fields are unreachable for every egg a mint-off server can produce.
+function eggRouteRow(id, wallet) {
+  const row = assetReg.get(id);
+  if (!row || row.type !== "egg") return { err: { status: 404, body: { error: "no such egg" } } };
+  if (row.owner !== wallet) {
+    if (row.mint) return { err: { status: 404, body: { error: "no such egg", notYours: true, registered: true } } };
+    return { err: { status: 404, body: { error: "no such egg" } } };
+  }
+  return { row };
+}
 
 // Issue an egg. The client has already taken the barter from the player's own inventory; what the
 // server adds — and what the client cannot fake — is the identity and the clock.
@@ -7178,8 +7526,24 @@ app.post("/assets/egg/claim", (req, res) => {
   const now = Date.now();
   if (now - (_lastEggClaim.get(wallet) || 0) < EGG_CLAIM_MIN_MS) return res.status(429).json({ error: "too fast" });
   // the client's own rule: one egg of each kind at a time (Profile.gd start_egg)
-  if (regOwned(wallet, "egg").some(e => e.kind === kind)) {
-    return res.status(409).json({ error: "your nest already cradles an egg of that kind" });
+  {
+    const held = regOwned(wallet, "egg").find(e => e.kind === kind);
+    if (held) {
+      // ESCROW HOLDS THE SLOT — AND NOW SAYS SO. The owner ruling hides a listed egg from the nest, so
+      // this refusal named an object the player had been made unable to see, with no way to act on it.
+      // The slot is deliberately KEPT rather than released: the escrow copy promises "delist and it is
+      // back in the nest exactly as it was", which is only true if nothing else took its place — freeing
+      // the slot would let a player hold two eggs of one kind the moment they delisted, and the client's
+      // egg_of(kind) can only hold one. So the rule stands and the SENTENCE changes, to one that names
+      // the real obstacle and the way out. No-op for a never-minted egg, so a marketplace-off server
+      // answers exactly as it does today. (A1-ESCROW-NESTSLOT)
+      if (held.mint && (held.listedOffchain || held.pendingHandover)) {
+        return res.status(409).json({
+          error: `your ${kind} egg is in escrow on the NFT marketplace — delist it there to free the nest`,
+          escrow: true, escrowWhy: held.pendingHandover ? "selling" : "listed", kind });
+      }
+      return res.status(409).json({ error: "your nest already cradles an egg of that kind" });
+    }
   }
   // ...AND THE EGG HAS TO BE ABLE TO EXIST. Asked BEFORE a single material is charged — see the note
   // at eggPoolFor. A completionist is the most invested player there is and was the only one this
@@ -7241,13 +7605,14 @@ app.post("/assets/egg/claim", (req, res) => {
 
 // Hatch. The server checks the clock IT wrote, rolls the result ITSELF, consumes the egg forever,
 // and mints the creature. A crafted save can do none of those four things.
-app.post("/assets/egg/hatch", (req, res) => {
+app.post("/assets/egg/hatch", async (req, res) => {
   if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
   const wallet = regWallet(req);
   if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
   const id = String(req.body?.id || "").slice(0, 64);
-  const row = assetReg.get(id);
-  if (!row || row.type !== "egg" || row.owner !== wallet) return res.status(404).json({ error: "no such egg" });
+  const _rr = eggRouteRow(id, wallet);
+  if (_rr.err) return res.status(_rr.err.status).json(_rr.err.body);
+  const row = _rr.row;
   if (row.state !== "active") return res.status(409).json(_alreadyHatched(row));
   const ready = eggReadyAt(row);
   if (Date.now() < ready) return res.status(425).json({ error: "still incubating", readyIn: ready - Date.now() });
@@ -7256,6 +7621,8 @@ app.post("/assets/egg/hatch", (req, res) => {
   // is never left holding an order for a token the seller already turned into a creature. No-op for a
   // never-minted egg (every egg a marketplace-off server can produce), so flag-off this changes nothing.
   { const _nb = eggNftHatchBlock(row); if (_nb) return res.status(_nb.status).json(_nb.body); }
+  // ...and the half our own marker cannot see: an order placed on magiceden.io. (A1-MEWEB-HATCH-RACE)
+  { const _mb = await eggNftMarketBlock(row, wallet); if (_mb) return res.status(_mb.status).json(_mb.body); }
 
   let born;
   try {
@@ -7321,18 +7688,20 @@ app.post("/assets/egg/hatch", (req, res) => {
 // grandfathering is absolute and the lineage stays readable. "consumed" is the state used because it
 // is the one restoreAssetReg round-trips; an invented state would come back "active" on the next
 // restart and re-block the nest.
-app.post("/assets/egg/discard", (req, res) => {
+app.post("/assets/egg/discard", async (req, res) => {
   if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
   const wallet = regWallet(req);
   if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
   const id = String(req.body?.id || "").slice(0, 64);
-  const row = assetReg.get(id);
-  if (!row || row.type !== "egg" || row.owner !== wallet) return res.status(404).json({ error: "no such egg" });
+  const _rr = eggRouteRow(id, wallet);
+  if (_rr.err) return res.status(_rr.err.status).json(_rr.err.body);
+  const row = _rr.row;
   if (row.state !== "active") return res.status(409).json({ error: "that egg is already spent" });
   // A minted egg that is listed / settling must be delisted before it can be discarded, for the same
   // buyer-safety reason as hatch: destroying the row while a buyer could still fill the order would
   // convey a worthless token. No-op for a never-minted egg. (truth unknown #5: discard needs the freeze too)
   { const _nb = eggNftHatchBlock(row); if (_nb) return res.status(_nb.status).json(_nb.body); }
+  { const _mb = await eggNftMarketBlock(row, wallet); if (_mb) return res.status(_mb.status).json(_mb.body); }
   if (eggPoolFor(wallet, row.kind).length) {
     return res.status(409).json({ error: "that egg can still hatch — let it finish", canHatch: true });
   }
@@ -7350,13 +7719,14 @@ app.post("/assets/egg/discard", (req, res) => {
              message: "Mithra takes the egg back and returns what you paid for it." });
 });
 
-app.post("/assets/egg/consume", (req, res) => {
+app.post("/assets/egg/consume", async (req, res) => {
   if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
   const wallet = regWallet(req);
   if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
   const id = String(req.body?.id || "").slice(0, 64);
-  const row = assetReg.get(id);
-  if (!row || row.type !== "egg" || row.owner !== wallet) return res.status(404).json({ error: "no such egg" });
+  const _rr = eggRouteRow(id, wallet);
+  if (_rr.err) return res.status(_rr.err.status).json(_rr.err.body);
+  const row = _rr.row;
   if (row.state !== "active") return res.status(409).json(_alreadyHatched(row));
   // the same incubation floor the server-rolled hatch enforces — a registered egg cannot be
   // reported as hatched before it could possibly have finished
@@ -7365,6 +7735,7 @@ app.post("/assets/egg/consume", (req, res) => {
   // Same NFT freeze as the server-rolled hatch: a minted egg that is listed / settling cannot be
   // consumed until it is delisted. No-op for a never-minted egg. (attack table: THE CORE RACE)
   { const _nb = eggNftHatchBlock(row); if (_nb) return res.status(_nb.status).json(_nb.body); }
+  { const _mb = await eggNftMarketBlock(row, wallet); if (_mb) return res.status(_mb.status).json(_mb.body); }
 
   const sp = String(req.body?.sp || "").slice(0, 24);
   const isMount = row.kind === "mount";
@@ -7774,6 +8145,16 @@ app.get("/assets/mine", (req, res) => {
     const r = assetReg.get(id);
     if (!r) continue;
     const card = { id: r.id, sp: r.sp, kind: r.kind, born: r.born, origin: r.origin, state: r.state };
+    // A RETIRED ROW IS STILL SERVED — the record is kept forever (owner lock D5), and a spent egg's
+    // certificate has to stay reachable — but it must never be MISTAKEN for a live one. `state` alone
+    // left that to the client's string handling, so a BURNED mount sat in mounts[] beside live mounts
+    // with nothing else to mark it and whether the Stable still drew (and rode) it was accidental.
+    // Present ONLY on a row that is genuinely not active AND that carries a certificate, so every live
+    // card is byte-identical to today and so is every card a mint-off server can produce — the ambiguity
+    // this closes only exists for a token (a hatched egg's spent certificate, a burned mount's row). An
+    // ordinary consumed egg on a flag-off server is a shape that predates all of this and keeps it.
+    // (A1-BURNED-CARD)
+    if (r.state !== "active" && r.mint) card.retired = true;
     // Mint eligibility is SERVER-decided and served here so the client never re-implements a single
     // rule of the gate (and an old client, which never asks, is unaffected). Flag-gated: with
     // CHIK_NFT_MINT off this block adds no key and the reply is byte-identical to today's.
@@ -7781,9 +8162,37 @@ app.get("/assets/mine", (req, res) => {
       const el = nftEligibility(r, w);
       card.mint = r.mint || null;
       card.edition = r.edition || null;
-      card.mintCode = r.mint ? "minted" : el.code;
-      card.mintWhy = r.mint ? null : (el.error || null);
-      card.mintable = !r.mint && el.code === "ok" && !_nftBoardListed(r);
+      // A SUBMIT IN FLIGHT IS NOT "NEVER TRIED". A row carrying `mintPending` has a reserved edition and
+      // a reserved on-chain address and WILL resolve itself, but it answered mint:null / mintCode:"ok" /
+      // mintable:true — byte-identical to a card nobody has ever touched. So the UI painted the ordinary
+      // "Mint as NFT" button and every tap came back 409 "still confirming", with "Try again" as the only
+      // affordance — the exact wrong advice. Named on the wire instead. (A1-PENDING-INVISIBLE)
+      // Emitted ONLY while a submit is genuinely in flight: absent means "nothing pending", which is
+      // what every reader already assumes, and it keeps an ordinary card byte-identical to today's.
+      if (r.mintPending) card.mintPending = true;
+      card.mintCode = r.mint ? "minted" : (r.mintPending ? "pending" : el.code);
+      card.mintWhy = r.mint ? null
+                            : (r.mintPending ? "this one is already being certified — it should land in a moment"
+                                             : (el.error || null));
+      card.mintable = !r.mint && !r.mintPending && el.code === "ok" && !_nftBoardListed(r);
+      // WHAT THE MARKETPLACE THINKS, ON THE FEED THE SATCHEL AND THE STABLE ACTUALLY READ. Only eggs
+      // carried escrow state, so a listed legendary looked exactly like an unlisted one on every card a
+      // player scrolls past; the only way to find out was to open each certificate one at a time.
+      // Emitted ONLY for a certified row that genuinely has something on the market, so an uncertified
+      // card, an unlisted certified card, and every card on a mint-off server are all unchanged — absent
+      // means "not on the market", which is what every reader already assumes. (A1-SEAM-ASSETSMINE)
+      if (r.mint && (r.listedOffchain || r.pendingHandover)) {
+        card.listed = !!r.listedOffchain;
+        card.listPrice = (r.meList && Number.isFinite(Number(r.meList.price))) ? Number(r.meList.price) : null;
+        card.pendingSale = !!r.pendingHandover;
+      }
+      // F6 says in-game privileges can be restricted when the on-chain record is contradicted, and the
+      // Mine tab prints that clause to every player — but when it actually happened the only symptom was
+      // a control that silently stopped working. Present ONLY on a restricted row. (A1-FLAGGED-INVISIBLE)
+      if ((r.gameStatus ?? "good") !== "good") {
+        card.gameStatus = String(r.gameStatus);
+        card.statusReason = r.statusReason || null;
+      }
     }
       if (r.type === "egg") {
       card.readyAt = eggReadyAt(r); card.hatchedTo = r.hatchedTo || null;
@@ -7794,9 +8203,16 @@ app.get("/assets/mine", (req, res) => {
       // to be told. One field, so the client has a single thing to branch on rather than inferring
       // escrow from a combination — and so a future egg action cannot forget to check.
       // It returns to them intact on delist, and moves to the buyer on settle.
-      card.escrowed = !!(r.mint && (r.listedOffchain || r.pendingHandover));
-      if (card.escrowed) card.escrowWhy = r.pendingHandover ? "selling" : "listed";
-      card.nftRetired = r.nftRetired ? true : false;   // spent by hatching — no NFT value remains
+      // FLAG-OFF WIRE SHAPE: these were unconditional, so a server with the WHOLE marketplace arc
+      // switched off still put `escrowed:false, nftRetired:false` on every egg — two keys the
+      // pre-marketplace build never sent (measured: keys(10) vs the baseline's keys(8)). Emitted when the
+      // egg marketplace is live OR the egg actually carries a mint, which keeps a token minted while the
+      // flags were on protected if a flag is later switched off — the same rule eggNftHatchBlock uses.
+      if (EGG_NFT_ON || r.mint) {
+        card.escrowed = !!(r.mint && (r.listedOffchain || r.pendingHandover));
+        if (card.escrowed) card.escrowWhy = r.pendingHandover ? "selling" : "listed";
+        card.nftRetired = r.nftRetired ? true : false;   // spent by hatching — no NFT value remains
+      }
       out.eggs.push(card);
     }
     else if (r.type === "chikimon") { card.lvl = r.lvl; out.chikimon.push(card); }
@@ -7828,6 +8244,17 @@ app.get("/assets/cert", (req, res) => {
     out.hatcher = r.hatcher || r.owner;
     out.gameStatus = r.gameStatus || "good";
     if (r.gameStatus === "restricted") { out.statusReason = r.statusReason || null; out.statusAt = r.statusAt || null; }
+    // THE CERTIFICATE HAS TO BE SELF-SUFFICIENT. It is the screen a player opens to find out what is
+    // true about one asset, and it said nothing at all about the market: the certificate of a creature
+    // listed thirty seconds ago was identical to the one before it was listed. The pop-up got it right
+    // only by cross-referencing a SEPARATE, cached tab read. Present only for a row that carries a mint,
+    // so an uncertified asset's certificate is unchanged. (A1-CERT-NOLISTED)
+    if (r.mint) {
+      out.listed = !!r.listedOffchain;
+      out.listPrice = (r.meList && Number.isFinite(Number(r.meList.price))) ? Number(r.meList.price) : null;
+      out.pendingSale = !!r.pendingHandover;
+      out.nftRetired = !!r.nftRetired;
+    }
   }
   res.json(out);
 });
@@ -7896,6 +8323,9 @@ app.post("/assets/arrivals", (req, res, next) => {
     if (have.has(r.id) || (r.type === "mount" && haveMounts.has(String(r.sp)))) { already++; continue; }
     add.push({ id: r.id, type: r.type, sp: r.sp, kind: r.kind || null, lvl: r.lvl || null,
                born: r.born, origin: r.origin, mint: r.mint || null, arrivedAt: r.arrivedAt,
+               // An EGG arrival has to be able to become a nest entry, and a nest entry needs a clock.
+               // `undefined` is dropped by JSON.stringify, so a creature/mount arrival is byte-identical.
+               readyAt: r.type === "egg" ? eggReadyAt(r) : undefined,
                from: r.handover ? r.handover.from : null });
   }
   res.json({ wallet: w, add, already, count: add.length });
@@ -7924,10 +8354,17 @@ app.post("/assets/nft/prepare", async (req, res) => {
   if (!a.ok) return res.status(403).json({ error: "prove this wallet first" });
   const id = String(req.body?.id || "").slice(0, 64);
   const row = assetReg.get(id);
-  const el = nftEligibility(row, _nftResolveWho(a, row));
+  const who = _nftResolveWho(a, row);
+  // A ROW THAT ALREADY CARRIES A MINT HAS NOTHING LEFT TO GATE — see the same reordering in
+  // /assets/nft/mint below. Identity, ownership and retirement are all still checked first, in
+  // nftEligibility's own words, so a stranger and a burned row answer exactly as before. (A1-MINT-BUSY)
+  if (!row) return res.status(404).json({ error: "no such asset" });
+  if (!who || row.owner !== who) return res.status(403).json({ error: "the registry says this wallet does not own that asset" });
+  if (row.state !== "active") return res.status(409).json({ error: `asset is ${row.state}, not mintable` });
+  if (row.mint) return res.json({ ok: true, already: true, mint: row.mint, edition: row.edition, intent: nftMintIntent(row) });
+  const el = nftEligibility(row, who);
   if (el.code !== "ok") return res.status(el.status).json({ error: el.error });
   if (_nftBoardListed(row)) return res.status(409).json({ error: "asset is listed on the in-game board — unlist it first" });
-  if (row.mint) return res.json({ ok: true, already: true, mint: row.mint, edition: row.edition, intent: nftMintIntent(row) });
   // The number this row WOULD get, read without incrementing anything. Two previews can show the same
   // "#1"; only the mint route decides, and it decides once.
   const previewEdition = (nftEdition[_censusKey(row.type, row.sp)] || 0) + 1;
@@ -7947,6 +8384,9 @@ function _nftCommitMint(row, addr, sig) {
   row.hatcher = row.hatcher || row.owner;                     // birth-hatcher split from current owner
   row.mint = addr;                                            // write-once — the on-chain address
   if (_meMintIdx) _meMintIdx.set(addr, row.id);               // keep the mint->row index warm
+  // ...and drop the Magic Eden reads this mint just invalidated, so the collection tab and /list do not
+  // spend the next 45 s insisting the wallet does not hold it. (see meCacheDrop)
+  meWalletCacheDrop(row.owner); meTokenCacheDrop(addr);
   row.holderSince = Date.now();
   delete row.mintPending;
   _nftPendingKeys.delete(row.id);
@@ -7969,10 +8409,21 @@ app.post("/assets/nft/mint", async (req, res) => {
   const id = String(req.body?.id || "").slice(0, 64);
   const row = assetReg.get(id);
   const who = _nftResolveWho(a, row);
+  // IDEMPOTENT: a retry returns the SAME mint, never a second one — and that answer is owed BEFORE the
+  // eligibility gate, not after it. nftEligibility's `listed/pending -> busy` branch ran first, so the
+  // moment the asset was listed a re-ask for an EXISTING certificate turned into 409 "asset is listed
+  // on-chain or has a pending transfer": a refusal that reads like trouble, for a question whose answer
+  // is simply "here is the certificate you already have". Identity and ownership are still proven first,
+  // in nftEligibility's own words, so a stranger gets exactly the 404/403 they got before — and so does
+  // a RETIRED row: a burned or consumed asset must keep answering "asset is burned, not mintable" rather
+  // than cheerfully handing back a certificate for something that no longer exists. Only the
+  // listed/pending "busy" gate is reordered. (A1-MINT-BUSY)
+  if (!row) return res.status(404).json({ error: "no such asset" });
+  if (!who || row.owner !== who) return res.status(403).json({ error: "the registry says this wallet does not own that asset" });
+  if (row.state !== "active") return res.status(409).json({ error: `asset is ${row.state}, not mintable` });
+  if (row.mint) return res.json(_nftMintReply(row, true));
   const el = nftEligibility(row, who);
   if (el.code !== "ok") return res.status(el.status).json({ error: el.error });
-  // IDEMPOTENT: a retry returns the SAME mint, never a second one.
-  if (row.mint) return res.json(_nftMintReply(row, true));
   if (NFT_MINT_PAUSED && !row.edition) return res.status(503).json({ error: "new mints are paused" });
   if (_nftBoardListed(row)) return res.status(409).json({ error: "asset is listed on the in-game board — unlist it first" });
   // Fail CLOSED on configuration: without a collection there is nothing to verify membership AGAINST,
@@ -8136,12 +8587,30 @@ app.get("/assets/nft/meta/:id", (req, res, next) => {
   if (!r) return res.status(404).json({ error: "no such asset" });
   const attrs = nftAttributes(r).map(a => ({ trait_type: a.key, value: a.value }));
   attrs.push({ trait_type: "gameStatus", value: String(r.gameStatus || "good") });
+  // AN EGG IS NOT A CREATURE, and this JSON is the whole basis on which a buyer decides — it is what
+  // every marketplace, wallet and aggregator shows about the token. The creature template rendered
+  // "Legendary — a legendary of Chikoria, hatched in-world" for an UNHATCHED egg (r.sp IS the kind, so
+  // it named the tier twice) and asserted the one fact a buyer most needs to be FALSE. And because
+  // retire is not burn, a SPENT egg's token still exists and can still be listed from Magic Eden's own
+  // page, so a spent certificate has to say so in the place a buyer actually reads.
+  // (A1-EGGMETA, and the honest half of A1-RETIRED-GRID)
+  const isEgg = r.type === "egg";
+  const eggSpent = isEgg && (r.state !== "active" || !!r.nftRetired);
+  if (isEgg) attrs.push({ trait_type: "hatched", value: eggSpent ? "yes" : "no" });
   const out = {
     name: r.edition ? nftAssetName(r) : _nftCap(r.sp), symbol: "CHIKI",
-    description: `${_nftCap(r.sp)} — a ${r.kind || r.type} of Chikoria, hatched in-world and certified by the Chikoria registry. Provenance is on-chain in this asset's Attributes.`,
+    description: !isEgg
+      ? `${_nftCap(r.sp)} — a ${r.kind || r.type} of Chikoria, hatched in-world and certified by the Chikoria registry. Provenance is on-chain in this asset's Attributes.`
+      : (eggSpent
+         ? `A ${_nftCap(r.kind)} Egg of Chikoria that has already hatched. This certificate is SPENT — the egg it names can never be hatched, tended or traded in Chikoria again. Provenance is on-chain in this asset's Attributes.`
+         : `An unhatched ${_nftCap(r.kind)} Egg of Chikoria, issued and clocked by the Chikoria registry. Hatching it retires this certificate. Provenance is on-chain in this asset's Attributes.`),
     attributes: attrs,
   };
-  if (NFT_IMAGE_BASE) out.image = `${NFT_IMAGE_BASE}/${encodeURIComponent(r.type)}/${encodeURIComponent(r.sp)}.png`;
+  // an egg has no species (r.sp IS its kind), so its art path is named outright rather than landing on
+  // the right file by coincidence of the per-species convention
+  if (NFT_IMAGE_BASE) out.image = isEgg
+    ? `${NFT_IMAGE_BASE}/egg/${encodeURIComponent(String(r.kind || r.sp))}.png`
+    : `${NFT_IMAGE_BASE}/${encodeURIComponent(r.type)}/${encodeURIComponent(r.sp)}.png`;
   if (NFT_META_BASE) out.external_url = `${NFT_META_BASE}/assets/cert?id=${encodeURIComponent(r.id)}`;
   res.json(out);
 });
@@ -8211,6 +8680,52 @@ const ME_STALE_MS = Math.max(ME_CACHE_MS, _meNum(process.env.ME_STALE_MS, 600000
 // returned, never logged. `meKeyPresent()` is the only thing about it any response may ever say.
 function meKey() { return String(process.env.ME_API_KEY || "").trim(); }
 function meKeyPresent() { return meKey().length > 0; }
+
+// ============ THE BOOK GUARD — one switch for "consult Magic Eden before a VALUE decision" ============
+// Three places now want to ask Magic Eden's own book a question our registry cannot answer ("is this
+// token on sale ANYWHERE?"): the egg hatch/discard/consume freeze, the reconcile's egg sweep, and
+// /nft/market/confirm{list}. Each of those is an OUTBOUND call on a player-facing path, so it is one
+// named switch rather than three quiet ones, and the operator can see it and turn it off.
+//
+//   CHIK_EGG_MEGUARD=1     force ON  (still needs CHIK_ME_MARKET — there is no book without it)
+//   CHIK_EGG_MEGUARD=0     force OFF (the marker-only behaviour this file shipped with)
+//   unset / "auto"         ON exactly when the marketplace is OPERATED here: CHIK_ME_MARKET=1 AND an
+//                          ME_API_KEY is present. Today BOTH the live server and every existing sim
+//                          have no key, so the default is OFF and every one of those paths is
+//                          byte-identical to git HEAD — measurable, not asserted.
+// (ME_GUARD_MODE itself is declared with the other CHIK_* flags near the top of this file, not here:
+//  the boot-time configuration warning calls meBookGuardOn() while this module is still evaluating.)
+//
+// WHAT IT COSTS WHEN ON, stated plainly rather than discovered later:
+//   * hatch / discard / consume of a MINTED egg: at most ONE upstream `mine:<wallet>` read, on the
+//     SAME cache key the collection tab warms, and only when that key is older than
+//     ME_EGG_GUARD_TTL_MS. Never-minted eggs — every egg in every nest today — cost nothing.
+//   * the reconcile sweep: one `mine:<wallet>` read per DISTINCT WALLET THAT HOLDS A MINTED EGG, once
+//     per 5-minute pass, shared with everything else on that key. Creatures are deliberately NOT swept:
+//     no in-game action destroys a creature's certificate, so a stale marker there costs a refusal, not
+//     a buyer's money.
+//   * confirm{list}: one `tok:<mint>` read, which that route's delist sibling already makes.
+// All of it sits under the same global read bucket (ME_GLOBAL_READ_PER_MIN), so it degrades to
+// stale-cache instead of ever becoming an outage.
+function meBookGuardOn() {
+  if (!ME_MARKET_ON) return false;                 // no marketplace configured -> no book to read
+  if (ME_GUARD_MODE === "0") return false;
+  if (ME_GUARD_MODE === "1") return true;
+  // AUTO. NOTE (2026-08-09): auto currently follows the KEY, not just the mint flag. A verify lens
+  // argued it should be on whenever eggs are mintable (the public book read is keyless), and that is
+  // probably right — but changing this one line to `NFT_MINT_ON && ME_MARKET_ON` re-opened
+  // egn_va_doublesell (confirm{list} stops writing its marker when the guard turns on in that sim's
+  // config: 17 refused / 1 BREACHED). The guard-on path and confirm{list} are coupled through the
+  // book read, so this must be changed WITH the sim wired for the guard-on book stub, not alone.
+  // Left as-is deliberately; tracked as an open B3 residual. The whole feature is dormant (mint off).
+  return meKeyPresent();
+}
+// How fresh the wallet read has to be before a MINTED egg may be spent, and how stale it is allowed to
+// get before the spend is held. The first bounds the RACE (how long a magiceden.io listing can stay
+// invisible to the freeze); the second bounds the STRAND (how long a Magic Eden outage may stop an
+// honest player hatching a minted egg that is not listed at all). Both are measured in meb_sv_b3_race.
+const ME_EGG_GUARD_TTL_MS    = Math.max(0,    _meNum(process.env.ME_EGG_GUARD_TTL_MS, 5000));
+const ME_EGG_GUARD_MAXAGE_MS = Math.max(5000, _meNum(process.env.ME_EGG_GUARD_MAXAGE_MS, 300000));
 // DEFENCE IN DEPTH on top of "never put it in a response": every string that came from Magic Eden and
 // is about to be handed to a player passes through here first. If the key ever appears in an upstream
 // error body (or a future refactor puts it in a URL), it is redacted before it can leave.
@@ -8297,6 +8812,17 @@ const ME_GLOBAL_READ_PER_MIN = Math.max(1, _meNum(process.env.ME_GLOBAL_READ_PER
 const ME_GLOBAL_READ_BURST   = Math.max(1, _meNum(process.env.ME_GLOBAL_READ_BURST, 30));
 const _meGlobalRead = { tokens: ME_GLOBAL_READ_BURST, ts: Date.now() };
 function meGlobalReadTake() { return _meBucketTake(_meGlobalRead, ME_GLOBAL_READ_BURST, ME_GLOBAL_READ_PER_MIN); }
+// ...and a PEEK, without spending, so an OPTIONAL read can decline. Not every upstream read is equally
+// entitled to the last token: a BUY needs one, and the forced re-read that removes a stale "no" is a
+// nicety on top. Measured: with no reserve, a burst of collection-tab re-reads emptied the bucket and
+// the next /nft/market/buy answered 429 "the marketplace is busy" instead of its own honest refusal
+// (me_proxy_sim §O, 96/0 -> 95/1). A reserve costs the nicety, never the transaction.
+function meGlobalReadSpare() {
+  const dt = Date.now() - _meGlobalRead.ts;
+  return dt > 0 ? Math.min(ME_GLOBAL_READ_BURST, _meGlobalRead.tokens + dt / 60000 * ME_GLOBAL_READ_PER_MIN)
+                : _meGlobalRead.tokens;
+}
+const ME_REFETCH_RESERVE = Math.max(0, _meNum(process.env.ME_REFETCH_RESERVE, 6));
 
 // One cache entry per key, shared by every player, with SINGLE-FLIGHT (a burst of N simultaneous
 // requests for the same page costs ONE upstream call) and STALE-WHILE-REVALIDATE (a rate-limited or
@@ -8338,6 +8864,117 @@ async function meCached(key, ttlMs, staleMs, fn) {
   if (r && r.ok) return { val: e.val !== null ? e.val : r.body, at: e.at || Date.now(), stale: false, cached: false, hit: "miss" };
   if (e.val !== null && e.val !== undefined) return { val: e.val, at: e.at, stale: true, cached: true, hit: "stale-on-error", warn: r && r.error };
   return { val: null, at: 0, stale: false, cached: false, hit: "fail", err: r };
+}
+// INVALIDATE WHAT THIS SERVER KNOWS IS WRONG. Time-based expiry is right for a marketplace nobody here
+// controls, but there are moments when we KNOW the answer just changed: we minted an asset into a
+// wallet, we settled a hand-off between two wallets, a player confirmed a list or a delist. Before this
+// nothing in the request path ever cleared a key (only `_meCacheClearForTest` did), so `mine:<wallet>`
+// held the pre-event answer for up to ME_MINE_CACHE_MS — 45 s shipped — and /nft/market/list reads the
+// SAME key the collection tab had just poisoned. Measured: a buyer whose asset had already arrived was
+// told "Magic Eden does not see that asset in your wallet yet — if it just arrived, give it a minute",
+// while the tab that caused it kept reporting onChainSeen=false and the card was dropped from the grid
+// with no message. (A1-STALE-ARRIVAL / A1-STALE-TAB)
+// Dropping an entry is always safe: the next read simply pays for one upstream call.
+// try/catch because two callers (_nftCommitMint, nftSettleHandover) sit ABOVE this const in the module
+// and are reachable from the boot-time registry restore — a TDZ read there means "nothing is cached yet",
+// which is exactly the no-op we want.
+function meCacheDrop(...keys) {
+  try { for (const k of keys) if (k) _meCache.delete(String(k)); }
+  catch (e) { /* cache not constructed yet — there is nothing to invalidate */ }
+}
+function meWalletCacheDrop(...wallets) { for (const w of wallets) if (w) meCacheDrop(`mine:${w}`); }
+function meTokenCacheDrop(mint) { if (mint) meCacheDrop(`tok:${mint}`); }
+
+// A CACHED "NO" IS THE ONE ANSWER THIS CACHE MUST NOT KEEP GIVING. The invalidations above cover the
+// moments THIS server knows the holdings changed; they cannot cover the moment MAGIC EDEN's indexer
+// catches up, which is the other half of the measured 45-second hole: the buyer opens the collection tab
+// while ME is still behind, that empty answer is cached under `mine:<wallet>`, and /nft/market/list then
+// reads the very key the tab poisoned — so the refusal ("Magic Eden does not see that asset in your
+// wallet yet") outlives the fact by up to ME_MINE_CACHE_MS, and the tab keeps agreeing with itself.
+// A cached MISS is therefore worth one forced re-read before it is allowed to become a refusal or a
+// dropped card. Bounded two ways so this can never become a hammer: only when we were served a CACHED
+// copy (a fresh miss IS the live answer), and at most once per wallet per ME_MINE_REFETCH_MIN_MS.
+const _meMineRefetchAt = new Map();      // wallet -> ts of the last forced wallet re-read
+const ME_MINE_REFETCH_MIN_MS = Math.max(1000, _meNum(process.env.ME_MINE_REFETCH_MIN_MS, 8000));
+async function meWalletRowsRefetch(wallet, wasCached) {
+  if (!wasCached) return null;                       // already the live answer — nothing to gain
+  // A THIRD BOUND, and the one that matters most under load: never spend the last of the SHARED upstream
+  // budget on an optimisation. The drop below is destructive — if the re-read then cannot afford a token,
+  // the last good copy is gone and the caller has nothing at all — so the affordability question is asked
+  // BEFORE the key is dropped, with headroom left for the reads that carry money.
+  if (meGlobalReadSpare() < ME_REFETCH_RESERVE) return null;
+  const now = Date.now();
+  if (now - (_meMineRefetchAt.get(wallet) || 0) < ME_MINE_REFETCH_MIN_MS) return null;
+  _meMineRefetchAt.set(wallet, now);
+  if (_meMineRefetchAt.size > 4000) { let d = 400; for (const k of _meMineRefetchAt.keys()) { if (d-- <= 0) break; if (k !== wallet) _meMineRefetchAt.delete(k); } }
+  // NON-DESTRUCTIVE. Dropping the key is the only way to force meCached to WAIT for a fresh answer
+  // (a zero TTL still serves the stale copy while revalidating behind you), but a drop followed by a
+  // failed read would leave the wallet with NO copy at all — strictly worse than the slightly stale one
+  // we set out to improve. So the copy is stashed first and put back if the re-read comes home empty.
+  const key = `mine:${wallet}`;
+  const prev = _meCache.get(key);
+  const keep = (prev && prev.val !== null && prev.val !== undefined) ? { at: prev.at, val: prev.val } : null;
+  meCacheDrop(key);
+  const r = await meCached(key, ME_MINE_CACHE_MS, ME_STALE_MS,
+    () => meFetch(`/v2/wallets/${encodeURIComponent(wallet)}/tokens`, { query: { collection_symbol: ME_SYMBOL, limit: 500 } }));
+  if ((!r || r.val === null || r.val === undefined) && keep) {
+    const e = _meCache.get(key) || { at: 0, val: null, inflight: null };
+    e.at = keep.at; e.val = keep.val; _meCache.set(key, e);
+    return null;
+  }
+  return r;
+}
+
+// THE BOOK IS THE TRUTH ABOUT THE BOOK. `listedOffchain` was only ever written by our own
+// /nft/market/confirm, so it meant "listed THROUGH US" — while every rule that reads it (the hatch,
+// discard and consume freeze, the mint gate, the in-game board, the egg escrow render) means "listed
+// ANYWHERE". A listing made on magiceden.io is invisible to the reconcile BY DESIGN — a Core listing is
+// a delegate, not an escrow, so DAS keeps naming the seller and nftClassifyHolder reads "same" — which
+// is how a listed egg could still be hatched out from under a live order. Magic Eden's wallet read
+// answers the question directly, and this is where that answer gets written down, so one flag can mean
+// "listed anywhere" everywhere it is read.
+// `src` records WHO set the marker, and that decides who may clear it from a WALLET read:
+//   * src:"book"    — this read put it there, so this read may take it away, immediately.
+//   * src:"confirm" — our own /nft/market/confirm verified a live order on the TOKEN book. Magic Eden's
+//     wallet index can lag its own order book by seconds, and clearing on that lag would pop a
+//     just-listed egg straight back into the seller's nest. So a confirm-sourced marker is only cleared
+//     from a wallet read once it is older than ME_MARKER_GRACE_MS — long enough for the index to catch
+//     up, short enough that a delist done on magiceden.io still heals on its own within a couple of
+//     minutes. Before then it is ended the way it always was: a verified delist, /nft/market/delist's
+//     own not-on-book self-heal, or a settled sale.
+// Returns true when the row actually changed.
+const ME_MARKER_GRACE_MS = Math.max(30000, _meNum(process.env.ME_MARKER_GRACE_MS, 120000));
+// THE ONE PLACE `meList` IS EVER WRITTEN outside restoreAssetReg (which only carries a persisted one
+// across a restart). Keeping it to a single writer is what makes the flag-off claim checkable by
+// reading the file: no route a CHIK_ME_MARKET=0 server serves can reach this function.
+function meListWrite(row, price, extra) {
+  row.listedOffchain = true;
+  row.meList = Object.assign(
+    { price: (Number.isFinite(Number(price)) && Number(price) > 0) ? Number(price) : null,
+      at: Date.now(), src: "book", verified: true }, extra || {});
+  _assetsDirty = true;
+  return row.meList;
+}
+function meMarkListedFromBook(row, tok) {
+  if (!row || !row.mint) return false;
+  const listed = !!(tok && String(tok.listStatus || "") === "listed");
+  const price = (tok && Number.isFinite(Number(tok.price)) && Number(tok.price) > 0) ? Number(tok.price) : null;
+  if (listed) {
+    if (row.listedOffchain && row.meList) return false;                 // already recorded — nothing to do
+    meListWrite(row, (row.meList && row.meList.price) || price);
+    regEvent(row, "me_listed", { price: row.meList.price, src: "book" });
+    return true;
+  }
+  if (tok && row.listedOffchain && row.meList) {
+    const src = String(row.meList.src || "");
+    const age = Date.now() - (Number(row.meList.at) || 0);
+    if (src !== "book" && age < ME_MARKER_GRACE_MS) return false;      // the index may simply be behind
+    row.listedOffchain = false; delete row.meList;
+    regEvent(row, "me_delisted", { why: "not-on-book", src, ageMs: age });
+    _assetsDirty = true;
+    return true;
+  }
+  return false;
 }
 
 // PER-WALLET, not per-request and not per-IP: the shared budget is spent by PEOPLE, and a wallet is
@@ -8549,6 +9186,13 @@ function meCardFor(lrow) {
   // the token image rather than rendering a hole.
   const img = String((lrow.extra && lrow.extra.img) || tok.image || "");
   const lam = lrow.priceInfo && lrow.priceInfo.solPrice ? String(lrow.priceInfo.solPrice.rawAmount || "") : "";
+  // A RETIRED CERTIFICATE CAN STILL BE ON SALE. Retire is not burn: a hatched egg's Core asset still
+  // exists and anybody can list it from magiceden.io, and THIS card is what advertises it inside the
+  // game. The card read the registry for sp/kind/edition but never for `state`/`nftRetired`, so the grid
+  // drew a spent egg as a named, editioned, plaqued, ENABLED Buy — and the refusal ("that asset has
+  // hatched and is no longer tradeable") only arrived after the tap. The registry knows; the card says
+  // so, and stops claiming the in-game button can do it. (A1-RETIRED-GRID)
+  const spent = !!(reg && (reg.state !== "active" || reg.nftRetired));
   return {
     mint,
     // priceSol is a SOL float; priceLamports is the exact integer. Both, deliberately: the 1e9
@@ -8557,8 +9201,11 @@ function meCardFor(lrow) {
     priceLamports: /^[0-9]{1,20}$/.test(lam) ? lam : null,
     seller: isPubkey(String(lrow.seller || "")) ? String(lrow.seller) : null,
     source: src,
-    // Honest per-card answer to "can the in-game Buy button do this one?"
-    buyable: (src === "M2" && !!String(lrow.auctionHouse || "")) || (ME_POOL_BUY && src === "MMM"),
+    // Honest per-card answer to "can the in-game Buy button do this one?" — which a certificate the game
+    // has already retired never can (meMintGate refuses every value route on a non-active row).
+    buyable: !spent && ((src === "M2" && !!String(lrow.auctionHouse || "")) || (ME_POOL_BUY && src === "MMM")),
+    // ...and WHY, so the grid can draw an honest "certificate spent" chip instead of a dead button.
+    spent,
     img: img ? meImgRef(img) : null,
     rank: (lrow.rarity && lrow.rarity.meInstant && Number(lrow.rarity.meInstant.rank)) || null,
     name: String(tok.name || (reg ? nftAssetName(reg) : "")).slice(0, 64) || null,
@@ -8611,6 +9258,19 @@ function meBrowseGuard(res) {
 function meCapableGuard(res) {
   if (ME_MARKET_CAPABLE) return true;
   res.status(409).json({ error: "trading is not open in-game yet — browse here, and buy or sell on Magic Eden for now", capable: false, canTrade: false, reason: "handover-off" });
+  return false;
+}
+// ...AND ASK THE CHEAPEST QUESTION FIRST. Every value route ends at a keyed instruction endpoint, so
+// without ME_API_KEY none of them can ever produce a transaction — and meFetch says exactly that, with
+// exactly this sentence. But it said it AFTER the route had already spent an upstream read (and a token
+// out of the shared budget) discovering a listing it could never act on. Measured: with the budget
+// exhausted, that pre-read failed first and a keyless server answered "the marketplace is busy right
+// now" instead of "trading is not switched on for this server yet — use the Magic Eden link" — a
+// misleading refusal that invites a retry which can never work. Same status, same words, no read.
+function meKeyGuard(res) {
+  if (meKeyPresent()) return true;
+  res.status(503).json({ error: "in-game trading is not switched on for this server yet — use the Magic Eden link",
+                         tradingReady: false, reason: "no-api-key" });
   return false;
 }
 
@@ -8723,20 +9383,49 @@ app.get("/nft/market/mine", async (req, res, next) => {
       edition: r.edition || null, mint: r.mint || null, minted: !!r.mint,
       // "mintable" answers the certificate button; "listable" answers this tab's button.
       mintable: el.code === "ok" && !r.mint, mintBlockedBy: (el.code === "ok" || r.mint) ? null : el.code,
+      // A GATE CODE IS NOT AN EXPLANATION. /assets/mine sends prose for the same rule (`mintWhy`);
+      // this route — the one the collection tab is actually built on — sent only "origin"/"kind", so the
+      // tab had to invent its own wording (which then drifts) or draw two dead controls and no reason.
+      // Same string, same authority, one place it is written. (A1-DEADROW)
+      mintBlockedWhy: (el.code === "ok" || r.mint) ? null : (el.error || null),
       listable: !!r.mint && !r.listedOffchain && !r.pendingHandover && (r.gameStatus ?? "good") === "good",
       listed: !!r.listedOffchain,
+      // F6's restriction, named on the card rather than only felt as a control that stopped working.
+      gameStatus: (r.gameStatus ?? "good"),
+      statusReason: (r.gameStatus ?? "good") === "good" ? null : (r.statusReason || null),
       priceSol: (r.meList && Number.isFinite(Number(r.meList.price))) ? Number(r.meList.price) : null,
       listedAt: (r.meList && Number(r.meList.at)) || null,
       pendingHandover: !!r.pendingHandover,
+      // MINT AT SALE (flag-gated keys — absent on a flag-off server, so the wire shape is unchanged):
+      // an UNMINTED eligible row lists through the id-keyed first-sale path; the client shows SELL,
+      // never a Mint button (owner ruling 1 — assets are certified from issuance, players view or sell).
+      ...(MINT_AT_SALE_ON ? {
+        firstSaleListable: !r.mint && !r.mintPending && !r.listedOffchain && !r.pendingHandover && el.code === "ok",
+        mintPending: !!r.mintPending,
+        editionOf: masEditionOf(r),
+      } : {}),
     });
   }
   rows.sort((a, b) => (b.minted ? 1 : 0) - (a.minted ? 1 : 0) || String(a.sp).localeCompare(String(b.sp)));
   // Magic Eden's own view of the wallet. Cached per wallet; `listStatus` lets the picker grey out an
   // asset already listed from ME's website without a second call. NEVER authoritative — if this read
   // fails the tab still works off the registry and says `meRead:false` rather than lying.
-  const c = await meCached(`mine:${wallet}`, ME_MINE_CACHE_MS, ME_STALE_MS,
+  let c = await meCached(`mine:${wallet}`, ME_MINE_CACHE_MS, ME_STALE_MS,
     () => meFetch(`/v2/wallets/${encodeURIComponent(wallet)}/tokens`, { query: { collection_symbol: ME_SYMBOL, limit: 500 } }));
+  // A CACHED COPY THAT CANNOT SEE A MINTED ASSET IS THE ONE ANSWER WORTH RE-ASKING (see
+  // meWalletRowsRefetch): it is what makes a just-bought creature vanish from this very tab, and what
+  // then poisons /nft/market/list. Bounded to one forced read per wallet per ME_MINE_REFETCH_MIN_MS.
+  // ...and only when Magic Eden actually ANSWERED. A read that failed outright is not a stale answer to
+  // improve on; re-asking it costs a shared token and can only fail again.
+  if (Array.isArray(c.val)) {
+    const seen0 = new Set(c.val.map(t => String((t && t.mintAddress) || "")));
+    if (rows.some(r => r.mint && !seen0.has(r.mint))) {
+      const c2 = await meWalletRowsRefetch(wallet, !!c.cached);
+      if (c2 && Array.isArray(c2.val)) c = c2;
+    }
+  }
   const meRows = Array.isArray(c.val) ? c.val : null;
+  let healed = 0;
   if (meRows) {
     const byMint = new Map();
     for (const t of meRows) if (t && isPubkey(String(t.mintAddress || ""))) byMint.set(String(t.mintAddress), t);
@@ -8749,10 +9438,31 @@ app.get("/nft/market/mine", async (req, res, next) => {
         if (row.meListed && Number.isFinite(Number(t.price)) && Number(t.price) > 0 && !row.priceSol) row.priceSol = Number(t.price);
         // ME's own row is where tokenAccount comes from for a sell — never derived, never guessed.
         row.tokenAccount = isPubkey(String(t.tokenAddress || "")) ? String(t.tokenAddress) : null;
+        // THE SELF-HEAL. This poll is the cheapest, most frequent place the server ever learns that the
+        // book and our marker disagree — so it is where the disagreement is settled, in the direction the
+        // book says. That is what makes `listedOffchain` mean "listed anywhere": an egg listed on
+        // magiceden.io becomes escrowed (and unhatchable) here, and a marker we ourselves inferred from
+        // the book is dropped here when the order goes. (see meMarkListedFromBook)
+        const reg = assetReg.get(row.id);
+        if (reg && meMarkListedFromBook(reg, t)) {
+          healed++;
+          row.listed = !!reg.listedOffchain;
+          // recomputed from the HEALED row, not left at the value the pre-merge pass produced — otherwise
+          // a delist noticed here reads `listable:false` for one more poll for no reason
+          row.listable = !!reg.mint && !reg.listedOffchain && !reg.pendingHandover && (reg.gameStatus ?? "good") === "good";
+          if (reg.meList && Number.isFinite(Number(reg.meList.price))) row.priceSol = Number(reg.meList.price);
+          row.listedAt = (reg.meList && Number(reg.meList.at)) || null;
+        }
       }
+      // `listable` was computed from the registry ALONE, before this merge, and was never revised — so an
+      // asset Magic Eden already had on the book came back listable:true and the tab offered a List
+      // button that /nft/market/list then refused with a 409. One line, after the merge, so a row cannot
+      // contradict itself inside one response. (A1-SEAM-LISTABLE)
+      row.listable = row.listable && !row.meListed && !row.listed;
     }
   }
-  res.json({ ok: true, wallet, rows, count: rows.length, meRead: !!meRows,
+  if (healed) { _assetsDirty = true; try { await saveAssetLedger(true); } catch (e) {} }
+  res.json({ ok: true, wallet, rows, count: rows.length, meRead: !!meRows, healed,
              asOf: c.at || Date.now(), ageMs: c.at ? Math.max(0, Date.now() - c.at) : null, stale: !!c.stale,
              tradingReady: meKeyPresent(), priceMinSol: ME_PRICE_MIN_SOL, priceMaxSol: ME_PRICE_MAX_SOL });
 });
@@ -8761,6 +9471,7 @@ app.get("/nft/market/mine", async (req, res, next) => {
 app.post("/nft/market/buy", async (req, res, next) => {
   if (!ME_MARKET_ON) return next();
   if (!meCapableGuard(res)) return;                          // B1: THE headline — no buy the game can't deliver
+  if (!meKeyGuard(res)) return;                              // ...and no upstream read for a buy that cannot be built
   if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
   const wallet = _meWallet(req);
   if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
@@ -8855,6 +9566,163 @@ app.post("/nft/market/buy", async (req, res, next) => {
              listingAsOf: lr.at || Date.now() });
 });
 
+// ============ MINT AT FIRST SALE — the id-keyed first listing (CHIK_MINT_AT_SALE) ============
+// The whole /nft/market/* surface keys on tokenMint, and an unminted registry row has no mint
+// address — it cannot even be NAMED (meMintGate 403s by construction). These three functions are the
+// id-keyed entry: /nft/market/list accepts {id} for the caller's OWN unminted row, reserves the
+// address+edition exactly like /assets/nft/mint's server-mints dance (durable row.mintPending BEFORE
+// anything leaves the server, same-address retry, TTL+absent abandon), hands back ONE partial-signed
+// transaction carrying CreateV2 + Magic Eden's sell — and /nft/market/confirm resolves the reserved
+// address to its pending row and stamps minted(txSig)+listed in ONE transition, after POLLING the
+// reader (the RPC lag trap: a single read right after confirmation routinely answers null).
+const MAS_CONF_TRIES = Math.max(1, Number(process.env.MAS_CONF_TRIES || 8) || 8);
+const MAS_CONF_GAP_MS = Math.max(0, Number(process.env.MAS_CONF_GAP_MS || 1500) || 1500);
+function masRowByPending(addr) {
+  addr = String(addr || "");
+  if (!addr || !isPubkey(addr)) return null;
+  // same-process first (the small pending-key map), then the crash-durable reservations
+  for (const [id, k] of _nftPendingKeys) if (k && k.addr === addr) { const r = assetReg.get(id); if (r && !r.mint) return r; }
+  for (const r of assetReg.values()) if (r && !r.mint && r.mintPending && String(r.mintPending.addr) === addr) return r;
+  return null;
+}
+async function masListUnminted(req, res, wallet, row) {
+  // the cheapest questions first: config that can never build a transaction refuses before anything
+  // is reserved, so a keyless server never strands a reservation it cannot use
+  if (!meKeyGuard(res)) return;
+  if (!NFT_COLLECTION) return res.status(503).json({ error: "the NFT collection is not configured" });
+  if (!nftDelegate()) return res.status(503).json({ error: "minting is not configured" });
+  if (NFT_MINT_PAUSED) return res.status(503).json({ error: "new mints are paused" });
+  if (row.state !== "active") return res.status(409).json({ error: `that asset is ${row.state}` });
+  // eligibility carries the whole ruling: clean origin sells (normals and avatars included),
+  // unverified is HELD (refused, never burned), flagged/listed/pending refuse exactly as ever
+  const el = nftEligibility(row, wallet);
+  if (el.code !== "ok") return res.status(el.status).json({ error: el.error });
+  if (_nftBoardListed(row)) return res.status(409).json({ error: "that one is listed on the in-game board — unlist it there first", boardListed: true });
+  // A PRICE IS MONEY — the same validation, clamp and lamport snap as the minted path (B4).
+  const asked = req.body?.priceSol;
+  if (typeof asked !== "number" || !Number.isFinite(asked) || asked <= 0) return res.status(400).json({ error: "give a price in SOL (a number)" });
+  const priceSol = Math.round(asked * 1e9) / 1e9;
+  if (priceSol < ME_PRICE_MIN_SOL) return res.status(400).json({ error: `the lowest price this server will list is ${ME_PRICE_MIN_SOL} SOL`, priceMinSol: ME_PRICE_MIN_SOL });
+  if (priceSol > ME_PRICE_MAX_SOL) return res.status(400).json({ error: `the highest price this server will list is ${ME_PRICE_MAX_SOL} SOL`, priceMaxSol: ME_PRICE_MAX_SOL });
+  if (_nftMinting.has(row.id)) return res.status(409).json({ error: "a mint for this asset is already in flight" });
+  _nftMinting.add(row.id);                                   // claim BEFORE the awaits (TOCTOU)
+  try {
+    // ---- the reservation dance, verbatim from the server-mints path -----------------------------
+    // A tx-build retry storm must never yield two live mints or listings for one asset_id, so every
+    // rebuild reuses the SAME reserved address and the SAME edition; a reservation whose tx was
+    // never submitted is reclaimed only when the reader positively ANSWERS "absent" past the TTL.
+    let key = _nftPendingKeys.get(row.id);
+    if (row.mintPending && row.mintPending.addr) {
+      const pAddr = String(row.mintPending.addr), pAt = Number(row.mintPending.at) || 0;
+      const obs = await _nftDasRead(pAddr);
+      const vf = nftVerifyOnchain(obs, wallet);
+      if (vf.ok) {
+        // the earlier atomic tx DID land — promote the mint (never re-create); the client re-asks
+        // and the id resolves straight into the grandfathered tokenMint path
+        _nftCommitMint(row, pAddr);
+        try { await saveAssetLedger(true); } catch (e) {}
+        return res.status(409).json({ error: "that one is already certified — ask again and the listing will go through the normal path", minted: true, mint: pAddr, id: row.id });
+      }
+      const gone = !!(obs && obs.dasFailed);
+      if (!gone) {                                           // readable but not ours/not right: never rebuild onto it
+        _nftReviewFlags.set(row.id, { reason: "mas-pending-verify-failed", at: Date.now() });
+        return res.status(409).json({ error: "that mint is still confirming — try again in a moment", pending: true });
+      }
+      if (key && key.addr === pAddr) { /* same process: rebuild the tx on the SAME address+edition below */ }
+      else if (!obs.absent) {                                // reader down — hold the reservation, never a second address
+        return res.status(409).json({ error: "that mint is still confirming — try again in a moment", pending: true });
+      } else if (Date.now() - pAt > NFT_PENDING_TTL_MS) {    // the key died with a restart and it never landed
+        regEvent(row, "mint_abandoned", { addr: pAddr, via: "mint-at-sale" });
+        delete row.mintPending; key = null; _assetsDirty = true;
+        try { await saveAssetLedger(true); } catch (e) {}
+      } else {
+        return res.status(409).json({ error: "that mint is still confirming — try again in a moment", pending: true });
+      }
+    }
+    if (!row.edition) row.edition = nftEditionFor(row);      // assigned at issuance normally; heal covers stragglers
+    row.hatcher = row.hatcher || row.owner;
+    if (!key || !row.mintPending) {
+      const kp = Keypair.generate();                         // ephemeral; the secret never leaves memory
+      key = { addr: kp.publicKey.toBase58(), secret: kp.secretKey, at: Date.now() };
+      _nftPendingKeys.set(row.id, key);
+      row.mintPending = { addr: key.addr, at: key.at };
+      regEvent(row, "mint_reserved", { addr: key.addr, edition: row.edition, via: "mint-at-sale" });
+      _assetsDirty = true;
+      try { await saveAssetLedger(true); } catch (e) {}      // durable BEFORE any bytes leave — never after
+    }
+    const comp = await masComposeMintList({ id: row.id, owner: wallet, assetSecret: key.secret, assetAddr: key.addr,
+      name: nftAssetName(row), uri: nftMetaUri(row), priceSol,
+      plugins: [{ type: "Attributes", attributeList: nftAttributes(row) }] });
+    if (!comp || !comp.ok) {
+      // FAILED/ABANDONED IS CLEAN: the registry row stays unminted-unlisted (only the reservation
+      // stands, and the TTL+absent rule above reclaims it); a rebuild is offered idempotently.
+      const st = Number((comp && comp.status)) || 502;
+      return res.status(st).json({ error: (comp && comp.error) || "could not compose the mint+list transaction — try again",
+        code: (comp && comp.code) || "compose", retryInMs: (comp && comp.retryInMs) || undefined, pending: true, id: row.id });
+    }
+    meIntentRecord(wallet, key.addr, "mintlist", priceSol);
+    res.json({ ok: true, action: "list", composed: "mint+list", id: row.id, tokenMint: key.addr,
+      priceSol, edition: row.edition, editionOf: masEditionOf(row),
+      tx: comp.b64, ver: comp.ver, cosigned: false, bytes: comp.bytes || comp.b64.length,
+      payer: wallet, mintPending: true,
+      note: "sign in Phantom and submit — you pay the mint rent and the network fee; the server co-signed only as collection authority and never pays. Then POST /nft/market/confirm {tokenMint, signature, action:\"list\"}." });
+  } finally { _nftMinting.delete(row.id); }
+}
+async function masConfirmMintList(req, res, wallet, row, addr) {
+  if (row.owner !== wallet) return res.status(403).json({ error: "the registry says this wallet does not own that asset" });
+  const sig = String(req.body?.signature || "").slice(0, 96);
+  let sigOk = false;
+  try { sigOk = bs58.decode(sig).length === 64; } catch (e) { sigOk = false; }
+  if (!sigOk) return res.status(400).json({ error: "that is not a transaction signature" });
+  if (String(req.body?.action) !== "list") return res.status(400).json({ error: "a mint+list confirm is action \"list\"" });
+  // POLL, NEVER ONE READ (the RPC lag trap, hit three times this session): the reader routinely
+  // answers null right after the cluster confirms. Readable-but-WRONG stops the poll — waiting
+  // cannot fix a foreign owner or a foreign collection.
+  let obs = null, vf = { ok: false, status: 503, error: "could not read that mint on-chain — try again" };
+  for (let i = 0; i < MAS_CONF_TRIES; i++) {
+    obs = await _nftDasRead(addr);
+    vf = nftVerifyOnchain(obs, wallet);
+    if (vf.ok) break;
+    if (obs && !obs.dasFailed) break;
+    if (i < MAS_CONF_TRIES - 1) await new Promise((r) => setTimeout(r, MAS_CONF_GAP_MS));
+  }
+  if (!vf.ok) {
+    if (obs && !obs.dasFailed) {
+      _nftReviewFlags.set(row.id, { reason: "mas-confirm-verify-failed", at: Date.now() });
+      return res.status(vf.status).json({ error: vf.error, applied: "none", verified: false });
+    }
+    // unreadable / not indexed yet: NOTHING is recorded — the row stays unminted-unlisted with its
+    // reservation standing, and the client simply confirms again (202, the confirm-path convention)
+    return res.status(202).json({ ok: true, action: "list", composed: "mint+list", tokenMint: addr, id: row.id,
+      applied: "pending", verified: false, reason: "chain-unreadable",
+      message: "the chain cannot see that mint yet — confirm again in a moment; nothing was recorded and nothing is lost" });
+  }
+  const dupe = nftMintBoundTo(addr, row.id);
+  if (dupe) return res.status(409).json({ error: "that on-chain asset is already the certificate of another creature" });
+  // BELT TO THE HATCH-WINDOW BRACE: a row spent between compose and confirm (an egg hatched, a burn)
+  // must never be stamped minted+listed — the on-chain orphan's own metadata URI already tells any
+  // buyer the truth, and the registry refuses to bind it. Surfaced for an operator, never recorded.
+  if (row.state !== "active") {
+    _nftReviewFlags.set(row.id, { reason: "mas-confirm-row-spent", at: Date.now() });
+    return res.status(409).json({ error: `that asset is ${row.state} — the sale cannot complete`, applied: "none" });
+  }
+  // ONE TRANSITION: minted(txSig) + listed together. The evidence for the LISTING half is the mint
+  // itself: the delegate's partial signature bound the WHOLE composed message — mint AND sell
+  // instructions — so the reserved address existing on-chain proves the one transaction that could
+  // create it also executed its sell. No client-supplied price is ever recorded (F9): the price is
+  // the one THIS server composed into the intent, and null after a restart (self-heals off the book).
+  const intent = _meIntents.get(wallet + ":" + addr) || null;
+  _nftCommitMint(row, addr, sig);
+  const price = (intent && intent.action === "mintlist" && Number.isFinite(Number(intent.priceSol))) ? Number(intent.priceSol) : null;
+  meListWrite(row, price, { sig, verified: true, src: "confirm", evidence: intent ? "mint-at-sale-intent" : "mint-at-sale-onchain" });
+  regEvent(row, "me_listed", { price: row.meList.price, sig, verified: true, via: "mint-at-sale" });
+  meWalletCacheDrop(wallet); meTokenCacheDrop(addr);
+  _assetsDirty = true; try { await saveAssetLedger(true); } catch (e) {}
+  return res.json({ ok: true, action: "list", composed: "mint+list", tokenMint: addr, id: row.id,
+    applied: "minted+listed", mint: addr, edition: row.edition || null, priceSol: row.meList.price,
+    verified: true, explorer: `${NFT_EXPLORER_BASE}/${addr}` });
+}
+
 // LIST. {wallet, mktToken, tokenMint, priceSol}
 app.post("/nft/market/list", async (req, res, next) => {
   if (!ME_MARKET_ON) return next();
@@ -8864,7 +9732,21 @@ app.post("/nft/market/list", async (req, res, next) => {
   if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
   const rl = meRateOk(wallet, "write");
   if (!rl.ok) return res.status(429).json({ error: rl.why, retryInMs: rl.retryInMs });
-  const mint = String(req.body?.tokenMint || "").slice(0, 64);
+  let mint = String(req.body?.tokenMint || "").slice(0, 64);
+  // ============ MINT AT FIRST SALE (CHIK_MINT_AT_SALE): the id-keyed entry ============
+  // An unminted asset cannot be named by tokenMint, so the FIRST sale is keyed by registry id. The
+  // anti-relay gate is preserved and tightened: the row must exist and be OWNED by the proven caller
+  // before a single upstream call — this server never builds a transaction for an asset that is not
+  // the caller's own. A row named by id that is ALREADY minted is grandfathered straight into the
+  // existing tokenMint flow below, untouched (a tx composition, not a second implementation).
+  // Flag-off, `id` is ignored and the body reads exactly as it always has.
+  if (MINT_AT_SALE_ON && !mint && req.body?.id) {
+    const idRow = assetReg.get(String(req.body.id).slice(0, 64));
+    if (!idRow) return res.status(404).json({ error: "no such asset" });
+    if (idRow.owner !== wallet) return res.status(403).json({ error: "the registry says this wallet does not own that asset" });
+    if (idRow.mint) mint = idRow.mint;                       // already minted — the old path, unchanged
+    else return masListUnminted(req, res, wallet, idRow);
+  }
   const gate = meMintGate(mint);
   if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
   const row = gate.row;
@@ -8875,6 +9757,12 @@ app.post("/nft/market/list", async (req, res, next) => {
   if ((row.gameStatus ?? "good") !== "good") return res.status(409).json({ error: "that asset is flagged and cannot be listed" });
   if (row.pendingHandover) return res.status(409).json({ error: "that asset has a transfer settling — try again shortly" });
   if (row.listedOffchain) return res.status(409).json({ error: "that one is already listed — delist it first", listed: true });
+  // THE TWO BOARDS ARE MUTUALLY EXCLUSIVE BY CONSTRUCTION, NOT BY TIER ACCIDENT. /assets/nft/mint has
+  // always checked the in-game board; this route never did, so an asset escrowed on the Trading Post
+  // could be put on Magic Eden at the same time and sold twice — with the in-game buyer and the NFT
+  // buyer both able to pay. Latent only because every NFT tier is currently barred from the board by
+  // `chikimonTierBlocked`; a rule that holds by accident is not a rule.
+  if (_nftBoardListed(row)) return res.status(409).json({ error: "that one is listed on the in-game board — unlist it there first", boardListed: true });
   // A PRICE IS MONEY. Finite, positive, inside the clamp, and snapped to lamport granularity so a
   // float tail cannot become a price nobody meant to type.
   // B4: a price is money — it must be a REAL JS number, not a string or a one-element array that
@@ -8889,8 +9777,16 @@ app.post("/nft/market/list", async (req, res, next) => {
   // tokenAccount comes from Magic Eden's OWN row for this wallet, never from an ATA derivation. The
   // same read doubles as an on-chain ownership cross-check; if it fails we proceed on the registry's
   // word (the game's authority) and say which one we used.
-  const c = await meCached(`mine:${wallet}`, ME_MINE_CACHE_MS, ME_STALE_MS,
+  let c = await meCached(`mine:${wallet}`, ME_MINE_CACHE_MS, ME_STALE_MS,
     () => meFetch(`/v2/wallets/${encodeURIComponent(wallet)}/tokens`, { query: { collection_symbol: ME_SYMBOL, limit: 500 } }));
+  // ...and if the CACHED copy cannot see this asset, re-ask once before that becomes a refusal. This is
+  // the exact measured hole: the collection tab's own read cached the pre-arrival answer under this key,
+  // and a buyer whose asset Magic Eden could already see was told for up to 45 s to "give it a minute"
+  // about something that had already happened. (A1-STALE-ARRIVAL, see meWalletRowsRefetch)
+  if (Array.isArray(c.val) && !c.val.some(x => x && String(x.mintAddress || "") === mint)) {
+    const c2 = await meWalletRowsRefetch(wallet, !!c.cached);
+    if (c2 && Array.isArray(c2.val)) c = c2;
+  }
   const meRows = Array.isArray(c.val) ? c.val : null;
   // B6: FAIL CLOSED. The Magic Eden wallet read is our only INDEPENDENT confirmation that this wallet
   // really holds the asset on chain. The old behaviour proceeded on the registry's word alone when the
@@ -8901,7 +9797,12 @@ app.post("/nft/market/list", async (req, res, next) => {
   let tokenAccount = mint, accSrc = "asset-address (Core)", ownerCheck = "magic-eden";
   const t = meRows.find(x => x && String(x.mintAddress || "") === mint);
   if (!t) return res.status(409).json({ error: "Magic Eden does not see that asset in your wallet yet — if it just arrived, give it a minute" });
-  if (String(t.listStatus || "") === "listed") return res.status(409).json({ error: "Magic Eden already has that one listed — delist it first", listed: true });
+  if (String(t.listStatus || "") === "listed") {
+    // our marker was behind the book — write it down while we are holding the answer, so the refusal is
+    // not the ONLY place this fact exists (see meMarkListedFromBook)
+    if (meMarkListedFromBook(row, t)) { try { await saveAssetLedger(true); } catch (e) {} }
+    return res.status(409).json({ error: "Magic Eden already has that one listed — delist it first", listed: true });
+  }
   if (isPubkey(String(t.tokenAddress || ""))) { tokenAccount = String(t.tokenAddress); accSrc = "magic-eden row"; }
   const r = await meFetch("/v2/instructions/sell", { auth: true, query: {
     seller: wallet, tokenMint: mint, tokenAccount, price: priceSol,
@@ -8999,6 +9900,14 @@ app.post("/nft/market/confirm", async (req, res, next) => {
   const rl = meRateOk(wallet, "write");
   if (!rl.ok) return res.status(429).json({ error: rl.why, retryInMs: rl.retryInMs });
   const mint = String(req.body?.tokenMint || "").slice(0, 64);
+  // MINT AT FIRST SALE: a reserved address is not yet anybody's `mint`, so meMintGate cannot name
+  // it. Resolve a pending mint-at-sale reservation first — owner-gated, poll-confirmed, and the
+  // minted(txSig)+listed stamp lands as ONE transition. Flag-off this lookup does not run and an
+  // unknown address answers exactly today's 403.
+  if (MINT_AT_SALE_ON) {
+    const pend = masRowByPending(mint);
+    if (pend) return masConfirmMintList(req, res, wallet, pend, mint);
+  }
   const gate = meMintGate(mint);
   if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
   const row = gate.row;
@@ -9014,19 +9923,66 @@ app.post("/nft/market/confirm", async (req, res, next) => {
   const intent = _meIntents.get(wallet + ":" + mint) || null;
   let applied = "none";
   if (action === "list") {
+    // B8 — THE BOOK DECIDES, NOT THE CALLER. Writing `listedOffchain` is a value transition in exactly
+    // the way the delist branch below already treats one: it escrows an EGG out of its owner's nest (no
+    // tending, no hatching, no render), blocks the certificate mint, blocks the in-game board, and
+    // publishes an asking price to every other player's collection view. It used to happen on nothing but
+    // a 64-byte base58 string — no /list call, no order on Magic Eden's book, no chain read. Measured: a
+    // fabricated signature froze a meme egg out of its own nest at a claimed 4999 SOL that had never been
+    // on any order book. (A1-CONFIRM-NOEVIDENCE / A1-CONFIRM-PRICE)
+    // THE EVIDENCE RULE, AND WHY IT IS NOT THE DELIST RULE. Both branches want proof, but they fail in
+    // OPPOSITE directions, so they cannot share a policy:
+    //   * DELIST clears the marker. That is the PERMISSIVE direction — it re-opens hatch, mint and the
+    //     in-game board — so "I could not read the book" must NOT be allowed to clear it. Absence of
+    //     evidence is not evidence of absence. Unreadable => nothing written.
+    //   * LIST sets the marker. That is the RESTRICTIVE direction — the worst it can do to the caller is
+    //     freeze the caller's OWN asset (this route requires row.owner === wallet), and the worst it can
+    //     do if it is WRONGLY SKIPPED is leave an egg hatchable while a real order stands, which is the
+    //     double-sell this whole file exists to prevent. So an unreadable book must not be allowed to
+    //     SKIP it either.
+    // Therefore: POSITIVE EVIDENCE OF ABSENCE refuses; inability to read does not.
+    //   OUR OWN INTENT (this server built the sell instruction for this wallet+mint through
+    //       /nft/market/list, which already proved the wallet holds it on chain and clamped the price)
+    //                                                      -> apply, at the price WE asked for, no read
+    //   book readable + a live order for this seller+mint  -> apply, price from the book
+    //   book readable + no such order, and no intent       -> 202 pending, NOTHING written  (this is the
+    //       measured F9 exploit exactly: a fabricated signature, no /list call ever made, nothing on any
+    //       order book — the confirm is now the only step that was skipped, and it is the one refused)
+    //   book unreadable / guard off                        -> apply, marked unverified and SELF-HEALING:
+    //       meMarkListedFromBook drops a confirm-sourced marker once a wallet read shows no order and
+    //       ME_MARKER_GRACE_MS has passed, so a marker set on a bad read cannot become a stuck nest.
+    // The client-supplied price is gone in every branch (see below), which is the other half of F9.
+    // The intent branch is also what keeps the HONEST flow free: Magic Eden's book can take seconds to
+    // publish an order after the seller signs, and a legitimate confirm must not be told "not yet" for a
+    // listing this server itself asked for.
+    const ourIntent = !!(intent && intent.action === "list");
+    let order = null, bookRead = false;
+    if (!ourIntent && meBookGuardOn()) {
+      const bk = await meCached(`tok:${mint}`, ME_TOKEN_CACHE_MS, ME_TOKEN_CACHE_MS,
+        () => meFetch(`/v2/tokens/${encodeURIComponent(mint)}/listings`, {}));
+      bookRead = !!(bk.val && !bk.stale);
+      if (bookRead) order = (Array.isArray(bk.val) ? bk.val : []).find(x => x && String(x.seller || "") === wallet && Number(x.price) > 0) || null;
+      if (bookRead && !order) {
+        return res.status(202).json({ ok: true, action, tokenMint: mint, id: row.id, applied: "pending",
+          verified: false, reason: "not-on-book",
+          message: "Magic Eden has not published that order yet — the game will pick it up on its own as soon as it does.",
+          settlesVia: "magic-eden book re-read", handoverOn: NFT_HANDOVER_ON, reconcileOn: NFT_MINT_ON });
+      }
+    }
     // The listing MARKER, not a lock. The owner's standing decision is that a listed creature is never
     // locked: the player keeps playing with it, and only a SETTLED sale moves it. All this does is
     // stop the same creature being sold twice (in-game board, second listing, certificate mint).
-    row.listedOffchain = true;
-    // The price is DISPLAY only (the tab's "listed at" line) — the money was decided when the
-    // instruction was built. Prefer what THIS server actually asked Magic Eden for; a client-supplied
-    // figure is a fallback for a restart mid-flow, and is clamped so it can only ever be a sane number.
-    const _claimed = Number(req.body?.priceSol);
-    const _price = (intent && intent.priceSol) ||
-                   ((Number.isFinite(_claimed) && _claimed > 0 && _claimed <= ME_PRICE_MAX_SOL) ? Math.round(_claimed * 1e9) / 1e9 : null);
-    row.meList = { price: _price, at: Date.now(), sig, verified: !!(st.seen && st.ok) };
+    // THE PRICE IS THE BOOK'S, NEVER THE CLIENT'S. It used to fall back to `req.body.priceSol` whenever
+    // this server held no intent record — clamped only to ME_PRICE_MAX_SOL — so a card could advertise a
+    // figure nobody had ever asked for (measured: claimed 4999 -> recorded 4999). Recorded now from what
+    // THIS server asked Magic Eden for, else the live order's OWN price, and NULL otherwise. Never the
+    // caller's. The card already words a price-less listing honestly.
+    const _price = (intent && intent.priceSol) || (order && Number.isFinite(Number(order.price)) ? Number(order.price) : null);
+    meListWrite(row, _price, { sig, verified: !!(st.seen && st.ok), src: "confirm",
+                               evidence: ourIntent ? "our-intent" : (order ? "book" : "unread") });
     regEvent(row, "me_listed", { price: row.meList.price, sig, verified: row.meList.verified });
     applied = "listed";
+    meWalletCacheDrop(wallet); meTokenCacheDrop(mint);   // the wallet read now says "listed" — see meCacheDrop
     _assetsDirty = true; try { await saveAssetLedger(true); } catch (e) {}
   } else if (action === "delist") {
     // B2/B3: clearing the listing marker UNBLOCKS the creature for every other disposal path (the
@@ -9057,6 +10013,7 @@ app.post("/nft/market/confirm", async (req, res, next) => {
     if (row.meList) delete row.meList;
     regEvent(row, "me_delisted", { sig, verified: true });
     applied = "delisted";
+    meWalletCacheDrop(wallet); meTokenCacheDrop(mint);   // the wallet read now says "unlisted" — see meCacheDrop
     _assetsDirty = true; try { await saveAssetLedger(true); } catch (e) {}
   } else {
     // A BUY CHANGES NOTHING HERE. It nudges the reconcile — debounced, because a room full of buyers
@@ -9122,9 +10079,14 @@ export function _meFlagsForTest() {
            capable: ME_MARKET_CAPABLE, handoverOn: NFT_HANDOVER_ON,
            globalReadPerMin: ME_GLOBAL_READ_PER_MIN, globalReadBurst: ME_GLOBAL_READ_BURST,
            imgReqPerMin: ME_IMG_REQ_PER_MIN, imgReqBurst: ME_IMG_REQ_BURST,
-           imgFetchPerMin: ME_IMG_FETCH_PER_MIN, imgFetchBurst: ME_IMG_FETCH_BURST };
+           imgFetchPerMin: ME_IMG_FETCH_PER_MIN, imgFetchBurst: ME_IMG_FETCH_BURST,
+           // The book guard and the two numbers that define its trade-off, so a sim measures the
+           // SHIPPED window rather than restating one. (see meBookGuardOn)
+           bookGuard: meBookGuardOn(), guardMode: ME_GUARD_MODE,
+           eggGuardTtlMs: ME_EGG_GUARD_TTL_MS, eggGuardMaxAgeMs: ME_EGG_GUARD_MAXAGE_MS,
+           mineCacheMs: ME_MINE_CACHE_MS, tokenCacheMs: ME_TOKEN_CACHE_MS, markerGraceMs: ME_MARKER_GRACE_MS };
 }
-export function _meCacheClearForTest() { _meCache.clear(); _meRate.clear(); _meIntents.clear(); _meImg.clear(); _meImgBody.clear(); _meMintIdx = null; }
+export function _meCacheClearForTest() { _meCache.clear(); _meRate.clear(); _meIntents.clear(); _meImg.clear(); _meImgBody.clear(); _meMineRefetchAt.clear(); _meMintIdx = null; }
 export function _meTxOutForTest(body) { return meTxOut(body); }
 export function _meScrubForTest(s) { return _meScrub(s); }
 export function _meBoardBlockedForTest(w, uid) { return meBoardBlocked(w, uid); }
@@ -9242,6 +10204,13 @@ export function restoreAssetReg(v) {
                      at: Number(src.meList.at) || Date.now(),
                      sig: String(src.meList.sig || "").slice(0, 96) || null,
                      verified: !!src.meList.verified };
+      // WHO SET THE MARKER SURVIVES THE RESTART TOO, because it decides who may clear it: a marker this
+      // server INFERRED from Magic Eden's book may be dropped by the next book read immediately, while
+      // one written by our own /nft/market/confirm waits out ME_MARKER_GRACE_MS so a lagging wallet index
+      // cannot pop a just-listed egg back into the nest. Dropped on restore, every marker came back
+      // looking confirm-sourced. (see meMarkListedFromBook)
+      const _src = String(src.meList.src || "").slice(0, 16);
+      if (_src) row.meList.src = _src;
     }
     if (Number(src.holderSince) > 0) row.holderSince = Number(src.holderSince);
     if (src.pendingHandover && typeof src.pendingHandover === "object" && isPubkey(String(src.pendingHandover.to || "")))
@@ -9360,6 +10329,15 @@ export function _nftResetDasForTest() { _nftDasUnsupported = false; _nftReviewFl
 // The Core CREATE seam: a sim installs its own submitter, so no sim ever builds a transaction, opens a
 // socket or reads a key — the real submit path is exercised only in SHAPE (args in, {address} out).
 export function _setNftCoreStubForTest(fn) { _nftCoreStub = fn; }
+// ---- mint-at-sale seams (CHIK_MINT_AT_SALE). Never a chain, never a key, never Magic Eden. ----
+export function _setMasComposeStubForTest(fn) { _masComposeStub = fn; }
+export function _masFlagsForTest() { return { on: MINT_AT_SALE_ON, confTries: MAS_CONF_TRIES, confGapMs: MAS_CONF_GAP_MS }; }
+export function _masHealEditionsForTest() { return masHealEditions(); }
+export function _masWitnessForTest(row) { return masWitness(row); }
+export function _masEditionOfForTest(row) { return masEditionOf(row); }
+export function _nftAttributesForTest(row) { return nftAttributes(row); }
+// drive the ledger audit (and its flag-gated avatar registry heal) directly, without a cloud save
+export function _auditAssetsForTest(wallet, mmo, firstSeen) { return auditAssets(wallet, mmo, firstSeen || 0); }
 // Delegate visibility for sims: the PUBLIC key only, never the secret. `_nftDelegateResetForTest`
 // re-reads the environment so a sim can prove the missing-key refusal without restarting the server.
 export function _nftDelegateInfoForTest() { const d = nftDelegate(); return { configured: !!d, pubkey: d ? d.pubkey : null }; }
@@ -9678,6 +10656,29 @@ function auditAssets(wallet, mmo, walletFirstSeen = 0) {
   // the look they are WEARING counts too — a ceremony avatar can be worn without ever being listed
   const worn = String(mmo.avatar || "").slice(0, 24);
   if (worn && !has(rec.avatars, worn)) { rec.avatars[worn] = { ts: now }; newAvatars++; }
+  // ============ REGISTRY COMPLETENESS FOR AVATARS (CHIK_MINT_AT_SALE) ============
+  // Owner ruling 1 makes avatars sellable, and a sale needs a registry row — but the ceremony grant
+  // and the onboarding roulette are CLIENT-side, so most held avatars exist only in this ledger.
+  // Heal them here, at the login save the server already reads, with ZERO chain interaction and ZERO
+  // change to the client-visible profile shape (nothing in `mmo` is written; only registry rows).
+  //   origin "legacy"  — honest (the look predates avatar registration), CLEAN (sellable), and
+  //                      cap-EXEMPT at mintAsset, so a species already over its tightened cap still
+  //                      heals (grandfathering is absolute — nothing a player holds is ever refused);
+  //   luid = species   — rec.avatars is species-keyed exactly like rec.mounts, so the census dedups
+  //                      the healed row against the ledger entry it adopts (one avatar, counted once);
+  //   handed-over guard — an avatar adopted once and then SOLD is never re-adopted from the ledger
+  //                      ghost, the same rule the mount/chikimon sync routes enforce.
+  // Catalog looks only (AVATAR_IDS), one row per species per wallet, capacity ends the pass quietly.
+  if (MINT_AT_SALE_ON) {
+    const ownedAv = new Set(regOwned(wallet, "avatar").map((r) => r.sp));
+    for (const sp of Object.keys(rec.avatars)) {
+      if (!AVATAR_IDS.includes(sp)) continue;
+      if (ownedAv.has(sp)) continue;
+      if (nftAdoptionHandedOver(wallet, "avatar", sp)) continue;
+      try { mintAsset("avatar", wallet, { sp, kind: "avatar", luid: sp }, "legacy"); ownedAv.add(sp); }
+      catch (e) { break; }   // registry capacity — the rest heals on a later save
+    }
+  }
 
   if (eggGlut) flag(`eggglut:${eggsNow}`);
   for (const why of flagLater) flag(why);
@@ -9898,6 +10899,9 @@ setInterval(saveAssetLedger, ASSET_SAVE_MS).unref?.();   // SIGTERM flush lives 
       const rn = restoreAssetReg(rv);
       const n = restoreAssetLedger(lv);
       _assetsReady = true;
+      // Ruling 4 heal (CHIK_MINT_AT_SALE): number every pre-existing editionless row by issuance
+      // order — flag-off this is a guaranteed 0 and nothing is touched.
+      { const h = masHealEditions(); if (h) console.log(`mint-at-sale: healed ${h} issuance editions`); }
       if (rn || n) console.log(`assets restored: ${rn} registered, ${n} ledger wallets`);
       else console.log(`assets restored: empty registry (fresh database)`);
       if (i > 1) console.log(`  (the asset store was not readable until attempt ${i} — the schema was still being created)`);
