@@ -329,6 +329,9 @@ async function chikiBalance(owner, strict = false) {
     return 0;
   }
 }
+// sim seam: seed the balance cache so an in-process sim (dead RPC) can model a holder/non-holder
+// wallet through the exact code path /verify reads. Requires CHIKI_MINT set (any throwaway pubkey).
+export function _setBalanceForTest(wallet, v) { _balCache.set(String(wallet), { t: Date.now(), v: Number(v) || 0 }); return Number(v) || 0; }
 // Treasury (reward pool) SOL — CACHED 20s. Pool changes slowly; this kills the per-request getBalance spam.
 let _poolCache = { t: 0, v: 0 };
 const poolSol = async () => {
@@ -1395,6 +1398,7 @@ async function loadCupState() {
   try { const ch = await store.kvGet("cup_champion"); if (ch != null) cupChampion = ch; } catch (e) {}
   try { const bw = await store.kvGet("banned_wallets"); if (Array.isArray(bw)) for (const w of bw) if (isPubkey(w)) bannedWallets.add(w); } catch (e) {}   // reward-pool bans persist across restarts
   try { const fe = await store.kvGet("fish_event"); if (fe && Number(fe.mult) > 1 && Number(fe.ends) > Date.now()) _fishEvent = { mult: Math.min(10, Math.max(1, Number(fe.mult))), ends: Number(fe.ends), label: String(fe.label || "Fishing Festival").slice(0, 40) }; } catch (e) {}   // a mid-festival restart must not end the party
+  await restoreLiveEvents();   // open-gates/founder state + the permanent founder claim book (same rule as fish_event)
   try { const wins = await store.kvGet("battle_wins"); if (wins && typeof wins === "object") battleWins = wins; } catch (e) {}   // server-authoritative BR win ledger
   try { const mm = await store.kvGet("meme_minted"); if (mm && typeof mm === "object") memeMinted = mm; } catch (e) {}
   try { const mh = await store.kvGet("meme_hatches"); if (Array.isArray(mh)) memeHatches = mh; } catch (e) {}
@@ -1703,6 +1707,12 @@ async function getStats() {
   out.cupOwedSol = +cupOwed.toFixed(4);
   out.cupAwardedSol = +Number(cupTotalAwarded || 0).toFixed(4);       // ALL-TIME SOL rewarded in the Chikoria Cup
   out.cupChampion = cupChampion;                                     // {wallet, name, ts} reigning champion (or null)
+  // LIVE EVENTS on the InfoBar/website's existing 30s poll — additive keys, absent when nothing runs
+  try {
+    const evs = liveEventsWire();
+    if (evs) out.events = evs;
+    if (_founderCount > 0 || founderEventActive()) { out.founderClaimed = _founderCount; out.founderCap = FOUNDER_CAP; }
+  } catch (e) {}
   _statsCache = { t: Date.now(), data: out };
   return out;
 }
@@ -1891,14 +1901,21 @@ app.post("/verify", async (req, res) => {
     if (signedIn) { try { await store.kvSet("signin:" + wallet, { ts: Date.now() }); } catch (e) {} }
     // 1) The wallet GATE = the on-chain balance. This is the only thing the connect flow truly
     //    needs, and it never touches the database.
-    let balance = 0, eligible = true;
-    if (verifyOn) { balance = await chikiBalance(wallet); eligible = balance >= MIN; }
+    let balance = 0, holdOk = true;
+    if (verifyOn) { balance = await chikiBalance(wallet); holdOk = balance >= MIN; }
+    // OPEN-GATES (admin-triggered event): the 500k hold is waived in the RESPONSE eligibility only.
+    // `holdOk` — the real on-chain answer — still feeds store.touch's players flag and the old-game
+    // chikis count below, and the SOL faucets (/claim, quest winner slots) re-check the hold
+    // themselves and stay closed. The sign-in SIGNATURE is a separate variable (signedIn, above)
+    // and is never waived: an unsigned wallet still gets no mktToken, no session, no cloud save.
+    const gateWaived = !holdOk && openGatesActive();
+    const eligible = holdOk || gateWaived;
     // 2) DB-backed EXTRAS (whale hold-timer + cross-device roster/Glory). Degrade gracefully if
     //    the database is unreachable — a dead/expired Postgres must NEVER zero out a real holder's
     //    balance (previously store.touch() threw and 500'd the whole request → "0 $CHIKI").
     let whaleSince = null, firstSeen = 0, profile = null, dbOk = true;
     try {
-      const p = await store.touch(wallet, eligible, balance);
+      const p = await store.touch(wallet, holdOk, balance);   // the DB players flag reads the REAL hold, never the waiver
       whaleSince = p?.whale_since ?? null;
       firstSeen = Number(p?.first_seen) || 0;
       profile = await applyGloryCredit(wallet, p?.profile || null);   // pending Glory gift on login (clobber-proof)
@@ -1913,8 +1930,8 @@ app.post("/verify", async (req, res) => {
       profile = { ...profile };
       delete profile.mmo;
     }
-    const chikis = eligible ? (chikiCount(balance, whaleSince) || 1) : 0;
-    const whalePending = eligible && balance >= WHALE_MIN && chikis < 2;
+    const chikis = holdOk ? (chikiCount(balance, whaleSince) || 1) : 0;   // the old accrual game keeps its real gate
+    const whalePending = holdOk && balance >= WHALE_MIN && chikis < 2;
     const whaleReadyInMs = whalePending && whaleSince ? Math.max(0, WHALE_HOLD_MS - (Date.now() - Number(whaleSince))) : 0;
     // CREATOR/ADMIN unlock: the client (Chain.gd) reads `isAdmin` here to unlock the in-game
     // F8/F9 Creator Toolbox. It was never sent → admin could never sign in and access it.
@@ -1960,6 +1977,18 @@ app.post("/verify", async (req, res) => {
     }
     const out = { wallet, eligible, balance, chikis, whalePending, whaleReadyInMs, minHold: MIN, verified: verifyOn, firstSeen, profile: profile || null, dbOk, signedIn, isAdmin, mktToken, sessionId };
     if (signedIn && syncRtOn()) { out.sessionEpoch = sessEpoch; out.handoffWait = handoffWait; }
+    // LIVE EVENTS (additive keys — an older client ignores them): the real hold verdict, the waiver
+    // flag while OPEN-GATES is on, the active-event banners, and — once the event has ended — the
+    // honest grandfathering line the gate refusal card should show. The cloud save above is gated
+    // only on signedIn, never on eligible, so a gateless entrant's progress is KEPT automatically.
+    out.holdOk = holdOk;
+    if (gateWaived) out.gateWaived = true;
+    const _evw = liveEventsWire();
+    if (_evw) out.events = _evw;
+    if (!holdOk && !openGatesActive())
+      out.gateNote = `Hold ${MIN.toLocaleString()} $CHIKI to enter Chikoria. Everything you earned is saved to this wallet — ` +
+                     `if you joined during Open Gates, your progress and creatures are kept and waiting; you just can't ` +
+                     `re-enter until this wallet holds ${MIN.toLocaleString()} $CHIKI again.`;
     res.json(out);
   } catch (e) { res.status(500).json({ error: "verify failed: " + String(e.message || e) }); }
 });
@@ -2366,9 +2395,15 @@ app.get("/world/feed", (req, res) => {
 // Read-only, public: is a festival on? The operator's answer to "did my curl land?", the website's
 // banner source, and the only status check that needs no login and writes nothing.
 app.get("/world/event", (_req, res) => {
-  if (!fishEventActive()) return res.json({ active: false });
-  res.json({ active: true, mult: _fishEvent.mult, ends: _fishEvent.ends, label: _fishEvent.label,
-             remainingMs: Math.max(0, Number(_fishEvent.ends) - Date.now()) });
+  // ADDITIVE: `events` (all live events, any kind) + the founder counter ride alongside the original
+  // fishing-only shape, which stays byte-identical whenever no new-style event has ever run.
+  const extra = {};
+  const evs = liveEventsWire();
+  if (evs) extra.events = evs;
+  if (_founderCount > 0 || founderEventActive()) { extra.founderClaimed = _founderCount; extra.founderCap = FOUNDER_CAP; }
+  if (!fishEventActive()) return res.json(Object.assign({ active: false }, extra));
+  res.json(Object.assign({ active: true, mult: _fishEvent.mult, ends: _fishEvent.ends, label: _fishEvent.label,
+             remainingMs: Math.max(0, Number(_fishEvent.ends) - Date.now()) }, extra));
 });
 // Admin: schedule (or cancel) the fishing festival. Auth: ?key= or body key must equal ADMIN_KEY
 // (which never leaves the env). mult clamps to 1..10, duration to 168h; mult<=1 or hours<=0 cancels.
@@ -2389,6 +2424,70 @@ app.post("/admin/fishing-event", async (req, res) => {
   chronicleAdd("festival", "*", { sub: label, val: mult, route: "/admin/fishing-event",
     idem: "fest:" + _fishEvent.ends, data: { mult, hours, ends: _fishEvent.ends } });
   res.json({ ok: true, active: true, mult, hours, label, ends: _fishEvent.ends });
+});
+
+// ============ ADMIN EVENT CONTROL — generic start/stop, durations in DAYS ============
+// POST /admin/event/start {event, days [, mult, label]} — event: open_gates | fishing_festival |
+// founder_drop. Same ?key=/body-key ADMIN_KEY gate as the fishing festival. NOTHING starts on
+// deploy: the owner curls each event on when THEY choose. Starting an already-active event simply
+// re-arms its deadline (now + days). The public read is GET /world/event (`events` key).
+app.post("/admin/event/start", async (req, res) => {
+  const key = String(req.body?.key ?? req.query?.key ?? "");
+  if (!process.env.ADMIN_KEY || key !== process.env.ADMIN_KEY) return res.status(403).json({ error: "admin key required" });
+  const kind = normEventKind(req.body?.event ?? req.query?.event);
+  if (!kind) return res.status(400).json({ error: "event must be one of open_gates | fishing_festival | founder_drop" });
+  const days = Math.min(EVENT_MAX_DAYS, Math.max(0, Number(req.body?.days ?? req.query?.days) || 0));
+  if (!(days > 0)) return res.status(400).json({ error: `days required (0 < days <= ${EVENT_MAX_DAYS}) — use /admin/event/stop to end an event` });
+  const ends = Date.now() + Math.round(days * 86400000);
+  const label = stripTags(String(req.body?.label || "")).slice(0, 60);
+  if (kind === "fishing_festival") {
+    // the EXISTING festival machinery, parameterized to N days — same state, same odds chokepoint,
+    // same kv key, so the in-world banner pill and every displayed odd keep working unchanged
+    const mult = Math.min(10, Math.max(1, Number(req.body?.mult) || 4));
+    if (mult <= 1) return res.status(400).json({ error: "mult must be > 1 (use /admin/event/stop to cancel)" });
+    _fishEvent = { mult, ends, label: (label || "Fishing Festival").slice(0, 40) };
+    await saveFishEvent();
+    chronicleAdd("festival", "*", { sub: _fishEvent.label, val: mult, route: "/admin/event/start",
+      idem: "fest:" + ends, data: { mult, days, ends } });
+    return res.json({ ok: true, event: kind, active: true, days, mult, label: _fishEvent.label, ends });
+  }
+  if (kind === "open_gates") {
+    _openGates = { ends, label: label || "Open Gates" };
+  } else {
+    _founderEvent = { ends, label: label || "Founder Drop" };
+    _founderLastSweep = Date.now();   // presence accrual starts at the start, never from a pre-event sweep
+  }
+  _evWireCache = { t: 0, v: null };
+  await saveLiveEvents(true);
+  chronicleAdd("event", "*", { sub: kind + ":on", route: "/admin/event/start",
+    idem: "ev:" + kind + ":" + ends, data: { days, ends, label: label || null } });
+  const out = { ok: true, event: kind, active: true, days, ends,
+                label: kind === "open_gates" ? _openGates.label : _founderEvent.label };
+  if (kind === "founder_drop") { out.cap = FOUNDER_CAP; out.perSpecies = FOUNDER_PER_SPECIES; out.claimed = _founderCount;
+                                 out.bar = { minutes: FOUNDER_MIN_MS / 60000, actions: FOUNDER_MIN_ACTIONS }; }
+  res.json(out);
+});
+// POST /admin/event/stop {event} — ends the event NOW. Founder claims and counters are PERMANENT:
+// stopping (or re-running) the drop never forgets who already claimed, so one-per-wallet-ever holds.
+app.post("/admin/event/stop", async (req, res) => {
+  const key = String(req.body?.key ?? req.query?.key ?? "");
+  if (!process.env.ADMIN_KEY || key !== process.env.ADMIN_KEY) return res.status(403).json({ error: "admin key required" });
+  const kind = normEventKind(req.body?.event ?? req.query?.event);
+  if (!kind) return res.status(400).json({ error: "event must be one of open_gates | fishing_festival | founder_drop" });
+  if (kind === "fishing_festival") {
+    _fishEvent = { mult: 1, ends: 0, label: "" };
+    await saveFishEvent();
+    chronicleAdd("festival", "*", { sub: "off", route: "/admin/event/stop" });
+    return res.json({ ok: true, event: kind, active: false });
+  }
+  if (kind === "open_gates") _openGates = { ends: 0, label: "" };
+  else _founderEvent = { ends: 0, label: "" };          // the claim book stays — permanent by design
+  _evWireCache = { t: 0, v: null };
+  await saveLiveEvents(true);
+  chronicleAdd("event", "*", { sub: kind + ":off", route: "/admin/event/stop" });
+  const out = { ok: true, event: kind, active: false };
+  if (kind === "founder_drop") { out.claimed = _founderCount; out.cap = FOUNDER_CAP; }
+  res.json(out);
 });
 
 // ============ THE CHRONICLE QUERY SURFACE — CHIK_CHRONICLE (default OFF) ============
@@ -4711,6 +4810,7 @@ app.post("/world/node/claim", (req, res) => {
       markNodesDirty();
       const drop1 = nodeDrop(kind);
       recordGather(b.wallet, kind, drop1);
+      if (claimProven) founderNoteAction(b.wallet);   // founder bar: a PROVEN gather is a verified action
       return res.json({ ok: true, taken: false, left, felled: false, drop: drop1 });
     }
     worldNodeUses.delete(id);
@@ -4718,6 +4818,7 @@ app.post("/world/node/claim", (req, res) => {
     markNodesDirty();
     const drop2 = nodeDrop(kind);
     recordGather(b.wallet, kind, drop2);
+    if (claimProven) founderNoteAction(b.wallet);
     return res.json({ ok: true, taken: false, left: 0, felled: true, until: now + cd, drop: drop2 });
   }
 
@@ -4725,6 +4826,7 @@ app.post("/world/node/claim", (req, res) => {
   markNodesDirty();
   const drop3 = nodeDrop(kind);   // the SINGLE-USE path — every node except wood comes through here
   recordGather(b.wallet, kind, drop3);
+  if (claimProven) founderNoteAction(b.wallet);      // grace-window (unproven) claims never feed the bar
   res.json({ ok: true, taken: false, until: now + cd, drop: drop3 });
 });
 
@@ -4846,6 +4948,214 @@ function fishEventActive(now = Date.now()) {
   return _fishEvent.mult > 1 && now < Number(_fishEvent.ends);
 }
 async function saveFishEvent() { try { await store.kvSet("fish_event", _fishEvent); } catch (e) {} }
+
+// ============ LIVE EVENTS v2 — admin-triggered, N-day, store-persisted (2026-08-11) ============
+// Three owner-defined events ride one framework: OPEN-GATES (the 500k hold gate is waived in the
+// /verify RESPONSE only — the signature, the SOL faucets, the DB flag and the old-game chikis count
+// all still read the real hold), the FISHING FESTIVAL (the existing _fishEvent machinery, now
+// startable in DAYS through the generic admin route), and the FOUNDER DROP (the first FOUNDER_CAP
+// genuinely-active wallets each receive ONE special-edition legendary, server-birthed through
+// mintAsset with a distinct provenance origin).
+//
+// NOTHING AUTO-STARTS. Every event begins when the owner curls /admin/event/start and ends at its
+// deadline or an explicit /admin/event/stop. State persists in the kv store (the fish_event
+// pattern): a mid-event redeploy must not end or restart an event, and must never forget who
+// already claimed a founder drop.
+const FOUNDER_CAP = Math.max(1, Math.floor(Number(process.env.FOUNDER_CAP || 50)));
+const FOUNDER_PER_SPECIES = Math.max(1, Math.floor(Number(process.env.FOUNDER_PER_SPECIES || 10)));
+const FOUNDER_MIN_MS = Math.max(0, Number(process.env.FOUNDER_MIN_MINUTES || 15)) * 60000;
+const FOUNDER_MIN_ACTIONS = Math.max(1, Math.floor(Number(process.env.FOUNDER_MIN_ACTIONS || 3)));
+const FOUNDER_ORIGIN = "open-gates-founder";   // the forever-distinguishable series marker
+const EVENT_MAX_DAYS = 30;
+const FOUNDER_ACTIVITY_MAX = 20000;            // bound the accumulator like every per-wallet map here
+let _openGates = { ends: 0, label: "" };
+let _founderEvent = { ends: 0, label: "" };
+// THE FOUNDER BOOK. Claims are permanent — one drop per wallet EVER, across restarts and across any
+// future run of the event — so they are persisted with the event state and never trimmed.
+let _founderClaims = Object.create(null);      // wallet -> { n, sp, id, ts }
+let _founderCount = 0;                          // claims issued, 0..FOUNDER_CAP — the live "X of 50"
+let _founderPerSp = Object.create(null);        // species -> issued (<= FOUNDER_PER_SPECIES each)
+const _founderActivity = new Map();             // wallet -> { ms, acts } — event-scoped, server-verified only
+let _founderLastSweep = 0;
+function openGatesActive(now = Date.now()) { return now < Number(_openGates.ends); }
+function founderEventActive(now = Date.now()) { return now < Number(_founderEvent.ends); }
+function normEventKind(v) {
+  const s = String(v || "").toLowerCase().replace(/[\s-]+/g, "_");
+  if (["open_gates", "opengates", "gates"].includes(s)) return "open_gates";
+  if (["fishing_festival", "fishing", "festival", "fish"].includes(s)) return "fishing_festival";
+  if (["founder_drop", "founder", "founders"].includes(s)) return "founder_drop";
+  return "";
+}
+// what the client banners read — one additive shape for every surface (/verify, /world/event,
+// /stats, the move-reply `events` key). The frozen fishing `event` move-reply key is untouched.
+function liveEventsWire(now = Date.now()) {
+  const ev = {};
+  if (openGatesActive(now)) ev.openGates = { ends: Number(_openGates.ends), label: _openGates.label || "Open Gates",
+                                             remainingMs: Math.max(0, Number(_openGates.ends) - now) };
+  if (fishEventActive(now)) ev.fishing = { mult: _fishEvent.mult, ends: Number(_fishEvent.ends), label: _fishEvent.label,
+                                           remainingMs: Math.max(0, Number(_fishEvent.ends) - now) };
+  if (founderEventActive(now)) ev.founder = { ends: Number(_founderEvent.ends), label: _founderEvent.label || "Founder Drop",
+                                              remainingMs: Math.max(0, Number(_founderEvent.ends) - now),
+                                              claimed: _founderCount, cap: FOUNDER_CAP, full: _founderCount >= FOUNDER_CAP };
+  return Object.keys(ev).length ? ev : null;
+}
+// the move reply builds this on EVERY ping — cache the wire object for a second so a quiet island
+// pays one allocation, not three hundred. undefined when no event is on, so the reply keeps its shape.
+let _evWireCache = { t: 0, v: null };
+function liveEventsWireCached() {
+  const now = Date.now();
+  if (now - _evWireCache.t > 1000) _evWireCache = { t: now, v: liveEventsWire(now) };
+  return _evWireCache.v;
+}
+function liveEventsSnapshot() {
+  const act = {};
+  let n = 0;
+  for (const [w, a] of _founderActivity) { if (++n > FOUNDER_ACTIVITY_MAX) break; act[w] = { ms: Math.round(a.ms), acts: a.acts }; }
+  return { openGates: _openGates, founder: _founderEvent, founderClaims: _founderClaims,
+           founderCount: _founderCount, founderPerSp: _founderPerSp, activity: act };
+}
+let _liveEvSavedAt = 0;
+async function saveLiveEvents(force = false) {
+  const now = Date.now();
+  if (!force && now - _liveEvSavedAt < 5000) return;   // batch writes — accrual ticks are frequent
+  _liveEvSavedAt = now;
+  try { await store.kvSet("live_events", liveEventsSnapshot()); } catch (e) {}
+}
+// boot restore — the fish_event pattern: a mid-event restart must not end an event or forget a claim
+async function restoreLiveEvents() {
+  try {
+    const le = await store.kvGet("live_events");
+    if (!le || typeof le !== "object") return;
+    if (le.openGates) _openGates = { ends: Number(le.openGates.ends) || 0, label: String(le.openGates.label || "").slice(0, 60) };
+    if (le.founder) _founderEvent = { ends: Number(le.founder.ends) || 0, label: String(le.founder.label || "").slice(0, 60) };
+    if (le.founderClaims && typeof le.founderClaims === "object") {
+      _founderClaims = Object.create(null);
+      for (const w of Object.keys(le.founderClaims)) if (isPubkey(w)) _founderClaims[w] = le.founderClaims[w];
+    }
+    _founderCount = Math.max(Number(le.founderCount) || 0, Object.keys(_founderClaims).length);
+    _founderPerSp = Object.create(null);
+    if (le.founderPerSp && typeof le.founderPerSp === "object")
+      for (const sp of Object.keys(le.founderPerSp)) _founderPerSp[sp] = Number(le.founderPerSp[sp]) || 0;
+    if (le.activity && typeof le.activity === "object") {
+      _founderActivity.clear();
+      for (const w of Object.keys(le.activity)) {
+        if (_founderActivity.size >= FOUNDER_ACTIVITY_MAX) break;
+        const a = le.activity[w];
+        _founderActivity.set(w, { ms: Number(a && a.ms) || 0, acts: Number(a && a.acts) || 0 });
+      }
+    }
+  } catch (e) {}
+}
+// ---- the ACTIVITY BAR: server-verified signals only, demo and puppets excluded by construction ----
+// Presence minutes accrue in the same 10s sweep that expires stale rows, and ONLY for rows that are
+// (a) a real pubkey — a net_id/demo session never accrues — and (b) `proven` (presenceOk with the
+// /verify-minted mktToken), so a stranger POSTing a wallet they read off /world/roster accrues
+// nothing in that wallet's name. Actions are counted at the three WITNESSED choke points only:
+// a proven node claim, a counted fish report, a witnessed mob kill. The self-declared routes
+// (/world/kill/report, /world/mat/flow) deliberately do not count — so "craft", whose only signal
+// today is client-declared telemetry, is not part of the bar.
+function founderNoteAction(wallet) {
+  wallet = String(wallet || "");
+  if (!founderEventActive() || !isPubkey(wallet)) return;
+  if (_founderClaims[wallet] || _founderCount >= FOUNDER_CAP) return;
+  if (!_founderActivity.has(wallet) && _founderActivity.size >= FOUNDER_ACTIVITY_MAX) return;
+  const a = _founderActivity.get(wallet) || { ms: 0, acts: 0 };
+  a.acts += 1;
+  _founderActivity.set(wallet, a);
+  founderMaybeAward(wallet, a);
+  void saveLiveEvents();
+}
+function founderPresenceTick(now = Date.now()) {
+  const dt = _founderLastSweep ? Math.min(Math.max(0, now - _founderLastSweep), 30000) : 0;
+  _founderLastSweep = now;
+  if (!founderEventActive(now) || dt <= 0) return;
+  let touched = false;
+  for (const [w, p] of worldPlayers) {
+    if (now - p.ts > WORLD_TTL_MS) continue;            // expired — the sweep is about to drop it
+    if (!p.proven || !isPubkey(w)) continue;            // demo/net_id sessions and unproven pubkeys never accrue
+    if (_founderClaims[w]) continue;
+    if (!_founderActivity.has(w) && _founderActivity.size >= FOUNDER_ACTIVITY_MAX) continue;
+    const a = _founderActivity.get(w) || { ms: 0, acts: 0 };
+    a.ms += dt;
+    _founderActivity.set(w, a);
+    touched = true;
+    founderMaybeAward(w, a);
+  }
+  if (touched) void saveLiveEvents();
+}
+function founderBarMet(a) { return a.ms >= FOUNDER_MIN_MS || a.acts >= FOUNDER_MIN_ACTIONS; }
+function founderMaybeAward(wallet, a) { return founderBarMet(a) ? founderAward(wallet) : null; }
+// ---- THE AWARD: exactly-once per wallet, hard global cap, race-safe by construction --------------
+// Legendary chikimon are UNCAPPED in the registry (supplyOf -> 0), so the 50-cap lives HERE, and it
+// is decided synchronously: from the claim/cap checks through mintAsset (a synchronous function) to
+// the claim write there is NO await, so two wallets crossing the bar in the same tick serialize on
+// the event loop and can never mint #50 and #51. kv persistence happens after the fact and is only
+// a mirror of this in-memory truth.
+function founderAward(wallet) {
+  if (!founderEventActive()) return null;
+  if (!_assetsReady) return null;                       // registry still loading — retried on the next accrual
+  if (_founderClaims[wallet]) return null;              // one drop per wallet, ever
+  if (_founderCount >= FOUNDER_CAP) return null;        // series complete
+  // species: round-robin by claim number — exactly FOUNDER_PER_SPECIES per legendary at the cap
+  let sp = SPECIES_LEGEND[_founderCount % SPECIES_LEGEND.length];
+  if ((_founderPerSp[sp] || 0) >= FOUNDER_PER_SPECIES) {
+    sp = SPECIES_LEGEND.find((s) => (_founderPerSp[s] || 0) < FOUNDER_PER_SPECIES) || "";
+    if (!sp) return null;
+  }
+  const n = _founderCount + 1;
+  let row;
+  try {
+    // the grant chokepoint: unforgeable id, origin stored on the row, chronicle "mint" carrying the
+    // founder origin, census counted like any chikimon row. Legendaries are uncapped so this cannot
+    // refuse on supply; any other throw (registry capacity) leaves the claim slot UNSPENT.
+    row = mintAsset("chikimon", wallet, { sp, kind: "legendary", lvl: 1 }, FOUNDER_ORIGIN);
+  } catch (e) { console.error("founder award: mint failed —", e?.message || e); return null; }
+  _founderCount = n;
+  _founderPerSp[sp] = (_founderPerSp[sp] || 0) + 1;
+  _founderClaims[wallet] = { n, sp, id: row.id, ts: Date.now() };
+  _founderActivity.delete(wallet);
+  // the ledger holding + arrival — byte-for-byte the admin-grant materialisation pattern, so the
+  // creature lands in the satchel through the same /assets/news + /assets/arrivals pull
+  const rec = assetRec(wallet);
+  let luid;
+  do { luid = "u9" + String(crypto.randomInt(100000000)).padStart(8, "0"); } while (has(rec.units, luid));
+  rec.units[luid] = { sp, kind: "legendary", lvl: 1, ts: Date.now(), origin: FOUNDER_ORIGIN, held: true };
+  regEvent(row, "founder", { number: n, of: FOUNDER_CAP, sp_number: _founderPerSp[sp], sp_of: FOUNDER_PER_SPECIES,
+                             luid, route: "founder-drop" });
+  row.arrivedAt = Date.now();
+  nftNewsPush(wallet, { kind: "arrived", id: row.id, type: "chikimon", sp, cls: "legendary", lvl: 1,
+    mint: null, other: null, dormant: false,
+    text: `FOUNDER DROP — a special-edition ${sp} (founder #${n} of ${FOUNDER_CAP}) has been born to this wallet. It arrives in your satchel.` });
+  // the chronicle award record — idem per wallet, so a retry can never double-record a founder
+  chronicleAdd("founder", wallet, { sub: sp, qty: 1, route: "founder-drop", idem: "founder:" + wallet,
+    data: { n, of: FOUNDER_CAP, sp, origin: FOUNDER_ORIGIN, id: row.id } });
+  _assetsDirty = true;
+  void saveLiveEvents(true);
+  console.log(`FOUNDER DROP: #${n}/${FOUNDER_CAP} ${sp} -> ${wallet}`);
+  return { n, sp, id: row.id };
+}
+// sim seams — in-process verification only
+export function _liveEventsForTest() {
+  return { openGates: { ..._openGates }, founder: { ..._founderEvent }, fishing: { ..._fishEvent },
+           founderCount: _founderCount, perSp: { ..._founderPerSp }, claims: Object.keys(_founderClaims).length };
+}
+export function _openGatesActiveForTest(now) { return openGatesActive(now); }
+export function _fishEventActiveForTest(now) { return fishEventActive(now); }
+export function _founderEventActiveForTest(now) { return founderEventActive(now); }
+export function _founderClaimForTest(w) { return _founderClaims[String(w)] || null; }
+export function _founderActivityForTest(w) { const a = _founderActivity.get(String(w)); return a ? { ms: a.ms, acts: a.acts } : null; }
+export function _founderTickForTest(now) { founderPresenceTick(now); }
+// stamp a presence row's ts so a sim can walk the 15-minute presence bar through the REAL tick
+// (TTL + proven + pubkey checks all live) without waiting 15 real minutes
+export function _stampPresenceForTest(wallet, ts) { const p = worldPlayers.get(String(wallet)); if (p) p.ts = Number(ts) || Date.now(); return !!p; }
+export function _liveEventsWireForTest(now) { return liveEventsWire(now || Date.now()); }
+export async function _saveLiveEventsForTest() { await saveLiveEvents(true); }
+export function _resetLiveEventsForTest() {
+  _openGates = { ends: 0, label: "" }; _founderEvent = { ends: 0, label: "" };
+  _founderClaims = Object.create(null); _founderCount = 0; _founderPerSp = Object.create(null);
+  _founderActivity.clear(); _founderLastSweep = 0; _evWireCache = { t: 0, v: null };
+}
+export async function _bootRestoreLiveEventsForTest() { await restoreLiveEvents(); }
 
 // ============ THE WORLD FEED: server-witnessed rare moments, shown under every minimap ============
 // Only events THIS server rolled may enter (fantasy catches, server-rolled legendary/meme hatches),
@@ -5036,6 +5346,7 @@ app.post("/world/fish/report", (req, res) => {
     for (const [k, t] of _lastFishRec) { if (now - t > 120000) _lastFishRec.delete(k); }
   }
   recordGather(String(b.wallet), "fish", ["fish"]);   // pubkey-only inside; net_id catches are ignored
+  founderNoteAction(String(b.wallet));                // founder bar: a COUNTED catch behind presenceOk
   // NOTE: recordGather already credits the book one "fish" per entry (creditOwn defaults true), so
   // there is deliberately no ownCredit for the ordinary catch here — adding one double-counted it.
   // THE SERVER ROLLS THE LEGEND. tier and rod are client-asserted and only clamped (see the note at
@@ -6037,6 +6348,7 @@ app.post("/world/mob/hit", (req, res) => {
     // a WITNESSED kill (the server's own health pool hit zero) — per-species counter, island ceiling
     // ~16/min shared, so an aggregate is generous and a raw row would be noise
     if (CHRONICLE_ON) chronicleBump(String(b.wallet), "kill:" + spec[0], 1);
+    founderNoteAction(String(b.wallet));   // founder bar: a witnessed kill behind presenceOk
     const _fst = MOB_STATS[spec[0]];
     const ess = _fst ? _fst.essence : 1;
     const paid = [];
@@ -6081,6 +6393,7 @@ app.post("/world/mob/hit", (req, res) => {
     m.deadAt = now;
     _mobKills++;
     if (CHRONICLE_ON) chronicleBump(wallet, "kill:" + spec[0], 1);   // witnessed: the pool the server owns reached zero
+    founderNoteAction(wallet);   // founder bar: same witnessed-kill fact, damage path
     // 6. THE REWARD IS THE SERVER'S, ONCE PER LIFE, SPLIT ACROSS EVERYONE WHO REALLY FOUGHT IT. The
     //    client never names it. Everyone who landed a hit on THIS generation gets the mob's own
     //    essence value — co-op pays both trainers rather than racing them for a last hit.
@@ -6650,6 +6963,25 @@ function regOwned(wallet, type, state = "active") {
 // the provenance, and a mutable provenance is not one.
 function regEvent(row, what, extra) { row.chain.push(Object.assign({ at: Date.now(), what }, extra || {})); }
 
+// SELF-HEAL A CLIPPED ORIGIN. The restore sanitizer used to slice origin at 16 chars, which silently
+// truncated "open-gates-founder" (18) to "open-gates-found" on every cold boot and then persisted it
+// at the next asset flush — a string in neither ORIGIN_CLEAN nor ORIGINS, so the row quietly lost the
+// right to be sold, to enter the Cup, and to be vouched. The slice is 32 now, but rows written under
+// the old one are already on disk, so restore repairs them from their OWN birth record: mintAsset
+// writes regEvent(row, "minted", { to, origin }) with the FULL string (measured intact in a real
+// two-boot probe). Only ever LENGTHENS a value that is a strict prefix of the chain's — never
+// rewrites an origin that simply differs, so a legitimately-changed origin is untouched.
+function _originHeal(origin, rawChain) {
+  if (!Array.isArray(rawChain) || rawChain.length === 0) return origin;
+  for (const ev of rawChain) {
+    if (!ev || ev.what !== "minted") continue;
+    const full = String(ev.origin || "");
+    if (full.length > origin.length && full.startsWith(origin)) return full.slice(0, 32);
+    break;                    // the birth event is the first one; do not scan the whole chain
+  }
+  return origin;
+}
+
 // ============ NFT MINT AUTHORITY — CHIK_NFT_MINT (default OFF) ============
 // The mint LAUNDERS whatever it touches, so ONLY a server-witnessed, registry-owned, rare-tier row
 // may mint. Opt-in like every new subsystem: with the flag OFF every /assets/nft/* route 503s and
@@ -6845,7 +7177,8 @@ function masEditionOf(row) {
 //   player-reported  a ledger adoption / backfill — an honest record of a client-declared holding
 function masWitness(row) {
   if (row.parent && !row.luid) return "server-hatched";
-  if (!row.luid && (row.origin === "issued" || row.origin === "scroll" || row.origin === "restitution")) return "server-issued";
+  if (!row.luid && (row.origin === "issued" || row.origin === "scroll" || row.origin === "restitution"
+                    || row.origin === "open-gates-founder")) return "server-issued";   // founder drops: this server created the row itself
   return "player-reported";
 }
 // The provenance, pinned ON CHAIN as a Core Attributes plugin — so the certificate outlives the
@@ -8855,6 +9188,208 @@ function regBackfillAll(wallet, chikis) {
   _regBackfillRuns++;
   return out;
 }
+
+// ============ THE OWNER'S FULL-COLLECTION GRANT — POST /admin/grant-collection (CHIK_REG_ALL) ============
+// THE OWNER ASK (2026-08-11, verbatim intent): "give the admin wallet all chikimons, mounts and
+// avatars, authenticated and server birthed and included in the rarity mechanism." So every grant
+// here is a REAL issuance through the mintAsset chokepoint: origin "issued", NO luid, NO saleBacked
+// — which is exactly the shape the cap test at mintAsset counts (_issuing), so a granted griffin
+// spends a real griffin slot and a species with no room is REFUSED per-species (SUPPLY_EXHAUSTED)
+// and reported with its cap numbers, never minted past, never silently skipped. The Wanderer grant's
+// luid:"classic" and the adoption arms' luid rows are the OPPOSITE of this mandate (cap-exempt) and
+// are deliberately not imitated; row.luid stays unset so masWitness reads "server-issued" and the
+// row counts HARD (full) in the census.
+//
+// ONE of every species the wallet does not already hold — "hold" meaning ANY record of the species:
+// a registry row in any state (an owner-burned row is still a held history — re-granting after a
+// burn is an owner decision, not a default), a held ledger entry, the old game's profile.chikis
+// record, or a handed-over (NFT-sold) species (the sync routes' never-twice rule; re-granting a
+// species the owner sold would quietly re-issue on every re-run, so sold reads as held and is
+// SURFACED in the report for the owner to decide). That is the same per-species already-held
+// discipline the W2 sync/backfill arms use, so a second call grants exactly zero.
+//
+// THE PLAYABLE SIDE — what makes the wallet actually hold and play the collection — writes ONLY
+// records the server owns (profile.mmo is client-signed and stored verbatim; it is never touched):
+//   registry row      mintAsset ("issued", edition at issuance under CHIK_MINT_AT_SALE, chronicle
+//                     "mint" row at the chokepoint, provenance chain) + a "granted" chain event
+//                     carrying the ledger key below — the uid<->row link, recorded in the chain
+//                     rather than as row.luid so the witness stays "server-issued";
+//   ledger holding    chikimon: one rec.units entry (fresh "u9########" uid — the client's own uids
+//                     are low sequential "u<seq>", so this range cannot collide and can never
+//                     rebrand-flag an honest save; origin "issued", held) — the census dedups it
+//                     against the luid-less row by the absorption term, and regAdoptChikimonPerUid's
+//                     absorbing-row budget mints nothing for it, so W2 can never double it (the
+//                     agc_grant_sim proof); mounts: rec.mounts[sp]; avatars: rec.avatars[sp]
+//                     ("avatars into the avatar state" — the census/ledger record auditAssets keeps);
+//   arrival           row.arrivedAt + a pull-and-ack notice (nftNewsPush), the exact channel a
+//                     settled hand-off materialises through: the client calls POST /assets/arrivals
+//                     on sign-in and adds what is missing, idempotent by construction.
+// profile.chikis is deliberately NOT written: it is a SECOND materialisation channel (the legacy
+// import), and feeding both would put two live copies of each species in the save and inflate the
+// census (R=1, L=2 -> 2). One channel, the modern one.
+//
+// STATED DEPENDENCIES (this route itself is a 404 without CHIK_REG_ALL, the ceremony pattern):
+//   CHIK_REG_ALL=1       this route exists (the REG_ALL admin-grant precedent, :2172);
+//   CHIK_NFT_HANDOVER=1  /assets/arrivals + /assets/news answer (else they 404 and chikimon/avatars
+//                        wait, granted but unmaterialised; mounts appear via /assets/mounts/sync
+//                        regardless — flag-independent);
+//   CHIK_MINT_AT_SALE=1  editions stamp AT issuance (else masHealEditions assigns them, born-order,
+//                        at the next flag-on boot);
+//   CHIK_CHRONICLE=1     the chokepoint's "mint" chronicle rows actually record (flag-off no-op).
+// The response names which of these were off at grant time so the owner sees what still rides.
+//
+// GATE: cupAdminOk (the /assets/audit pattern — ?key=ADMIN_KEY or a fresh-signature admin wallet).
+// The target wallet is a PARAMETER; nothing is hardcoded. ?dryRun=1 (or body dryRun) reports what
+// WOULD happen without writing anything — not even an empty ledger record (assetRec creates one, so
+// dry-run only ever reads assetLedger.get). Never touches any other wallet's state.
+app.post("/admin/grant-collection", async (req, res, next) => {
+  if (!REG_ALL_ON) return next();                     // flag-off: this URL answers 404, exactly as before
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  if (!cupAdminOk(req)) return res.status(403).json({ error: "forbidden" });
+  const wallet = String(req.body?.wallet || req.query?.wallet || "");
+  if (!isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  const dryRun = String(req.query?.dryRun ?? req.body?.dryRun ?? "0") === "1";
+  const now = Date.now();
+
+  // the catalog: every species, one grant shape each — byte-for-byte the existing server-birth shapes
+  // (admin chikimon grant :2172, the egg-hatch mount shape :8376 minus the parent, the Wanderer avatar
+  // shape :7283 WITHOUT its luid)
+  const catalog = [
+    ...SPECIES_NORMAL.map((sp) => ({ type: "chikimon", sp, kind: "normal" })),
+    ...SPECIES_LEGEND.map((sp) => ({ type: "chikimon", sp, kind: "legendary" })),
+    ...SPECIES_MEME.map((sp) => ({ type: "chikimon", sp, kind: "meme" })),
+    ...MOUNT_SUPPLY.map(([sp]) => ({ type: "mount", sp, kind: "mount" })),
+    ...AVATAR_IDS.map((sp) => ({ type: "avatar", sp, kind: "avatar" })),
+  ];
+
+  // ---- already-held evidence, gathered once (reads only — a dry run must write NOTHING) ----------
+  const regSp = { chikimon: new Map(), mount: new Map(), avatar: new Map() };   // sp -> state
+  for (const id of (assetsByOwner.get(wallet) || [])) {
+    const r = assetReg.get(id);
+    if (!r || !regSp[r.type]) continue;
+    if (r.type === "egg" || !r.sp) continue;
+    // an active row wins the label; any other surviving state (burned/retired) still reads as held
+    const prev = regSp[r.type].get(r.sp);
+    if (!prev || r.state === "active") regSp[r.type].set(r.sp, r.state);
+  }
+  const lrec = assetLedger.get(wallet) || null;
+  const ledSp = { chikimon: new Set(), mount: new Set(), avatar: new Set() };
+  if (lrec) {
+    if (lrec.units) for (const uid of Object.keys(lrec.units)) {
+      const u = lrec.units[uid];
+      if (u && u.held !== false && u.sp) ledSp.chikimon.add(String(u.sp));
+    }
+    if (lrec.mounts) for (const sp of Object.keys(lrec.mounts)) {
+      const m = lrec.mounts[sp];
+      if (m && m.held !== false) ledSp.mount.add(sp);
+    }
+    if (lrec.avatars) for (const sp of Object.keys(lrec.avatars)) {
+      const a = lrec.avatars[sp];
+      if (a && a.held !== false) ledSp.avatar.add(sp);
+    }
+  }
+  const oldSp = new Set();                             // the old game's record — holding, not just history
+  try {
+    const prof = await store.getProfile(wallet);
+    if (prof && Array.isArray(prof.chikis)) {
+      for (const c of prof.chikis.slice(0, 40)) {
+        const spn = c && typeof c === "object" ? spFromChikiIndex(c.sp | 0) : null;
+        if (spn) oldSp.add(spn);
+      }
+    }
+  } catch (e) { /* profile store unreachable: the registry/ledger checks still hold the line */ }
+  // WHAT COUNTS AS "ALREADY HELD" — REGISTERED HOLDINGS ONLY.
+  // Measured 2026-08-11 (agcv_ledgergap 9/0): counting a ledger-only or old-game-record holding as
+  // held made this endpoint a NO-OP for exactly the wallet it exists to serve. A veteran wallet
+  // (21 chikimon / 6 mounts / 10 avatars in the ledger, 0 registry rows) got granted=0 already=37
+  // and stayed UNregistered, UNeditioned, UNauthenticated — the opposite of the owner's mandate that
+  // every creature be server-birthed and inside the rarity mechanism. So an unregistered holding
+  // still BIRTHS its registry row; the row itself carries idempotency from then on (a re-run reads
+  // "registry" and stops). Census-safe: a luid-less "issued" row over an existing ledger unit is
+  // absorbed, count 1 -> 1, control-tested in the same probe. A species already SOLD as an NFT stays
+  // held — parting with it was deliberate and is never silently undone.
+  const heldVia = (type, sp) => {
+    const st = regSp[type].get(sp);
+    if (st === "active") return "registry";
+    if (st) return "registry-" + st;                   // burned/retired history — owner decision to re-grant
+    if (nftAdoptionHandedOver(wallet, type, sp)) return "sold-nft";   // sold once — never silently re-issued
+    return null;
+  };
+  // Kept for the REPORT, not the gate: the response names which unregistered holdings this pass
+  // upgraded, so the owner can SEE the mandate being satisfied instead of inferring it.
+  const priorUnregistered = (type, sp) =>
+    ledSp[type].has(sp) ? "ledger" : ((type === "chikimon" && oldSp.has(sp)) ? "old-record" : null);
+
+  // ---- the pass: grant / already / refuse, per species, honestly -------------------------------
+  const granted = [], already = [], refused = [], skipped = [];
+  let capacityFault = false;
+  for (const c of catalog) {
+    const cap = supplyOf(c.type, c.sp);                // 0 = uncapped (normal/legendary chikimon)
+    const capInfo = cap > 0 ? { cap, issued: issuedCount(c.type, c.sp) } : { cap: 0, issued: issuedCount(c.type, c.sp) };
+    if (capacityFault) { skipped.push({ ...c, why: "registry-capacity" }); continue; }
+    const via = heldVia(c.type, c.sp);
+    if (via) { already.push({ ...c, via, ...capInfo }); continue; }
+    if (cap > 0 && atSupplyCap(c.type, c.sp)) {        // honest per-species refusal, dry or real
+      refused.push({ ...c, ...capInfo, remaining: 0 });
+      continue;
+    }
+    const upgrades = priorUnregistered(c.type, c.sp);  // report-only: an unregistered holding being registered
+    if (dryRun) { granted.push({ ...c, ...capInfo, wouldGrant: true, ...(upgrades ? { upgrades } : {}) }); continue; }
+    let row;
+    try {
+      row = mintAsset(c.type, wallet,
+        c.type === "chikimon" ? { sp: c.sp, kind: c.kind, lvl: 1 } : { sp: c.sp, kind: c.kind },
+        "issued");                                     // the chokepoint: cap, id, edition, chronicle, provenance
+    } catch (e) {
+      if (e && e.code === "SUPPLY_EXHAUSTED") {        // raced past the pre-check — same honest answer
+        refused.push({ ...c, cap, issued: issuedCount(c.type, c.sp), remaining: remainingOf(c.type, c.sp) });
+        continue;
+      }
+      capacityFault = true;                            // ASSET_REG_MAX (a non-coded throw) is a server fault,
+      skipped.push({ ...c, why: "registry-capacity" });  // NOT species exhaustion — named apart (sync-loop rule)
+      continue;
+    }
+    // the ledger holding — the in-game record auditAssets keeps, written with the server's own verdict
+    const rec = assetRec(wallet);
+    let luid = c.sp;                                   // species-keyed sources: the species IS the ledger key
+    if (c.type === "chikimon") {
+      do { luid = "u9" + String(crypto.randomInt(100000000)).padStart(8, "0"); } while (has(rec.units, luid));
+      rec.units[luid] = { sp: c.sp, kind: c.kind, lvl: 1, ts: now, origin: "issued", held: true };
+    } else if (c.type === "mount") {
+      if (!has(rec.mounts, c.sp)) rec.mounts[c.sp] = { ts: now, origin: "issued" };
+    } else if (!has(rec.avatars, c.sp)) rec.avatars[c.sp] = { ts: now };
+    // the grant record + the arrival: the exact materialisation channel a settled hand-off uses
+    regEvent(row, "granted", { route: "/admin/grant-collection", luid });
+    row.arrivedAt = now;
+    nftNewsPush(wallet, { kind: "arrived", id: row.id, type: row.type, sp: row.sp,
+      cls: row.kind || null, lvl: row.lvl || null, mint: null, other: null, dormant: false,
+      text: `${row.sp} (${row.type === "mount" ? "mount" : (row.kind || row.type)}) has been granted to this wallet — it is yours to play.` });
+    granted.push({ ...c, id: row.id, edition: row.edition || null, luid,
+                   ...(upgrades ? { upgrades } : {}),   // this species was held but unregistered until now
+                   cap, issued: issuedCount(c.type, c.sp), remaining: remainingOf(c.type, c.sp) });
+    _assetsDirty = true;
+  }
+
+  if (!dryRun && granted.length)
+    console.log(`Admin grant-collection: ${granted.length} granted, ${already.length} already, ${refused.length} refused at cap for ${wallet}`);
+  res.json({
+    ok: true, wallet, dryRun,
+    totals: { catalog: catalog.length, granted: granted.length, already: already.length,
+              refused: refused.length, skipped: skipped.length },
+    granted, already, refused, skipped, capacityFault,
+    // which materialisation/recording legs were live at grant time — stated, never assumed
+    flags: { regAll: REG_ALL_ON, nftHandover: NFT_HANDOVER_ON, mintAtSale: MINT_AT_SALE_ON, chronicle: CHRONICLE_ON },
+    notes: [
+      NFT_HANDOVER_ON ? "arrivals live: the client materialises the grants at next sign-in (/assets/arrivals + /assets/news)"
+                      : "CHIK_NFT_HANDOVER=0: /assets/arrivals and /assets/news 404 — chikimon/avatars are granted and counted but wait for the flag to materialise; mounts appear via /assets/mounts/sync regardless",
+      MINT_AT_SALE_ON ? "editions stamped at issuance"
+                      : "CHIK_MINT_AT_SALE=0: editions arrive at the next flag-on boot heal (born-order, write-once)",
+      CHRONICLE_ON ? "chronicle recorded each birth once (idem mint:<id>)"
+                   : "CHIK_CHRONICLE=0: the chokepoint's chronicle rows were no-ops this run",
+      "a species sold as an NFT reads as held (sold-nft) and is never silently re-issued — re-granting one is an owner decision",
+    ],
+  });
+});
 
 // Redeem an Avatar Scroll. Avatars had NO server record of any kind — adding one to a save was free
 // and permanent, and each carries a rarity-scaled perk that converts into materials, which do sell
@@ -11392,7 +11927,14 @@ export function restoreAssetReg(v) {
     const _born = (Number.isFinite(_bornSrc) && _bornSrc > 0) ? _bornSrc
                 : ((Number.isFinite(_bornChain) && _bornChain > 0) ? _bornChain : Date.now());
     const row = { id, type, owner, sp: String(src.sp || "").slice(0, 24), kind: String(src.kind || "").slice(0, 12),
-                  born: _born, origin: String(src.origin || "issued").slice(0, 16),
+                  // ORIGIN IS 32, NOT 16. Measured 2026-08-11 (evv_b_restart, a real two-boot probe):
+                 // "open-gates-founder" (18 chars) was clipped to "open-gates-found" on every COLD
+                 // boot and then persisted at the next asset flush. The clipped string is in neither
+                 // ORIGIN_CLEAN nor ORIGINS, so after one redeploy a founder legendary silently
+                 // became unsellable, Cup-ineligible and unvouchable. Event origins are long by
+                 // nature; 32 leaves room and still bounds the field. The row's chain "minted" event
+                 // keeps the full string, so _originHeal below can repair anything already clipped.
+                 born: _born, origin: _originHeal(String(src.origin || "issued").slice(0, 32), _rawChain),
                   state: retired ? "burned" : ((src.state === "consumed" || spent) ? "consumed" : "active"),
                   parent: src.parent ? String(src.parent).slice(0, 64) : null,
                   hatchedTo, lvl: Number(src.lvl) || undefined, chain,
@@ -11567,6 +12109,12 @@ export function _regBackfillResetForTest(wallet) { if (wallet) _regBackfillAt.de
 export function _regOwnedForTest(wallet, type) {
   return regOwned(String(wallet), type).map((r) => ({ id: r.id, sp: r.sp, kind: r.kind, origin: r.origin, luid: r.luid || null, parent: r.parent || null, edition: r.edition || null }));
 }
+// read one wallet's authenticity-ledger record (deep copy, never the live object) — the
+// grant-collection sims assert the in-game holding writes without reaching into module state
+export function _assetLedgerRecForTest(wallet) {
+  const r = assetLedger.get(String(wallet));
+  return r ? JSON.parse(JSON.stringify(r)) : null;
+}
 // Delegate visibility for sims: the PUBLIC key only, never the secret. `_nftDelegateResetForTest`
 // re-reads the environment so a sim can prove the missing-key refusal without restarting the server.
 export function _nftDelegateInfoForTest() { const d = nftDelegate(); return { configured: !!d, pubkey: d ? d.pubkey : null }; }
@@ -11636,7 +12184,8 @@ const _testFirstSeen = new Map();
 // Flagging is honest and reversible; blocking on a guess is not.
 const assetLedger = new Map();          // wallet -> { first, units:{}, mounts:{}, eggs:{}, eggsLast, unverified }
 const ASSET_LEDGER_MAX = 20000;
-const ORIGIN_CLEAN = new Set(["legacy", "hatched", "purchased", "issued", "traded", "restitution"]);
+const ORIGIN_CLEAN = new Set(["legacy", "hatched", "purchased", "issued", "traded", "restitution",
+                              "open-gates-founder"]);   // the founder series is server-issued — clean by construction
 
 // A uid is arbitrary CLIENT TEXT. The client's own format is "u<seq>" (Profile.gd _mk_unit), and
 // anything else is a crafted save — including the Object.prototype key names, which a plain
@@ -12058,7 +12607,8 @@ export function restoreAssetLedger(v) {
   censusInvalidate();   // a restored ledger is a different world than the empty one that preceded it
   return n;
 }
-const ORIGINS = new Set(["legacy", "hatched", "purchased", "issued", "traded", "restitution", "unverified"]);
+const ORIGINS = new Set(["legacy", "hatched", "purchased", "issued", "traded", "restitution", "unverified",
+                         "open-gates-founder"]);   // preserved on sync — the founder marker must never launder to "unverified"
 
 // test seams: empty the ledger, and AGE a wallet's eggs so a sim can prove the incubation floor in
 // both directions without waiting 12 real hours for a legendary.
@@ -12449,6 +12999,9 @@ function worldMoveReply(base, wallet, x, z, dl, fs, iAmProven) {
   base.online = worldPlayers.size;
   base.mobs = _worldTickOn ? mobSnapshot(Date.now()) : undefined;
   base.event = fishEventActive() ? { mult: _fishEvent.mult, ends: _fishEvent.ends, label: _fishEvent.label } : undefined;
+  // NEW event kinds ride a NEW key — the `event` shape above is frozen (Net.gd expects {mult,ends,label}).
+  // undefined when nothing is live, and JSON.stringify drops it, so the reply keeps its exact shape.
+  base.events = liveEventsWireCached() || undefined;
   // PROVEN CALLERS ONLY. The presence slot is CLAIMED, not owned (see the puppeteering
   // note above): an unproven caller may still take an UNCLAIMED slot — which is what a
   // wallet's row becomes ~12 s after they close the tab. That is tolerable for a
@@ -12905,7 +13458,7 @@ app.get("/world/roster", (_q, res) => {
   }
   res.json({ users, count: users.length });
 });
-setInterval(() => { const now = Date.now(); for (const [w, p] of worldPlayers) if (now - p.ts > WORLD_TTL_MS) worldPlayers.delete(w); }, 10000);
+setInterval(() => { const now = Date.now(); founderPresenceTick(now); for (const [w, p] of worldPlayers) if (now - p.ts > WORLD_TTL_MS) worldPlayers.delete(w); }, 10000);
 // THE WORLD TICK. Every other interval in this file is housekeeping — flush a ledger, prune a map.
 // This one advances the world: a monster killed anywhere comes back for everyone when its clock runs
 // out, whether or not a single client is polling. One second is plenty for a 90 s respawn and it costs
@@ -15124,6 +15677,7 @@ async function flushDurableState() {
     ["bans", () => store.kvSet("banned_wallets", [...bannedWallets])],
     ["pending gifts", () => store.kvSet("pending_gifts", pendingGifts)],
     ["fishing event", () => store.kvSet("fish_event", _fishEvent)],
+    ["live events", () => store.kvSet("live_events", liveEventsSnapshot())],
     ["meme ledger", () => Promise.all([
       store.kvSet("meme_minted", memeMinted),
       store.kvSet("meme_hatches", memeHatches),
