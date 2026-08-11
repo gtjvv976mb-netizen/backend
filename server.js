@@ -1830,6 +1830,17 @@ function buildSafeProfile(wallet, profile, prev, hasMmo, stampMs) {
       try { auditAssets(wallet, profile.mmo, _testFirstSeen.get(wallet) || Number(prev?.first_seen) || 0); }
       catch (e) { console.error("auditAssets threw for", String(wallet).slice(0, 8), e && e.message); }
     }
+    // ============ CHIK_REG_ALL — lazy per-individual backfill at the login save ============
+    // AFTER the audit, so the ledger this reads is current. Serves BOTH populations (the legacy
+    // trap): the ledger arms cover pure-MMO wallets, the profile.chikis arm covers pure old-game
+    // wallets — deliberately NOT gated on hasMmo, because an old-game client's save has no mmo at
+    // all. `safe.chikis` is the merged never-reduced roster (sanitizeProfile), falling back to the
+    // stored one. Rate-limited per wallet; idempotent (luid-keyed), so repeat and concurrent logins
+    // mint nothing twice. Never fatal to a save, exactly like the audit above.
+    if (REG_ALL_ON && _assetsReady) {
+      try { regBackfillAll(wallet, Array.isArray(safe && safe.chikis) ? safe.chikis : (prev && Array.isArray(prev.chikis) ? prev.chikis : null)); }
+      catch (e) { console.error("regBackfillAll threw for", String(wallet).slice(0, 8), e && e.message); }
+    }
   safe._serverSavedAt = stampMs;   // authoritative "last seen" for offline progression
   return { safe, matClamps };
 }
@@ -1869,7 +1880,14 @@ app.get("/admin/grant-chiki", async (req, res) => {
     profile.chikis.push({ br: 1, sp, xp: 0, food: 1800, nick, level: 1, hungry: false, tending: false, battleXp: 0, cardTier: null, isLegend: false, skillPts: 0, tasksDone: 0, arenaSkills: null, sleepCycles: 0 });
     profile._serverSavedAt = Date.now();
     await store.setProfile(wallet, profile);
-    res.json({ ok: true, wallet, granted: { sp, nick }, totalChikis: profile.chikis.length });
+    // CHIK_REG_ALL — a grant is a creature: record it at creation (server-witnessed, so "issued").
+    // Additive only; the grant itself succeeds exactly as before if the registry is at capacity.
+    let regId = null;
+    if (REG_ALL_ON && _assetsReady) {
+      const spn = spFromChikiIndex(sp);
+      if (spn) { try { regId = mintAsset("chikimon", wallet, { sp: spn, kind: "normal", lvl: 1 }, "issued").id; } catch (e) {} }
+    }
+    res.json({ ok: true, wallet, granted: { sp, nick }, totalChikis: profile.chikis.length, ...(regId ? { regId } : {}) });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
@@ -1939,6 +1957,16 @@ app.get("/admin/restore-chikis", async (req, res) => {
     }
     profile._serverSavedAt = Date.now();
     await store.setProfile(wallet, profile);
+    // CHIK_REG_ALL — a recovery is a make-good, not an issuance: origin "restitution" (cap-EXEMPT
+    // and clean, the same verdict the egg make-good carries). One row per restored creature.
+    if (REG_ALL_ON && _assetsReady) {
+      for (const a of added) {
+        const spn = spFromChikiIndex(a.sp);
+        if (!spn) continue;
+        try { mintAsset("chikimon", wallet, { sp: spn, kind: a.isLegend ? "legendary" : "normal", lvl: 1 }, "restitution"); }
+        catch (e) { break; }   // capacity — the roster grant above already stands; backfill heals later
+      }
+    }
     res.json({ ok: true, wallet, replace, added, totalChikis: profile.chikis.length });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
@@ -1975,6 +2003,11 @@ async function adminGiftChiki(req, res) {
     profile.chikis.push(chikiFromGift(gift));
     profile._serverSavedAt = Date.now();
     await store.setProfile(wallet, profile);
+    // CHIK_REG_ALL — an admin gift is a server-witnessed creature: record it at creation.
+    if (REG_ALL_ON && _assetsReady) {
+      const spn = spFromChikiIndex(si);
+      if (spn) { try { mintAsset("chikimon", wallet, { sp: spn, kind: isLegend ? "legendary" : "normal", lvl: 1 }, "issued"); } catch (e) {} }
+    }
     res.json({ ok: true, pending: false, granted: { sp: si, level: lv, isLegend, nick: gift.nick } });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 }
@@ -2142,6 +2175,12 @@ app.post("/gift/claim", async (req, res) => {
     profile.chikis[ri] = chikiFromGift(g);
     profile._serverSavedAt = Date.now(); await store.setProfile(wallet, profile);
     list.splice(gi, 1); if (!list.length) delete pendingGifts[wallet]; await savePendingGifts();
+    // CHIK_REG_ALL — the accepted gift is recorded at creation. The REPLACED creature's row (if it
+    // has one) is deliberately untouched: grandfathering never deletes, and the record stays honest.
+    if (REG_ALL_ON && _assetsReady) {
+      const spn = spFromChikiIndex(g.sp);
+      if (spn) { try { mintAsset("chikimon", wallet, { sp: spn, kind: g.isLegend ? "legendary" : "normal", lvl: 1 }, "issued"); } catch (e) {} }
+    }
     res.json({ ok: true, accepted: true, replaced: ri, granted: { sp: g.sp, level: g.level, isLegend: g.isLegend } });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
@@ -3416,6 +3455,18 @@ app.post("/meme/hatched", async (req, res) => {
       if (!c) return res.status(409).json({ error: "the dynasty is fully hatched" });
       h.char = c.key; h.name = c.name; h.edition = (memeMinted[c.key] || 0) + 1; memeMinted[c.key] = h.edition; h.undetermined = false;
       censusInvalidate();      // a sale just determined its species — the world census changed
+      // ============ CHIK_REG_ALL — the roll IS the birth, so the row is written HERE ============
+      // The whole meme path used to reach the client purely via ownedChars, with the registry row
+      // arriving only later through species-collapsed adoption (an unrecorded issuance path).
+      // saleBacked: this creature is already census-counted by THIS wallet-attributed sale row, and
+      // pickMeme just enforced the per-character cap — re-applying it would refuse the very sale
+      // that holds the slot. Runs once per hatch (inside the !h.char roll), id kept on the hatch row.
+      if (REG_ALL_ON) {
+        try {
+          const rr = mintAsset("chikimon", wallet, { sp: h.char, kind: "meme", lvl: 1, hatcher: wallet }, "issued", null, { saleBacked: true });
+          h.regId = rr.id;
+        } catch (e) { console.error("meme registry row failed for", String(wallet).slice(0, 8), e && e.message); }
+      }
     }
     h.status = "pending"; h.hatchedAt = Date.now(); await saveMeme();
     censusInvalidate();        // status incubating -> pending is what makes this sale countable
@@ -6275,6 +6326,20 @@ const MINT_AT_SALE_ON = String(process.env.CHIK_MINT_AT_SALE ?? "0") === "1";
 // Mintable ORIGINS — server-witnessed births ONLY. legacy/unverified/adopted rows were never vouched;
 // minting them would launder exactly what the mint is meant to prove. Widen via env without a deploy.
 const NFT_MINT_ORIGINS = new Set(String(process.env.NFT_MINT_ORIGINS || "hatched").split(",").map(s => s.trim()).filter(Boolean));
+// ============ REGISTRY COMPLETENESS — CHIK_REG_ALL (default OFF) ============
+// THE OWNER MANDATE (2026-08-11): every creature AND avatar a player holds — including the OLD
+// game's record (profile.chikis) and ledger-only holdings — gets a per-INDIVIDUAL provenance row,
+// and everything born from now on is recorded server-side AT CREATION. Three parts, all inert
+// flag-off: (1) a lazy, rate-limited backfill at the login save (regBackfillAll — the same hook the
+// avatar heal uses); (2) rows minted inside every issuance path the registry used to miss (Meme
+// Dynasty rolls, admin grants, the ceremony egg route); (3) /assets/chikimon/sync widened from
+// species-collapse to per-uid so "sell one of three dragonos" names a specific individual.
+// GRANDFATHERING ABSOLUTE: nothing is deleted, renumbered or downgraded — backfill only ADDS rows,
+// carries the ledger's own verdict verbatim, and is cap-EXEMPT (luid / origin "legacy").
+const REG_ALL_ON = String(process.env.CHIK_REG_ALL ?? "0") === "1";
+// How often one wallet's backfill may run (per login, not per save): idempotence does the real work —
+// this only bounds the scan. Memory-only; a restart simply lets it run once more, which mints nothing.
+const REG_ALL_BACKFILL_MS = Math.max(60000, Number(process.env.CHIK_REG_ALL_MS || 21600000) || 21600000);
 // ============ EGGS AS SELLABLE NFTs — dormant behind the MARKETPLACE flags ============
 // The owner's feature (2026-08-09): an egg becomes a mintable/sellable NFT, and HATCHING removes that
 // NFT's value so a player can never be paid for BOTH the egg and the creature it becomes. An egg can
@@ -6640,6 +6705,11 @@ function nftEligibility(row, wallet) {
     if (!masOriginClean(row.origin)) return { code: "origin", status: 403, error: "this one's record is unverified — it stays yours, but it cannot be certified or sold" };
     if ((row.gameStatus ?? "good") !== "good") return { code: "flagged", status: 409, error: "asset is flagged and cannot be minted" };
     if (row.listedOffchain || row.pendingHandover) return { code: "busy", status: 409, error: "asset is listed on-chain or has a pending transfer" };
+    // CHIK_REG_ALL clamped rows: the cap binds HERE, at mint, not at backfill. Only rows carrying
+    // the census-clamp marker ever reach this line non-null (regRowSoft), so flag-off — where no
+    // such row exists — this gate is a no-op and the block answers byte-identically to today.
+    const clampGate = regClampedSupplyGate(row);
+    if (clampGate) return clampGate;
     return { code: "ok", status: 200 };
   }
   if (!NFT_MINT_ORIGINS.has(String(row.origin))) return { code: "origin", status: 403, error: "only server-witnessed births can be minted" };
@@ -7099,6 +7169,22 @@ const CENSUS_TTL_MS = 30000;            // backstop only; every mutation invalid
 // counted, so no single /profile save can inflate a rare species to false-Extinct. See the reconcile
 // loop in buildCensus. No stored origin is touched, so nothing is deleted, revoked or made unsellable.
 const LEDGER_CLEAN_QUOTA = 1;
+// ============ THE CENSUS-CLAMP MARKER (CHIK_REG_ALL) ============
+// A backfilled row minted from CLIENT-CLAIMED evidence — a ledger-only clean unit or a
+// profile.chikis entry — carries `clamped: true`. Registry rows normally count IN FULL (`w.c.R`),
+// which is exactly what the 2026-08-04 scarcity-DoS clamp relies on: only SELF-DECLARED ledger
+// surplus is clamped to LEDGER_CLEAN_QUOTA. The per-uid backfill converted that self-declared
+// surplus into registry rows and so counted it in full — a wallet forging 12 clean units of a
+// cap-10 meme drove the census 1 -> 13 and refused honest hatchers SUPPLY_EXHAUSTED (measured,
+// w2v_a_backfill.mjs §A). The marker keeps such rows under the SAME quota rule their evidence
+// lived under pre-backfill, so the census is IDENTICAL before/after backfill by construction.
+// The row itself is untouched property (grandfathering): it exists, persists, plays, and is
+// HELD — only the cap arithmetic treats it as the client claim it is. It HARDENS (counts in
+// full) the moment it gains on-chain evidence: `mint` (committed) or `mintPending` (reserved,
+// the supply check in regClampedSupplyGate ran first). Rows from SERVER-side evidence — hatches,
+// paid meme sales, admin grants, mounts/avatars (species-keyed, inherently 1-per-wallet and
+// luid-deduped 1:1 against their ledger arm) — never carry the marker and count full as built.
+function regRowSoft(r) { return !!(r && r.clamped && !r.mint && !r.mintPending); }
 let _census = null, _censusAt = 0, _censusBuilds = 0;
 function censusInvalidate() { _census = null; }
 // the asset TYPE is a closed set that never contains ":", so type+sp is unambiguous as one key
@@ -7115,13 +7201,16 @@ function buildCensus() {
   // Each wallet keeps two parallel tallies of the same shape: `c` (clean — what binds the cap) and
   // `f` (flagged — reported only). Both are reconciled by the identical rule, so a forged asset is
   // deduped as carefully as an honest one; it is simply counted somewhere that costs nobody.
-  const grp = () => ({ R: 0, L: 0, luids: null, uids: null });
+  // `Rs` counts the SOFT rows inside R — census-clamp-marked, unminted (regRowSoft). They ride in
+  // R (and in the luid match) so the dedup lands exactly as before; only the quota arithmetic below
+  // reads them out again. Zero everywhere no backfill has run, so the sums are byte-identical then.
+  const grp = () => ({ R: 0, Rs: 0, L: 0, luids: null, uids: null });
   const wOf = (slot, wallet) => {
     let w = slot.w.get(wallet);
     if (!w) { w = { c: grp(), f: grp(), S: 0 }; slot.w.set(wallet, w); }
     return w;
   };
-  const addReg = (g, luid) => { g.R++; if (luid) (g.luids || (g.luids = new Set())).add(String(luid)); };
+  const addReg = (g, luid, soft) => { g.R++; if (soft) g.Rs++; if (luid) (g.luids || (g.luids = new Set())).add(String(luid)); };
   const addLed = (g, uid) => { g.L++; (g.uids || (g.uids = [])).push(String(uid)); };
   const distinctOf = (g) => {
     let matched = 0;
@@ -7139,7 +7228,7 @@ function buildCensus() {
     if (!type || !sp) continue;
     const slot = slotOf(type, sp), w = wOf(slot, String(r.owner || "?"));
     const bad = r.origin === "unverified";
-    addReg(bad ? w.f : w.c, r.luid);
+    addReg(bad ? w.f : w.c, r.luid, regRowSoft(r));
     if (!bad) slot.registry++;                     // `flagged` is filled in by the reconcile below
   }
   // ---- 2. the legacy ledger: what predates the registry -------------------------------------
@@ -7209,8 +7298,13 @@ function buildCensus() {
     for (const [_wallet, w] of slot.w) {
       const base = distinctOf(w.c);                  // this wallet's TRUE distinct clean holdings
       let counted = base;
+      // HARD backing only: a census-clamp-marked row (regRowSoft) is a registry echo of a CLIENT
+      // claim, so it must not harden the clamp — subtracting Rs keeps `surplus` exactly what it was
+      // before the backfill minted those rows, which is what keeps the census fixed across backfill
+      // and keeps one forged save from driving a capped species to false-Extinct (w2v_a §A).
+      const Rhard = w.c.R - w.c.Rs;
       if (capped) {
-        const surplus = base - w.c.R;                // ledger units beyond the registry-backed ones
+        const surplus = base - Rhard;                // claims beyond the HARD registry-backed ones
         if (surplus > LEDGER_CLEAN_QUOTA) { const d = surplus - LEDGER_CLEAN_QUOTA; counted -= d; dropped += d; }
       }
       // A CREATURE THAT CHANGED HANDS IS NOT A NEW CREATURE. When a settled NFT hand-off moves a
@@ -7225,7 +7319,9 @@ function buildCensus() {
       let left = 0;
       if (nftHandDebit.size) {
         const deb = nftDebitOf(_wallet, slot.type, slot.sp);
-        if (deb > 0) { left = Math.min(deb, Math.max(0, counted - w.c.R)); counted -= left; gone += left; }
+        // Rhard, not R: a soft row's holding is still ledger-derived count for the debit's purposes,
+        // so the debit eats exactly what it ate pre-backfill (before == after, including sellers).
+        if (deb > 0) { left = Math.min(deb, Math.max(0, counted - Rhard)); counted -= left; gone += left; }
       }
       total += counted + Math.max(0, w.S - base);    // a sale already standing in (1)/(2) adds nothing
       // clamped clean surplus is reported, not counted. A handed-over ghost is NOT flagged — nobody
@@ -7272,8 +7368,62 @@ function remainingOf(type, sp) {
   return cap > 0 ? Math.max(0, cap - issuedCount(type, sp)) : -1;   // -1 = uncapped
 }
 
+// ============ CAPS BIND AT MINT FOR CLAMPED ROWS ============
+// The other half of the census-clamp marker: a soft row is HELD and playable forever
+// (grandfathering — in-game nothing changes), but before it may harden into on-chain evidence the
+// NORMAL supply check runs. The question asked is exact: "would counting this row in full RAISE the
+// species census?" — computed by replaying buildCensus's own clean-group arithmetic for this wallet
+// +species with the row soft vs hard. Delta 0 means the row is ALREADY inside the wallet's counted
+// quota (or the species is uncapped): the mint is census-neutral and proceeds regardless of the cap,
+// so an honest single holding is never refused. Delta 1 means the row is currently clamped OUT:
+// minting it spends a real slot, so it needs room — no room, honest refusal (the creature stays
+// yours; it is not burned, not delisted in-game, just not certifiable while the series is full).
+// Returns null (pass) or the refusal object nftEligibility hands straight back.
+function regClampedSupplyGate(row) {
+  if (!regRowSoft(row)) return null;                 // hard rows already count in full — nothing to ask
+  const cap = supplyOf(row.type, row.sp);
+  if (!(cap > 0)) return null;                       // uncapped species: the clamp never dropped it
+  const wallet = String(row.owner || ""), sp = String(row.sp || "");
+  let R = 0, Rs = 0; const luids = new Set(); let L = 0; const uids = [];
+  for (const r of regOwned(wallet, row.type)) {
+    if (r.sp !== sp || r.origin === "unverified") continue;
+    R++; if (regRowSoft(r)) Rs++;
+    if (r.luid) luids.add(String(r.luid));
+  }
+  const lrec = assetLedger.get(wallet);
+  if (row.type === "chikimon" && lrec && lrec.units) {
+    for (const uid of Object.keys(lrec.units)) {
+      const u = lrec.units[uid];
+      if (!u || u.held === false) continue;
+      if (String(u.sp || "") !== sp || u.origin === "unverified") continue;
+      L++; uids.push(String(uid));
+    }
+  }
+  let matched = 0;
+  for (const uid of uids) if (luids.has(uid)) matched++;
+  if (matched > R) matched = R;
+  const unmatchedL = L - matched;
+  const base = R + (unmatchedL - Math.min(unmatchedL, Math.max(0, R - matched)));
+  const deb = nftHandDebit.size ? nftDebitOf(wallet, row.type, sp) : 0;
+  const contrib = (hardBonus) => {                    // buildCensus's clean-group count, exactly
+    const Rhard = (R - Rs) + hardBonus;
+    let counted = base;
+    const surplus = base - Rhard;
+    if (surplus > LEDGER_CLEAN_QUOTA) counted -= (surplus - LEDGER_CLEAN_QUOTA);
+    if (deb > 0) counted -= Math.min(deb, Math.max(0, counted - Rhard));
+    return counted;
+  };
+  const delta = contrib(1) - contrib(0);
+  if (delta <= 0) return null;                       // census-neutral: already a counted holding
+  const issued = issuedCount(row.type, sp);
+  if (issued >= cap)
+    return { code: "supply", status: 409,
+             error: `every ${sp} that will ever exist has been claimed — this one stays yours in-game, but it cannot be certified while the series is full` };
+  return null;
+}
+
 let _regWarnAt = 0;
-function mintAsset(type, wallet, fields, origin, parent) {
+function mintAsset(type, wallet, fields, origin, parent, opts) {
   if (assetReg.size >= ASSET_REG_MAX) throw new Error("asset registry is full");
   // THE CHOKEPOINT. Every path that issues anything comes through here; refusing here is what makes
   // the advertised rarity true. Restores/adoptions of assets that ALREADY EXIST are not issuance —
@@ -7289,7 +7439,12 @@ function mintAsset(type, wallet, fields, origin, parent) {
   // already own (and, through the sync loop's `break`, denied it for their whole stable).
   const _sp = String((fields && fields.sp) || "");
   const _adopting = !!(fields && fields.luid);
-  const _issuing = !_adopting && !["legacy", "unverified", "restitution"].includes(String(origin || ""));
+  // saleBacked (CHIK_REG_ALL): the creature is ALREADY counted by a wallet-attributed PAID-SALE row
+  // (census source 3, deduped per wallet by the S-vs-base term), so recording it is not a second
+  // issuance — re-applying the cap here would refuse the row for the very sale that holds the slot.
+  // No production caller passes `opts` while the flag is off, so flag-off behaviour is unchanged.
+  const _saleBacked = !!(opts && opts.saleBacked);
+  const _issuing = !_adopting && !_saleBacked && !["legacy", "unverified", "restitution"].includes(String(origin || ""));
   if (_issuing && _sp && atSupplyCap(type, _sp)) {
     const e = new Error(`every ${_sp} that will ever exist has been claimed`);
     e.code = "SUPPLY_EXHAUSTED";
@@ -7765,6 +7920,39 @@ app.post("/assets/egg/claim", (req, res) => {
   res.json({ ok: true, egg: { id: row.id, kind, born: row.born, readyAt: eggReadyAt(row) } });
 });
 
+// ============ THE CEREMONY EGG, RECORDED FROM BIRTH — CHIK_REG_ALL ============
+// The award-ceremony starter egg (and the 1M-wallet second egg) is appended straight to the client
+// nest by Onboarding — no counter, no registry row, the exact unrecorded path the restitution block
+// below documents. This route closes it: the client asks the SERVER for the ceremony egg, so the row
+// exists from birth (origin "issued", the same witness Mithra's barter egg carries) and hatches
+// through the server's own roll like every other registered egg. ONE-SHOT per wallet per slot, and
+// the record of the grant is the registry itself — a "ceremony" chain event on the egg row, which
+// persists and restores WITH the rows (chain survives serializeAssetReg), so no second store can
+// drift from it and a restart can never double-grant.
+// CLIENT CONTRACT (one line): Onboarding.gd replaces its local nest append with
+//   POST /assets/egg/ceremony {wallet, mktToken, slot:"starter"|"second"}
+// and nests the returned egg (same answer shape as /assets/egg/claim). DEPLOY CLIENT BEFORE FLAG.
+// Flag-off this route does not exist (falls through 404), so flag-off HTTP behaviour is unchanged.
+app.post("/assets/egg/ceremony", (req, res, next) => {
+  if (!REG_ALL_ON) return next();
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  const wallet = regWallet(req);
+  if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
+  const slot = String(req.body?.slot || "starter");
+  if (slot !== "starter" && slot !== "second") return res.status(400).json({ error: "slot must be \"starter\" or \"second\"" });
+  for (const id of (assetsByOwner.get(wallet) || [])) {
+    const r = assetReg.get(id);
+    if (r && r.type === "egg" && Array.isArray(r.chain) && r.chain.some((c) => c && c.what === "ceremony" && c.slot === slot))
+      return res.status(409).json({ error: "that ceremony egg was already granted to this wallet", slot });
+  }
+  let row;
+  try { row = mintAsset("egg", wallet, { kind: "normal", sp: "normal" }, "issued"); }
+  catch (e) { return res.status(503).json({ error: "the asset registry is at capacity — this is a server fault, not yours" }); }
+  regEvent(row, "ceremony", { slot });
+  _assetsDirty = true;
+  res.json({ ok: true, slot, egg: { id: row.id, kind: "normal", born: row.born, readyAt: eggReadyAt(row) } });
+});
+
 // Hatch. The server checks the clock IT wrote, rolls the result ITSELF, consumes the egg forever,
 // and mints the creature. A crafted save can do none of those four things.
 app.post("/assets/egg/hatch", async (req, res) => {
@@ -8042,7 +8230,12 @@ app.post("/assets/chikimon/sync", (req, res) => {
   const ownedSp = new Set(regOwned(wallet, "chikimon").map((r) => r.sp));
   const adopted = [];
   const lrec = assetLedger.get(wallet);
-  if (lrec) {
+  // CHIK_REG_ALL: adoption is per-INDIVIDUAL (one row per held ledger uid, surplus-only so nothing
+  // double-counts — see regAdoptChikimonPerUid). The species-collapse loop below is the flag-off
+  // behaviour, byte-identical to today.
+  if (lrec && REG_ALL_ON) {
+    for (const sp of regAdoptChikimonPerUid(wallet)) { adopted.push(sp); ownedSp.add(sp); _chikisAdopted++; }
+  } else if (lrec) {
     for (const uid of Object.keys(lrec.units)) {
       const u = lrec.units[uid];
       if (!u || u.held === false) continue;      // only creatures currently in the roster
@@ -8066,14 +8259,204 @@ app.post("/assets/chikimon/sync", (req, res) => {
 
   // the canonical answer: unique active species with provenance, one card per species. `lvl` is the
   // frozen birth level (1) — NOT live state; the client keeps its own level and only reads id/sp.
+  // CHIK_REG_ALL: one card per ROW (per individual), each carrying `luid` — the ledger uid this row
+  // adopted — so the client stamps the registry id onto the EXACT unit and "sell one of three
+  // dragonos" resolves to a specific individual. `species` stays the unique list either way.
+  // CLIENT CONTRACT (one line): for each card with a luid matching a local unit uid, stamp
+  // unit.reg_id = card.id (additive, never a state overwrite). DEPLOY THE CLIENT BEFORE THE FLAG.
   const seen = new Set(); const cards = [];
   for (const r of regOwned(wallet, "chikimon")) {
+    if (REG_ALL_ON) {
+      seen.add(r.sp);
+      cards.push({ id: r.id, sp: r.sp, kind: r.kind, origin: r.origin, born: r.born, luid: r.luid || null });
+      continue;
+    }
     if (seen.has(r.sp)) continue;
     seen.add(r.sp);
     cards.push({ id: r.id, sp: r.sp, kind: r.kind, origin: r.origin, born: r.born });
   }
   res.json({ ok: true, species: [...seen], chikimon: cards, adopted });
 });
+
+// ============ CHIK_REG_ALL — THE LAZY PER-INDIVIDUAL BACKFILL ============
+// Runs at the login save (buildSafeProfile — the exact hook the MAS avatar heal uses) and inside the
+// per-uid sync route. It unions EVERY record source, because each one alone excludes a population
+// (the legacy trap): assetLedger units/mounts/avatars cover pure-MMO wallets; profile.chikis covers
+// pure old-game wallets that never entered the MMO. All of it is idempotent — the dedup key is the
+// ledger's own name for the holding (unit uid for chikimon, species for mounts/avatars, "p<spIndex>"
+// for the old record), written as row.luid, which is also what makes the census count one creature
+// and the mint cap-EXEMPT (grandfathering absolute; an over-cap holding backfills legally).
+const _regBackfillAt = new Map();       // wallet -> last run ms (bound below; memory-only)
+let _regBackfillRuns = 0, _regBackfillRows = 0;
+
+// profile.chikis speaks in species INDICES: 0-9 the SPECIES_NORMAL order, 10-14 SPECIES_LEGEND,
+// 15-20 SPECIES_MEME (sanitizeProfile's own 21-species dex comment).
+function spFromChikiIndex(i) {
+  i = i | 0;
+  if (i >= 0 && i <= 9) return SPECIES_NORMAL[i];
+  if (i >= 10 && i <= 14) return SPECIES_LEGEND[i - 10];
+  if (i >= 15 && i <= 20) return SPECIES_MEME[i - 15];
+  return null;
+}
+
+// Per-INDIVIDUAL chikimon adoption — the census-exact widening of the species-collapse loop.
+// THE COUNTING LAW (buildCensus distinctOf): a wallet's count is R + (unmatchedL - min(unmatchedL,
+// R - matched)). Rows whose luid names no currently-held uid — server-hatched rows (parent, no
+// luid), pre-luid adoptions, and stale-luid rows after a uid churn — each ABSORB one unmatched
+// ledger unit. So the mint budget per species is the SURPLUS only: held-uncovered uids minus
+// absorbing rows. Minting past that budget would double-count a creature AND duplicate property
+// (the duplicate-luid trap: R=2/luids={u}/L=1 -> distinct 2); minting within it leaves every
+// species' census number exactly where it was. Verified in w2_backfill_sim.mjs with printed values.
+function regAdoptChikimonPerUid(wallet) {
+  const adopted = [];
+  const lrec = assetLedger.get(wallet);
+  if (!lrec || !lrec.units) return adopted;
+  // held, catalog-species units, grouped by species (the :8048 precedent: held===false never adopts)
+  const bySp = new Map();
+  for (const uid of Object.keys(lrec.units)) {
+    const u = lrec.units[uid];
+    if (!u || u.held === false) continue;
+    const sp = String(u.sp || "");
+    if (!CHIKIMON_IDS.has(sp)) continue;
+    if (!bySp.has(sp)) bySp.set(sp, []);
+    bySp.get(sp).push(uid);
+  }
+  if (!bySp.size) return adopted;
+  const rows = regOwned(wallet, "chikimon");
+  for (const [sp, uids] of bySp) {
+    // adopted once and SOLD as an NFT: never re-adopted from the ledger ghost (the sync routes' rule)
+    if (nftAdoptionHandedOver(wallet, "chikimon", sp)) continue;
+    uids.sort((a, b) => (lrec.units[a].ts || 0) - (lrec.units[b].ts || 0));   // oldest first
+    const spRows = rows.filter((r) => r.sp === sp);
+    const usedLuids = new Set(spRows.map((r) => String(r.luid || "")).filter(Boolean));
+    const heldSet = new Set(uids);
+    const absorbing = spRows.filter((r) => !r.luid || !heldSet.has(String(r.luid))).length;
+    const uncovered = uids.filter((uid) => !usedLuids.has(uid));
+    const budget = uncovered.length - absorbing;
+    if (budget <= 0) continue;                    // every creature already stands behind a row
+    // The absorbing rows stand for SOME uncovered units — decide which, so the minted rows name the
+    // rest: registry-vouched units first ("issued" = the server-witnessed rows' own client copies),
+    // then the oldest (likeliest to be the pre-luid adoptions' creatures).
+    const skip = new Set();
+    let need = uncovered.length - budget;
+    for (const uid of uncovered) { if (need <= 0) break; if (lrec.units[uid].origin === "issued") { skip.add(uid); need--; } }
+    for (const uid of uncovered) { if (need <= 0) break; if (!skip.has(uid)) { skip.add(uid); need--; } }
+    for (const uid of uncovered) {
+      if (skip.has(uid)) continue;
+      const u = lrec.units[uid];
+      const origin = ORIGINS.has(u.origin) ? u.origin : "unverified";   // the ledger's verdict, NEVER upgraded
+      try {
+        // `clamped`: this row's only evidence is the CLIENT-DECLARED ledger unit, so it counts under
+        // the same LEDGER_CLEAN_QUOTA rule the unit lived under (regRowSoft / regClampedSupplyGate)
+        // — the census is identical before and after this mint, forged saves included.
+        mintAsset("chikimon", wallet, { sp, kind: String(u.kind || "normal").slice(0, 12), lvl: 1, luid: uid, clamped: true }, origin);
+        adopted.push(sp); _regBackfillRows++;
+      } catch (e) {
+        if (e && e.code === "SUPPLY_EXHAUSTED") continue;   // unreachable (luid exempts) — never abort the stable
+        return adopted;   // capacity: adopt what fits — the rest stays ledger-known and retries later
+      }
+    }
+  }
+  return adopted;
+}
+
+// Mount + avatar halves: species-keyed sources, so adoption is inherently one row per species —
+// the exact loops the sync route / MAS heal already run, callable from the login backfill.
+function regAdoptMountsLedger(wallet) {
+  const adopted = [];
+  const lrec = assetLedger.get(wallet);
+  if (!lrec || !lrec.mounts) return adopted;
+  const ownedSp = new Set(regOwned(wallet, "mount").map((r) => r.sp));
+  for (const sp of Object.keys(lrec.mounts)) {
+    if (!MOUNT_IDS.has(sp)) continue;
+    if (ownedSp.has(sp)) continue;
+    if (nftAdoptionHandedOver(wallet, "mount", sp)) continue;
+    const lo = lrec.mounts[sp] && lrec.mounts[sp].origin;
+    const origin = ORIGINS.has(lo) ? lo : "unverified";
+    try { mintAsset("mount", wallet, { sp, kind: "mount", luid: sp }, origin); ownedSp.add(sp); adopted.push(sp); _regBackfillRows++; }
+    catch (e) { if (e && e.code === "SUPPLY_EXHAUSTED") continue; break; }
+  }
+  return adopted;
+}
+function regAdoptAvatarsLedger(wallet) {
+  const adopted = [];
+  const lrec = assetLedger.get(wallet);
+  if (!lrec || !lrec.avatars) return adopted;
+  const ownedAv = new Set(regOwned(wallet, "avatar").map((r) => r.sp));
+  for (const sp of Object.keys(lrec.avatars)) {
+    if (!AVATAR_IDS.includes(sp)) continue;
+    if (ownedAv.has(sp)) continue;
+    if (nftAdoptionHandedOver(wallet, "avatar", sp)) continue;
+    try { mintAsset("avatar", wallet, { sp, kind: "avatar", luid: sp }, "legacy"); ownedAv.add(sp); adopted.push(sp); _regBackfillRows++; }
+    catch (e) { break; }
+  }
+  return adopted;
+}
+
+// THE OLD RECORD (owner mandate: "even from the OLD record"). profile.chikis is the old game's
+// array — integer sp indices, NO uid, at most one creature per species (the hatch caps + the admin
+// routes' own species dedup make that exact, and sanitizeProfile collapses to first-per-species).
+// The census NEVER reads it, so these rows count once cleanly in the registry arm; when the player
+// later imports (fresh client uids that cannot match "p<idx>"), the absorption term re-dedups
+// exactly as it does for pre-luid adoptions. SKIPPED whenever the LEDGER already knows the species:
+// the MMO import is the newer truth for that creature — its per-uid row (or its recorded sale)
+// already tells the story, and minting from the old record too would resurrect a sold creature.
+// Memes are included ONLY when a wallet-attributed Meme Dynasty hatch row backs them: an orphan
+// memeMinted tally can never be deduped against a row (scout risk 7), so those stay excluded —
+// overcount is the safe direction for a capped species, double-recording property is not.
+function regAdoptOldRecord(wallet, chikis) {
+  const adopted = [];
+  if (!Array.isArray(chikis) || !chikis.length) return adopted;
+  const lrec = assetLedger.get(wallet);
+  const ledgerSp = new Set();
+  if (lrec && lrec.units) for (const uid of Object.keys(lrec.units)) ledgerSp.add(String(lrec.units[uid].sp || ""));
+  const ownedSp = new Set(regOwned(wallet, "chikimon").map((r) => r.sp));
+  const seenIdx = new Set();
+  for (const c of chikis.slice(0, 40)) {
+    if (!c || typeof c !== "object") continue;
+    const idx = c.sp | 0;
+    if (seenIdx.has(idx)) continue;               // one creature per species in the old game
+    seenIdx.add(idx);
+    const sp = spFromChikiIndex(idx);
+    if (!sp) continue;
+    if (ledgerSp.has(sp) || ownedSp.has(sp)) continue;
+    if (nftAdoptionHandedOver(wallet, "chikimon", sp)) continue;
+    const isMeme = idx >= 15;
+    if (isMeme && !memeHatches.some((h) => h && h.wallet === wallet && h.char === sp
+        && (h.status === "pending" || h.status === "minted"))) continue;   // orphan-tally memes stay out
+    const kind = isMeme ? "meme" : ((c.isLegend || idx >= 10) ? "legendary" : "normal");
+    try {
+      // `clamped`: profile.chikis rides in the client-authored save — client-claimed evidence, so
+      // the row counts under the ledger quota rule and the cap binds at mint (regClampedSupplyGate).
+      mintAsset("chikimon", wallet, { sp, kind, lvl: 1, luid: "p" + idx, clamped: true }, "legacy");
+      ownedSp.add(sp); adopted.push(sp); _regBackfillRows++;
+    } catch (e) { if (e && e.code === "SUPPLY_EXHAUSTED") continue; break; }
+  }
+  return adopted;
+}
+
+// The one entry point. Rate-limited per wallet and CLAIMED BEFORE THE WORK, so two overlapping
+// logins run the scan once (Node runs this synchronously — there is no await between the claim and
+// the mints, so "concurrent" logins serialize here); even a forced second run mints nothing, because
+// every holding's ledger key is already carried by a row. Returns the per-source tallies.
+function regBackfillAll(wallet, chikis) {
+  if (!REG_ALL_ON || !_assetsReady) return null;
+  const now = Date.now();
+  if (now - (_regBackfillAt.get(wallet) || 0) < REG_ALL_BACKFILL_MS) return null;
+  _regBackfillAt.set(wallet, now);
+  if (_regBackfillAt.size > 5000) {               // same bounded sweep as the route rate maps
+    let _d = 250;
+    for (const k of _regBackfillAt.keys()) { if (_d-- <= 0) break; _regBackfillAt.delete(k); }
+  }
+  const out = {
+    chikimon: regAdoptChikimonPerUid(wallet),     // ledger units, per-uid — BEFORE the old record,
+    mounts: regAdoptMountsLedger(wallet),         // so the species-skip below sees the truth
+    avatars: regAdoptAvatarsLedger(wallet),
+    oldRecord: regAdoptOldRecord(wallet, chikis),
+  };
+  _regBackfillRuns++;
+  return out;
+}
 
 // Redeem an Avatar Scroll. Avatars had NO server record of any kind — adding one to a save was free
 // and permanent, and each carries a rarity-scaled perk that converts into materials, which do sell
@@ -8657,6 +9040,7 @@ app.post("/assets/nft/mint", async (req, res) => {
       else if (Date.now() - pAt > NFT_PENDING_TTL_MS) {       // the key died with a restart and it never landed
         regEvent(row, "mint_abandoned", { addr: pAddr });
         delete row.mintPending; _assetsDirty = true;
+        if (row.clamped) censusInvalidate();                  // the row just SOFTENED back (regRowSoft)
         try { await saveAssetLedger(true); } catch (e) {}
       } else {
         return res.status(409).json({ error: "that mint is still confirming — try again in a moment", pending: true });
@@ -8671,6 +9055,7 @@ app.post("/assets/nft/mint", async (req, res) => {
       key = { addr: kp.publicKey.toBase58(), secret: kp.secretKey, at: Date.now() };
       _nftPendingKeys.set(id, key);
       row.mintPending = { addr: key.addr, at: key.at };
+      if (row.clamped) censusInvalidate();   // a clamped row just HARDENED (regRowSoft) — the cap must count it now, not in 30s
       // honest provenance: the player path RESERVES (nothing has been submitted — the player will);
       // the admin path SUBMITS. Flag-off, playerPaid is always false: byte-identical "mint_submitted".
       if (playerPaid) regEvent(row, "mint_reserved", { addr: key.addr, edition: row.edition, via: "manual" });
@@ -10049,6 +10434,7 @@ async function masListUnminted(req, res, wallet, row) {
       } else if (Date.now() - pAt > NFT_PENDING_TTL_MS) {    // the key died with a restart and it never landed
         regEvent(row, "mint_abandoned", { addr: pAddr, via: "mint-at-sale" });
         delete row.mintPending; key = null; _assetsDirty = true;
+        if (row.clamped) censusInvalidate();                  // the row just SOFTENED back (regRowSoft)
         try { await saveAssetLedger(true); } catch (e) {}
       } else {
         return res.status(409).json({ error: "that mint is still confirming — try again in a moment", pending: true });
@@ -10061,6 +10447,7 @@ async function masListUnminted(req, res, wallet, row) {
       key = { addr: kp.publicKey.toBase58(), secret: kp.secretKey, at: Date.now() };
       _nftPendingKeys.set(row.id, key);
       row.mintPending = { addr: key.addr, at: key.at };
+      if (row.clamped) censusInvalidate();   // a clamped row just HARDENED (regRowSoft) — the cap must count it now, not in 30s
       regEvent(row, "mint_reserved", { addr: key.addr, edition: row.edition, via: "mint-at-sale" });
       _assetsDirty = true;
       try { await saveAssetLedger(true); } catch (e) {}      // durable BEFORE any bytes leave — never after
@@ -10610,6 +10997,10 @@ export function restoreAssetReg(v) {
                   // the census dedup key, re-typed like everything else — a row that adopted a
                   // ledger entry must keep saying so, or the restart double-counts that creature
                   luid: src.luid ? String(src.luid).slice(0, 32) : undefined };
+    // The census-clamp marker (CHIK_REG_ALL backfill) must survive a restart, or a reboot would
+    // HARDEN every client-claimed backfilled row and re-open the forged-census hole this marker
+    // closes. Additive: absent from `src` — every row a flag-off server writes — changes nothing.
+    if (src.clamped) row.clamped = true;
     // NFT provenance — validated, write-once, ADDITIVE: a field absent from `src` leaves the row
     // byte-identical to a pre-NFT restore, so a flag-off round-trip is unchanged. A lost `mint` field
     // used to VANISH here while `minted_onchain` survived in the chain — orphaning a live NFT (F7).
@@ -10763,6 +11154,13 @@ export function _masEditionOfForTest(row) { return masEditionOf(row); }
 export function _nftAttributesForTest(row) { return nftAttributes(row); }
 // drive the ledger audit (and its flag-gated avatar registry heal) directly, without a cloud save
 export function _auditAssetsForTest(wallet, mmo, firstSeen) { return auditAssets(wallet, mmo, firstSeen || 0); }
+// ---- CHIK_REG_ALL seams: drive the backfill directly and read the tallies. Never a chain/key. ----
+export function _regAllFlagsForTest() { return { on: REG_ALL_ON, backfillMs: REG_ALL_BACKFILL_MS, runs: _regBackfillRuns, rows: _regBackfillRows }; }
+export function _regBackfillForTest(wallet, chikis) { return regBackfillAll(String(wallet), chikis || null); }
+export function _regBackfillResetForTest(wallet) { if (wallet) _regBackfillAt.delete(String(wallet)); else _regBackfillAt.clear(); }
+export function _regOwnedForTest(wallet, type) {
+  return regOwned(String(wallet), type).map((r) => ({ id: r.id, sp: r.sp, kind: r.kind, origin: r.origin, luid: r.luid || null, parent: r.parent || null, edition: r.edition || null }));
+}
 // Delegate visibility for sims: the PUBLIC key only, never the secret. `_nftDelegateResetForTest`
 // re-reads the environment so a sim can prove the missing-key refusal without restarting the server.
 export function _nftDelegateInfoForTest() { const d = nftDelegate(); return { configured: !!d, pubkey: d ? d.pubkey : null }; }
@@ -11094,7 +11492,9 @@ function auditAssets(wallet, mmo, walletFirstSeen = 0) {
   //   handed-over guard — an avatar adopted once and then SOLD is never re-adopted from the ledger
   //                      ghost, the same rule the mount/chikimon sync routes enforce.
   // Catalog looks only (AVATAR_IDS), one row per species per wallet, capacity ends the pass quietly.
-  if (MINT_AT_SALE_ON) {
+  // CHIK_REG_ALL runs the SAME heal (owner mandate: avatars recorded too) — identical loop, so with
+  // both flags on nothing runs twice (ownedAv dedups), and with both off nothing runs at all.
+  if (MINT_AT_SALE_ON || REG_ALL_ON) {
     const ownedAv = new Set(regOwned(wallet, "avatar").map((r) => r.sp));
     for (const sp of Object.keys(rec.avatars)) {
       if (!AVATAR_IDS.includes(sp)) continue;
