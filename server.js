@@ -1252,12 +1252,28 @@ const MEME_CHARS = [
   { key: "doge",    name: "Doge",      cap: 15, weight: 15, rarity: "Meme Legendary" },
   { key: "chillguy",name: "Chill Guy", cap: 15, weight: 15, rarity: "Meme Legendary" },
   { key: "alon",    name: "Alon",      cap: 10, weight: 10, rarity: "Founder's Edition" },  // rarest — its own tier
+  // ---- WAVE 2 (2026-08-12): the owner's eleven new Meme Dynasty characters. APPENDED, NEVER
+  // INSERTED — same discipline as SPECIES_MEME/SPECIES_LEGEND below. Order here feeds nothing but
+  // pickMeme's weighted roll; `weight` stays equal to `cap` so every character depletes
+  // proportionally and the scarce ones (cap 10) are genuinely the long shots. Caps are the owner's
+  // exact numbers and are the ONLY authority — Econ.MEME_NFT on the client mirrors them for display.
+  { key: "ansem",        name: "Ansem Blackbull", cap: 10, weight: 10, rarity: "Meme Legendary" },
+  { key: "successkid",   name: "Success Kid",     cap: 10, weight: 10, rarity: "Meme Legendary" },
+  { key: "chloe",        name: "Side-eye Chloe",  cap: 10, weight: 10, rarity: "Meme Legendary" },
+  { key: "grumpycat",    name: "Grumpy Cat",      cap: 20, weight: 20, rarity: "Meme Legendary" },
+  { key: "peanut",       name: "Peanut",          cap: 20, weight: 20, rarity: "Meme Legendary" },
+  { key: "cryingcat",    name: "Crying Cat",      cap: 15, weight: 15, rarity: "Meme Legendary" },
+  { key: "thisisfine",   name: "This Is Fine Dog",cap: 15, weight: 15, rarity: "Meme Legendary" },
+  { key: "babygoat",     name: "Proud Baby Goat", cap: 15, weight: 15, rarity: "Meme Legendary" },
+  { key: "triplet",      name: "Triple T",        cap: 25, weight: 25, rarity: "Meme Legendary" },
+  { key: "stonks",       name: "Stonks",          cap: 20, weight: 20, rarity: "Meme Legendary" },
+  { key: "nervousmonkey",name: "Nervous Monkey",  cap: 20, weight: 20, rarity: "Meme Legendary" },
 ];
 const MEME_KEYS = new Set(MEME_CHARS.map(c => c.key));
 const MEME_CAP = Number(process.env.MEME_EDITION_CAP || 10);   // fallback cap if a character has none
 const capOf = (key) => { const c = MEME_CHARS.find(x => x.key === key); return (c && c.cap) || MEME_CAP; };
 const rarityOf = (key) => { const c = MEME_CHARS.find(x => x.key === key); return (c && c.rarity) || "Meme Legendary"; };
-const MEME_TOTAL = MEME_CHARS.reduce((s, c) => s + (c.cap || MEME_CAP), 0);   // 105
+const MEME_TOTAL = MEME_CHARS.reduce((s, c) => s + (c.cap || MEME_CAP), 0);   // 285 (105 wave 1 + 180 wave 2)
 const MEME_EGG_PRICE = Number(process.env.MEME_EGG_PRICE || 1000000);   // $CHIKI per egg
 // 🔒 SALE SWITCH — hard server-side lock. CLOSED by default. Flip MEME_SALE_OPEN=true on Render at your X launch.
 // While closed, /meme/hatch is rejected for everyone EXCEPT admin wallets (so you can still dry-run).
@@ -1302,7 +1318,7 @@ async function verifyEggPayment(sig, wallet) {
   if (treasuryGain < MEME_EGG_PRICE * 0.999) return { ok: false, error: "payment did not reach the treasury — the full price must land in the treasury" };
   return { ok: true, spent, treasuryGain };
 }
-// how many eggs are claimed (bought) — incubating(mystery) + pending + minted all hold a slot against the 105 total.
+// how many eggs are claimed (bought) — incubating(mystery) + pending + minted all hold a slot against MEME_TOTAL.
 function memeReserved() { return memeHatches.filter(h => h.status === "incubating" || h.status === "pending" || h.status === "minted").length; }
 function memeSupply() {
   const chars = {}; let hatched = 0;
@@ -3885,7 +3901,7 @@ app.post("/meme/hatch", async (req, res) => {
     if (!v.ok) { delete memeUsedSigs[paySig]; return res.status(402).json({ error: v.error }); }
   }
   // 🎲 The species is NOT chosen here — it stays a MYSTERY and is rolled at hatch time (POST /meme/hatched).
-  // We only RESERVE a slot against the 105 total here.
+  // We only RESERVE a slot against MEME_TOTAL here.
   if (memeReserved() >= MEME_TOTAL) { if (MEME_VERIFY_PAY && paySig) delete memeUsedSigs[paySig]; return res.status(409).json({ error: "sold out — every Meme Dynasty egg has been claimed" }); }
   _memeLastHatch.set(wallet, now);
   const h = { id: "h" + now.toString(36) + Math.random().toString(36).slice(2, 6), wallet, hatcher: wallet, char: null, name: "Mystery Meme Egg", edition: null, status: "incubating", undetermined: true, mintAddr: null, ts: now, paySig: paySig || null };
@@ -4107,12 +4123,24 @@ const pvpPlayerMatch = new Map();     // wallet -> their current matchId (so cup
 // Count of ONLINE players who own a Legendary (= eligible to battle in the Chikiseum). Cached to avoid DB load.
 // THE WIRE INDEX, NOT THE SPECIES STRING. store.world rows carry the client's compact companion code
 // (Net.gd:1006 `10 + LEG_ORDER.find(sp)`), so this set has to speak the same encoding: LEG_ORDER is
-// the 5 legendaries (10-14) then the 6 memes (15-20), and the six NEW legendaries append after them
-// at 21-26. Without 21-26 the live "N online eligible" pill would silently undercount every trainer
-// whose only Legendary is one of the new six — they ARE eligible (cupSnapFromBody :1496 gates on the
-// registry row's kind, which is "legendary" for all eleven), they just would not be counted.
-const PVP_LEGEND_SP = new Set([10, 11, 12, 13, 14,          // galador adalor tyrannos grovador dragonos
-                               21, 22, 23, 24, 25, 26]);    // astraya bamboran borealon horoxyn rivaros solvarex
+// the 5 legendaries (10-14) then the 6 memes (15-20), and every legendary added after that appends
+// past them from 21 up. Without those indices the live "N online eligible" pill would silently
+// undercount every trainer whose only Legendary is a post-2026-08 one — they ARE eligible
+// (cupSnapFromBody :1496 gates on the registry row's kind, which is "legendary" for all fourteen),
+// they just would not be counted.
+//
+// DERIVED FROM SPECIES_LEGEND, NOT RE-TYPED. The hand-written literal here was the reason the six
+// of 2026-08-11 needed a second edit, and hand-writing 27-29 for astragor/crysalune/vesperos would
+// leave the same landmine for the fifteenth. LAZY on purpose: SPECIES_LEGEND is declared ~2,900
+// lines below, so touching it at module-init time is a temporal-dead-zone crash (same hazard called
+// out above _meMintIdx). Built on first use, when every const in the file exists.
+const legWireIndex = (i) => (i < 5 ? 10 + i : 21 + (i - 5));   // 0-4 -> 10-14, 5+ -> 21,22,...
+const LEG_WIRE_MAX = () => legWireIndex(SPECIES_LEGEND.length - 1);
+let _pvpLegendSp = null;
+function pvpLegendSp() {
+  if (_pvpLegendSp === null) _pvpLegendSp = new Set(SPECIES_LEGEND.map((_sp, i) => legWireIndex(i)));
+  return _pvpLegendSp;
+}
 let _pvpOnlineCache = { n: 0, t: 0 };
 async function eligibleOnline() {
   const now = Date.now();
@@ -4120,10 +4148,15 @@ async function eligibleOnline() {
   try {
     const rows = await store.world(PRESENCE_WINDOW, "", 5000);   // [{wallet, sp, level}]
     const set = new Set();
-    for (const r of rows) if (PVP_LEGEND_SP.has(r.sp | 0)) set.add(r.wallet);
+    for (const r of rows) if (pvpLegendSp().has(r.sp | 0)) set.add(r.wallet);
     _pvpOnlineCache = { n: set.size, t: now };
   } catch (e) {}
   return _pvpOnlineCache.n;
+}
+// Sims read the derived wire encoding rather than re-deriving it — the point of legWireIndex is that
+// there is ONE definition, so a test that recomputed the mapping would prove nothing.
+export function _legWireForTest() {
+  return { max: LEG_WIRE_MAX(), eligible: [...pvpLegendSp()], roster: [...SPECIES_LEGEND] };
 }
 function pvpStartMatch(a, b, opts) {  // a,b = snapshots with .wallet
   const m = pvpCreate(a, b, opts || { turnMs: 30000 });
@@ -6970,25 +7003,39 @@ let _meMintIdx = null, _meMintIdxAt = 0;
 // mismatch shows up as a species the client cannot render rather than as a silent exploit.
 const SPECIES_NORMAL = Object.freeze(["drolax", "electrox", "firix", "forestle", "healix",
                                       "jellox", "mushrow", "owzard", "scorplex", "solarix"]);
-// THE LEGENDARY ROSTER GREW 5 -> 11 (owner ruling 2026-08-11: "same mechanics, no special
-// treatment"). astraya/bamboran/borealon/horoxyn/rivaros/solvarex are ORDINARY legendaries — they
-// hatch from a legendary egg out of the same uniform pool, carry the same kind:"legendary", the same
-// cap 0 (uncapped), the same Cup eligibility, the same NFT tier and the same census row as the
-// original five. There is deliberately NO branch anywhere that names them: everything below reads
-// this one list, so the six are indistinguishable from galador downstream.
+// THE LEGENDARY ROSTER GREW 5 -> 11 -> 14 (owner ruling 2026-08-11: "same mechanics, no special
+// treatment"). astraya/bamboran/borealon/horoxyn/rivaros/solvarex (2026-08-11) and then
+// astragor/crysalune/vesperos (2026-08-12) are ORDINARY legendaries — they hatch from a legendary
+// egg out of the same uniform pool, carry the same kind:"legendary", the same cap 0 (uncapped), the
+// same Cup eligibility, the same NFT tier and the same census row as the original five. There is
+// deliberately NO branch anywhere that names them: everything below reads this one list, so the
+// nine are indistinguishable from galador downstream.
 //
 // APPENDED, NEVER INSERTED. profile.chikis speaks in INDICES (spFromChikiIndex :9072 — 0-9 normal,
 // 10-14 legend, 15-20 meme) and sanitizeProfile clamps c.sp to 0..20 (:186), so inserting here would
-// renumber every Meme Dynasty index in every stored legacy roster. The six live only in the
+// renumber every Meme Dynasty index in every stored legacy roster. The nine live only in the
 // registry/ledger, which is keyed by species STRING; spFromChikiIndex stays frozen at 21 entries and
 // answers null for anything past 20, which is what keeps a legacy index from ever naming one.
 //
 // EGG ODDS, measured (eggPoolFor :8439 + the uniform roll at :8760): a fresh wallet's legendary egg
-// was 1/5 = 20.0000% per species and is now 1/11 = 9.0909%. The pool filters species already owned,
-// so a complete legendary set is exactly 11 legendary eggs (no duplicate rolls), up from 5.
+// was 1/5 = 20.0000% per species, then 1/11 = 9.0909%, and is now 1/14 = 7.1429%. The pool filters
+// species already owned, so a complete legendary set is exactly 14 legendary eggs (no duplicate
+// rolls), up from 11. MEASURED, not assumed — 140,000 hatches through /assets/egg/hatch in
+// w2_roster_sim §B: all 14 appeared, shares 6.9857%-7.2736%, worst deviation 0.1571 pp (2.28 sigma),
+// chi-square 17.17 on 13 dof against a 99.9% critical value of 34.53. Nothing is favoured.
 const SPECIES_LEGEND = Object.freeze(["galador", "adalor", "tyrannos", "grovador", "dragonos",
-                                      "astraya", "bamboran", "borealon", "horoxyn", "rivaros", "solvarex"]);
-const SPECIES_MEME   = Object.freeze(["popcat", "moodeng", "doge", "pepe", "chillguy", "alon"]);
+                                      "astraya", "bamboran", "borealon", "horoxyn", "rivaros", "solvarex",
+                                      "astragor", "crysalune", "vesperos"]);
+// APPENDED, NEVER INSERTED — for exactly the reason spelled out above SPECIES_LEGEND, and it binds
+// harder here: spFromChikiIndex (:9107) maps legacy indices 15-20 onto SPECIES_MEME[i-15], so the
+// first six entries are FROZEN FOREVER. The eleven wave-2 characters sit past index 5 and therefore
+// have no legacy index at all — they live in the registry/ledger keyed by species STRING, the only
+// path the MMO writes. sanitizeProfile still clamps c.sp to 0..20 (:186), so no stored roster can
+// ever name one by number, which is what stops a crafted save from claiming a capped edition.
+const SPECIES_MEME   = Object.freeze(["popcat", "moodeng", "doge", "pepe", "chillguy", "alon",
+                                      "ansem", "successkid", "chloe", "grumpycat", "peanut",
+                                      "cryingcat", "thisisfine", "babygoat", "triplet", "stonks",
+                                      "nervousmonkey"]);
 // supply-weighted exactly as Econ.MOUNTS: the Mythic griffin is the longest shot, and rolling it
 // server-side is the point — a crafted save used to simply name it.
 const MOUNT_SUPPLY = Object.freeze([["chicken", 15], ["boar", 20], ["gator", 15],
@@ -9095,11 +9142,11 @@ let _regBackfillRuns = 0, _regBackfillRows = 0;
 
 // profile.chikis speaks in species INDICES: 0-9 the SPECIES_NORMAL order, 10-14 SPECIES_LEGEND,
 // 15-20 SPECIES_MEME (sanitizeProfile's own 21-species dex comment).
-// FROZEN AT 21 ON PURPOSE. SPECIES_LEGEND now holds ELEVEN, but this map still stops at 14: the six
-// new legendaries have no legacy index and must never acquire one, because sanitizeProfile clamps
-// c.sp to 0..20 (:186) — an index of 21+ would be silently rewritten to 20 (alon), i.e. a legendary
-// would become a meme in the stored roster. The six live in the registry/ledger only, keyed by
-// species string, which is the sole path the MMO writes anyway (the client only ever READS chikis).
+// FROZEN AT 21 ON PURPOSE. SPECIES_LEGEND now holds FOURTEEN, but this map still stops at 14: the
+// nine new legendaries have no legacy index and must never acquire one, because sanitizeProfile
+// clamps c.sp to 0..20 (:186) — an index of 21+ would be silently rewritten to 20 (alon), i.e. a
+// legendary would become a meme in the stored roster. The nine live in the registry/ledger only,
+// keyed by species string, which is the sole path the MMO writes anyway (the client only READS it).
 function spFromChikiIndex(i) {
   i = i | 0;
   if (i >= 0 && i <= 9) return SPECIES_NORMAL[i];
@@ -13044,13 +13091,16 @@ function worldMoveApply(b) {
     x: px, y: py, z: pz, dir: Math.round(clampF(b.dir, -7, 7, 0) * 1000) / 1000,   // 3dp — do NOT round coarser (yaw stepping)
     handle: stripTags(String(b.handle || "Trainer")).slice(0, 20),
     // COMPANION SPECIES INDEX, in the client's own wire encoding (Net.gd `10 + LEG_ORDER.find(sp)`:
-    // 10-14 the five original legendaries, 15-20 the Meme Dynasty, 21-26 the six new legendaries).
-    // The ceiling was 20 and would have silently rewritten every one of the six to 20 (= alon) —
-    // the same clamp trap as profile.chikis at :186, and exactly the kind of "legendary quietly
-    // becomes something else" bug this roster change has to avoid. Widened to 26; an OLD client
-    // receiving 21-26 still clamps it to its own LEG_ORDER length as it always did, so nothing
-    // regresses for a stale build, and a current one renders the right creature.
-    leg: clampF(b.leg, 0, 26, 14) | 0,
+    // 10-14 the five original legendaries, 15-20 the Meme Dynasty, then 21+ for every legendary
+    // added after that — 21-26 the six of 2026-08-11, 27-29 astragor/crysalune/vesperos).
+    // The ceiling was 20 and would have silently rewritten every one of them to 20 (= alon) — the
+    // same clamp trap as profile.chikis at :186, and exactly the kind of "legendary quietly becomes
+    // something else" bug this roster change has to avoid. It is now DERIVED from SPECIES_LEGEND
+    // (legWireIndex :4131) so it widens with the roster instead of needing an edit per wave; an OLD
+    // client receiving an index it doesn't know still clamps it to its own LEG_ORDER length as it
+    // always did, so nothing regresses for a stale build, and a current one renders the right
+    // creature. 14 legendaries -> ceiling 29.
+    leg: clampF(b.leg, 0, LEG_WIRE_MAX(), 14) | 0,
     el: stripTags(String(b.el || "Fire")).slice(0, 10),
     avatar: stripTags(String(b.avatar || "classic")).slice(0, 20),   // player's chosen look → remote renders the real rig
     comp: stripTags(String(b.comp || "")).slice(0, 24),              // player's lead chikimon → remote renders it beside them

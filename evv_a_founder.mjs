@@ -82,8 +82,13 @@ async function actAll(ws, n, gap = 950) {
 
 let r = await post("/admin/event/start", { key: KEY, event: "founder_drop", days: 7 });
 console.log("start reply:", JSON.stringify(r.body));
-chk(r.body.cap === 50 && r.body.perSpecies === 10 && r.body.bar && r.body.bar.minutes === 30 && r.body.bar.actions === 10,
-    `armed cap=${r.body.cap} perSp=${r.body.perSpecies} bar=${JSON.stringify(r.body.bar)} (expect 50/10/{30min,10 actions})`);
+// NO species named here, so the pool falls back to the game's own SPECIES_LEGEND — which grew
+// 5 -> 11 on 2026-08-11, making perSpecies ceil(50/11) = 5 rather than ceil(50/5) = 10. Derived from
+// the pool the server reports rather than hardcoded, so the roster can grow again without lying here.
+const POOL = r.body.species || [];
+const PER = Math.max(1, Math.ceil(50 / (POOL.length || 1)));
+chk(r.body.cap === 50 && r.body.perSpecies === PER && r.body.bar && r.body.bar.minutes === 30 && r.body.bar.actions === 10,
+    `armed cap=${r.body.cap} perSp=${r.body.perSpecies} pool=${POOL.length} species (expect ceil(50/${POOL.length})=${PER}) bar=${JSON.stringify(r.body.bar)}`);
 
 // ---------------------------------------------------------------------------
 sec("E control — a demo/net_id session cannot accrue no matter how it bursts");
@@ -159,7 +164,15 @@ chk(pool.length === N + 3 && awarded.length === 50 && mobAwarded.length === 49 &
 const nums = awarded.map(w => claim(w.wallet).n).sort((a, b) => a - b);
 chk(nums.length === 50 && new Set(nums).size === 50 && nums[0] === 1 && nums[49] === 50,
     `claim numbers 1..50 unique (first=${nums[0]}, last=${nums[49]}, unique=${new Set(nums).size})`);
-chk(LEGENDS.every(sp => ev.perSp[sp] === 10), `species spread exactly 10 each: ${LEGENDS.map(sp => sp + "=" + ev.perSp[sp]).join(", ")}`);
+// EVEN ACROSS THE WHOLE POOL. The round-robin gives every species floor(cap/pool) or ceil(cap/pool)
+// — 10 each when the pool was five, 5/5/5/5/5/5/4/4/4/4/4 now that it is eleven. The invariant is
+// that the awards sum to the cap and no species is favoured by more than one.
+{
+  const spread = POOL.map(sp => ev.perSp[sp] || 0);
+  const lo = Math.floor(50 / POOL.length), hi = Math.ceil(50 / POOL.length);
+  chk(spread.reduce((a, b) => a + b, 0) === 50 && spread.every(n => n >= lo && n <= hi),
+      `species spread over the ${POOL.length}-species pool (each ${lo}..${hi}, sum ${spread.reduce((a, b) => a + b, 0)}): ${POOL.map(sp => sp + "=" + (ev.perSp[sp] || 0)).join(", ")}`);
+}
 const rowCounts = pool.map(w => founderRows(w.wallet).length);
 chk(rowCounts.reduce((a, b) => a + b, 0) === 50 && Math.max(...rowCounts) === 1, `registry founder rows total=${rowCounts.reduce((a, b) => a + b, 0)}, max/wallet=${Math.max(...rowCounts)}`);
 chk(refused.every(w => founderRows(w.wallet).length === 0), `every one of the ${refused.length} unawarded wallets holds ZERO founder rows`);
