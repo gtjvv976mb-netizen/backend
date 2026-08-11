@@ -11058,8 +11058,12 @@ export function restoreAssetReg(v) {
     // Read the UNTRUNCATED blob chain, not the row's capped copy: the cap is a memory bound, and a
     // debit dropped by it is a creature counted twice and a cap-exempt re-adoption handed back to a
     // seller. What the blob remembers, the debit remembers.
+    // "tp-settle" is the Trading Post escrow settle (CHIK_TP_ESCROW), the same census debit as an NFT
+    // hand-off: the seller's row moved to a buyer, so their ledger ghost must be re-debited on
+    // restore or the reboot re-counts the sold creature and re-arms a cap-exempt re-adoption. A
+    // flag-off blob carries no such event, so this OR-clause never fires flag-off (byte-identity).
     for (const c of _rawChain)
-      if (c && c.what === "transferred" && c.why === "nft-handover" && isPubkey(String(c.from || "")))
+      if (c && c.what === "transferred" && (c.why === "nft-handover" || c.why === "tp-settle") && isPubkey(String(c.from || "")))
         nftDebitKeyAdd(String(c.from), row.type, row.sp, 1);
     // Defensive: floor the edition counter at the highest edition ever issued, so a lost counter can
     // never re-issue a live edition (mint rows are truncation-exempt, but a prepared row may be dropped).
@@ -12881,6 +12885,23 @@ export const _partySeam = {
 // the whole path needs a live mainnet Phantom test. Until then this returns 503 and the game uses
 // the safe in-game-$CHIKI rail (op:buy above).
 const MARKET_ONCHAIN = String(process.env.MARKET_ONCHAIN || "") === "1" && !!MINT && !!TEAM_WALLET;
+// ============ CHIK_TP_ESCROW — real-world Trading Post escrow (default OFF) ============
+// The owner ruling: "Treat the Trading Post like the real world." LIST removes the goods from the
+// seller's usable inventory; CANCEL returns them exactly; a settled BUY transfers them PERMANENTLY,
+// and the seller "never gets it back." Two of the three legs already hold for every tradeable good:
+// the client takes the goods out of the bag at list time (the row IS the escrow), and for the two
+// registry-derived ceilings the server already refuses re-listing an escrowed quantity —
+// ownEscrowed lowers ownAvailable for mat/ffish (server.js ~5039/5073), reserveUnit blocks a second
+// listing of the same chikimon uid (~13746). What is MISSING is the third leg for the only
+// REGISTRY-BACKED tradeable — a normal chikimon: today a settled sale flips the seller's ledger
+// unit held:false but NEVER moves the seller's assetReg row, so the census counts that creature in
+// BOTH wallets (the documented W2 ghost-row residual). This flag closes exactly that, and nothing
+// else: on a verified settle it moves the seller's registry row to the buyer and debits the seller's
+// census ghost, ONCE, crash-durably — reusing transferAsset + nftDebitKeyAdd (the nftSettleHandover
+// pattern minus the mint gate), so the seller-side re-adoption guard (nftAdoptionHandedOver) and the
+// restore-time debit rebuild come for free. FLAG OFF ⇒ byte-identical HTTP behaviour: every new path
+// is behind TP_ESCROW_ON and no flag-off blob can carry the "tp-settle" chain event the rebuild reads.
+const TP_ESCROW_ON = String(process.env.CHIK_TP_ESCROW ?? "0") === "1";
 // replay guard + idempotent recovery: each tx sig settles at most ONE listing/order (BOUND to its
 // id), and re-POSTing the same sig for the SAME listing returns the cached release — so a dropped
 // 200 response can't lose the buyer's paid-for goods. Pruned by AGE, not by count: a count cap could
@@ -12930,7 +12951,9 @@ function _alreadyHatched(row) {
 // the whole window is "not there". The caller deletes the sig from _usedTxSigs on failure, so a retry
 // with the SAME signature is safe and idempotent — the buyer never pays twice.
 const TXCONF_TRIES = 8, TXCONF_GAP_MS = 1500;
+let _txConfirmStub = null;   // test-only (see _setTxConfirmedStubForTest); null in production -> real RPC
 async function _txConfirmed(sig) {
+  if (_txConfirmStub) return _txConfirmStub(sig);
   for (let i = 0; i < TXCONF_TRIES; i++) {
     try { const tx = await conn.getParsedTransaction(sig, { commitment: "confirmed", maxSupportedTransactionVersion: 0 }); if (tx) return tx; }
     catch (e) { /* transient RPC error — keep polling */ }
@@ -12938,6 +12961,9 @@ async function _txConfirmed(sig) {
   }
   return null;
 }
+// test seam: inject a synthetic parsed transaction so a sim can drive the REAL /market/buy-onchain
+// route (split verify, escrow settle, idempotent replay) without a live chain. Never set in production.
+export function _setTxConfirmedStubForTest(fn) { _txConfirmStub = (typeof fn === "function") ? fn : null; }
 async function txMarketSplit(sig, buyer, seller, price) {
   try {
     const tx = await _txConfirmed(sig);
@@ -13030,6 +13056,21 @@ app.post("/market/buy-onchain", async (req, res) => {
   // 75% to the seller, 20% to the reward pool, 5% burned (full price left the buyer)
   const split = await txMarketSplit(sig, buyer, sellerWallet, Number(row.price) || 0);
   if (!split.ok) { _usedTxSigs.delete(sig); return res.status(409).json({ error: `on-chain split for that signature failed: ${split.reason}` }); }
+  // POST-AWAIT RE-CHECK — the double-buy TOCTOU (measured 2026-08-11, tpev_a_conservation A1):
+  // two buyers with two DIFFERENT valid sigs both pass the pre-await find at the top of this route,
+  // park in txMarketSplit together, and both used to settle — one creature granted twice, the
+  // seller paid twice. The per-sig claim above cannot stop it (each buyer has their own sig).
+  // Node resumes awaited handlers one at a time, and everything from THIS line to _consumeListing
+  // runs synchronously — so re-finding the row here is atomic with consuming it: the first resumed
+  // buyer consumes, the second finds nothing and is refused. The loser's verified payment is bound
+  // to this listing by _usedTxSigs and recoverable through the existing lost-sale path — a wrong
+  // payment is recoverable, a duplicated capped creature is not.
+  if (!marketListings.some(x => x.id === id) || _soldListings.has(id))
+    return res.status(409).json({ error: "another buyer completed this purchase first — the payment is recorded against this listing; contact support to recover it", soldOut: true });
+  // ESCROW SETTLE (CHIK_TP_ESCROW): capture the sold individual's uid from its reservation BEFORE
+  // _consumeListing clears it — this is a permanent transfer, and the seller's registry row moves
+  // to the buyer below (see tpeSettleChikimon). No-op field-read when the flag is off.
+  const _tpeRes = (TP_ESCROW_ON && String(row.kind) === "chikimon") ? _tpeReservedUidFor(row.id) : null;
   marketListings = marketListings.filter(x => x.id !== id);
   _consumeListing(id);   // SOLD -> a re-push can never resurrect it
   const released = { id: row.id, kind: row.kind, item: row.item, qty: row.qty, lvl: row.lvl, xp: row.xp };
@@ -13037,6 +13078,11 @@ app.post("/market/buy-onchain", async (req, res) => {
   // $CHIKI split. It is what lets the ledger stamp the buyer's new unit "purchased" instead of
   // condemning every honest Trading Post buyer as unverified.
   recordAssetBuy(buyer, row.kind, row.item, row.lvl);
+  // THE PERMANENT TRANSFER (CHIK_TP_ESCROW): a settled chikimon sale moves the seller's registry row
+  // to the buyer and retires the seller's census ghost — so a capped species is counted ONCE, not
+  // twice. Idempotent + crash-durable; no-op flag-off and for non-registry-backed goods.
+  if (TP_ESCROW_ON && String(row.kind) === "chikimon")
+    tpeSettleChikimon(sellerWallet, buyer, String(row.item || ""), _tpeRes ? _tpeRes.uid : "", row.id);
   // THE ACQUISITION BOUND. Reached only after txMarketSplit confirmed a real on-chain $CHIKI split,
   // so this is a settled sale: it counts against the seller's lifetime total, and the buyer genuinely
   // acquired the goods HERE, which is the strongest provenance a material can have.
@@ -13755,6 +13801,65 @@ function releaseUnitFor(rowId) {
   for (const [k, v] of unitReserved) if (v === rowId) unitReserved.delete(k);
 }
 
+// ============ CHIK_TP_ESCROW settle — the ghost-row fix (see TP_ESCROW_ON) ============
+// The seller's uid is not stored on the listing row, but reserveUnit keyed it to the listing/auction
+// id at list time (chikimonSaleBlocked), so a reverse walk of unitReserved recovers (wallet, uid)
+// for the exact individual. MUST be read BEFORE _consumeListing/releaseUnitFor clears it.
+function _tpeReservedUidFor(rowId) {
+  if (!rowId) return null;
+  for (const [k, v] of unitReserved) {
+    if (v !== rowId) continue;
+    const i = k.indexOf("|");
+    if (i < 0) continue;
+    return { wallet: k.slice(0, i), uid: k.slice(i + 1) };
+  }
+  return null;
+}
+// Resolve the seller's active registry row for a sold chikimon. Precise when the client sent a uid
+// (W2: listing-uid → row.luid → row.id); else the sole/oldest active row of that SPECIES for this
+// owner (species-collapse world / older client). Never crosses species, never touches a non-active
+// row. Returns null when the seller holds no registry row — grandfathered, nothing to move.
+function _tpeSellerRow(sellerWallet, sp, uid) {
+  if (!isPubkey(String(sellerWallet || "")) || !sp) return null;
+  const ids = assetsByOwner.get(sellerWallet);
+  if (!ids || !ids.size) return null;
+  if (uid) {
+    for (const id of ids) {
+      const r = assetReg.get(id);
+      if (r && r.type === "chikimon" && r.state === "active" && r.sp === sp && String(r.luid || "") === String(uid)) return r;
+    }
+  }
+  let noLuid = null, oldest = null;
+  for (const id of ids) {
+    const r = assetReg.get(id);
+    if (!r || r.type !== "chikimon" || r.state !== "active" || r.sp !== sp) continue;
+    if (!r.luid && (!noLuid || (r.born || 0) < (noLuid.born || 0))) noLuid = r;
+    if (!oldest || (r.born || 0) < (oldest.born || 0)) oldest = r;
+  }
+  return noLuid || oldest;
+}
+// The BUY-settle leg of the escrow ruling: move the seller's registry row to the BUYER and debit the
+// seller's census ghost, ONCE. Called only from the VERIFIED settle points (/market/buy-onchain, the
+// auction hammer) where a real buyer pubkey exists — the soft op:buy hands a bare sid and cannot
+// transfer, and chikimon rows are on-chain-only while MARKET_ONCHAIN, so this is their sole live
+// settle. Idempotent: transferAsset re-checks owner===from, so a replay after a dropped 200 or a
+// restart mid-settle is a no-op and the debit is added ONLY on a real move. The why:"tp-settle"
+// chain event is what restoreAssetReg rebuilds the debit from, so the ghost stays closed across a
+// reboot (the seller-side re-adoption guard, nftAdoptionHandedOver, rides on that same debit). Returns
+// the moved row (or null). No-op unless the flag is on — flag-off byte-identity.
+function tpeSettleChikimon(sellerWallet, buyerWallet, sp, uid, listingId) {
+  if (!TP_ESCROW_ON) return null;
+  sellerWallet = String(sellerWallet || ""); buyerWallet = String(buyerWallet || "");
+  if (!isPubkey(sellerWallet) || !isPubkey(buyerWallet) || sellerWallet === buyerWallet) return null;
+  const row = _tpeSellerRow(sellerWallet, sp, uid);
+  if (!row) return null;                                   // seller has no active row — grandfathered
+  const moved = transferAsset(row.id, sellerWallet, buyerWallet, "tp-settle", { listing: String(listingId || "").slice(0, 40) });
+  if (!moved) return null;                                 // idempotent replay / refused: never double-debit
+  nftDebitKeyAdd(sellerWallet, "chikimon", sp, 1);         // cancel the transient ledger ghost + arm the re-adoption guard
+  censusInvalidate();
+  return moved;
+}
+
 // ================= THE NFT TIERS DO NOT TRADE IN-GAME =================
 // Owner rule: mounts, LEGENDARY chikimon and MEME DYNASTY chikimon are the NFT tiers — exactly the
 // set nftMintableKind (:6260) will certify — and a certified creature changes hands as a certificate
@@ -13826,6 +13931,13 @@ function sweepAuctions(now) {
         // unit from nowhere and the ledger condemns an honest buyer. recordAssetBuy used to have a
         // single call site (/market/buy-onchain), so every auction win was branded unverified.
         recordAssetBuy(a.curWallet, "chikimon", a.species, a.lvl);
+        // ESCROW SETTLE (CHIK_TP_ESCROW): the hammer is a permanent transfer too — move the seller's
+        // registry row to the winner + retire the ghost, before releaseUnitFor below clears the uid.
+        // (The house is shut while MARKET_ONCHAIN, so this fires only for pre-flip/dev auctions.)
+        if (TP_ESCROW_ON) {
+          const _ar = _tpeReservedUidFor(a.id);
+          tpeSettleChikimon(String(a.wallet || ""), String(a.curWallet || ""), String(a.species || ""), _ar ? _ar.uid : "", a.id);
+        }
       }
       const sarr = marketSales[a.sid] || (marketSales[a.sid] = []);
       if (!sarr.some(s => s.id === a.id))
