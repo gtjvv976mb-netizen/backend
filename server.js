@@ -296,6 +296,20 @@ function sanitizeProfile(prev, p, wallet) {
 }
 const _lastSave = new Map();   // light per-wallet write throttle
 const _lastChat = new Map();   // light per-wallet chat throttle
+// CHIK_SYNC_RT — real-time cross-device sync hardening (default OFF, flag-off byte-identity):
+//   * the 600ms /profile throttle COALESCES (stores the window's LAST payload when it closes)
+//     instead of silently dropping it while answering {ok:true}
+//   * an mmo push from a >=SYNC_SID_MIN_V client without a sessionId is refused loudly (409)
+//   * a persisted per-wallet session EPOCH survives redeploys, so a stale tab cannot regain
+//     push rights when the in-memory liveSession map forgets everyone
+//   * a superseded session gets ONE short grace window to flush its final state (stamp-gated
+//     so it can never overwrite anything the new device already saved)
+// Read per-request so sims can prove flag-off identity and the flip needs no code change.
+const syncRtOn = () => String(process.env.CHIK_SYNC_RT ?? "0") === "1";
+const SYNC_SID_MIN_V = 1;        // floor on mmo.sidv (NOT mmo.v — bumping v arms the MAT_SAVE_MIN_V
+                                 // clamp tier the owner has kept off; see Profile.gd's task-board note).
+                                 // Only a client that ALWAYS sends its sessionId stamps sidv>=1, so every
+                                 // older cached build keeps working exactly as before (grandfathered).
 
 // Per-wallet $CHIKI balance — CACHED 30s so 500+ polling clients don't spam Helius (429s).
 const _balCache = new Map();
@@ -1439,7 +1453,11 @@ process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e?.
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// CHIK_SYNC_RT: also parse text/plain bodies as JSON. navigator.sendBeacon(url, string) sends
+// text/plain;charset=UTF-8 — the ONLY content type a beacon can use cross-origin (application/json
+// needs a CORS preflight a dying tab cannot perform, so it is silently blocked). The unload-flush
+// backstop in Chain.gd depends on this. Boot-time read: flag-off keeps the exact shipped parser.
+app.use(syncRtOn() ? express.json({ type: ["application/json", "text/plain"] }) : express.json());
 
 // Render sends SIGTERM before taking an instance away. From that instant onward, stop accepting
 // new work on keep-alive connections while requests already in flight are allowed to finish.
@@ -1635,8 +1653,30 @@ app.post("/verify", async (req, res) => {
     // its very next save and stops, instead of playing for an hour into a save that cannot land.
     // TAKEOVER, never refusal: the NEWEST sign-in always wins, so a stale session can never lock a
     // player out of their own wallet.
+    const prevLive = (signedIn && syncRtOn()) ? (liveSession.get(wallet) || null) : null;
     const sessionId = signedIn ? mintSession(wallet) : "";
-    res.json({ wallet, eligible, balance, chikis, whalePending, whaleReadyInMs, minHold: MIN, verified: verifyOn, firstSeen, profile: profile || null, dbOk, signedIn, isAdmin, mktToken, sessionId });
+    // CHIK_SYNC_RT — supersede handoff + redeploy-proof epoch. The epoch is persisted (kv), so a
+    // redeploy that empties liveSession cannot hand push rights back to a stale tab: its pushes
+    // carry an older epoch and are refused loudly. When this sign-in supersedes a LIVE session,
+    // that session gets one short stamp-gated grace window to flush its final minutes; the old
+    // tab's world socket is nudged ("superseded") so the flush happens NOW, not on its 60s tick,
+    // and this new device is told to wait (handoffWait) and re-fetch after the grace.
+    let handoffWait = false, sessEpoch = 0;
+    if (signedIn && syncRtOn()) {
+      sessEpoch = bumpSessionEpoch(wallet);
+      if (prevLive && prevLive.sid && prevLive.sid !== sessionId) {
+        const baseAt = Number(profile && profile._serverSavedAt) || 0;
+        _superGrace.set(wallet, { sid: prevLive.sid, until: Date.now() + SUPER_GRACE_MS, baseAt });
+        handoffWait = true;
+        for (const sock of wsClients) {
+          const st = sock._chik;
+          if (st && st.wallet === wallet) { try { wsSend(sock, { t: "superseded", flushMs: SUPER_GRACE_MS }); } catch (e) {} }
+        }
+      }
+    }
+    const out = { wallet, eligible, balance, chikis, whalePending, whaleReadyInMs, minHold: MIN, verified: verifyOn, firstSeen, profile: profile || null, dbOk, signedIn, isAdmin, mktToken, sessionId };
+    if (signedIn && syncRtOn()) { out.sessionEpoch = sessEpoch; out.handoffWait = handoffWait; }
+    res.json(out);
   } catch (e) { res.status(500).json({ error: "verify failed: " + String(e.message || e) }); }
 });
 
@@ -1667,23 +1707,97 @@ app.post("/profile", async (req, res) => {
   // Only ever fires for a client that sent a session id (older clients are unaffected), and only
   // when a NEWER sign-in for this same wallet has taken over. The client stops pushing and tells
   // the player, rather than playing on into saves that can never land.
-  if (hasMmo && sessionSuperseded(wallet, String(req.body?.sessionId || ""))) {
+  const sid = String(req.body?.sessionId || "");
+  let graceFinal = false;
+  if (hasMmo && syncRtOn()) {
+    const sidV = Math.floor(safeNum(profile.mmo.sidv)) || 0;
+    // F4 — the ONE final flush a just-superseded session is allowed. Stamp-gated: if the new
+    // device has ALREADY written (the stored _serverSavedAt moved past the takeover snapshot),
+    // the flush is refused loudly — an older save must never clobber a newer one. Single-use.
+    const g = _superGrace.get(wallet);
+    if (g && sid && sid === g.sid) {
+      _superGrace.delete(wallet);
+      if (Date.now() >= g.until) {
+        // grace expired: fall through to the normal supersede refusal below
+      } else if ((Number(prev?._serverSavedAt) || 0) > g.baseAt) {
+        return res.status(409).json({ error: "final flush refused — the new device already saved", superseded: true });
+      } else {
+        graceFinal = true;
+      }
+    }
+    // F3 — fail-closed session identity, version-gated exactly like MAT_SAVE_MIN_V so every older
+    // cached build stays grandfathered: only a client that ALWAYS sends its sessionId stamps
+    // mmo.sidv >= SYNC_SID_MIN_V, and for those a sid-less push is a loud 409, never a clobber.
+    if (!graceFinal && sidV >= SYNC_SID_MIN_V) {
+      if (!sid) return res.status(409).json({ error: "session id required — sign in again", superseded: true });
+      const cur = liveSession.get(wallet);
+      if (!cur) {
+        // M4 — redeploy amnesia: liveSession is memory-only ON PURPOSE, but the persisted epoch
+        // survives. Only the LATEST sign-in's epoch may re-establish the live seat; anything older
+        // is a stale tab that must re-verify. The refusal is loud, never a silent drop.
+        const ep = Math.floor(safeNum(req.body?.sessionEpoch)) || 0;
+        const curEp = sessionEpoch.get(wallet) || 0;
+        if (ep <= 0 || ep < curEp) {
+          return res.status(409).json({ error: "session expired (server restarted) — sign in again", superseded: true });
+        }
+        liveSession.set(wallet, { sid, ts: Date.now() });   // the current session re-adopts its seat
+      }
+    }
+  }
+  if (!graceFinal && hasMmo && sessionSuperseded(wallet, sid)) {
     return res.status(409).json({ error: "this trainer was opened on another device", superseded: true });
   }
   const now = Date.now();
-  if (now - (_lastSave.get(wallet) || 0) < 600) return res.json({ ok: true, throttled: true });   // ignore rapid-fire writes (anti-spam)
+  if (now - (_lastSave.get(wallet) || 0) < 600) {
+    if (!syncRtOn()) return res.json({ ok: true, throttled: true });   // ignore rapid-fire writes (anti-spam)
+    // F2 — HONEST THROTTLE. The window no longer drops the write: the LAST payload arriving inside
+    // it is fully validated NOW (auth + supersede ran above; sanitize runs here) and committed when
+    // the window closes — the same store-latest + trailing-timer shape as credLatch. The response
+    // carries the serverSavedAt that WILL be written, so the client's stamp bookkeeping stays
+    // truthful. The pending slot survives the request cycle and a graceful SIGTERM
+    // (flushDurableState drains it); a hard crash still loses <=600ms — stated, not hidden.
+    try {
+      const plannedAt = (_lastSave.get(wallet) || 0) + 600;
+      const { safe, matClamps } = buildSafeProfile(wallet, profile, prev, hasMmo, plannedAt);
+      schedulePendingSave(wallet, safe, plannedAt);
+      const out = { ok: true, serverSavedAt: plannedAt, coalesced: true };
+      if (graceFinal) { out.superseded = true; out.final = true; }
+      if (matClamps) { out.matClamps = matClamps; out.matFlagged = true; }
+      return res.json(out);
+    } catch (e) { return res.status(500).json({ error: "save failed: " + String(e.message || e) }); }
+  }
   _lastSave.set(wallet, now);
   try {
-    // admins are trusted (creator testing); everyone else is clamped to legal values
-    const safe = isAdminWallet(wallet) ? profile : sanitizeProfile(prev, profile, wallet);
-    // SECURITY: an unsigned legacy write must NOT drop protected identity/score fields it didn't
-    // supply — carry them forward from the stored profile so a `{profile:{}}` can't zero a wallet's
-    // Glory (Cup entry currency, real prize pool) or erase its handle/leaderboard score.
-    if (!isAdminWallet(wallet) && prev) {
-      if (!("glory"  in profile) && prev.glory  != null) safe.glory  = prev.glory;
-      if (!("handle" in profile) && prev.handle != null) safe.handle = prev.handle;
-      if (!("bal"    in profile) && prev.bal    != null) safe.bal    = prev.bal;
-    }
+    if (syncRtOn()) cancelPendingSave(wallet);   // this write is newer than any payload still waiting in the window
+    const safe0 = buildSafeProfile(wallet, profile, prev, hasMmo, now);
+    const safe = safe0.safe, matClamps = safe0.matClamps;
+    await store.setProfile(wallet, safe);
+    // matClamps: { material: bound } — the wallet exceeded the acquisition invariant; the client sets
+    // each local count to min(current, bound) and re-signs. Old clients ignore unknown keys (Chain.gd
+    // reads only serverSavedAt), so this is additive and non-destructive.
+    const out = { ok: true, serverSavedAt: safe._serverSavedAt };
+    if (graceFinal) { out.superseded = true; out.final = true; }
+    if (matClamps) { out.matClamps = matClamps; out.matFlagged = true; }
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: "save failed: " + String(e.message || e) }); }
+});
+
+// The ONE validated-payload builder both /profile paths share: everything that used to run inline
+// between the throttle and store.setProfile — sanitize/clamp, identity carry-forward, the one-time
+// opening balance, the material invariant, the mmo verbatim rule, the asset audit, and the
+// authoritative _serverSavedAt stamp. Extracted UNCHANGED so the coalesce path (CHIK_SYNC_RT) can
+// validate at receive time and commit at window close without a second copy of any of it.
+function buildSafeProfile(wallet, profile, prev, hasMmo, stampMs) {
+  // admins are trusted (creator testing); everyone else is clamped to legal values
+  const safe = isAdminWallet(wallet) ? profile : sanitizeProfile(prev, profile, wallet);
+  // SECURITY: an unsigned legacy write must NOT drop protected identity/score fields it didn't
+  // supply — carry them forward from the stored profile so a `{profile:{}}` can't zero a wallet's
+  // Glory (Cup entry currency, real prize pool) or erase its handle/leaderboard score.
+  if (!isAdminWallet(wallet) && prev) {
+    if (!("glory"  in profile) && prev.glory  != null) safe.glory  = prev.glory;
+    if (!("handle" in profile) && prev.handle != null) safe.handle = prev.handle;
+    if (!("bal"    in profile) && prev.bal    != null) safe.bal    = prev.bal;
+  }
     // STORING THE SAVE AND AUDITING IT ARE SEPARATE CONCERNS, and conflating them destroyed data:
     // this `else` belongs to hasMmo alone (an unsigned legacy write must not wipe the owner's cloud
     // save). When an `&& _assetsReady` was bolted onto the audit condition, the else-branch started
@@ -1716,15 +1830,9 @@ app.post("/profile", async (req, res) => {
       try { auditAssets(wallet, profile.mmo, _testFirstSeen.get(wallet) || Number(prev?.first_seen) || 0); }
       catch (e) { console.error("auditAssets threw for", String(wallet).slice(0, 8), e && e.message); }
     }
-    safe._serverSavedAt = now;   // authoritative "last seen" for offline progression
-    await store.setProfile(wallet, safe);
-    // matClamps: { material: bound } — the wallet exceeded the acquisition invariant; the client sets
-    // each local count to min(current, bound) and re-signs. Old clients ignore unknown keys (Chain.gd
-    // reads only serverSavedAt), so this is additive and non-destructive.
-    if (matClamps) res.json({ ok: true, serverSavedAt: safe._serverSavedAt, matClamps, matFlagged: true });
-    else res.json({ ok: true, serverSavedAt: safe._serverSavedAt });
-  } catch (e) { res.status(500).json({ error: "save failed: " + String(e.message || e) }); }
-});
+  safe._serverSavedAt = stampMs;   // authoritative "last seen" for offline progression
+  return { safe, matClamps };
+}
 
 app.get("/profile", async (req, res) => {
   const wallet = req.query?.wallet;
@@ -13056,6 +13164,101 @@ function sessionSuperseded(wallet, sid) {
 }
 export function _liveSessionFor(w) { return liveSession.get(w) || null; }
 export function _clearSessions() { liveSession.clear(); }
+// ---- CHIK_SYNC_RT: persisted session epoch + supersede grace + coalesced saves ---------------
+// EPOCH (M4): a per-wallet counter bumped at every proven sign-in and PERSISTED, so the "redeploy
+// forgets every session" safety property no longer hands push rights back to stale tabs: after a
+// restart liveSession is empty but the epoch map is not — only the LATEST sign-in's epoch may
+// re-establish the seat. Persisted with the credLatch throttle shape (latest state, trailing timer).
+const sessionEpoch = new Map();        // wallet -> epoch counter (persisted: kv "session_epoch")
+let _sessEpochDirty = false, _sessEpochTimer = null, _sessEpochSavedAt = 0;
+function saveSessionEpochNow(strict = false) {
+  _sessEpochDirty = false; _sessEpochSavedAt = Date.now();
+  const o = {}; for (const [w, e] of sessionEpoch) if (e > 0) o[w] = e;
+  return store.kvSet("session_epoch", o).catch(e => { _sessEpochDirty = true; if (strict) throw e; });
+}
+function saveSessionEpoch() {
+  _sessEpochDirty = true;
+  if (Date.now() - _sessEpochSavedAt > 5000) { saveSessionEpochNow(); return; }
+  if (!_sessEpochTimer) {
+    _sessEpochTimer = setTimeout(() => { _sessEpochTimer = null; if (_sessEpochDirty) saveSessionEpochNow(); }, 5000);
+    if (_sessEpochTimer.unref) _sessEpochTimer.unref();
+  }
+}
+store.kvGet("session_epoch").then(v => {
+  if (!v || typeof v !== "object") return;
+  for (const w of Object.keys(v)) {
+    const e = Math.floor(Number(v[w]));
+    if (isPubkey(w) && Number.isFinite(e) && e > 0) sessionEpoch.set(w, Math.max(e, sessionEpoch.get(w) || 0));
+  }
+}).catch(() => {});   // a fresh DB has no row yet — epochs then start at 0, which only loosens (fail-open in the safe direction)
+function bumpSessionEpoch(wallet) {
+  if (!isPubkey(wallet)) return 0;
+  if (sessionEpoch.size >= SESSION_MAX && !sessionEpoch.has(wallet)) {
+    let drop = Math.max(1, Math.floor(SESSION_MAX * 0.05));
+    for (const k of sessionEpoch.keys()) { if (drop-- <= 0) break; sessionEpoch.delete(k); }
+  }
+  const e = (sessionEpoch.get(wallet) || 0) + 1;
+  sessionEpoch.set(wallet, e);
+  saveSessionEpoch();
+  return e;
+}
+// GRACE (F4): wallet -> { sid: the JUST-superseded session, until, baseAt: stored _serverSavedAt at
+// takeover }. One final mmo push from that sid inside the window is accepted — it is the NEWEST
+// state, not a stale one — but ONLY while the stored stamp has not moved (i.e. the new device has
+// not written yet). In-memory on purpose: the window is seconds; a redeploy inside it ends it early.
+const SUPER_GRACE_MS = 8000;
+const _superGrace = new Map();
+// COALESCE (F2): wallet -> { safe, at, timer } — the newest fully-validated payload that arrived
+// inside the 600ms window, committed when the window closes. Bounded by the throttle itself: at
+// most one slot per actively-saving wallet, replaced (never queued) by a later payload.
+const _pendingSave = new Map();
+function cancelPendingSave(wallet) {
+  const p = _pendingSave.get(wallet);
+  if (!p) return;
+  if (p.timer) clearTimeout(p.timer);
+  _pendingSave.delete(wallet);
+}
+function schedulePendingSave(wallet, safe, at) {
+  const p = _pendingSave.get(wallet);
+  if (p && p.timer) clearTimeout(p.timer);
+  const timer = setTimeout(() => {
+    flushPendingSave(wallet).catch(e => console.error("pending save flush failed for", String(wallet).slice(0, 8), String(e?.message || e)));
+  }, Math.max(1, at - Date.now() + 5));
+  if (timer.unref) timer.unref();
+  _pendingSave.set(wallet, { safe, at, timer });
+}
+async function flushPendingSave(wallet) {
+  const p = _pendingSave.get(wallet);
+  if (!p) return;
+  if (p.timer) clearTimeout(p.timer);
+  _pendingSave.delete(wallet);
+  _lastSave.set(wallet, Math.max(_lastSave.get(wallet) || 0, p.at));
+  await store.setProfile(wallet, p.safe);
+}
+async function flushAllPendingSaves(strict = false) {
+  for (const w of [..._pendingSave.keys()]) {
+    try { await flushPendingSave(w); }
+    catch (e) { if (strict) throw e; console.error("pending save flush failed for", String(w).slice(0, 8), String(e?.message || e)); }
+  }
+}
+export function _pendingSaveCountForTest() { return _pendingSave.size; }
+// Sim-only: what a REAL redeploy does to this state — liveSession + grace forgotten (memory),
+// pending slots drained by the shutdown flush, epochs dropped and re-restored through the store's
+// actual kv round-trip. Never called by the server itself.
+export async function _syncRtRedeployForTest() {
+  await flushAllPendingSaves(true);
+  await saveSessionEpochNow(true);
+  liveSession.clear();
+  _superGrace.clear();
+  sessionEpoch.clear();
+  const v = await store.kvGet("session_epoch");
+  if (v && typeof v === "object") {
+    for (const w of Object.keys(v)) {
+      const e = Math.floor(Number(v[w]));
+      if (Number.isFinite(e) && e > 0) sessionEpoch.set(w, e);
+    }
+  }
+}
 function mintMarketToken(wallet) {
   if (!isPubkey(wallet)) return "";
   if (!marketTokens[wallet]) { marketTokens[wallet] = crypto.randomBytes(24).toString("hex"); saveMarketSessions().catch(() => {}); }
@@ -13964,6 +14167,10 @@ async function flushDurableState() {
   // Ownership and the market are one save because escrow is derived from the board. The asset
   // ledger first joins any write already in flight, then performs one final dirty pass.
   const jobs = [
+    // CHIK_SYNC_RT: a coalesced /profile payload waiting for its 600ms window must not be the write
+    // a deploy forgets — drain the pending slots FIRST (they are the newest player state we hold).
+    ["pending saves", () => flushAllPendingSaves(true)],
+    ["session epochs", () => _sessEpochDirty ? saveSessionEpochNow(true) : Promise.resolve()],
     ["battle wins", () => saveBattleWins(true)],
     ["credential latch", () => _credLatchDirty ? saveCredLatchNow(true) : Promise.resolve()],
     ["world nodes", () => saveWorldNodes(true)],
