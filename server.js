@@ -6419,6 +6419,60 @@ async function masComposeMintList(args) {
     return { ok: false, status: 502, code: "compose", error: "could not compose the mint+list transaction — try again in a moment" };
   }
 }
+// ============ THE MANUAL PLAYER-PAID MINT COMPOSITION (owner ruling 2026-08-11) ============
+// The owner's ruling: minting is PLAYER-PAID on EVERY path — at sale (masComposeMintList above) AND
+// manual. This is the manual half: the mint-at-sale composer MINUS the listing — no Magic Eden call,
+// no decompile-and-merge, so the cosigned/ALT refusal classes above simply do not exist here (they
+// were properties of the SELL merge, never of the mint). Compose-only, NEVER submits: one legacy
+// transaction carrying the CreateV2 instructions with the PLAYER as fee payer (a noop signer — this
+// server never holds or needs the player's key; Phantom supplies that signature), partial-signed by
+// the delegate ONLY as collection authority and by the server-ephemeral asset key as the new account.
+// The delegate NEVER pays on this path. Reached only from /assets/nft/mint's player branch, which is
+// gated NFT_MINT_ON && MINT_AT_SALE_ON — flag-off this function is unreachable and the server is
+// byte-identical to today.
+// Sims replace this whole function via `_masMintComposeStub`, so no sim touches a network or a key —
+// except the compose sim, which points RPC_URL at its own local fake and drives the REAL body below
+// to print the actual signer set.
+let _masMintComposeStub = null;           // test seam: (args) -> { ok, b64, ver, ... }
+async function masComposeMintOnly(args) {
+  if (_masMintComposeStub) return await _masMintComposeStub(args);
+  const d = nftDelegate();
+  if (!d) return { ok: false, status: 503, code: "no-delegate", error: "minting is not configured" };
+  if (!NFT_COLLECTION) return { ok: false, status: 503, code: "no-collection", error: "the NFT collection is not configured" };
+  try {
+    const [umiMod, bundle, core] = await Promise.all([
+      import("@metaplex-foundation/umi"), import("@metaplex-foundation/umi-bundle-defaults"), import("@metaplex-foundation/mpl-core"),
+    ]);
+    const umi = bundle.createUmi(RPC_URL);
+    // THE PAYER IS THE PLAYER — the same noop-signer device as masComposeMintList: the builder marks
+    // the fee-payer slot without this server ever holding the player's key.
+    umi.use(umiMod.signerIdentity(umiMod.createNoopSigner(umiMod.publicKey(args.owner))));
+    const delegateSigner = umiMod.createSignerFromKeypair(umi, umi.eddsa.createKeypairFromSecretKey(d.secret));
+    const assetSigner = umiMod.createSignerFromKeypair(umi, umi.eddsa.createKeypairFromSecretKey(args.assetSecret));
+    const collection = await core.fetchCollection(umi, umiMod.publicKey(NFT_COLLECTION));
+    const builder = core.create(umi, {
+      asset: assetSigner, collection, authority: delegateSigner, owner: umiMod.publicKey(args.owner),
+      name: args.name, uri: args.uri, plugins: args.plugins,
+    });
+    // umi instruction -> web3.js instruction, hand-rolled (the adapters package is not a dependency).
+    const mintIxs = builder.getInstructions().map((ix) => new TransactionInstruction({
+      programId: new PublicKey(String(ix.programId)),
+      keys: ix.keys.map((k) => ({ pubkey: new PublicKey(String(k.pubkey)), isSigner: !!k.isSigner, isWritable: !!k.isWritable })),
+      data: Buffer.from(ix.data),
+    }));
+    const tx = new Transaction();
+    tx.feePayer = new PublicKey(args.owner);                 // the player pays rent AND fees
+    tx.recentBlockhash = (await conn.getLatestBlockhash("confirmed")).blockhash;
+    tx.add(...mintIxs);
+    // Partial-sign: collection authority + the new asset account. NEVER the player; NEVER a payer.
+    tx.partialSign(Keypair.fromSecretKey(Uint8Array.from(d.secret)), Keypair.fromSecretKey(Uint8Array.from(args.assetSecret)));
+    const b64 = tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString("base64");
+    return { ok: true, b64, ver: "legacy", cosigned: false, bytes: b64.length };
+  } catch (e) {
+    // nothing about the failure is echoed back (it can carry key material); the reservation stands
+    return { ok: false, status: 502, code: "compose", error: "could not compose the mint transaction — try again in a moment" };
+  }
+}
 // ONE certificate per creature, and one creature per certificate: an on-chain address already bound to
 // another registry row can never be adopted by a second one. `nftEligibility` guards the first
 // direction (row.mint is write-once); this guards the second, which a format check alone left open.
@@ -6857,7 +6911,7 @@ if (NFT_MINT_ON) {
   // One honest boot line so the owner can see WHY minting is or is not open. Public halves only —
   // the delegate's secret is never printed, and TREASURY_SECRET is not read anywhere on this path.
   const _d = nftDelegate();
-  console.log(`◆ NFT minting ON — model=server-mints collection=${NFT_COLLECTION || "NOT CONFIGURED"} authority=${_d ? _d.pubkey : "NOT CONFIGURED"}${NFT_MINT_PAUSED ? " paused=1" : ""}${NFT_HANDOVER_ON ? " handover=1" : ""}`);
+  console.log(`◆ NFT minting ON — model=${MINT_AT_SALE_ON ? "player-pays" : "server-mints"} collection=${NFT_COLLECTION || "NOT CONFIGURED"} authority=${_d ? _d.pubkey : "NOT CONFIGURED"}${NFT_MINT_PAUSED ? " paused=1" : ""}${NFT_HANDOVER_ON ? " handover=1" : ""}`);
   setInterval(() => { reconcileNftOwners().catch(() => {}); }, 5 * 60 * 1000).unref?.();
 }
 // The migration rides the reconcile loop, and that loop only runs while CHIK_NFT_MINT is on. Setting
@@ -8433,6 +8487,16 @@ app.post("/assets/nft/mint", async (req, res) => {
   const adopt = !!mintAddr;
   if (adopt && !isPubkey(mintAddr)) return res.status(400).json({ error: "a valid on-chain mint address is required (the player's wallet creates it; the server never signs a player mint)" });
   if (!adopt && !nftDelegate()) return res.status(503).json({ error: "minting is not configured" });
+  // ============ WHO PAYS (owner ruling 2026-08-11): the PLAYER, on every path ============
+  // A PLAYER-proven call (wallet + mktToken) no longer submits anything: it gets back a composed,
+  // partial-signed CreateV2 to sign in Phantom — the player pays the ~0.004 SOL rent and the network
+  // fee; the delegate co-signs only as collection authority and NEVER pays. Rides the existing gates:
+  // active only while MINT_AT_SALE_ON (the flag that carries the player-pays machinery) — flag-off,
+  // playerPaid is false on every request and this route is byte-identical to today. The delegate-pays
+  // submit below stays reachable ONLY for an ADMIN-authenticated call (no player wallet to sign —
+  // operational tooling, not a player path). Already-minted rows are untouched either way: the
+  // idempotent re-ask above answered with the existing certificate before this line.
+  const playerPaid = MINT_AT_SALE_ON && !adopt && !!a.wallet;
   if (_nftMinting.has(id)) return res.status(409).json({ error: "a mint for this asset is already in flight" });
   _nftMinting.add(id);                                       // CLAIM the dedup key BEFORE the await (TOCTOU)
   try {
@@ -8499,9 +8563,34 @@ app.post("/assets/nft/mint", async (req, res) => {
       key = { addr: kp.publicKey.toBase58(), secret: kp.secretKey, at: Date.now() };
       _nftPendingKeys.set(id, key);
       row.mintPending = { addr: key.addr, at: key.at };
-      regEvent(row, "mint_submitted", { addr: key.addr, edition: row.edition });
+      // honest provenance: the player path RESERVES (nothing has been submitted — the player will);
+      // the admin path SUBMITS. Flag-off, playerPaid is always false: byte-identical "mint_submitted".
+      if (playerPaid) regEvent(row, "mint_reserved", { addr: key.addr, edition: row.edition, via: "manual" });
+      else regEvent(row, "mint_submitted", { addr: key.addr, edition: row.edition });
       _assetsDirty = true;
       try { await saveAssetLedger(true); } catch (e) {}       // durable BEFORE the submit — never after
+    }
+    // ============ PLAYER-PAID MANUAL MINT: compose and hand back, never submit ============
+    // The reservation dance above ran verbatim — durable row.mintPending BEFORE any bytes leave, the
+    // same address and edition on every rebuild, TTL+absent-only abandon — so a retry storm can never
+    // yield two live mints for one asset id: every reply carries the SAME reserved address, and
+    // CreateV2 on an existing account fails on-chain even if two signed copies raced. A composed tx
+    // the player never signs leaves the registry row clean (unminted, reservation reclaimed by the
+    // TTL+absent rule). Settlement: POST /assets/nft/mint/confirm — or simply re-ask this route, whose
+    // pending-verify branch promotes a landed mint idempotently.
+    if (playerPaid) {
+      const comp = await masComposeMintOnly({ id: row.id, owner: who, assetSecret: key.secret, assetAddr: key.addr,
+        name: nftAssetName(row), uri: nftMetaUri(row),
+        plugins: [{ type: "Attributes", attributeList: nftAttributes(row) }] });
+      if (!comp || !comp.ok) {
+        const st = Number((comp && comp.status)) || 502;
+        return res.status(st).json({ error: (comp && comp.error) || "could not compose the mint transaction — try again",
+          code: (comp && comp.code) || "compose", pending: true, id: row.id });
+      }
+      return res.json({ ok: true, action: "mint", composed: "mint", id: row.id, tokenMint: key.addr,
+        edition: row.edition, editionOf: masEditionOf(row), payer: who, mintPending: true,
+        tx: comp.b64, ver: comp.ver, cosigned: false, bytes: comp.bytes || comp.b64.length,
+        note: "sign in Phantom and submit — you pay the mint rent (~0.004 SOL) and the network fee; the server co-signed only as collection authority and never pays. Then POST /assets/nft/mint/confirm {wallet, mktToken, id, signature}." });
     }
     let out;
     try {
@@ -8538,6 +8627,70 @@ app.post("/assets/nft/mint", async (req, res) => {
   } finally { _nftMinting.delete(id); }
 });
 
+// ============ PLAYER-PAID MANUAL MINT — the confirm half (owner ruling 2026-08-11) ============
+// The player signed and submitted the composed CreateV2 in Phantom; this RECORDS it — after POLLING
+// the reader (the RPC lag trap, same MAS_CONF_TRIES x MAS_CONF_GAP_MS discipline as the mint-at-sale
+// confirm: one read right after cluster confirmation routinely answers null). Nothing here submits or
+// signs; the ONLY writer is _nftCommitMint AFTER nftVerifyOnchain, so a forged confirm can record
+// nothing that is not really on-chain, in OUR collection, owned by THIS wallet. Flag-off (either
+// flag) the route does not exist at all: next() reproduces today's 404 exactly.
+app.post("/assets/nft/mint/confirm", async (req, res, next) => {
+  if (!NFT_MINT_ON || !MINT_AT_SALE_ON) return next();
+  if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
+  if (!matEnforceOn()) return res.status(503).json({ error: "minting is paused" });      // E11
+  const a = _nftAuth(req);
+  if (!a.ok) return res.status(403).json({ error: "prove this wallet first" });
+  const id = String(req.body?.id || "").slice(0, 64);
+  const row = assetReg.get(id);
+  const who = _nftResolveWho(a, row);
+  if (!row) return res.status(404).json({ error: "no such asset" });
+  if (!who || row.owner !== who) return res.status(403).json({ error: "the registry says this wallet does not own that asset" });
+  // IDEMPOTENT: once recorded, every re-confirm answers with the certificate — retry storms and
+  // double-taps land here, never in a second commit.
+  if (row.mint) return res.json(_nftMintReply(row, true));
+  if (!row.mintPending || !row.mintPending.addr)
+    return res.status(409).json({ error: "no mint is awaiting confirmation for that asset — ask /assets/nft/mint for the transaction first" });
+  const sig = String(req.body?.signature || "").slice(0, 96);
+  let sigOk = false;
+  try { sigOk = bs58.decode(sig).length === 64; } catch (e) { sigOk = false; }
+  if (!sigOk) return res.status(400).json({ error: "that is not a transaction signature" });
+  if (_nftMinting.has(id)) return res.status(409).json({ error: "a mint for this asset is already in flight" });
+  _nftMinting.add(id);                                       // CLAIM the dedup key BEFORE the awaits (TOCTOU)
+  try {
+    const addr = String(row.mintPending.addr);
+    let obs = null, vf = { ok: false, status: 503, error: "could not read that mint on-chain — try again" };
+    for (let i = 0; i < MAS_CONF_TRIES; i++) {
+      obs = await _nftDasRead(addr);
+      vf = nftVerifyOnchain(obs, who);
+      if (vf.ok) break;
+      if (obs && !obs.dasFailed) break;                      // readable-but-WRONG: waiting cannot fix it
+      if (i < MAS_CONF_TRIES - 1) await new Promise((r) => setTimeout(r, MAS_CONF_GAP_MS));
+    }
+    if (!vf.ok) {
+      if (obs && !obs.dasFailed) {
+        _nftReviewFlags.set(row.id, { reason: "manual-confirm-verify-failed", at: Date.now() });
+        return res.status(vf.status).json({ error: vf.error, applied: "none", verified: false });
+      }
+      // unreadable / not indexed yet: NOTHING is recorded — the row stays unminted with its
+      // reservation standing, and the client simply confirms again (202, the confirm-path convention)
+      return res.status(202).json({ ok: true, action: "mint", tokenMint: addr, id: row.id,
+        applied: "pending", verified: false, reason: "chain-unreadable",
+        message: "the chain cannot see that mint yet — confirm again in a moment; nothing was recorded and nothing is lost" });
+    }
+    const dupe = nftMintBoundTo(addr, row.id);
+    if (dupe) return res.status(409).json({ error: "that on-chain asset is already the certificate of another creature" });
+    // a row spent between compose and confirm (an egg hatched, a burn) must never be stamped minted
+    if (row.state !== "active") {
+      _nftReviewFlags.set(row.id, { reason: "manual-confirm-row-spent", at: Date.now() });
+      return res.status(409).json({ error: `that asset is ${row.state} — the mint cannot be recorded`, applied: "none" });
+    }
+    _nftCommitMint(row, addr, sig);
+    try { await saveAssetLedger(true); } catch (e) {}        // registry first; on failure _assetsDirty retries
+    const out = _nftMintReply(row, false); out.applied = "minted"; out.verified = true;
+    return res.json(out);
+  } finally { _nftMinting.delete(id); }
+});
+
 // Admin: force an immediate on-chain ownership reconcile (mirrors /meme/sync).
 app.post("/assets/nft/reconcile", async (req, res) => {
   if (!NFT_MINT_ON) return res.status(503).json({ error: "minting is not open" });
@@ -8564,7 +8717,9 @@ app.post("/assets/nft/status", async (req, res) => {
 // Public (behind flag): the mint config the client needs — royalty, collection, mintable set.
 app.get("/assets/nft/config", (req, res) => {
   if (!NFT_MINT_ON) return res.status(503).json({ error: "minting is not open" });
-  res.json({ standard: "core", program: "mpl-core", paused: NFT_MINT_PAUSED, mintModel: "server-mints",
+  // mintModel is the client sheet's honesty anchor: under MINT_AT_SALE the manual path composes a
+  // PLAYER-PAID transaction (owner ruling 2026-08-11); flag-off the string is byte-identical to today.
+  res.json({ standard: "core", program: "mpl-core", paused: NFT_MINT_PAUSED, mintModel: MINT_AT_SALE_ON ? "player-pays" : "server-mints",
     royalty: { bps: NFT_ROYALTY_BPS, wallet: NFT_ROYALTY_WALLET, model: "collection-inherited" }, collection: NFT_COLLECTION,
     // `ready` is the honest one-word answer to "can anyone mint right now": a collection to verify
     // against AND an authority to sign with. The delegate's PUBLIC key is safe to publish; its secret
@@ -10492,6 +10647,7 @@ export function _nftResetDasForTest() { _nftDasUnsupported = false; _nftReviewFl
 export function _setNftCoreStubForTest(fn) { _nftCoreStub = fn; }
 // ---- mint-at-sale seams (CHIK_MINT_AT_SALE). Never a chain, never a key, never Magic Eden. ----
 export function _setMasComposeStubForTest(fn) { _masComposeStub = fn; }
+export function _setMasMintComposeStubForTest(fn) { _masMintComposeStub = fn; }
 export function _masFlagsForTest() { return { on: MINT_AT_SALE_ON, confTries: MAS_CONF_TRIES, confGapMs: MAS_CONF_GAP_MS }; }
 export function _masHealEditionsForTest() { return masHealEditions(); }
 export function _masWitnessForTest(row) { return masWitness(row); }
