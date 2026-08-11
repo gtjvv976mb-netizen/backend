@@ -339,6 +339,27 @@ const poolSol = async () => {
 };
 
 /* ----------------------------- storage ----------------------------- */
+// ============ THE WORLD CHRONICLE — CHIK_CHRONICLE (default OFF) ============
+// The owner's mandate: "record everything so that you have total data and number about what is
+// happening and what happened in the world". Two records, deliberately different lifetimes:
+//   * chronicle_events — an append-only RAW log of the RARE value events (hatch, settle, mint,
+//     transfer, fantasy catch, raid, quest, payout, festival), each row carrying an IDEMPOTENCY key
+//     derived from the op's own settle id so a retried settle can never double-record. TTL-rotated
+//     (CHIK_CHRONICLE_TTL_D) with a hard row-count runaway guard — NEVER an unbounded table.
+//   * chronicle_agg — always-on counters keyed (day, wallet, metric): per-day and lifetime (day=0)
+//     tallies of every faucet and sink, including the high-frequency ones (gather/fish/kill) that
+//     must never produce raw rows. Lifetime rows are the permanent record and survive rotation.
+// Events are recorded ONLY at server-authoritative choke points; client-claimed inputs are either
+// excluded or labelled claims (hatch_claim, kill_claim, cspend/cgain, quest while QUEST_AUTH off).
+// Writes are batched + fire-and-forget: a store failure NEVER fails a player op (loss is bounded by
+// the queue cap and counted loudly). Flag-off: no tables are created, no route exists, no write
+// happens — HTTP and persisted state are byte-identical to today.
+const CHRONICLE_ON = String(process.env.CHIK_CHRONICLE ?? "0") === "1";
+const CHRON_TTL_D = Math.max(1, Number(process.env.CHIK_CHRONICLE_TTL_D || 60));        // raw-event retention
+const CHRON_AGG_TTL_D = Math.max(30, Number(process.env.CHIK_CHRONICLE_AGG_TTL_D || 180)); // per-DAY agg rows (day=0 lifetime rows are forever)
+const CHRON_MAX_ROWS = Math.max(1000, Number(process.env.CHIK_CHRONICLE_MAX_ROWS || 500000)); // runaway guard on the raw table
+// memStore-only chronicle containers (dev/sims): same semantics as the Postgres tables.
+const _memChronEvents = []; const _memChronIdem = new Set(); const _memChronAgg = new Map();
 // Two backends with one interface. Postgres when DATABASE_URL is set; else in-memory (dev only).
 function makeStore() {
   if (DATABASE_URL) return pgStore();
@@ -423,6 +444,91 @@ function pgStore() {
         WHERE table_name='quest_rewards' AND column_name='done_mask'`);
       if (dmType.rows[0] && dmType.rows[0].data_type === "integer")
         await pool.query(`ALTER TABLE quest_rewards ALTER COLUMN done_mask TYPE BIGINT`);
+      // CHRONICLE DDL rides store.init() — NEVER import time (the measured fresh-DB race). Flag-off
+      // creates nothing, so a flag-off database is byte-identical to today's.
+      if (CHRONICLE_ON) {
+        await pool.query(`CREATE TABLE IF NOT EXISTS chronicle_events(
+          id BIGSERIAL PRIMARY KEY, ts BIGINT NOT NULL, type TEXT NOT NULL, wallet TEXT,
+          subject TEXT, qty DOUBLE PRECISION, val DOUBLE PRECISION, route TEXT,
+          idem TEXT NOT NULL UNIQUE, data JSONB)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS chron_ev_ts ON chronicle_events(ts)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS chron_ev_wallet ON chronicle_events(wallet, ts)`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS chronicle_agg(
+          day INT NOT NULL, wallet TEXT NOT NULL, metric TEXT NOT NULL,
+          n DOUBLE PRECISION NOT NULL DEFAULT 0, PRIMARY KEY(day, wallet, metric))`);
+      }
+    },
+    // ---- chronicle (CHIK_CHRONICLE): append-only raw log + counter upserts. Its OWN tables,
+    // never a kv blob — one new row must never rewrite a wholesale-persisted blob (write amplification).
+    async chronInsertEvents(rows) {
+      if (!rows || !rows.length) return 0;
+      for (let i = 0; i < rows.length; i += 200) {
+        const chunk = rows.slice(i, i + 200);
+        const vals = [], params = [];
+        chunk.forEach((r, j) => { const o = j * 9;
+          vals.push(`($${o + 1},$${o + 2},$${o + 3},$${o + 4},$${o + 5},$${o + 6},$${o + 7},$${o + 8},$${o + 9}::jsonb)`);
+          params.push(r.ts, r.type, r.wallet, r.subject, r.qty, r.val, r.route, r.idem, r.data ? jsonbSafe(r.data) : null); });
+        // ON CONFLICT (idem) DO NOTHING is the durable half of the idempotency contract: a batch
+        // re-flushed after a mid-write failure, or a settle retried across a restart, lands once.
+        await pool.query(`INSERT INTO chronicle_events(ts,type,wallet,subject,qty,val,route,idem,data)
+          VALUES ${vals.join(",")} ON CONFLICT (idem) DO NOTHING`, params);
+      }
+      return rows.length;
+    },
+    async chronUpsertAgg(rows) {
+      if (!rows || !rows.length) return 0;
+      for (let i = 0; i < rows.length; i += 200) {
+        const chunk = rows.slice(i, i + 200);
+        const vals = [], params = [];
+        chunk.forEach(([k, n], j) => { const p = String(k).split("|"); const o = j * 4;
+          vals.push(`($${o + 1},$${o + 2},$${o + 3},$${o + 4})`);
+          params.push(Number(p[0]) | 0, p[1] || "?", p.slice(2).join("|") || "?", Number(n) || 0); });
+        await pool.query(`INSERT INTO chronicle_agg(day,wallet,metric,n) VALUES ${vals.join(",")}
+          ON CONFLICT (day,wallet,metric) DO UPDATE SET n = chronicle_agg.n + EXCLUDED.n`, params);
+      }
+      return rows.length;
+    },
+    async chronPrune(cutTs, maxRows, aggCutDay) {
+      const a = await pool.query(`DELETE FROM chronicle_events WHERE ts < $1`, [Math.floor(cutTs) || 0]);
+      let overflow = 0;
+      const c = await pool.query(`SELECT COUNT(*)::int n FROM chronicle_events`);
+      const n = Number(c.rows[0].n);
+      if (maxRows > 0 && n > maxRows) {   // the runaway guard: announced by the caller, never silent
+        const o = await pool.query(`DELETE FROM chronicle_events WHERE id IN
+          (SELECT id FROM chronicle_events ORDER BY id ASC LIMIT $1)`, [n - maxRows]);
+        overflow = o.rowCount || 0;
+      }
+      const g = await pool.query(`DELETE FROM chronicle_agg WHERE day > 0 AND day < $1`, [Math.max(1, aggCutDay | 0)]);
+      return { events: a.rowCount || 0, overflow, agg: g.rowCount || 0 };
+    },
+    async chronCount() {
+      const r = await pool.query(`SELECT COUNT(*)::int n, COALESCE(MIN(ts),0) o FROM chronicle_events`);
+      return { rows: Number(r.rows[0].n), oldestTs: Number(r.rows[0].o) };
+    },
+    async chronAggRows(f) {
+      f = f || {};
+      const wh = [], params = [];
+      if (f.wallet != null) { params.push(String(f.wallet)); wh.push(`wallet=$${params.length}`); }
+      if (f.day != null) { params.push(f.day | 0); wh.push(`day=$${params.length}`); }
+      if (f.dayMin != null) { params.push(f.dayMin | 0); wh.push(`day>=$${params.length}`); wh.push(`day>0`); }
+      if (f.metricPrefix) { params.push(String(f.metricPrefix).replace(/[%_]/g, "") + "%"); wh.push(`metric LIKE $${params.length}`); }
+      params.push(Math.min(5000, Math.max(1, Number(f.limit) || 500)));
+      const r = await pool.query(`SELECT day,wallet,metric,n FROM chronicle_agg
+        ${wh.length ? "WHERE " + wh.join(" AND ") : ""} ORDER BY day DESC, metric ASC LIMIT $${params.length}`, params);
+      return r.rows.map(x => ({ day: Number(x.day), wallet: x.wallet, metric: x.metric, n: Number(x.n) }));
+    },
+    async chronEvents(f) {
+      f = f || {};
+      const wh = [], params = [];
+      if (f.wallet) { params.push(String(f.wallet)); wh.push(`wallet=$${params.length}`); }
+      if (f.type) { params.push(String(f.type)); wh.push(`type=$${params.length}`); }
+      if (f.sinceTs) { params.push(Math.floor(Number(f.sinceTs)) || 0); wh.push(`ts>=$${params.length}`); }
+      params.push(Math.min(200, Math.max(1, Number(f.limit) || 50)));
+      const r = await pool.query(`SELECT ts,type,wallet,subject,qty,val,route,idem,data FROM chronicle_events
+        ${wh.length ? "WHERE " + wh.join(" AND ") : ""} ORDER BY id DESC LIMIT $${params.length}`, params);
+      return r.rows.map(x => ({ ts: Number(x.ts), type: x.type, wallet: x.wallet, subject: x.subject,
+        qty: x.qty == null ? null : Number(x.qty), val: x.val == null ? null : Number(x.val),
+        route: x.route, idem: x.idem, data: x.data }));
     },
     async kvGet(k) { const r = await pool.query(`SELECT v FROM kv WHERE k=$1`, [k]); return r.rows[0]?.v ?? null; },
     async kvSet(k, v) { await pool.query(`INSERT INTO kv(k,v) VALUES($1,$2::jsonb) ON CONFLICT(k) DO UPDATE SET v=$2::jsonb`, [k, jsonbSafe(v)]); },
@@ -661,6 +767,57 @@ function memStore() {
     async init() {},
     async kvGet(k) { return kv.has(k) ? kv.get(k) : null; },
     async kvSet(k, v) { kv.set(k, v); },
+    // ---- chronicle (CHIK_CHRONICLE): same contract as the Postgres tables, in memory (dev/sims).
+    async chronInsertEvents(rows) {
+      for (const r of (rows || [])) { if (_memChronIdem.has(r.idem)) continue; _memChronIdem.add(r.idem); _memChronEvents.push(r); }
+      return (rows || []).length;
+    },
+    async chronUpsertAgg(rows) {
+      for (const [k, n] of (rows || [])) _memChronAgg.set(k, (_memChronAgg.get(k) || 0) + (Number(n) || 0));
+      return (rows || []).length;
+    },
+    async chronPrune(cutTs, maxRows, aggCutDay) {
+      const before = _memChronEvents.length;
+      let kept = _memChronEvents.filter(r => r.ts >= cutTs);
+      const expired = before - kept.length;
+      let overflow = 0;
+      if (maxRows > 0 && kept.length > maxRows) { overflow = kept.length - maxRows; kept = kept.slice(overflow); }
+      _memChronEvents.length = 0; _memChronEvents.push(...kept);
+      let agg = 0;
+      for (const k of [..._memChronAgg.keys()]) {
+        const d = Number(String(k).split("|")[0]) | 0;
+        if (d > 0 && d < (aggCutDay | 0)) { _memChronAgg.delete(k); agg++; }
+      }
+      return { events: expired, overflow, agg };
+    },
+    async chronCount() { return { rows: _memChronEvents.length, oldestTs: _memChronEvents.length ? _memChronEvents[0].ts : 0 }; },
+    async chronAggRows(f) {
+      f = f || {};
+      const out = [];
+      for (const [k, n] of _memChronAgg) {
+        const p = String(k).split("|"); const day = Number(p[0]) | 0, wallet = p[1] || "?", metric = p.slice(2).join("|");
+        if (f.wallet != null && wallet !== String(f.wallet)) continue;
+        if (f.day != null && day !== (f.day | 0)) continue;
+        if (f.dayMin != null && !(day > 0 && day >= (f.dayMin | 0))) continue;
+        if (f.metricPrefix && !metric.startsWith(String(f.metricPrefix))) continue;
+        out.push({ day, wallet, metric, n });
+      }
+      out.sort((a, b) => (b.day - a.day) || (a.metric < b.metric ? -1 : 1));
+      return out.slice(0, Math.min(5000, Math.max(1, Number(f.limit) || 500)));
+    },
+    async chronEvents(f) {
+      f = f || {};
+      const out = [];
+      for (let i = _memChronEvents.length - 1; i >= 0; i--) {
+        const r = _memChronEvents[i];
+        if (f.wallet && r.wallet !== String(f.wallet)) continue;
+        if (f.type && r.type !== String(f.type)) continue;
+        if (f.sinceTs && r.ts < Number(f.sinceTs)) continue;
+        out.push(r);
+        if (out.length >= Math.min(200, Math.max(1, Number(f.limit) || 50))) break;
+      }
+      return out;
+    },
     async firstSeen(wallet) { return Number(get(wallet)?.first_seen || 0); },
     async winnersRemaining(cap) { return Math.max(0, cap - _memWinners.size); },
     async winnerGet(wallet) { return _memWinners.get(wallet) || null; },
@@ -787,6 +944,130 @@ function memStore() {
 
 const store = makeStore();
 
+/* ----------------------------- the world chronicle engine (CHIK_CHRONICLE) ----------------------------- */
+// One append path (chronicleAdd) + one counter path (chronicleBump). Both are SYNCHRONOUS in-memory
+// pushes — the store is only touched by the batched flush timer, so no player response ever waits on
+// a chronicle write, and a store outage costs at most CHRON_Q_MAX queued rows (counted, logged loudly).
+const CHRON_FLUSH_MS = 3000;         // the saveWorldFeed trailing-batch cadence
+const CHRON_Q_MAX = 5000;            // outage buffer — beyond this the OLDEST rows drop, counted
+const CHRON_BATCH_MAX = 400;         // rows per INSERT batch (well under pg's param ceiling)
+const CHRON_SEEN_MAX = 50000;        // in-process idem LRU, same bound as _soldListings
+const CHRON_AGG_KEYS_MAX = 50000;    // pending-counter map bound (flush clears it every few seconds)
+let _chronQ = [];                    // pending raw events
+const _chronAgg = new Map();         // "day|wallet|metric" -> n, pending upserts
+const _chronSeen = new Set();        // idem keys already accepted this process (belt; DB UNIQUE is braces)
+let _chronDropped = 0, _chronWritten = 0, _chronAggWritten = 0, _chronAggDropped = 0;
+let _chronFailAt = 0, _chronDayShift = 0, _chronFailForTest = false;
+const _chronBootTag = crypto.randomBytes(3).toString("hex");   // uniquifies no-idem events across restarts
+let _chronSeq = 0;
+const chronDay = (ts) => Math.floor(ts / 86400000) + _chronDayShift;
+// Bump a counter for (wallet, metric): this day + lifetime (day 0), for the wallet AND the world ('*').
+// The metric namespace is documented in CHRONICLE_SPEC.md (gather:<mat>, credit:<kind>:<item>, hatch:<sp>, ...).
+function chronicleBump(wallet, metric, n = 1) {
+  if (!CHRONICLE_ON) return;
+  const q = Number(n);
+  if (!Number.isFinite(q) || q === 0) return;
+  const d = chronDay(Date.now());
+  const w = String(wallet || "?").slice(0, 44) || "?";
+  const m = String(metric).slice(0, 56);
+  // Set-dedupe: for a world event (wallet '*') the wallet keys EQUAL the world keys — without the
+  // dedupe each was incremented twice (measured: 2 festival events read ev:festival=4, exactly 2x).
+  for (const k of new Set([`${d}|${w}|${m}`, `0|${w}|${m}`, `${d}|*|${m}`, `0|*|${m}`])) {
+    if (!_chronAgg.has(k) && _chronAgg.size >= CHRON_AGG_KEYS_MAX) { _chronAggDropped++; continue; }
+    _chronAgg.set(k, (_chronAgg.get(k) || 0) + q);
+  }
+}
+// Record one RAW event. o: { sub, qty, val, route, idem, data, agg:[[metric,n],...] }.
+// idem is the op's own settle/asset id — a retry (same idem) records NOTHING, here and in the store.
+function chronicleAdd(type, wallet, o = {}) {
+  if (!CHRONICLE_ON) return false;
+  const idem = String(o.idem || `u:${_chronBootTag}:${++_chronSeq}`).slice(0, 96);
+  if (_chronSeen.has(idem)) return false;
+  _chronSeen.add(idem);
+  if (_chronSeen.size > CHRON_SEEN_MAX) { let d = 5000; for (const k of _chronSeen) { if (d-- <= 0) break; _chronSeen.delete(k); } }
+  const ts = Date.now();
+  const row = { ts, type: String(type).slice(0, 24), wallet: String(wallet || "").slice(0, 44),
+    subject: o.sub != null ? String(o.sub).slice(0, 48) : null,
+    qty: Number.isFinite(Number(o.qty)) ? Number(o.qty) : null,
+    val: Number.isFinite(Number(o.val)) ? Number(o.val) : null,
+    route: o.route ? String(o.route).slice(0, 40) : null, idem,
+    data: (o.data && typeof o.data === "object") ? o.data : null };
+  if (_chronQ.length >= CHRON_Q_MAX) {
+    _chronQ.shift(); _chronDropped++;
+    const now = Date.now();
+    if (now - _chronFailAt > 30000) { _chronFailAt = now; console.error(`chronicle queue full (${CHRON_Q_MAX}) — dropped ${_chronDropped} raw events so far (aggregates unaffected)`); }
+  }
+  _chronQ.push(row);
+  chronicleBump(row.wallet || "?", "ev:" + row.type, 1);
+  if (row.val) chronicleBump(row.wallet || "?", "val:" + row.type, row.val);
+  if (Array.isArray(o.agg)) for (const a of o.agg) { if (Array.isArray(a)) chronicleBump(row.wallet || "?", a[0], Number(a[1]) || 1); }
+  return true;
+}
+// Batched, fire-and-forget flush. Events stay queued until a write SUCCEEDS (the DB's idem UNIQUE
+// makes the retry harmless); pending counters are re-merged on failure, so nothing aggregate is lost.
+let _chronFlushing = null, _chronFlushWarnAt = 0;
+function chronFlush() {
+  if (!CHRONICLE_ON || _chronFlushing) return _chronFlushing || Promise.resolve();
+  if (!_chronQ.length && !_chronAgg.size) return Promise.resolve();
+  _chronFlushing = (async () => {
+    try {
+      if (_chronFailForTest) throw new Error("chronicle store outage (test seam)");
+      if (_chronQ.length) {
+        const evs = _chronQ.slice(0, CHRON_BATCH_MAX);
+        await store.chronInsertEvents(evs);
+        _chronQ.splice(0, evs.length);
+        _chronWritten += evs.length;
+      }
+      if (_chronAgg.size) {
+        const rows = [..._chronAgg];
+        _chronAgg.clear();
+        try { await store.chronUpsertAgg(rows); _chronAggWritten += rows.length; }
+        catch (e) { for (const [k, n] of rows) _chronAgg.set(k, (_chronAgg.get(k) || 0) + n); throw e; }
+      }
+    } catch (e) {
+      const now = Date.now();
+      if (now - _chronFlushWarnAt > 30000) { _chronFlushWarnAt = now; console.error(`chronicle flush failed (queued=${_chronQ.length}, aggPending=${_chronAgg.size}) — will retry:`, String(e && e.message || e)); }
+    }
+  })();
+  // The in-flight marker is cleared via .finally AFTER the assignment, never inside the async body:
+  // a body that throws before its first await runs its own finally SYNCHRONOUSLY, so an inner
+  // `finally { _chronFlushing = null }` was overwritten by this very assignment and wedged every
+  // later flush behind a settled promise (measured: 40 recovery flushes, written=0). A promise
+  // callback can never run synchronously, so this ordering is safe by construction.
+  _chronFlushing = _chronFlushing.finally(() => { _chronFlushing = null; });
+  return _chronFlushing;
+}
+// ROTATION: raw events expire at CHRON_TTL_D; per-day agg rows at CHRON_AGG_TTL_D; lifetime (day 0)
+// rows are the permanent record and are never touched. The runaway guard announces, never silent.
+async function chronPruneSweep() {
+  if (!CHRONICLE_ON) return null;
+  try {
+    const r = await store.chronPrune(Date.now() - CHRON_TTL_D * 86400000, CHRON_MAX_ROWS, chronDay(Date.now()) - CHRON_AGG_TTL_D);
+    if (r && (r.events || r.overflow || r.agg))
+      console.log(`chronicle prune: ${r.events} raw rows past ${CHRON_TTL_D}d, ${r.overflow} over the ${CHRON_MAX_ROWS}-row guard${r.overflow ? " (RUNAWAY — investigate the writer)" : ""}, ${r.agg} day-agg rows past ${CHRON_AGG_TTL_D}d`);
+    return r;
+  } catch (e) { return null; }
+}
+if (CHRONICLE_ON) {
+  setInterval(chronFlush, CHRON_FLUSH_MS).unref?.();
+  setInterval(chronPruneSweep, 6 * 3600 * 1000).unref?.();
+  const t = setTimeout(chronPruneSweep, 90000); t.unref?.();   // one sweep shortly after boot
+}
+// sim seams — flag-off they observe only zeros (chronicleAdd/Bump no-op before any state is touched)
+export function _chronStatsForTest() {
+  return { on: CHRONICLE_ON, queued: _chronQ.length, aggPending: _chronAgg.size, seen: _chronSeen.size,
+           written: _chronWritten, aggWritten: _chronAggWritten, dropped: _chronDropped, aggKeysDropped: _chronAggDropped };
+}
+export async function _chronFlushForTest() { await chronFlush(); return _chronStatsForTest(); }
+export function _chronAddForTest(type, wallet, o) { return chronicleAdd(type, wallet, o); }
+export function _chronBumpForTest(wallet, metric, n) { return chronicleBump(wallet, metric, n); }
+export function _setChronDayShiftForTest(d) { _chronDayShift = d | 0; return _chronDayShift; }
+export function _setChronFailForTest(on) { _chronFailForTest = !!on; return _chronFailForTest; }
+export async function _chronAggRowsForTest(f) { return store.chronAggRows(f || {}); }
+export async function _chronEventsForTest(f) { return store.chronEvents(f || {}); }
+export async function _chronPruneForTest() { return chronPruneSweep(); }
+export async function _chronCountForTest() { return store.chronCount(); }
+
 /* ----------------------------- chat ----------------------------- */
 /* wallets allowed to pin/announce: ADMIN_WALLETS list + the team wallet */
 const ADMIN_SET = new Set(String(ADMIN_WALLETS || "").split(",").map(s => s.trim()).filter(Boolean));
@@ -808,7 +1089,8 @@ async function saveBanned() { try { await store.kvSet("banned_wallets", [...bann
 let battleWins = {};   // wallet -> count of server-resolved match wins
 const winsOf = (w) => Number(battleWins[w] || 0);
 let _winsDirty = false;
-function recordWin(wallet) { if (!isPubkey(wallet)) return; battleWins[wallet] = winsOf(wallet) + 1; _winsDirty = true; }
+function recordWin(wallet) { if (!isPubkey(wallet)) return; battleWins[wallet] = winsOf(wallet) + 1; _winsDirty = true;
+  if (CHRONICLE_ON) chronicleBump(wallet, "cup_win", 1); }
 async function saveBattleWins(strict = false) {
   if (!_winsDirty) return;
   _winsDirty = false;
@@ -1646,6 +1928,8 @@ app.post("/verify", async (req, res) => {
     // since the net_id is private (in the owner's save) and arrives with a proven signature.
     const mktToken = signedIn ? mintMarketToken(wallet) : "";
     if (signedIn) bindSid(stripTags(String(req.body?.netId || "")).slice(0, 40), wallet);
+    // the identity-proof event everything else keys on — counter only, never a raw wallet-named row
+    if (signedIn && CHRONICLE_ON) chronicleBump(wallet, "signin", 1);
     // ONE LIVE SESSION PER WALLET. Cloud saves resolve by newest-saved_at, wholesale, with no field
     // merge (merging inventories would be a duplication faucet) — so two devices on one wallet meant
     // the loser's ENTIRE session was silently discarded, however long they had played. A sign-in now
@@ -2097,12 +2381,58 @@ app.post("/admin/fishing-event", async (req, res) => {
   if (mult <= 1 || hours <= 0) {
     _fishEvent = { mult: 1, ends: 0, label: "" };
     await saveFishEvent();
+    chronicleAdd("festival", "*", { sub: "off", route: "/admin/fishing-event" });
     return res.json({ ok: true, active: false });
   }
   _fishEvent = { mult, ends: Date.now() + hours * 3600000, label };
   await saveFishEvent();
+  chronicleAdd("festival", "*", { sub: label, val: mult, route: "/admin/fishing-event",
+    idem: "fest:" + _fishEvent.ends, data: { mult, hours, ends: _fishEvent.ends } });
   res.json({ ok: true, active: true, mult, hours, label, ends: _fishEvent.ends });
 });
+
+// ============ THE CHRONICLE QUERY SURFACE — CHIK_CHRONICLE (default OFF) ============
+// Admin-key-gated (same ?key= gate as the fishing festival) because a wallet-keyed permanent record
+// is roster-grade sensitive — the world feed deliberately never names wallets, and this must not
+// become the page that does. Flag-off neither route is registered, so HTTP behaviour is unchanged.
+// /chronicle/summary: the aggregates ("total data and number") — lifetime world totals, optional
+//   per-wallet totals, optional recent per-day rows, metric-prefix filter (metric=hatch: for
+//   per-species hatches, metric=credit:ffish: for per-species catches, ...).
+// /chronicle/events: the raw log, filtered by wallet/type — for investigations, capped at 200 rows.
+if (CHRONICLE_ON) {
+  const _chronGate = (req, res) => {
+    const key = String(req.body?.key ?? req.query?.key ?? "");
+    if (!process.env.ADMIN_KEY || key !== process.env.ADMIN_KEY) { res.status(403).json({ error: "admin key required" }); return false; }
+    return true;
+  };
+  const _chronHandler = async (req, res) => {
+    if (!_chronGate(req, res)) return;
+    const q = Object.assign({}, req.query || {}, req.body || {});
+    const wallet = String(q.wallet || "");
+    const days = Math.min(400, Math.max(0, Number(q.days) || 0));
+    const prefix = String(q.metric || "");
+    try {
+      const out = { ok: true, ttlDays: CHRON_TTL_D, aggTtlDays: CHRON_AGG_TTL_D, maxRows: CHRON_MAX_ROWS };
+      out.totals = await store.chronAggRows({ wallet: "*", day: 0, metricPrefix: prefix, limit: Number(q.limit) || 500 });
+      if (days) out.daily = await store.chronAggRows({ wallet: wallet || "*", dayMin: chronDay(Date.now()) - days, metricPrefix: prefix, limit: 2000 });
+      if (wallet) out.walletTotals = await store.chronAggRows({ wallet, day: 0, metricPrefix: prefix, limit: Number(q.limit) || 500 });
+      out.log = Object.assign(await store.chronCount().catch(() => ({})), _chronStatsForTest());
+      res.json(out);
+    } catch (e) { res.status(500).json({ error: String(e && e.message || e) }); }
+  };
+  app.get("/chronicle/summary", _chronHandler);
+  app.post("/chronicle/summary", _chronHandler);
+  const _chronEvHandler = async (req, res) => {
+    if (!_chronGate(req, res)) return;
+    const q = Object.assign({}, req.query || {}, req.body || {});
+    try {
+      const rows = await store.chronEvents({ wallet: q.wallet, type: q.type, sinceTs: q.sinceTs, limit: q.limit });
+      res.json({ ok: true, count: rows.length, rows });
+    } catch (e) { res.status(500).json({ error: String(e && e.message || e) }); }
+  };
+  app.get("/chronicle/events", _chronEvHandler);
+  app.post("/chronicle/events", _chronEvHandler);
+}
 app.post("/admin/gift-chiki", adminGiftChiki);
 app.post("/admin/gift-legendary", adminGiftChiki);   // back-compat alias
 
@@ -2412,6 +2742,8 @@ app.post("/claim", async (req, res) => {
     if (r.status === "ok") await store.confirm(r.payoutId, sig);
     if (prizePay > 0) { const left = Math.floor(((cupPrizes.get(wallet) || 0) - prizePay) * 1e6) / 1e6; if (left > 0) cupPrizes.set(wallet, left); else cupPrizes.delete(wallet); await saveCupPrizes(); }
     pushFeed("claim", { wallet, short: wallet.slice(0, 4) + "…" + wallet.slice(-4), amountSol: total, signature: sig });
+    chronicleAdd("claim_sol", wallet, { val: total, route: "/claim", idem: "sol:" + sig,
+      data: { accrued: base, cupPrize: prizePay, sig } });
     res.json({ ok: true, wallet, amountSol: total, accruedSol: base, cupPrizeSol: prizePay, signature: sig,
       explorer: `https://explorer.solana.com/tx/${sig}?cluster=${NETWORK}` });
   } catch (e) {
@@ -2650,6 +2982,9 @@ async function sendChikiRaw(destWallet, amt) {
 // durable per-wallet payout history — the in-game "reward received" toast + Ledger history
 // read this. Appended ONLY on a confirmed on-chain landing; capped at the 50 newest.
 async function recordPayout(wallet, kind, amount, sig) {
+  // Every confirmed on-chain $CHIKI payout lands here (quest pouch + winner batches). The tx
+  // signature is globally unique, so it is the idem key — a reconcile that re-confirms records once.
+  chronicleAdd("payout", wallet, { sub: kind, val: amount, route: "recordPayout", idem: "pay:" + sig, data: { sig } });
   try {
     const key = "payhist:" + wallet;
     const cur = (await store.kvGet(key)) || [];
@@ -2770,6 +3105,11 @@ app.post("/quest/complete", async (req, res) => {
     }
     led.done[questId] = now;
     led.lastAt = now;
+    // Recorded as a CLAIM until CHIK_QUEST_AUTH flips (the measured 103k-$CHIKI curl liability):
+    // `claim` is false only for a completion this route actually authenticated. First completion
+    // only (the `already` branch returns above), and wallet:questId is the natural idem key.
+    chronicleAdd("quest", wallet, { sub: questId, route: "/quest/complete", idem: "q:" + wallet + ":" + questId,
+      data: { claim: !_qProven, final: isFinal } });
     // Accrue this quest's per-quest reward to the admin-released pouch (idempotent via the done_mask bit).
     try { await store.qrAccrue(wallet, QUEST_BIT.get(questId) || 0); } catch (e) { console.error("qrAccrue failed", wallet, questId, String(e.message || e)); }
     await _questSave(wallet, led);
@@ -3441,6 +3781,8 @@ app.post("/meme/hatch", async (req, res) => {
   _memeLastHatch.set(wallet, now);
   const h = { id: "h" + now.toString(36) + Math.random().toString(36).slice(2, 6), wallet, hatcher: wallet, char: null, name: "Mystery Meme Egg", edition: null, status: "incubating", undetermined: true, mintAddr: null, ts: now, paySig: paySig || null };
   memeHatches.push(h); await saveMeme();
+  chronicleAdd("meme_egg", wallet, { sub: "meme", qty: 1, route: "/meme/hatch", idem: "memeegg:" + h.id,
+    data: { paySig: paySig ? String(paySig).slice(0, 44) : null } });
   res.json({ ok: true, hatch: { id: h.id, status: "incubating", mystery: true }, supply: memeSupply() });
 });
 // The in-game egg finished its tended incubation → ROLL the random species now, then flip "incubating" → "pending" so the worker mints the NFT.
@@ -3455,6 +3797,10 @@ app.post("/meme/hatched", async (req, res) => {
       if (!c) return res.status(409).json({ error: "the dynasty is fully hatched" });
       h.char = c.key; h.name = c.name; h.edition = (memeMinted[c.key] || 0) + 1; memeMinted[c.key] = h.edition; h.undetermined = false;
       censusInvalidate();      // a sale just determined its species — the world census changed
+      // the SERVER rolled this species (pickMeme), so it counts as a witnessed hatch; the hatch id
+      // is the idem key — the `!h.char` guard above already makes a re-post roll nothing
+      chronicleAdd("meme_hatch", wallet, { sub: c.key, qty: 1, route: "/meme/hatched", idem: "meme:" + h.id,
+        data: { edition: h.edition }, agg: [["hatch:" + c.key, 1]] });
       // ============ CHIK_REG_ALL — the roll IS the birth, so the row is written HERE ============
       // The whole meme path used to reach the client purely via ownedChars, with the registry row
       // arriving only later through species-collapsed adoption (an unrecorded issuance path).
@@ -3600,6 +3946,7 @@ app.post("/cup/grant", async (req, res) => {
   if (!(sol > 0)) return res.status(400).json({ error: "positive 'sol' required" });
   cupPrizes.set(wallet, +(((cupPrizes.get(wallet) || 0) + sol)).toFixed(6));
   await saveCupPrizes();
+  chronicleAdd("cup_grant", wallet, { val: sol, route: "/cup/grant" });
   res.json({ ok: true, wallet, granted: sol, owedNow: cupPrizes.get(wallet) });
 });
 
@@ -4703,6 +5050,7 @@ app.post("/world/fish/report", (req, res) => {
   const _lvl = Math.floor(Number(b.lvl));
   if (_legend && Number.isFinite(_lvl) && _lvl >= 1 && _lvl < FFISH_LEVEL[_legend]) {
     _legend = ""; _ffishOutlevelled++;
+    if (CHRONICLE_ON) chronicleBump(String(b.wallet), "ffish_outlevelled", 1);
   }
   // A DAY'S FISHING IS A DAY'S FISHING. tier and rod are asserted by the caller and only clamped, so
   // a keypair that has never played can post {tier:3, rod:10} at the 800 ms floor and win the lottery
@@ -4719,12 +5067,18 @@ app.post("/world/fish/report", (req, res) => {
     const _fr = _ffishDay.get(String(b.wallet));
     const _row = (_fr && _fr.day === _day) ? _fr : { day: _day, n: 0 };
     const _cap = FFISH_DAILY_MAX * Math.max(1, Math.floor(fishEventActive() ? _fishEvent.mult : 1));
-    if (_row.n >= _cap) { _legend = ""; _ffishCapped++; }
+    if (_row.n >= _cap) { _legend = ""; _ffishCapped++; if (CHRONICLE_ON) chronicleBump(String(b.wallet), "ffish_capped", 1); }
     else { _row.n++; _ffishDay.set(String(b.wallet), _row); }
     if (_ffishDay.size > 20000) { for (const [k, v] of _ffishDay) { if (v.day !== _day) _ffishDay.delete(k); } }
   }
   if (_legend) ownCredit(String(b.wallet), "ffish", _legend, 1);
   if (_legend) worldFeedPush("ffish", b.wallet, _legend);   // a witnessed catch: the world hears about it
+  // THE PER-PLAYER CATCH RECORD, SERVER-SIDE (the owner named this explicitly): species, spot, gear
+  // and clock, recorded at the single server-witnessed roll site. The client save stays the display
+  // copy; this row is the truth. Each credited roll is a distinct fact — no idem, a fresh id per roll.
+  if (_legend) chronicleAdd("ffish", String(b.wallet), { sub: _legend, qty: 1, route: "/world/fish/report",
+    data: { tier: _tier, rod: _rod, x: Math.round(me.x || 0), z: Math.round(me.z || 0),
+            festival: fishEventActive() ? Number(_fishEvent.mult) : 1 } });
   // The client renders what the SERVER says was caught. An older client ignores `legend` and keeps
   // rolling its own for display only — it just gains no sellable entitlement from it, which is the
   // point. `counted` keeps its old meaning so nothing existing changes shape.
@@ -4759,6 +5113,8 @@ app.post("/world/kill/report", (req, res) => {
   if (now - last < KILL_REC_MIN_MS) return res.json({ ok: true, counted: false });
   _lastKillRec.set(String(b.wallet), now);
   if (_lastKillRec.size > 20000) { for (const [k, t] of _lastKillRec) { if (now - t > 120000) _lastKillRec.delete(k); } }
+  // an UNWITNESSED claim — counted apart from the witnessed kill:<species> metric, never merged
+  if (CHRONICLE_ON) chronicleBump(String(b.wallet), "kill_claim", 1);
   // record the per-kill ceiling of essence — pubkey-only inside recordGather, net_id kills ignored
   // The ceiling (6) is for the observe-only tally ONLY. The book gets ONE essence per counted kill:
   // at KILL_REC_MIN_MS 500 the ceiling would have been 43,200 essence/hour of sellable credit on a
@@ -4859,6 +5215,9 @@ app.post("/world/raid/claim", (req, res) => {
   // amounts are now in the reply so a future client can apply what the SERVER says rather than a
   // local constant.
   ownCredit(w, "mat", "crystal", RAID_PRIZE_CRYSTAL);
+  // one prize per wallet-week is the rule, so wallet:week IS the idem key — a replay records nothing
+  chronicleAdd("raid", w, { qty: RAID_PRIZE_CRYSTAL, val: RAID_PRIZE_CHIKI, route: "/world/raid/claim",
+    idem: "raid:" + w + ":" + week, data: { week } });
   res.json({ ok: true, granted: true, week, prize: { chiki: RAID_PRIZE_CHIKI, mat: "crystal", qty: RAID_PRIZE_CRYSTAL } });
 });
 
@@ -4989,6 +5348,9 @@ function ownCredit(wallet, kind, item, n) {
   const r = _ownRow(w), k = ownKey(kind, item);
   r.cred[k] = Math.min((r.cred[k] || 0) + q, Number.MAX_SAFE_INTEGER);
   _ownDirty = true;
+  // The economy-flow aggregates ride the acquisition book's own mutators — the exact numbers
+  // enforcement reads, at the only lines that move them. Counters only; never a raw row.
+  if (CHRONICLE_ON) chronicleBump(w, "credit:" + k, q);
 }
 // Record a completed SALE against the seller's lifetime total.
 function ownSold(wallet, kind, item, n) {
@@ -4999,6 +5361,7 @@ function ownSold(wallet, kind, item, n) {
   const r = _ownRow(w), k = ownKey(kind, item);
   r.sold[k] = Math.min((r.sold[k] || 0) + q, Number.MAX_SAFE_INTEGER);
   _ownDirty = true;
+  if (CHRONICLE_ON) chronicleBump(w, "sold:" + k, q);
 }
 // Consume material into a sink the SERVER itself authorised (today: Mithra's egg barter). This is not
 // the same thing as a client-DECLARED spend, which is still never debited — the client cannot reach
@@ -5020,6 +5383,7 @@ function ownRefund(wallet, kind, item, n) {
   if (back <= 0) return 0;
   r.used[k] -= back;
   _ownDirty = true;
+  if (CHRONICLE_ON) chronicleBump(w, "refund:" + k, back);
   return back;
 }
 function ownDebit(wallet, kind, item, n) {
@@ -5030,6 +5394,7 @@ function ownDebit(wallet, kind, item, n) {
   const r = _ownRow(w), k = ownKey(kind, item);
   r.used[k] = Math.min((r.used[k] || 0) + q, Number.MAX_SAFE_INTEGER);
   _ownDirty = true;
+  if (CHRONICLE_ON) chronicleBump(w, "debit:" + k, q);
 }
 // ESCROW IS NOT STORED. It is derived from the live board every time it is asked for. Every exit path
 // a listing has — cancel, TTL prune, the 400-row cap shift, a sale, an order decline or undeliver —
@@ -5280,8 +5645,11 @@ app.post("/world/mat/flow", (req, res) => {
       if (!Number.isFinite(q) || !(q > 0)) continue;
       // CLAMP, don't bit-twiddle. `q | 0` is ToInt32, so 2147483648 wrapped to -2147483648 and a
       // "cap" wrote a NEGATIVE tally that no lower bound caught. Floor into [1, FLOW_QTY_MAX].
-      _flowAdd(isSpend ? matSpent : matGained, String(b.wallet), mat,
-               Math.max(1, Math.min(FLOW_QTY_MAX, Math.floor(q))));
+      const _fq = Math.max(1, Math.min(FLOW_QTY_MAX, Math.floor(q)));
+      _flowAdd(isSpend ? matSpent : matGained, String(b.wallet), mat, _fq);
+      // client-declared telemetry, never a fact — the c-prefix keeps a declared gain forever
+      // distinguishable from a witnessed credit in every chronicle total
+      if (CHRONICLE_ON) chronicleBump(String(b.wallet), (isSpend ? "cspend:" : "cgain:") + mat, _fq);
       counted++;
     }
   }
@@ -5666,6 +6034,9 @@ app.post("/world/mob/hit", (req, res) => {
     m.deadAt = now;
     m.finisher = String(b.wallet);
     _mobKills++;
+    // a WITNESSED kill (the server's own health pool hit zero) — per-species counter, island ceiling
+    // ~16/min shared, so an aggregate is generous and a raw row would be noise
+    if (CHRONICLE_ON) chronicleBump(String(b.wallet), "kill:" + spec[0], 1);
     const _fst = MOB_STATS[spec[0]];
     const ess = _fst ? _fst.essence : 1;
     const paid = [];
@@ -5709,6 +6080,7 @@ app.post("/world/mob/hit", (req, res) => {
     killed = true;
     m.deadAt = now;
     _mobKills++;
+    if (CHRONICLE_ON) chronicleBump(wallet, "kill:" + spec[0], 1);   // witnessed: the pool the server owns reached zero
     // 6. THE REWARD IS THE SERVER'S, ONCE PER LIFE, SPLIT ACROSS EVERYONE WHO REALLY FOUGHT IT. The
     //    client never names it. Everyone who landed a hit on THIS generation gets the mob's own
     //    essence value — co-op pays both trainers rather than racing them for a last hit.
@@ -6177,7 +6549,12 @@ function recordGather(wallet, kind, drop, creditOwn = true) {
   // MATERIALS ONLY as tally keys. The restore path truncates a gather row to its first 40 keys, so
   // junk keys written here could push a wallet's REAL counts out of the row the oversold signal
   // reads. The flow tallies already enforce exactly this rule on restore.
-  for (const m of mats) { if (!MAT_IDS.has(m)) continue; g[m] = (g[m] || 0) + 1; }
+  for (const m of mats) { if (!MAT_IDS.has(m)) continue; g[m] = (g[m] || 0) + 1;
+    // AGGREGATE-ONLY by design: gathers are the highest-frequency faucet (57.6k/day/wallet bot
+    // ceiling), so they get per-day counters, never raw rows. A creditOwn=false entry is the kill
+    // report's inflated telemetry CEILING, not an acquisition — labelled apart so it can never read
+    // as one in the totals.
+    if (CHRONICLE_ON) chronicleBump(wallet, (creditOwn ? "gather:" : "claimceil:") + m, 1); }
   _assetsDirty = true;
   // THE ACQUISITION BOUND'S ONLY BULK CREDIT. A node claim is position-authorised against the
   // server's own record of where this wallet is, and one gather is exactly one item, so each entry
@@ -6926,7 +7303,8 @@ function nftApplyClassification(row, cls, now) {
       _nftReviewFlags.set(row.id, { reason: "das-unsupported", at: now });   // owner NEVER mutated
       return { applied: "das-unsupported" };
     case "retire":
-      if (row.state !== "burned") { row.state = "burned"; regEvent(row, "burned", {}); _assetsDirty = true; censusInvalidate(); }
+      if (row.state !== "burned") { row.state = "burned"; regEvent(row, "burned", {}); _assetsDirty = true; censusInvalidate();
+        chronicleAdd("burn", String(row.owner || ""), { sub: row.sp || row.type, route: "nftReconcile", idem: "burn:" + row.id }); }
       _nftHolderObs.delete(row.id);
       return { applied: "retired" };
     case "same":
@@ -7468,6 +7846,11 @@ function mintAsset(type, wallet, fields, origin, parent, opts) {
   // Flag-off this line does not run and every issued row is byte-identical to today's.
   if (MINT_AT_SALE_ON && !row.edition) row.edition = nftEditionFor(row);
   regEvent(row, "minted", { to: wallet, origin });
+  // THE ISSUANCE CHOKE POINT: every registry asset that ever exists passes this line exactly once,
+  // and the asset id is unforgeable — so it IS the idempotency key. (Witnessed hatches additionally
+  // record a typed "hatch" event at their route; a consume records "hatch_claim", honestly labelled.)
+  chronicleAdd("mint", wallet, { sub: row.sp || type, route: "mintAsset", idem: "mint:" + id,
+    data: { t: type, origin: String(origin || ""), kind: row.kind, parent: row.parent } });
   assetReg.set(id, row);
   ownerSet(wallet).add(id);
   _assetsDirty = true;
@@ -7521,6 +7904,10 @@ function transferAsset(id, from, to, why, extra) {
   ownerSet(from).delete(id);
   ownerSet(to).add(id);
   regEvent(row, "transferred", Object.assign({ from, to, why }, extra || {}));
+  // chain.length after the push is unique per transfer of this asset, so a replayed call (already
+  // refused above by the owner check) could never mint a second row even if it got here.
+  chronicleAdd("transfer", String(to), { sub: row.sp || row.type, route: "transferAsset",
+    idem: "xfer:" + id + ":" + row.chain.length, data: { from, to, why: String(why || "") } });
   _assetsDirty = true;
   censusInvalidate();      // the census reconciles PER WALLET, so a change of owner re-groups it
   return row;
@@ -7917,6 +8304,8 @@ app.post("/assets/egg/claim", (req, res) => {
     for (const m of Object.keys(_recipe)) ownDebit(wallet, "mat", m, _recipe[m]);
     if (_ffishAuth && _fishReq) ownDebit(wallet, "ffish", _fishReq.sp, _fishReq.n);
   }
+  chronicleAdd("egg_claim", wallet, { sub: kind, qty: 1, route: "/assets/egg/claim", idem: "eggc:" + row.id,
+    data: { mats: _charge ? _recipe : null, fish: (_charge && _ffishAuth && _fishReq) ? _fishReq : null } });
   res.json({ ok: true, egg: { id: row.id, kind, born: row.born, readyAt: eggReadyAt(row) } });
 });
 
@@ -8012,6 +8401,9 @@ app.post("/assets/egg/hatch", async (req, res) => {
   if (row.kind === "legendary" || row.kind === "meme" || row.kind === "mount") {
     worldFeedPush(row.kind === "meme" ? "meme" : (row.kind === "mount" ? "mount" : "legend"), wallet, born.sp);
   }
+  // THE WITNESSED ROLL — the egg id is the idem key (one egg hatches exactly once, either path).
+  chronicleAdd("hatch", wallet, { sub: born.sp, qty: 1, route: "/assets/egg/hatch", idem: "hatch:" + row.id,
+    data: { egg: row.id, into: born.id, kind: row.kind }, agg: [["hatch:" + born.sp, 1]] });
   _assetsDirty = true;
   res.json({ ok: true, hatched: { id: born.id, type: born.type, sp: born.sp, kind: born.kind, born: born.born, from: row.id } });
 });
@@ -8063,6 +8455,8 @@ app.post("/assets/egg/discard", async (req, res) => {
   row.state = "consumed";
   eggNftRetire(row, null);   // a discarded minted egg has its NFT value removed too (no-op if never minted)
   regEvent(row, "discarded", { why: "pool-empty", refunded });
+  chronicleAdd("egg_discard", wallet, { sub: row.kind, route: "/assets/egg/discard", idem: "disc:" + row.id,
+    data: { why: "pool-empty", refunded } });
   censusInvalidate();      // a discarded egg leaves the live count
   _assetsDirty = true;
   res.json({ ok: true, discarded: row.id, kind: row.kind, refunded,
@@ -8131,6 +8525,10 @@ app.post("/assets/egg/consume", async (req, res) => {
   eggNftRetire(row, born);   // remove the egg NFT's value on hatch (no-op for a never-minted egg)
   censusInvalidate();      // same as the server-rolled hatch: the egg leaves the live count
   regEvent(row, "hatched", { into: born.id, sp });
+  // A CLIENT-ROLLED SPECIES IS A CLAIM, NOT A WITNESSED ROLL — recorded, honestly labelled, and it
+  // never feeds the witnessed hatch:<sp> counters. Same idem prefix: one egg, one hatch, either path.
+  chronicleAdd("hatch_claim", wallet, { sub: born.sp, qty: 1, route: "/assets/egg/consume", idem: "hatch:" + row.id,
+    data: { claim: true, egg: row.id, into: born.id, kind: row.kind }, agg: [["hatchclaim:" + born.sp, 1]] });
   _assetsDirty = true;
   res.json({ ok: true, hatched: { id: born.id, type: born.type, sp: born.sp, from: row.id } });
 });
@@ -8936,6 +9334,10 @@ function _nftCommitMint(row, addr, sig) {
   delete row.mintPending;
   _nftPendingKeys.delete(row.id);
   regEvent(row, "minted_onchain", Object.assign({ addr, edition: row.edition }, sig ? { sig } : {}));
+  // the on-chain commit is re-entrant by design (reconcile paths re-call it) — the asset id idem
+  // key means however many callers confirm the same mint, the chronicle holds one row
+  chronicleAdd("nft_mint", String(row.owner || ""), { sub: row.sp || row.type, route: "_nftCommitMint",
+    idem: "nftm:" + row.id, data: Object.assign({ addr, edition: row.edition }, sig ? { sig } : {}) });
   _assetsDirty = true; censusInvalidate();
 }
 function _nftMintReply(row, already) {
@@ -13088,6 +13490,12 @@ app.post("/market/buy-onchain", async (req, res) => {
   // acquired the goods HERE, which is the strongest provenance a material can have.
   ownSold(sellerWallet, String(row.kind || "mat"), String(row.item || ""), Number(row.qty) || 0);
   ownCredit(buyer, String(row.kind || "mat"), String(row.item || ""), Number(row.qty) || 0);
+  // same idem key as the soft rail — a listing settles exactly once on exactly one rail, and the
+  // idempotent re-POST above (prior.released) returns before this line ever runs twice
+  chronicleAdd("sale_onchain", sellerWallet, { sub: row.item, qty: Number(row.qty) || 0, val: Number(row.price) || 0,
+    route: "/market/buy-onchain", idem: "sale:" + id,
+    data: { kind: row.kind, buyer, sig, sellerNet: split.seller, teamTax: split.team },
+    agg: [["salep:" + String(row.kind || "mat") + ":" + String(row.item || ""), Number(row.qty) || 0]] });
   _usedTxSigs.set(sig, { listingId: id, buyer, released, ts: Date.now() });   // cache release for idempotent retry
   saveUsedSigs();
   // record the sale so the SELLER'S client shows the on-chain proceeds landed
@@ -13144,6 +13552,10 @@ app.post("/market/order-pay", async (req, res) => {
   // would be clamped out of the save the moment the v>=2 client ships.
   ownSold(String(fresh.fillerWallet || ""), String(fresh.kind || "mat"), String(fresh.item || ""), Number(fresh.qty) || 0);
   ownCredit(payer, String(fresh.kind || "mat"), String(fresh.item || ""), Number(fresh.qty) || 0);
+  // the order id is what _soldOrders de-dupes on — the idem key for the whole 75/20/5 settlement
+  chronicleAdd("order", String(fresh.fillerWallet || ""), { sub: fresh.item, qty: Number(fresh.qty) || 0,
+    val: Number(fresh.price) || 0, route: "/market/order-pay", idem: "order:" + id,
+    data: { kind: fresh.kind, payer, sig } });
   // goods to the POSTER (their client grants via the fills poll). Value-bearing: never cap-drop.
   // BOTH QUEUES STILL KEY ON THE ORDER ID, and they must: the filler's client matches this id
   // against its own my_deliveries record (Market.gd _deliv_done) and the poster's against its
@@ -13942,12 +14354,17 @@ function sweepAuctions(now) {
       const sarr = marketSales[a.sid] || (marketSales[a.sid] = []);
       if (!sarr.some(s => s.id === a.id))
         sarr.push({ id: a.id, item: a.species, kind: "chikimon", qty: 1, price: a.curBid, buyer: String(a.curSid).slice(0, 8), buyerName: a.curName || "a trainer", ts: now });
+      // the hammer settles once per auction id — the idem key, however many sweeps re-walk the list
+      chronicleAdd("auction", String(a.wallet || ""), { sub: a.species, qty: 1, val: Number(a.curBid) || 0,
+        route: "sweepAuctions", idem: "auc:" + a.id, data: { winner: String(a.curWallet || "").slice(0, 8), lvl: a.lvl } });
     } else {
       const rarr = marketFills[a.sid] || (marketFills[a.sid] = []);
       if (!rarr.some(f => f.id === a.id)) {
         rarr.push({ id: a.id, item: a.species, kind: "chikimon", qty: 1, lvl: a.lvl, xp: a.xp, price: 0, fillerName: a.seller, returned: true, why: "noBids", ts: now });
         // a no-bid return puts the creature back in the SELLER's hands — same reasoning as above
         recordAssetBuy(a.wallet, "chikimon", a.species, a.lvl);
+        chronicleAdd("auction_return", String(a.wallet || ""), { sub: a.species, qty: 1, route: "sweepAuctions",
+          idem: "aucr:" + a.id, data: { why: "noBids" } });
       }
     }
     releaseUnitFor(a.id);   // the auction is over: its creature can be listed again
@@ -14304,6 +14721,11 @@ app.post("/market/op", async (req, res) => {
       // Same bookkeeping as the on-chain path. The buyer here is a sid, not necessarily a wallet, so
       // only the SELLER's side is recordable — ownCredit ignores anything that is not a pubkey anyway.
       if (row) ownSold(String(row.wallet || ""), String(row.kind || "mat"), String(row.item || ""), Number(row.qty) || 0);
+      // the listing id is exactly what _soldListings de-dupes on, so it is the idem key here too
+      if (row) chronicleAdd("sale", String(row.wallet || row.sid || ""), { sub: row.item, qty: Number(row.qty) || 0,
+        val: Number(row.price) || 0, route: "/market/op:buy", idem: "sale:" + id,
+        data: { kind: row.kind, buyer: sid.slice(0, 8), soft: true },
+        agg: [["salep:" + String(row.kind || "mat") + ":" + String(row.item || ""), Number(row.qty) || 0]] });
     }
   } else if (op === "cancel" || op === "sold") {
     const id = stripTags(String(l.id || "")).slice(0, 40);
@@ -14707,6 +15129,7 @@ async function flushDurableState() {
       store.kvSet("meme_hatches", memeHatches),
       store.kvSet("meme_used_sigs", memeUsedSigs),
     ])],
+    ["chronicle", () => CHRONICLE_ON ? chronFlush() : Promise.resolve()],
     ["cup state", () => store.kvSet("cup_state", liveCup ? liveCup.snapshot() : null)],
     ["cup public flag", () => store.kvSet("cup_public", cupPublic)],
     ["cup auto flag", () => store.kvSet("cup_auto", cupAuto)],
