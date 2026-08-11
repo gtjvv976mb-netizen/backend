@@ -1711,7 +1711,7 @@ async function getStats() {
   try {
     const evs = liveEventsWire();
     if (evs) out.events = evs;
-    if (_founderCount > 0 || founderEventActive()) { out.founderClaimed = _founderCount; out.founderCap = FOUNDER_CAP; }
+    if (_founderCount > 0 || founderEventActive()) { out.founderClaimed = _founderCount; out.founderCap = FOUNDER_CAP; out.founderSpecies = founderPool(); }
   } catch (e) {}
   _statsCache = { t: Date.now(), data: out };
   return out;
@@ -2400,7 +2400,10 @@ app.get("/world/event", (_req, res) => {
   const extra = {};
   const evs = liveEventsWire();
   if (evs) extra.events = evs;
-  if (_founderCount > 0 || founderEventActive()) { extra.founderClaimed = _founderCount; extra.founderCap = FOUNDER_CAP; }
+  if (_founderCount > 0 || founderEventActive()) { extra.founderClaimed = _founderCount; extra.founderCap = FOUNDER_CAP;
+                                                   // the creatures THIS drop hands out — the client shows them, and it is
+                                                   // the only way to SEE that a redeploy kept the owner's named set
+                                                   extra.founderSpecies = founderPool(); }
   if (!fishEventActive()) return res.json(Object.assign({ active: false }, extra));
   res.json(Object.assign({ active: true, mult: _fishEvent.mult, ends: _fishEvent.ends, label: _fishEvent.label,
              remainingMs: Math.max(0, Number(_fishEvent.ends) - Date.now()) }, extra));
@@ -2454,7 +2457,13 @@ app.post("/admin/event/start", async (req, res) => {
   if (kind === "open_gates") {
     _openGates = { ends, label: label || "Open Gates" };
   } else {
-    _founderEvent = { ends, label: label || "Founder Drop" };
+    // THE POOL IS NAMED HERE. {species:["aurox","zephyra",...]} (or a comma-separated string) picks
+    // the exact creatures this drop hands out — the owner's NEW legendary set. Omitted, it falls back
+    // to FOUNDER_SPECIES and then to the game's existing legendaries. Sanitised like every input.
+    const rawSp = req.body?.species ?? req.query?.species;
+    const pool = (Array.isArray(rawSp) ? rawSp : String(rawSp || "").split(","))
+      .map((s) => String(s || "").trim().slice(0, 24)).filter(Boolean).slice(0, 50);
+    _founderEvent = { ends, label: label || "Founder Drop", pool };
     _founderLastSweep = Date.now();   // presence accrual starts at the start, never from a pre-event sweep
   }
   _evWireCache = { t: 0, v: null };
@@ -2463,7 +2472,8 @@ app.post("/admin/event/start", async (req, res) => {
     idem: "ev:" + kind + ":" + ends, data: { days, ends, label: label || null } });
   const out = { ok: true, event: kind, active: true, days, ends,
                 label: kind === "open_gates" ? _openGates.label : _founderEvent.label };
-  if (kind === "founder_drop") { out.cap = FOUNDER_CAP; out.perSpecies = FOUNDER_PER_SPECIES; out.claimed = _founderCount;
+  if (kind === "founder_drop") { out.cap = FOUNDER_CAP; out.perSpecies = founderPerSpecies(); out.claimed = _founderCount;
+                                 out.species = founderPool();   // the creatures THIS drop hands out
                                  out.bar = { minutes: FOUNDER_MIN_MS / 60000, actions: FOUNDER_MIN_ACTIONS }; }
   res.json(out);
 });
@@ -4963,13 +4973,23 @@ async function saveFishEvent() { try { await store.kvSet("fish_event", _fishEven
 // already claimed a founder drop.
 const FOUNDER_CAP = Math.max(1, Math.floor(Number(process.env.FOUNDER_CAP || 50)));
 const FOUNDER_PER_SPECIES = Math.max(1, Math.floor(Number(process.env.FOUNDER_PER_SPECIES || 10)));
-const FOUNDER_MIN_MS = Math.max(0, Number(process.env.FOUNDER_MIN_MINUTES || 15)) * 60000;
-const FOUNDER_MIN_ACTIONS = Math.max(1, Math.floor(Number(process.env.FOUNDER_MIN_ACTIONS || 3)));
+// THE BAR: 30 MINUTES **AND** 10 ACTIONS (owner ruling 2026-08-11, tightened from 15-or-3).
+// WHY BOTH: sign-in is free — the forensics lens generated 200 valid wallets in seconds — so with an
+// OR bar, one operator doing 3 quick actions on each of 50 throwaway wallets could legitimately take
+// every founder drop before an honest player finished a session. Requiring BOTH arms makes each
+// sybil wallet cost a real half-hour of proven in-world presence AND ten witnessed actions, while an
+// ordinary player crosses it in one normal play session. Not sybil-PROOF (nothing per-wallet is),
+// but it converts a minutes-long farm into an expensive one. Both arms stay env-tunable.
+const FOUNDER_MIN_MS = Math.max(0, Number(process.env.FOUNDER_MIN_MINUTES || 30)) * 60000;
+const FOUNDER_MIN_ACTIONS = Math.max(1, Math.floor(Number(process.env.FOUNDER_MIN_ACTIONS || 10)));
 const FOUNDER_ORIGIN = "open-gates-founder";   // the forever-distinguishable series marker
 const EVENT_MAX_DAYS = 30;
 const FOUNDER_ACTIVITY_MAX = 20000;            // bound the accumulator like every per-wallet map here
 let _openGates = { ends: 0, label: "" };
-let _founderEvent = { ends: 0, label: "" };
+// `pool` is the species the drop hands out, chosen at START (owner ruling 2026-08-11: the drop
+// awards a NEW legendary set made for it, not the game's existing five). Stored WITH the event so a
+// mid-event redeploy keeps handing out the same creatures; empty means "fall back to SPECIES_LEGEND".
+let _founderEvent = { ends: 0, label: "", pool: [] };
 // THE FOUNDER BOOK. Claims are permanent — one drop per wallet EVER, across restarts and across any
 // future run of the event — so they are persisted with the event state and never trimmed.
 let _founderClaims = Object.create(null);      // wallet -> { n, sp, id, ts }
@@ -4977,6 +4997,21 @@ let _founderCount = 0;                          // claims issued, 0..FOUNDER_CAP
 let _founderPerSp = Object.create(null);        // species -> issued (<= FOUNDER_PER_SPECIES each)
 const _founderActivity = new Map();             // wallet -> { ms, acts } — event-scoped, server-verified only
 let _founderLastSweep = 0;
+// THE DROP'S SPECIES POOL, and the per-species share derived from it. A pool named at start wins;
+// then FOUNDER_SPECIES from the environment; then the game's existing legendaries as a last resort.
+// perSpecies is ALWAYS derived from the live pool so the cap divides evenly no matter how many
+// species the owner creates (5 species -> 10 each; 2 -> 25 each; 50 -> 1 each).
+function founderPool() {
+  const named = Array.isArray(_founderEvent.pool) ? _founderEvent.pool.filter(Boolean) : [];
+  if (named.length) return named;
+  const env = String(process.env.FOUNDER_SPECIES || "").split(",").map(s => s.trim()).filter(Boolean);
+  if (env.length) return env;
+  return SPECIES_LEGEND;
+}
+function founderPerSpecies() {
+  const n = founderPool().length || 1;
+  return Math.max(1, Math.ceil(FOUNDER_CAP / n));
+}
 function openGatesActive(now = Date.now()) { return now < Number(_openGates.ends); }
 function founderEventActive(now = Date.now()) { return now < Number(_founderEvent.ends); }
 function normEventKind(v) {
@@ -5027,7 +5062,12 @@ async function restoreLiveEvents() {
     const le = await store.kvGet("live_events");
     if (!le || typeof le !== "object") return;
     if (le.openGates) _openGates = { ends: Number(le.openGates.ends) || 0, label: String(le.openGates.label || "").slice(0, 60) };
-    if (le.founder) _founderEvent = { ends: Number(le.founder.ends) || 0, label: String(le.founder.label || "").slice(0, 60) };
+    // the POOL restores with the event: a redeploy mid-drop must keep awarding the SAME creatures
+    // the owner named at start (dropping it here would silently fall back to the game's legendaries
+    // half-way through the series — the exact shape of the origin-clipping bug found on 2026-08-11).
+    if (le.founder) _founderEvent = { ends: Number(le.founder.ends) || 0, label: String(le.founder.label || "").slice(0, 60),
+                                      pool: (Array.isArray(le.founder.pool) ? le.founder.pool : [])
+                                              .map((s) => String(s || "").trim().slice(0, 24)).filter(Boolean).slice(0, 50) };
     if (le.founderClaims && typeof le.founderClaims === "object") {
       _founderClaims = Object.create(null);
       for (const w of Object.keys(le.founderClaims)) if (isPubkey(w)) _founderClaims[w] = le.founderClaims[w];
@@ -5083,7 +5123,10 @@ function founderPresenceTick(now = Date.now()) {
   }
   if (touched) void saveLiveEvents();
 }
-function founderBarMet(a) { return a.ms >= FOUNDER_MIN_MS || a.acts >= FOUNDER_MIN_ACTIONS; }
+// AND, not OR (owner ruling 2026-08-11). A founder must have BOTH the proven presence time and the
+// witnessed actions — see the FOUNDER_MIN_* constants for why. FOUNDER_MIN_MINUTES=0 degrades to
+// actions-only, which is the documented way to loosen it without another deploy.
+function founderBarMet(a) { return a.ms >= FOUNDER_MIN_MS && a.acts >= FOUNDER_MIN_ACTIONS; }
 function founderMaybeAward(wallet, a) { return founderBarMet(a) ? founderAward(wallet) : null; }
 // ---- THE AWARD: exactly-once per wallet, hard global cap, race-safe by construction --------------
 // Legendary chikimon are UNCAPPED in the registry (supplyOf -> 0), so the 50-cap lives HERE, and it
@@ -5096,10 +5139,16 @@ function founderAward(wallet) {
   if (!_assetsReady) return null;                       // registry still loading — retried on the next accrual
   if (_founderClaims[wallet]) return null;              // one drop per wallet, ever
   if (_founderCount >= FOUNDER_CAP) return null;        // series complete
-  // species: round-robin by claim number — exactly FOUNDER_PER_SPECIES per legendary at the cap
-  let sp = SPECIES_LEGEND[_founderCount % SPECIES_LEGEND.length];
-  if ((_founderPerSp[sp] || 0) >= FOUNDER_PER_SPECIES) {
-    sp = SPECIES_LEGEND.find((s) => (_founderPerSp[s] || 0) < FOUNDER_PER_SPECIES) || "";
+  // species: round-robin by claim number — exactly perSpecies per species at the cap.
+  // THE POOL IS THE EVENT'S, NOT THE GAME'S (owner ruling 2026-08-11): the drop hands out a NEW
+  // legendary set created for it, so the pool is chosen when the owner STARTS the drop and is stored
+  // with the event (a mid-event redeploy must keep handing out the same creatures). It falls back to
+  // the game's existing legendaries only if no pool was named.
+  const pool = founderPool();
+  const perSp = founderPerSpecies();
+  let sp = pool[_founderCount % pool.length];
+  if ((_founderPerSp[sp] || 0) >= perSp) {
+    sp = pool.find((s) => (_founderPerSp[s] || 0) < perSp) || "";
     if (!sp) return null;
   }
   const n = _founderCount + 1;
@@ -5120,7 +5169,7 @@ function founderAward(wallet) {
   let luid;
   do { luid = "u9" + String(crypto.randomInt(100000000)).padStart(8, "0"); } while (has(rec.units, luid));
   rec.units[luid] = { sp, kind: "legendary", lvl: 1, ts: Date.now(), origin: FOUNDER_ORIGIN, held: true };
-  regEvent(row, "founder", { number: n, of: FOUNDER_CAP, sp_number: _founderPerSp[sp], sp_of: FOUNDER_PER_SPECIES,
+  regEvent(row, "founder", { number: n, of: FOUNDER_CAP, sp_number: _founderPerSp[sp], sp_of: perSp,
                              luid, route: "founder-drop" });
   row.arrivedAt = Date.now();
   nftNewsPush(wallet, { kind: "arrived", id: row.id, type: "chikimon", sp, cls: "legendary", lvl: 1,
