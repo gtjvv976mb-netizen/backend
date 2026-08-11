@@ -8666,9 +8666,16 @@ const ME_TIMEOUT_MS = Math.max(2000, _meNum(process.env.ME_TIMEOUT_MS, 9000));
 // per key, SHARED by every player at once. A per-player passthrough on a popular tab is a guaranteed
 // outage: 40 players opening the Buy tab in one minute is already a third of the budget. One cached
 // copy serves everybody, and a stale copy beats an empty tab.
-const ME_CACHE_MS = Math.max(1000, _meNum(process.env.ME_CACHE_MS, 30000));
+// TTLs PER ENDPOINT FAMILY (Magic Eden's own guidance: cache locally, batch, small delays). The
+// aggregate token bucket below is what actually protects the quota, so the volatile families
+// (listings, a wallet's tokens) run SHORT — one shared upstream fetch per window serves every player
+// in it, and a browse tab is at most ~8-10s behind the book instead of 30-45s. The slow-moving
+// families (collection stats ~60s, the activity feed ~30s) stay long. When the bucket is spent a
+// short TTL never turns into extra upstream calls — meCached degrades to the last good copy instead.
+const ME_CACHE_MS = Math.max(1000, _meNum(process.env.ME_CACHE_MS, 8000));
 const ME_STATS_CACHE_MS = Math.max(1000, _meNum(process.env.ME_STATS_CACHE_MS, 60000));
-const ME_MINE_CACHE_MS = Math.max(1000, _meNum(process.env.ME_MINE_CACHE_MS, 45000));
+const ME_ACT_CACHE_MS = Math.max(1000, _meNum(process.env.ME_ACT_CACHE_MS, 30000));
+const ME_MINE_CACHE_MS = Math.max(1000, _meNum(process.env.ME_MINE_CACHE_MS, 10000));
 // The ONE read that must not be cached hard: the anti-stale-buy re-read of a single token's listing.
 // Short enough that a re-priced listing cannot slip through, long enough that a double-click does not
 // cost two calls.
@@ -8760,6 +8767,14 @@ async function meFetch(path, opts) {
     // client falls back to the Magic Eden deep link, which is exactly today's behaviour.
     if (!k) return { ok: false, status: 503, code: "no-key", error: "in-game trading is not switched on for this server yet — use the Magic Eden link" };
     headers.authorization = "Bearer " + k;
+    // KEY-DAY DISCIPLINE: an instruction call is an outbound Magic Eden call like any read, and it
+    // spends against the SAME 120 QPM key quota — so it spends from the SAME shared bucket. Money is
+    // allowed to QUEUE for a refill token (the bounded wait), but never to bypass the cap: past the
+    // wait it is a clean 429, not a silent upstream hit. A keyless server returned above and is
+    // byte-identical to before; the cached-read path never reaches this (reads pay inside meCached).
+    if (!meGlobalReadTake() && !(await meGlobalReadWait())) {
+      return { ok: false, status: 429, code: "budget", error: "the marketplace is busy right now — try again in a few seconds", retryInMs: 5000 };
+    }
   }
   let r;
   try { r = await fetch(u, { headers, signal: AbortSignal.timeout(ME_TIMEOUT_MS) }); }
@@ -8805,13 +8820,42 @@ function _meBucketTake(b, cap, perMin) {
 // read endpoints), so N throwaway wallets each making ONE uncached read exhaust it for everyone —
 // measured before this fix: 151 upstream reads from 150 zero-cost identities in 57 ms (126% of a whole
 // minute's quota, instantly). This is the missing aggregate ceiling: a token bucket over EVERY upstream
-// read, sized to sit UNDER Magic Eden's limit (burst 30 + refill 90/min => at most 120 in any 60 s
+// read, sized to sit UNDER Magic Eden's limit (burst 20 + refill 70/min => at most 90 in any 60 s
 // window). When it is spent, meCached serves the last good copy (stale) rather than a call it cannot
 // afford, so the browse tab degrades to stale-cache and never becomes an outage for honest players.
-const ME_GLOBAL_READ_PER_MIN = Math.max(1, _meNum(process.env.ME_GLOBAL_READ_PER_MIN, 90));
-const ME_GLOBAL_READ_BURST   = Math.max(1, _meNum(process.env.ME_GLOBAL_READ_BURST, 30));
+// SIZED AT ~90, NOT ~120 (2026-08-11): the original 30+90 could legally spend the WHOLE of Magic
+// Eden's 120 QPM in one rolling minute, leaving zero headroom for the day the instruction key
+// arrives — and every /v2/instructions/* call spends against the SAME shared quota. 20+70 caps any
+// rolling 60 s at 90, so ~30 QPM stays free for key-day buys/lists plus plain safety margin. This is
+// also the ONE bucket every outbound Magic Eden call shares: meCached spends from it for reads, and
+// meFetch spends from it for keyed instruction calls (see the auth branch), so "under the quota" is a
+// property of the PROCESS, not of one lucky path.
+const ME_GLOBAL_READ_PER_MIN = Math.max(1, _meNum(process.env.ME_GLOBAL_READ_PER_MIN, 70));
+const ME_GLOBAL_READ_BURST   = Math.max(1, _meNum(process.env.ME_GLOBAL_READ_BURST, 20));
 const _meGlobalRead = { tokens: ME_GLOBAL_READ_BURST, ts: Date.now() };
 function meGlobalReadTake() { return _meBucketTake(_meGlobalRead, ME_GLOBAL_READ_BURST, ME_GLOBAL_READ_PER_MIN); }
+// QUEUE, DON'T SLAM THE DOOR. When the bucket is empty and there is no cached copy to fall back on,
+// the old behaviour was an immediate 429. The refill is ~one token every 860 ms, so a caller who waits
+// a moment usually gets served — and because meCached creates its inflight promise SYNCHRONOUSLY,
+// everyone else asking the SAME question during that wait coalesces onto the one queued call instead
+// of queueing again. Bounded BOTH ways (time and depth) so a distinct-key flood cannot park unbounded
+// work here: past either bound it is the same clean 429 as before, never a silent upstream hit.
+const ME_BUDGET_WAIT_MS   = Math.max(0, _meNum(process.env.ME_BUDGET_WAIT_MS, 2000));
+const ME_BUDGET_QUEUE_MAX = Math.max(0, _meNum(process.env.ME_BUDGET_QUEUE_MAX, 50));
+const _meBudgetQ = { waiting: 0 };
+async function meGlobalReadWait() {
+  if (ME_BUDGET_WAIT_MS <= 0 || _meBudgetQ.waiting >= ME_BUDGET_QUEUE_MAX) return false;
+  _meBudgetQ.waiting++;
+  try {
+    const t0 = Date.now();
+    for (;;) {
+      const left = ME_BUDGET_WAIT_MS - (Date.now() - t0);
+      if (left <= 0) return false;
+      await new Promise(r => setTimeout(r, Math.min(150, left)));
+      if (meGlobalReadTake()) return true;
+    }
+  } finally { _meBudgetQ.waiting--; }
+}
 // ...and a PEEK, without spending, so an OPTIONAL read can decline. Not every upstream read is equally
 // entitled to the last token: a BUY needs one, and the forced re-read that removes a stale "no" is a
 // nicety on top. Measured: with no reserve, a burst of collection-tab re-reads emptied the bucket and
@@ -8842,14 +8886,24 @@ async function meCached(key, ttlMs, staleMs, fn) {
   }
   if (!e.inflight) {
     // D1: before spending one of the shared upstream budget's tokens, check it is affordable. If it is
-    // not, do NOT start a fetch — fall through to whatever cached copy we have (however stale). A burst
-    // of DISTINCT keys (the attack shape — unique offsets) each tries to take a token and is bounded;
+    // not and a last-good copy exists, do NOT start (or queue) a fetch — serve that copy, honestly
+    // flagged stale. Players never wait on the bucket when anything at all is servable. A burst of
+    // DISTINCT keys (the attack shape — unique offsets) each tries to take a token and is bounded;
     // a burst of the SAME key still costs one token because single-flight coalesces it below.
-    if (!meGlobalReadTake()) {
-      if (e.val !== null && e.val !== undefined) return { val: e.val, at: e.at, stale: true, cached: true, hit: "budget-stale", budget: "spent" };
-      return { val: null, at: 0, stale: false, cached: false, hit: "budget-empty", err: { status: 429, code: "budget", error: "the marketplace is busy right now — try again in a few seconds", retryInMs: 5000 } };
+    if (meGlobalReadSpare() < 1 && e.val !== null && e.val !== undefined) {
+      return { val: e.val, at: e.at, stale: true, cached: true, hit: "budget-stale", budget: "spent" };
     }
-    const p = (async () => { const r = await fn(); if (r && r.ok) { e.at = Date.now(); e.val = r.body; } return r; })();
+    // The inflight promise is created SYNCHRONOUSLY (its body runs to the first await before anything
+    // else can interleave), so every concurrent same-key request — including ones arriving while this
+    // one is still QUEUED for a budget token — coalesces here into ONE upstream call.
+    const p = (async () => {
+      if (!meGlobalReadTake() && !(await meGlobalReadWait())) {
+        return { ok: false, status: 429, code: "budget", error: "the marketplace is busy right now — try again in a few seconds", retryInMs: 5000 };
+      }
+      const r = await fn();
+      if (r && r.ok) { e.at = Date.now(); e.val = r.body; }
+      return r;
+    })();
     e.inflight = p;
     const clear = () => { if (e.inflight === p) e.inflight = null; };
     p.then(clear, clear);
@@ -8862,7 +8916,8 @@ async function meCached(key, ttlMs, staleMs, fn) {
   }
   const r = await inflight;
   if (r && r.ok) return { val: e.val !== null ? e.val : r.body, at: e.at || Date.now(), stale: false, cached: false, hit: "miss" };
-  if (e.val !== null && e.val !== undefined) return { val: e.val, at: e.at, stale: true, cached: true, hit: "stale-on-error", warn: r && r.error };
+  if (e.val !== null && e.val !== undefined) return { val: e.val, at: e.at, stale: true, cached: true, hit: (r && r.code === "budget") ? "budget-stale" : "stale-on-error", warn: r && r.error };
+  if (r && r.code === "budget") return { val: null, at: 0, stale: false, cached: false, hit: "budget-empty", err: r };
   return { val: null, at: 0, stale: false, cached: false, hit: "fail", err: r };
 }
 // INVALIDATE WHAT THIS SERVER KNOWS IS WRONG. Time-based expiry is right for a marketplace nobody here
@@ -9322,6 +9377,103 @@ app.get("/nft/market/listings", async (req, res, next) => {
     statsAsOf: s.at || null,
     // The honest one-word answer to "can the Buy button work at all right now".
     tradingReady: meKeyPresent(), poolBuy: ME_POOL_BUY,
+  });
+});
+
+// STATS — the keyless shop-window strip (floor, listed count, volume). Same "stats" cache key the
+// listings route already warms, so a client drawing both pays for ONE upstream read per 60 s window
+// across every player. Units are the 1e9 trap again: /v2/collections/{sym}/stats is LAMPORTS on every
+// money field (floorPrice, volumeAll, volume24hr, avgPrice24hr) where the listings rows are SOL — so
+// this route converts ONCE, here, and the client only ever sees *Sol fields. Every key is ABSENT
+// entirely when the collection has nothing to report (live keyless answer today:
+// {"symbol":"chiki_monsters","listedCount":0}) — has-key checked, never read as 0.
+app.get("/nft/market/stats", async (req, res, next) => {
+  if (!ME_MARKET_ON) return next();
+  if (!meBrowseGuard(res)) return;                            // browse surface: no key, no handover
+  const wallet = _meWallet(req);
+  if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
+  const rl = meRateOk(wallet, "read");
+  if (!rl.ok) return res.status(429).json({ error: rl.why, retryInMs: rl.retryInMs });
+  const s = await meCached("stats", ME_STATS_CACHE_MS, ME_STALE_MS,
+    () => meFetch(`/v2/collections/${encodeURIComponent(ME_SYMBOL)}/stats`, {}));
+  if (!s.val) {
+    const e = s.err || {};
+    return res.status(e.status === 429 ? 429 : 503).json({ error: e.error || "the marketplace is unreachable right now", retryInMs: e.retryInMs || 5000 });
+  }
+  const st = (typeof s.val === "object") ? s.val : {};
+  const lam = (k) => (Object.hasOwn(st, k) && Number.isFinite(Number(st[k]))) ? Number(st[k]) : null;
+  const sol = (k) => { const v = lam(k); return v === null ? null : v / 1e9; };
+  const now = Date.now();
+  res.json({
+    ok: true, symbol: ME_SYMBOL,
+    floorSol: sol("floorPrice"),
+    listedCount: lam("listedCount"),
+    // Magic Eden varies WHICH volume keys a collection carries (live 2026-08-11: okay_bears answers
+    // volume7d + avgPrice24hr and NO volumeAll; chiki_monsters answers listedCount alone) — so all
+    // four are offered and each is null when absent, never invented.
+    volumeAllSol: sol("volumeAll"),
+    volume24hSol: sol("volume24hr"),
+    volume7dSol: sol("volume7d"),
+    avgPrice24hSol: sol("avgPrice24hr"),
+    asOf: s.at, ageMs: Math.max(0, now - s.at), stale: !!s.stale, cached: !!s.cached,
+    tradingReady: meKeyPresent(),
+  });
+});
+
+// ACTIVITY — the keyless "what just happened" feed (recent sales, listings, delistings) from
+// /v2/collections/{sym}/activities. Shaped like the listings grid: a SMALL fixed-field row per event,
+// never a passthrough of Magic Eden's unbounded envelope; images ride the same keyed proxy as the
+// cards; the registry adds the name/species/edition it knows so a feed line can say
+// "Galador #3 sold for 2.5 SOL" instead of echoing a mint address. NOTE the units seam: unlike
+// /stats, an activities row's `price` is a SOL float (same family as a listings row) — echoed, not
+// divided. One shared cached copy per (offset,limit) page serves every player in the 30 s window.
+app.get("/nft/market/activity", async (req, res, next) => {
+  if (!ME_MARKET_ON) return next();
+  if (!meBrowseGuard(res)) return;                            // browse surface: no key, no handover
+  const wallet = _meWallet(req);
+  if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
+  const rl = meRateOk(wallet, "read");
+  if (!rl.ok) return res.status(429).json({ error: rl.why, retryInMs: rl.retryInMs });
+  const limit = Math.max(1, Math.min(50, Number(req.query.limit) || 20));
+  const offset = Math.max(0, Math.min(1000, Number(req.query.offset) || 0));
+  const c = await meCached(`act:${offset}:${limit}`, ME_ACT_CACHE_MS, ME_STALE_MS,
+    () => meFetch(`/v2/collections/${encodeURIComponent(ME_SYMBOL)}/activities`, { query: { offset, limit } }));
+  if (!c.val) {
+    const e = c.err || {};
+    return res.status(e.status === 429 ? 429 : 503).json({ error: e.error || "the marketplace is unreachable right now", retryInMs: e.retryInMs || 5000 });
+  }
+  const raw = Array.isArray(c.val) ? c.val : [];
+  const rows = [];
+  for (const a of raw.slice(0, limit)) {
+    if (!a || typeof a !== "object") continue;
+    const mint = String(a.tokenMint || "");
+    if (!isPubkey(mint)) continue;
+    const reg = meRowByMint(mint);
+    const price = Number(a.price);
+    const bt = Number(a.blockTime);
+    rows.push({
+      // "buyNow" | "list" | "delist" | "bid" | "cancelBid" — echoed and capped, never trusted further
+      event: String(a.type || "").slice(0, 24) || null,
+      mint,
+      priceSol: (Number.isFinite(price) && price > 0) ? price : null,
+      buyer: isPubkey(String(a.buyer || "")) ? String(a.buyer) : null,
+      seller: isPubkey(String(a.seller || "")) ? String(a.seller) : null,
+      at: (Number.isFinite(bt) && bt > 0) ? Math.round(bt * 1000) : null,   // blockTime is SECONDS
+      source: String(a.source || "").slice(0, 32) || null,
+      img: a.image ? meImgRef(String(a.image)) : null,
+      // the registry's half — same contract as a listing card: null when unknown, never invented
+      known: !!reg,
+      name: reg ? String(nftAssetName(reg)).slice(0, 64) : null,
+      sp: reg ? reg.sp : null,
+      kind: reg ? (reg.kind || null) : null,
+      edition: reg ? (reg.edition || null) : null,
+    });
+  }
+  const now = Date.now();
+  res.json({
+    ok: true, symbol: ME_SYMBOL, rows, count: rows.length, offset, limit,
+    more: raw.length >= limit,
+    asOf: c.at, ageMs: Math.max(0, now - c.at), stale: !!c.stale, cached: !!c.cached,
   });
 });
 
@@ -10059,6 +10211,12 @@ app.get("/nft/market/config", (req, res, next) => {
              // `tradingReady` kept for older clients (= a key is configured); prefer `buyReady`. When
              // the market is not capable it is forced false so an old client also falls back to the link.
              tradingReady: ME_MARKET_CAPABLE && meKeyPresent(), browseReady: ME_BROWSE_ON, poolBuy: ME_POOL_BUY,
+             // THE KEYLESS EXTRAS (2026-08-11): the browse surface also carries a stats strip and an
+             // activity feed — both keyless, both served from this server's shared cache. The client
+             // lights those panels off THESE booleans, not off a new flag and not by probing the
+             // routes; they ride canBrowse exactly like the grid.
+             statsReady: ME_BROWSE_ON, activityReady: ME_BROWSE_ON,
+             statsCacheMs: ME_STATS_CACHE_MS, activityCacheMs: ME_ACT_CACHE_MS,
              priceMinSol: ME_PRICE_MIN_SOL, priceMaxSol: ME_PRICE_MAX_SOL,
              royalty: { bps: NFT_ROYALTY_BPS, wallet: NFT_ROYALTY_WALLET, model: "collection-inherited",
                         // HONEST: the server REPORTS 20%, but Core enforces royalty through a
@@ -10084,7 +10242,10 @@ export function _meFlagsForTest() {
            // SHIPPED window rather than restating one. (see meBookGuardOn)
            bookGuard: meBookGuardOn(), guardMode: ME_GUARD_MODE,
            eggGuardTtlMs: ME_EGG_GUARD_TTL_MS, eggGuardMaxAgeMs: ME_EGG_GUARD_MAXAGE_MS,
-           mineCacheMs: ME_MINE_CACHE_MS, tokenCacheMs: ME_TOKEN_CACHE_MS, markerGraceMs: ME_MARKER_GRACE_MS };
+           mineCacheMs: ME_MINE_CACHE_MS, tokenCacheMs: ME_TOKEN_CACHE_MS, markerGraceMs: ME_MARKER_GRACE_MS,
+           // the keyless-surface knobs (2026-08-11), so sims measure the SHIPPED values
+           actCacheMs: ME_ACT_CACHE_MS, statsCacheMs: ME_STATS_CACHE_MS,
+           budgetWaitMs: ME_BUDGET_WAIT_MS, budgetQueueMax: ME_BUDGET_QUEUE_MAX };
 }
 export function _meCacheClearForTest() { _meCache.clear(); _meRate.clear(); _meIntents.clear(); _meImg.clear(); _meImgBody.clear(); _meMineRefetchAt.clear(); _meMintIdx = null; }
 export function _meTxOutForTest(body) { return meTxOut(body); }
