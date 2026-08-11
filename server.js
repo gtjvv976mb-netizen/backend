@@ -4105,7 +4105,14 @@ setInterval(() => {
 const pvpQueue = [];                  // [{wallet, snap, ts}] players waiting for a live opponent
 const pvpPlayerMatch = new Map();     // wallet -> their current matchId (so cup + queued players can find their battle)
 // Count of ONLINE players who own a Legendary (= eligible to battle in the Chikiseum). Cached to avoid DB load.
-const PVP_LEGEND_SP = new Set([10, 11, 12, 13, 14]);   // legendary species indices
+// THE WIRE INDEX, NOT THE SPECIES STRING. store.world rows carry the client's compact companion code
+// (Net.gd:1006 `10 + LEG_ORDER.find(sp)`), so this set has to speak the same encoding: LEG_ORDER is
+// the 5 legendaries (10-14) then the 6 memes (15-20), and the six NEW legendaries append after them
+// at 21-26. Without 21-26 the live "N online eligible" pill would silently undercount every trainer
+// whose only Legendary is one of the new six — they ARE eligible (cupSnapFromBody :1496 gates on the
+// registry row's kind, which is "legendary" for all eleven), they just would not be counted.
+const PVP_LEGEND_SP = new Set([10, 11, 12, 13, 14,          // galador adalor tyrannos grovador dragonos
+                               21, 22, 23, 24, 25, 26]);    // astraya bamboran borealon horoxyn rivaros solvarex
 let _pvpOnlineCache = { n: 0, t: 0 };
 async function eligibleOnline() {
   const now = Date.now();
@@ -6963,7 +6970,24 @@ let _meMintIdx = null, _meMintIdxAt = 0;
 // mismatch shows up as a species the client cannot render rather than as a silent exploit.
 const SPECIES_NORMAL = Object.freeze(["drolax", "electrox", "firix", "forestle", "healix",
                                       "jellox", "mushrow", "owzard", "scorplex", "solarix"]);
-const SPECIES_LEGEND = Object.freeze(["galador", "adalor", "tyrannos", "grovador", "dragonos"]);
+// THE LEGENDARY ROSTER GREW 5 -> 11 (owner ruling 2026-08-11: "same mechanics, no special
+// treatment"). astraya/bamboran/borealon/horoxyn/rivaros/solvarex are ORDINARY legendaries — they
+// hatch from a legendary egg out of the same uniform pool, carry the same kind:"legendary", the same
+// cap 0 (uncapped), the same Cup eligibility, the same NFT tier and the same census row as the
+// original five. There is deliberately NO branch anywhere that names them: everything below reads
+// this one list, so the six are indistinguishable from galador downstream.
+//
+// APPENDED, NEVER INSERTED. profile.chikis speaks in INDICES (spFromChikiIndex :9072 — 0-9 normal,
+// 10-14 legend, 15-20 meme) and sanitizeProfile clamps c.sp to 0..20 (:186), so inserting here would
+// renumber every Meme Dynasty index in every stored legacy roster. The six live only in the
+// registry/ledger, which is keyed by species STRING; spFromChikiIndex stays frozen at 21 entries and
+// answers null for anything past 20, which is what keeps a legacy index from ever naming one.
+//
+// EGG ODDS, measured (eggPoolFor :8439 + the uniform roll at :8760): a fresh wallet's legendary egg
+// was 1/5 = 20.0000% per species and is now 1/11 = 9.0909%. The pool filters species already owned,
+// so a complete legendary set is exactly 11 legendary eggs (no duplicate rolls), up from 5.
+const SPECIES_LEGEND = Object.freeze(["galador", "adalor", "tyrannos", "grovador", "dragonos",
+                                      "astraya", "bamboran", "borealon", "horoxyn", "rivaros", "solvarex"]);
 const SPECIES_MEME   = Object.freeze(["popcat", "moodeng", "doge", "pepe", "chillguy", "alon"]);
 // supply-weighted exactly as Econ.MOUNTS: the Mythic griffin is the longest shot, and rolling it
 // server-side is the point — a crafted save used to simply name it.
@@ -9071,6 +9095,11 @@ let _regBackfillRuns = 0, _regBackfillRows = 0;
 
 // profile.chikis speaks in species INDICES: 0-9 the SPECIES_NORMAL order, 10-14 SPECIES_LEGEND,
 // 15-20 SPECIES_MEME (sanitizeProfile's own 21-species dex comment).
+// FROZEN AT 21 ON PURPOSE. SPECIES_LEGEND now holds ELEVEN, but this map still stops at 14: the six
+// new legendaries have no legacy index and must never acquire one, because sanitizeProfile clamps
+// c.sp to 0..20 (:186) — an index of 21+ would be silently rewritten to 20 (alon), i.e. a legendary
+// would become a meme in the stored roster. The six live in the registry/ledger only, keyed by
+// species string, which is the sole path the MMO writes anyway (the client only ever READS chikis).
 function spFromChikiIndex(i) {
   i = i | 0;
   if (i >= 0 && i <= 9) return SPECIES_NORMAL[i];
@@ -13014,7 +13043,14 @@ function worldMoveApply(b) {
 
     x: px, y: py, z: pz, dir: Math.round(clampF(b.dir, -7, 7, 0) * 1000) / 1000,   // 3dp — do NOT round coarser (yaw stepping)
     handle: stripTags(String(b.handle || "Trainer")).slice(0, 20),
-    leg: clampF(b.leg, 0, 20, 14) | 0,                 // companion species index
+    // COMPANION SPECIES INDEX, in the client's own wire encoding (Net.gd `10 + LEG_ORDER.find(sp)`:
+    // 10-14 the five original legendaries, 15-20 the Meme Dynasty, 21-26 the six new legendaries).
+    // The ceiling was 20 and would have silently rewritten every one of the six to 20 (= alon) —
+    // the same clamp trap as profile.chikis at :186, and exactly the kind of "legendary quietly
+    // becomes something else" bug this roster change has to avoid. Widened to 26; an OLD client
+    // receiving 21-26 still clamps it to its own LEG_ORDER length as it always did, so nothing
+    // regresses for a stale build, and a current one renders the right creature.
+    leg: clampF(b.leg, 0, 26, 14) | 0,
     el: stripTags(String(b.el || "Fire")).slice(0, 10),
     avatar: stripTags(String(b.avatar || "classic")).slice(0, 20),   // player's chosen look → remote renders the real rig
     comp: stripTags(String(b.comp || "")).slice(0, 24),              // player's lead chikimon → remote renders it beside them
