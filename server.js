@@ -7464,6 +7464,22 @@ const NFT_COLLECTION = String(process.env.NFT_COLLECTION || "").trim() || null;
 const NFT_META_BASE = String(process.env.NFT_META_BASE || "").trim().replace(/\/+$/, "");
 // Per-species art for the metadata `image` (display only; omitted when unset — never a broken guess).
 const NFT_IMAGE_BASE = String(process.env.NFT_IMAGE_BASE || "").trim().replace(/\/+$/, "");
+// ---- the COLLECTION document's own facts (served at GET /assets/nft/collection) ----------------
+// The name is NOT a choice made here. "Chiki Monsters" is the string already written into the Core
+// collection ACCOUNT on mainnet — read back from 2iyJEoY5… on 2026-08-12, not recalled. The doc must
+// agree with the chain, so the default IS the on-chain value and the env var exists only for the day
+// the on-chain name is deliberately changed (both must move together, or an indexer sees two names).
+const NFT_COLLECTION_NAME = String(process.env.NFT_COLLECTION_NAME || "Chiki Monsters").trim() || "Chiki Monsters";
+// The collection TILE — the square Phantom and Magic Eden render for the collection as a whole, which
+// is a different job from a creature's card: it is seen at ~64px, so it must be legible tiny and must
+// stand for the whole collection rather than for one member. Defaults to <NFT_IMAGE_BASE>/collection.png,
+// which sits in the same tree as the per-species art the meta route already serves. Overridable by env
+// so the tile can be re-pointed without a deploy — and left EMPTY rather than guessed if no base is set.
+const NFT_COLLECTION_IMAGE = String(process.env.NFT_COLLECTION_IMAGE || "").trim();
+// Where `external_url` sends a human who clicks through from a wallet or marketplace. Defaults to the
+// API origin only because that is the one host guaranteed to be reachable; set this to the game's front
+// door (https://chikimonsters.com) so a curious buyer lands on the game rather than on a JSON route.
+const NFT_COLLECTION_SITE = String(process.env.NFT_COLLECTION_SITE || "").trim().replace(/\/+$/, "");
 const NFT_EXPLORER_BASE = String(process.env.NFT_EXPLORER_BASE || "https://solscan.io/token").trim().replace(/\/+$/, "");
 // How long a reserved-but-unconfirmed mint address holds its row before it may be abandoned. In-memory
 // `_nftMinting` dies with the process; `row.mintPending` is the CRASH-DURABLE half of the same claim.
@@ -10651,6 +10667,73 @@ app.get("/assets/nft/config", (req, res) => {
     origins: [...NFT_MINT_ORIGINS], eggOrigins: EGG_NFT_ON ? [...EGG_NFT_ORIGINS] : undefined });
 });
 
+// THE COLLECTION'S OWN metadata JSON — the sibling of /assets/nft/meta/:id, one level up.
+//
+// WHY THIS EXISTS. The live Core collection 2iyJEoY5… carries the URI
+// https://gateway.irys.xyz/5KYrq8kJqGViAxDwnd7uByn8rqcanqwkUb6yWDKjTd1t, which 302s to
+// <…>.mainnet-1.datasprite-cdn.com and THAT HOST NO LONGER RESOLVES (NXDOMAIN, measured 2026-08-12).
+// So the collection's metadata is unreachable to every indexer alive. Two consequences, both observed:
+// Magic Eden renders each child with the right on-chain NAME but "image":"" / "attributes":[] because
+// it hangs the whole collection's display off the collection doc it cannot read; and Phantom files the
+// collection as SPAM, which is precisely its profile for "no resolvable metadata, no collection image".
+// The per-asset half was never the problem — /assets/nft/meta/:id has always answered 200 with art and
+// ten provenance traits (re-verified today from three independent vantage points).
+//
+// THE FIX IS TO STOP DEPENDING ON A THIRD PARTY'S CDN. This backend already hosts the per-asset
+// certificates; the collection doc belongs beside them, on a host we control and can re-point without
+// asking anyone. The on-chain URI is then moved here ONCE by update_collection_uri.mjs.
+//
+// EVERY FACT BELOW IS REUSED, NOT INVENTED. name is the string already written into the collection
+// ACCOUNT on chain ("Chiki Monsters" — read from mainnet, not from memory); symbol matches the
+// per-asset docs; royalty and collection address come from the same NFT_ROYALTY_* / NFT_COLLECTION
+// constants /assets/nft/config publishes, so the two routes can never drift apart.
+//
+// DELIBERATELY NOT GATED ON `_assetsReady`, unlike meta/:id. That route reads a registry row and
+// genuinely cannot answer before the ledger loads; this one is pure configuration and touches no row.
+// A 503 here during a restart is a failure an indexer may cache for days — the exact class of outage
+// being fixed — so this route answers from the moment the process is listening.
+//
+// Flag-off it does not exist at all: `next()` reproduces today's 404 on a URL that has never answered,
+// the same discipline /assets/nft/meta/:id uses, rather than inventing a new 503.
+app.get("/assets/nft/collection", (req, res, next) => {
+  if (!NFT_MINT_ON) return next();
+  const out = {
+    name: NFT_COLLECTION_NAME, symbol: "CHIKI",
+    // Written to be defensible line by line. It does NOT claim every member was witnessed being born,
+    // because the registry itself does not claim that — `witness` is one of server-hatched,
+    // server-issued or player-reported, and the per-asset metadata states which. Saying so here is
+    // both honest and the more interesting claim: most collections cannot say it at all.
+    description: "The creatures, mounts and eggs of Chikoria — a hand-built HD-voxel world. Every Chiki Monster comes from the game itself: raised, tended and recorded by the Chikoria registry, then certified on chain with its full history attached. Each token's Attributes state plainly how its record is backed — server-hatched, server-issued or player-reported — rather than pretending they are all the same.",
+  };
+  // Same "never a broken guess" rule the per-asset route follows: an image key is emitted only when a
+  // base to build it from is configured. An empty `image` is worse than an absent one — it is exactly
+  // the field whose emptiness Phantom reads as spam.
+  const img = NFT_COLLECTION_IMAGE || (NFT_IMAGE_BASE ? `${NFT_IMAGE_BASE}/collection.png` : "");
+  if (img) {
+    out.image = img;
+    // The Metaplex `properties.files` block. Aggregators that predate Core still look here for the
+    // media rather than at the bare `image` string, and it costs one object to satisfy both readers.
+    out.properties = { category: "image", files: [{ uri: img, type: "image/png" }] };
+  }
+  if (NFT_META_BASE) out.external_url = NFT_COLLECTION_SITE || NFT_META_BASE;
+  // Royalty, stated twice on purpose and identically both times. Core ENFORCES royalty through the
+  // collection's on-chain Royalties plugin (2000 bps to the pool wallet — read back from mainnet), and
+  // that plugin is the only thing that binds anyone. These two legacy keys bind nobody; they exist so
+  // a marketplace that reads its royalty DISPLAY out of the JSON shows the same number the chain will
+  // charge, instead of showing 0% next to a collection that actually takes 20%.
+  out.seller_fee_basis_points = NFT_ROYALTY_BPS;
+  if (NFT_ROYALTY_WALLET) out.creators = [{ address: NFT_ROYALTY_WALLET, share: 100 }];
+  // The collection this document describes, named in the document itself. An indexer that reached here
+  // from a child token can confirm it landed on the right doc without trusting the URL it followed.
+  if (NFT_COLLECTION) out.collection = { name: NFT_COLLECTION_NAME, family: NFT_COLLECTION_NAME, address: NFT_COLLECTION };
+  out.standard = "core";
+  // A collection doc is immutable in practice and read by crawlers far more often than it changes.
+  // Letting Cloudflare and the indexers hold it for an hour turns a metadata fetch storm into one
+  // origin hit, and `public` is honest: there is nothing per-caller in this response.
+  res.set("Cache-Control", "public, max-age=3600");
+  res.json(out);
+});
+
 // The metadata JSON every minted asset's on-chain `uri` points at (public — a certificate nobody can
 // read is not one). Flag-off it does not exist at all: `next()` reproduces today's 404 exactly, rather
 // than inventing a new 503 on a URL that has never answered.
@@ -10682,9 +10765,18 @@ app.get("/assets/nft/meta/:id", (req, res, next) => {
   };
   // an egg has no species (r.sp IS its kind), so its art path is named outright rather than landing on
   // the right file by coincidence of the per-species convention
-  if (NFT_IMAGE_BASE) out.image = isEgg
-    ? `${NFT_IMAGE_BASE}/egg/${encodeURIComponent(String(r.kind || r.sp))}.png`
-    : `${NFT_IMAGE_BASE}/${encodeURIComponent(r.type)}/${encodeURIComponent(r.sp)}.png`;
+  if (NFT_IMAGE_BASE) {
+    out.image = isEgg
+      ? `${NFT_IMAGE_BASE}/egg/${encodeURIComponent(String(r.kind || r.sp))}.png`
+      : `${NFT_IMAGE_BASE}/${encodeURIComponent(r.type)}/${encodeURIComponent(r.sp)}.png`;
+    // A TOP-LEVEL `image` IS NOT ENOUGH — DAS indexers read properties.files, and Magic Eden reads DAS.
+    // Measured 2026-08-13: DAS had already fetched Galador #6's metadata successfully (json_uri right,
+    // name right, all 10 attributes stored) yet recorded content.files = [] and no links.image, so ME
+    // rendered "image": "". Correlated against 8 live mainnet Core assets pulled from recent Core-program
+    // activity: 8/8 with properties.files had an indexed image, and the only one without — ours — did not.
+    // The block below is what those eight carry.
+    out.properties = { category: "image", files: [{ uri: out.image, type: "image/png" }] };
+  }
   if (NFT_META_BASE) out.external_url = `${NFT_META_BASE}/assets/cert?id=${encodeURIComponent(r.id)}`;
   res.json(out);
 });

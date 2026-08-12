@@ -1231,3 +1231,70 @@ the RPC URL, the delegate secret or the treasury secret; `/stats.clientRpc === "
 byte-identical to `git HEAD:server.js` (`_adv_nftoff_sim` 27/0, `_nft_offdiff` 13/0,
 `_nft_offdiff2` 19/0). Regression subset unchanged; `_av_census_attack_sim.mjs` 58/2 is
 **pre-existing** — bisected, `git HEAD:server.js` produces the identical two failures.
+
+## 17. An ERROR MESSAGE is a credential channel — the owner-run signer tool (2026-08-13)
+
+Section 5 says a public endpoint must never echo a server credential. This is the same class one step
+further out: **a local tool the owner runs by hand leaked the signing key to the terminal**, and it did
+so through the one surface nobody audits — the text of a caught exception.
+
+`chiki-backend/update_collection_uri.mjs` (a one-shot tool that repoints the Core collection's
+metadata URI) read a keypair from a path the owner passes, and on a parse failure printed
+`  ${e.message}`. Neither decoder on that path throws a generic error:
+
+    base58.serialize("<88-char export with one bad character>")
+      -> Error: Expected a string of base 58, got [<THE ENTIRE 88-CHARACTER KEY>]
+    JSON.parse("[2,113,114,X115,...]")
+      -> SyntaxError: Unexpected token 'X', ..."3,104,105,X106,107,1"... is not valid JSON
+         (a ~20-character window of the LEADING bytes of the secret scalar)
+
+Both landed on stderr two lines above the sentence *"The file's contents were NOT printed"*. The
+near-miss case is the dangerous one: a one-character-corrupted 88-char key, seen on a terminal, a
+screen share or pasted into a support chat, is brute-forceable in roughly 5,000 tries.
+
+**Five leak paths were proven with synthetic sentinel keys** (no real key ever used; all inputs
+deleted afterwards; RPC pointed at `127.0.0.1:9`, never mainnet):
+
+| # | input | what was printed |
+|---|---|---|
+| 1 | 88-char base58 with one non-base58 char | the whole key |
+| 2 | a valid export wrapped in quotes | the whole key + quotes |
+| 3 | JSON array with a stray char early / late | a 15-20 char window of the leading / trailing bytes |
+| 4 | the key pasted **as** `--keypair`'s value, or in `CHIKI_SIGNER_KEYPAIR` | the whole key, via `keypair file not found: ${KEYPATH}` |
+| 5 | any RPC error on a non-mainnet run | the RPC URL — i.e. the Helius api-key — via `network : ${onMainnet ? "MAINNET" : RPC}` |
+
+Path 4 is foreseeable rather than exotic: the tool's own help says "a Phantom base58 export is also
+accepted", so pasting the export where a filename belongs is a normal misreading. Path 5 is the
+third occurrence of the section-5 class.
+
+### The rules that came out of it
+
+1. **Never bind the exception in a key-parsing block.** `catch { keyFail = CATEGORY }` — with no `e`
+   in scope there is nothing to interpolate by accident. Failures map to a fixed sentence ("the file
+   is not valid base58", "…not valid JSON", "…is not 64 bytes"). A byte COUNT is safe; nothing else
+   derived from the input is.
+2. **Report the failure OUTSIDE the block.** `process.exit()` does not run `finally`, so `die()` from
+   inside the catch skipped the `secret.fill(0)` scrub on the only path that needed it.
+3. **Shape-check every argv value that is echoed.** A path contains a slash or is short; a Solana
+   address is 32-44 base58 chars; a key export is 87-88. Anything that fails its shape is refused
+   *without being quoted back*, because a key one flag out of place (`--collection`, `--uri`, `--rpc`)
+   prints just as readily as one in the right flag.
+4. **Never print the RPC endpoint, on any cluster.** Print a label (`MAINNET`, `devnet (endpoint not
+   printed)`). Helius carries the key in the query string, QuickNode in the path.
+5. **One redactor guards everything else.** `safe()` strips control bytes, the exact RPC string, any
+   URL, comma-separated byte runs and any 64+ character unbroken token, and it is the only way an
+   error reaches a console. `uncaughtException` / `unhandledRejection` handlers print one redacted
+   line and no stack — in Node 24 a post-`await` top-level throw goes to `uncaughtException`.
+
+### Verified
+
+38 cases across three probes, **0 leaking**, against the patched file
+(md5 `030889020d9743213f25a780098af770`). Detection was not substring matching — that under-reports,
+because `JSON.parse` echoes a window from the middle of the file — but the **longest common substring
+between the input file and the captured stdout+stderr**, flagged at 10 characters. Post-fix the worst
+common run across every malformed case is 2 characters. The safety properties held throughout: no
+`writeFile`/`appendFile`/`createWriteStream`/`execSync`/`spawn` anywhere (grep 0), `secret` confined
+to one lexical block and zeroed in `finally`, no default keypair path or `~/.config` search, dry run
+still the default, exactly one `sendAndConfirm` directly under the `if (!COMMIT) { … exit(0) }` gate,
+simulation still `sigVerify:false`, and the `--check-url` preflight still refuses a 404, a non-JSON
+body, a missing `image` and a dead image (proven against a local stub, never the live backend).
