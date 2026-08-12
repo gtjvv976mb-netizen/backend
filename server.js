@@ -1246,30 +1246,37 @@ function crownChampion() {   // capture the winner of the just-finished cup as t
 // Per-character supply = rarity. Fewer editions = rarer. `weight` = pull odds (set to the cap so each
 // character depletes proportionally and the scarcer ones are genuinely harder to hatch).
 const MEME_CHARS = [
-  { key: "pepe",    name: "Pepe",      cap: 25, weight: 25, rarity: "Meme Legendary" },
-  { key: "popcat",  name: "Popcat",    cap: 20, weight: 20, rarity: "Meme Legendary" },
-  { key: "moodeng", name: "Moo Deng",  cap: 20, weight: 20, rarity: "Meme Legendary" },
-  { key: "doge",    name: "Doge",      cap: 15, weight: 15, rarity: "Meme Legendary" },
-  { key: "chillguy",name: "Chill Guy", cap: 15, weight: 15, rarity: "Meme Legendary" },
-  { key: "alon",    name: "Alon",      cap: 10, weight: 10, rarity: "Founder's Edition" },  // rarest — its own tier
+  { key: "pepe",    name: "Pepe",      cap: 25, weight: 25, rarity: "Meme Legendary", wave: 1 },
+  { key: "popcat",  name: "Popcat",    cap: 20, weight: 20, rarity: "Meme Legendary", wave: 1 },
+  { key: "moodeng", name: "Moo Deng",  cap: 20, weight: 20, rarity: "Meme Legendary", wave: 1 },
+  { key: "doge",    name: "Doge",      cap: 15, weight: 15, rarity: "Meme Legendary", wave: 1 },
+  { key: "chillguy",name: "Chill Guy", cap: 15, weight: 15, rarity: "Meme Legendary", wave: 1 },
+  { key: "alon",    name: "Alon",      cap: 10, weight: 10, rarity: "Founder's Edition", wave: 1 },  // rarest — its own tier
   // ---- WAVE 2 (2026-08-12): the owner's eleven new Meme Dynasty characters. APPENDED, NEVER
   // INSERTED — same discipline as SPECIES_MEME/SPECIES_LEGEND below. Order here feeds nothing but
   // pickMeme's weighted roll; `weight` stays equal to `cap` so every character depletes
   // proportionally and the scarce ones (cap 10) are genuinely the long shots. Caps are the owner's
   // exact numbers and are the ONLY authority — Econ.MEME_NFT on the client mirrors them for display.
-  { key: "ansem",        name: "Ansem Blackbull", cap: 10, weight: 10, rarity: "Meme Legendary" },
-  { key: "successkid",   name: "Success Kid",     cap: 10, weight: 10, rarity: "Meme Legendary" },
-  { key: "chloe",        name: "Side-eye Chloe",  cap: 10, weight: 10, rarity: "Meme Legendary" },
-  { key: "grumpycat",    name: "Grumpy Cat",      cap: 20, weight: 20, rarity: "Meme Legendary" },
-  { key: "peanut",       name: "Peanut",          cap: 20, weight: 20, rarity: "Meme Legendary" },
-  { key: "cryingcat",    name: "Crying Cat",      cap: 15, weight: 15, rarity: "Meme Legendary" },
-  { key: "thisisfine",   name: "This Is Fine Dog",cap: 15, weight: 15, rarity: "Meme Legendary" },
-  { key: "babygoat",     name: "Proud Baby Goat", cap: 15, weight: 15, rarity: "Meme Legendary" },
-  { key: "triplet",      name: "Triple T",        cap: 25, weight: 25, rarity: "Meme Legendary" },
-  { key: "stonks",       name: "Stonks",          cap: 20, weight: 20, rarity: "Meme Legendary" },
-  { key: "nervousmonkey",name: "Nervous Monkey",  cap: 20, weight: 20, rarity: "Meme Legendary" },
+  { key: "ansem",        name: "Ansem Blackbull", cap: 10, weight: 10, rarity: "Meme Legendary", wave: 2 },
+  { key: "successkid",   name: "Success Kid",     cap: 10, weight: 10, rarity: "Meme Legendary", wave: 2 },
+  { key: "chloe",        name: "Side-eye Chloe",  cap: 10, weight: 10, rarity: "Meme Legendary", wave: 2 },
+  { key: "grumpycat",    name: "Grumpy Cat",      cap: 20, weight: 20, rarity: "Meme Legendary", wave: 2 },
+  { key: "peanut",       name: "Peanut",          cap: 20, weight: 20, rarity: "Meme Legendary", wave: 2 },
+  { key: "cryingcat",    name: "Crying Cat",      cap: 15, weight: 15, rarity: "Meme Legendary", wave: 2 },
+  { key: "thisisfine",   name: "This Is Fine Dog",cap: 15, weight: 15, rarity: "Meme Legendary", wave: 2 },
+  { key: "babygoat",     name: "Proud Baby Goat", cap: 15, weight: 15, rarity: "Meme Legendary", wave: 2 },
+  { key: "triplet",      name: "Triple T",        cap: 25, weight: 25, rarity: "Meme Legendary", wave: 2 },
+  { key: "stonks",       name: "Stonks",          cap: 20, weight: 20, rarity: "Meme Legendary", wave: 2 },
+  { key: "nervousmonkey",name: "Nervous Monkey",  cap: 20, weight: 20, rarity: "Meme Legendary", wave: 2 },
 ];
 const MEME_KEYS = new Set(MEME_CHARS.map(c => c.key));
+// THE WAVE-2 LIST, DERIVED — NOT A COPY. The Founder Drop hands out the eleven 2026-08-12 Meme
+// Dynasty characters (owner ruling 2026-08-12), and those eleven are HARD-CAPPED per species while
+// the legendaries the drop used to award are uncapped. A hand-typed eleventh copy of the list is
+// exactly how a cap breaks, so the drop's pool is read off the `wave` tag on the one table above:
+// add a character there and it joins the drop; change a cap there and the drop's reservation moves
+// with it. Nothing downstream may write these keys down again.
+const MEME_WAVE2 = Object.freeze(MEME_CHARS.filter(c => c.wave === 2).map(c => c.key));
 const MEME_CAP = Number(process.env.MEME_EDITION_CAP || 10);   // fallback cap if a character has none
 const capOf = (key) => { const c = MEME_CHARS.find(x => x.key === key); return (c && c.cap) || MEME_CAP; };
 const rarityOf = (key) => { const c = MEME_CHARS.find(x => x.key === key); return (c && c.rarity) || "Meme Legendary"; };
@@ -1320,18 +1327,43 @@ async function verifyEggPayment(sig, wallet) {
 }
 // how many eggs are claimed (bought) — incubating(mystery) + pending + minted all hold a slot against MEME_TOTAL.
 function memeReserved() { return memeHatches.filter(h => h.status === "incubating" || h.status === "pending" || h.status === "minted").length; }
+// FINDING #3 (2026-08-12): how many Meme Dynasty copies a normal buyer can STILL hatch right now.
+// REGISTRY-AWARE (memeIssued counts EVERY birth route — registry rows, the legacy ledger and paid
+// sales, not just memeHatches) and FOUNDER-HOLD-AWARE (the last copies a live drop reserves are not
+// buyable). This mirrors pickMeme()'s own availability test, so the /meme/hatch gate and the
+// /meme/hatched roll agree: the old gate compared memeReserved()+founderReserveTotal() to the NOMINAL
+// 285 and was blind to creatures born in-game, so it took an egg's payment into a dead end.
+function memeBuyableSupply() {
+  const rmap = founderReserveMap();
+  let n = 0;
+  for (const c of MEME_CHARS) {
+    const left = Math.max(0, capOf(c.key) - memeIssued(c.key));
+    const held = Math.min(left, Number(rmap[c.key] || 0));
+    n += Math.max(0, left - held);
+  }
+  return n;
+}
 function memeSupply() {
   const chars = {}; let hatched = 0;
   // per-character "minted" = species ROLLED at hatch (determined). Incubating eggs are a mystery and not counted per-character yet.
   // minted counts BOTH routes (see memeIssued) — the bar used to show only the paid sale, so a
   // creature hatched from an in-game meme egg was invisible to the very number advertising its rarity
+  // "prevent overflow of supply and INACCURATE INDICATION OF RARITY" (owner) — so the bar that
+  // advertises scarcity has to show the Founder Drop's hold too. `left` stays the honest remaining
+  // supply; `held` is how much of it is spoken for; `buyable` is what a player can actually get.
+  const rmap = founderReserveMap();
+  let heldTotal = 0;
   for (const c of MEME_CHARS) {
     const cap = capOf(c.key), m = memeIssued(c.key);
-    chars[c.key] = { name: c.name, minted: m, cap, left: Math.max(0, cap - m), rarity: c.rarity, sold: memeMinted[c.key] || 0 };
+    const left = Math.max(0, cap - m), held = Math.min(left, Number(rmap[c.key] || 0));
+    heldTotal += held;
+    chars[c.key] = { name: c.name, minted: m, cap, left, rarity: c.rarity, sold: memeMinted[c.key] || 0,
+                     wave: c.wave || 1, held, buyable: Math.max(0, left - held) };
     hatched += m;
   }
   const reserved = memeReserved();
-  return { chars, totalLeft: Math.max(0, MEME_TOTAL - reserved), total: MEME_TOTAL, reserved, hatched, cap: MEME_CAP };
+  return { chars, totalLeft: Math.max(0, MEME_TOTAL - reserved), total: MEME_TOTAL, reserved, hatched, cap: MEME_CAP,
+           founderHeld: heldTotal };
 }
 // MIGRATION: reset any already-bought (incubating) egg back to a MYSTERY so its species is re-rolled at hatch,
 // and recompute per-character counts from only the determined (pending/minted) hatches. Idempotent.
@@ -1397,8 +1429,13 @@ function memeRegistryCount(key) { return trueIssued("chikimon", key).registry; }
 function memeIssued(key) { return trueIssued("chikimon", key).count; }
 // is this meme species still mintable at all? used by every path that can create one
 function memeAtCap(key) { return memeIssued(key) >= capOf(key); }
-function pickMeme() {
-  const avail = MEME_CHARS.filter(c => memeIssued(c.key) < capOf(c.key));
+function pickMeme(forFounder) {
+  // A LIVE FOUNDER DROP HOLDS THE LAST COPIES. The paid sale's roll must not hand a buyer the very
+  // edition a founder is owed, so a reserved-out character leaves the weighted pool exactly the way
+  // a fully-claimed one does. `forFounder` is unused by the sale path and exists so the reservation
+  // has one honest name at every call site. No drop / uncapped pool -> the filter is a no-op.
+  const rmap = forFounder ? null : founderReserveMap();
+  const avail = MEME_CHARS.filter(c => memeIssued(c.key) < capOf(c.key) && !(rmap && memeReservedOut(c.key, rmap)));
   if (!avail.length) return null;
   let tot = avail.reduce((s, c) => s + (c.weight || 1), 0), r = Math.random() * tot;
   for (const c of avail) { r -= (c.weight || 1); if (r <= 0) return c; }
@@ -2476,9 +2513,17 @@ app.post("/admin/event/start", async (req, res) => {
     // THE POOL IS NAMED HERE. {species:["aurox","zephyra",...]} (or a comma-separated string) picks
     // the exact creatures this drop hands out — the owner's NEW legendary set. Omitted, it falls back
     // to FOUNDER_SPECIES and then to the game's existing legendaries. Sanitised like every input.
+    // SYMBOLIC TOKENS EXPAND HERE, ONCE, and the EXPANDED keys are what get persisted with the
+    // event — so a redeploy restores the same eleven even if the table were later edited, and the
+    // owner never hand-types a species list that could drift from MEME_CHARS.
+    //   {"species":"meme_dynasty"} -> the eleven wave-2 Meme Dynasty characters
     const rawSp = req.body?.species ?? req.query?.species;
-    const pool = (Array.isArray(rawSp) ? rawSp : String(rawSp || "").split(","))
-      .map((s) => String(s || "").trim().slice(0, 24)).filter(Boolean).slice(0, 50);
+    let pool;
+    try { pool = founderExpandPool(Array.isArray(rawSp) ? rawSp : String(rawSp || "").split(",")); }
+    catch (e) {                                        // FINDING #1: refuse a typo'd/unknown pool key
+      if (e && e.code === "FOUNDER_POOL_UNKNOWN") return res.status(400).json({ error: e.message, validTokens: e.validTokens });
+      throw e;
+    }
     _founderEvent = { ends, label: label || "Founder Drop", pool };
     _founderLastSweep = Date.now();   // presence accrual starts at the start, never from a pre-event sweep
   }
@@ -2490,6 +2535,19 @@ app.post("/admin/event/start", async (req, res) => {
                 label: kind === "open_gates" ? _openGates.label : _founderEvent.label };
   if (kind === "founder_drop") { out.cap = FOUNDER_CAP; out.perSpecies = founderPerSpecies(); out.claimed = _founderCount;
                                  out.species = founderPool();   // the creatures THIS drop hands out
+                                 // THE ALLOCATION, ANSWERED AT START so the owner sees it before players do:
+                                 // `deal` = planned grants per species over the whole series (checked against
+                                 // LIVE remaining supply, not the nominal cap), `reserved` = what is being held
+                                 // from normal buyers right now, `supply` = cap/left per capped species.
+                                 out.deal = founderDeal();
+                                 out.reserved = founderReserveMap();
+                                 out.reservedTotal = founderReserveTotal();
+                                 out.supply = Object.fromEntries(founderPool().map((sp) => {
+                                   const cap = supplyOf("chikimon", sp);
+                                   return [sp, cap > 0 ? { cap, issued: issuedCount("chikimon", sp), left: Math.max(0, cap - issuedCount("chikimon", sp)) }
+                                                       : { cap: 0, issued: issuedCount("chikimon", sp), left: -1 }];
+                                 }));
+                                 out.dealTotal = Object.values(out.deal).reduce((a, b) => a + b, 0);
                                  out.bar = { minutes: FOUNDER_MIN_MS / 60000, actions: FOUNDER_MIN_ACTIONS }; }
   res.json(out);
 });
@@ -3901,8 +3959,18 @@ app.post("/meme/hatch", async (req, res) => {
     if (!v.ok) { delete memeUsedSigs[paySig]; return res.status(402).json({ error: v.error }); }
   }
   // 🎲 The species is NOT chosen here — it stays a MYSTERY and is rolled at hatch time (POST /meme/hatched).
-  // We only RESERVE a slot against MEME_TOTAL here.
-  if (memeReserved() >= MEME_TOTAL) { if (MEME_VERIFY_PAY && paySig) delete memeUsedSigs[paySig]; return res.status(409).json({ error: "sold out — every Meme Dynasty egg has been claimed" }); }
+  // We only RESERVE a slot here.
+  // FINDING #3 (2026-08-12): refuse BEFORE taking the egg when nothing can actually roll. The gate is
+  // now REGISTRY-AWARE — memeBuyableSupply() counts real remaining supply the way /meme/hatched does,
+  // so a copy born through the in-game/registry route is not invisible — and it nets out the eggs
+  // already incubating (each will consume one buyable copy when it rolls). The Founder Drop's held
+  // editions are excluded too, so a buyer never pays for an egg /meme/hatched would strand.
+  const _fHeld = founderReserveTotal();
+  const _incubating = memeHatches.filter(h => h.status === "incubating").length;
+  if (_incubating >= memeBuyableSupply()) { if (MEME_VERIFY_PAY && paySig) delete memeUsedSigs[paySig];
+    return res.status(409).json({ error: _fHeld > 0
+      ? `sold out for now — the last ${_fHeld} Meme Dynasty editions are held for the Founder Drop`
+      : "sold out — every Meme Dynasty egg has been claimed" }); }
   _memeLastHatch.set(wallet, now);
   const h = { id: "h" + now.toString(36) + Math.random().toString(36).slice(2, 6), wallet, hatcher: wallet, char: null, name: "Mystery Meme Egg", edition: null, status: "incubating", undetermined: true, mintAddr: null, ts: now, paySig: paySig || null };
   memeHatches.push(h); await saveMeme();
@@ -3920,24 +3988,39 @@ app.post("/meme/hatched", async (req, res) => {
     if (!h.char) {   // roll the random Meme Legendary NOW (respecting remaining per-character caps)
       const c = pickMeme();
       if (!c) return res.status(409).json({ error: "the dynasty is fully hatched" });
-      h.char = c.key; h.name = c.name; h.edition = (memeMinted[c.key] || 0) + 1; memeMinted[c.key] = h.edition; h.undetermined = false;
+      h.char = c.key; h.name = c.name; h.undetermined = false;
+      // memeMinted stays the paid-sale SUPPLY COUNTER (census orphan-reconcile still reads it) but is
+      // NO LONGER the number a player sees.
+      const _supplyNum = (memeMinted[c.key] || 0) + 1; memeMinted[c.key] = _supplyNum;
       censusInvalidate();      // a sale just determined its species — the world census changed
-      // the SERVER rolled this species (pickMeme), so it counts as a witnessed hatch; the hatch id
-      // is the idem key — the `!h.char` guard above already makes a re-post roll nothing
-      chronicleAdd("meme_hatch", wallet, { sub: c.key, qty: 1, route: "/meme/hatched", idem: "meme:" + h.id,
-        data: { edition: h.edition }, agg: [["hatch:" + c.key, 1]] });
       // ============ CHIK_REG_ALL — the roll IS the birth, so the row is written HERE ============
       // The whole meme path used to reach the client purely via ownedChars, with the registry row
       // arriving only later through species-collapsed adoption (an unrecorded issuance path).
       // saleBacked: this creature is already census-counted by THIS wallet-attributed sale row, and
       // pickMeme just enforced the per-character cap — re-applying it would refuse the very sale
       // that holds the slot. Runs once per hatch (inside the !h.char roll), id kept on the hatch row.
+      let _regEd = null;
       if (REG_ALL_ON) {
         try {
           const rr = mintAsset("chikimon", wallet, { sp: h.char, kind: "meme", lvl: 1, hatcher: wallet }, "issued", null, { saleBacked: true });
-          h.regId = rr.id;
+          h.regId = rr.id; _regEd = rr.edition || null;
         } catch (e) { console.error("meme registry row failed for", String(wallet).slice(0, 8), e && e.message); }
       }
+      // ===== FINDING #2 + OWNER RULING (2026-08-12): ONE NUMBER PER CREATURE, UNIQUE PER SPECIES =====
+      // Two counters numbered one creature two ways: the paid path showed memeMinted+1 while the
+      // registry/on-chain series (nftEditionFor) was the real one, so a buyer's "#1 of 10" disagreed
+      // with the NFT and two creatures could both claim "Ansem #1". The number a player sees is now
+      // the REGISTRY edition — the SAME per-species counter the founder grant draws from — so founder
+      // and paid interleave 1..N with no collision. The eleven wave-2 Dynasty species are not live
+      // yet (zero exist), so they take the registry number from birth. The original SIX (wave 1) are
+      // already live under the legacy memeMinted counter; the owner's "never renumber" rule keeps
+      // their display on that counter (a monotonic per-species series → still collision-free). Flags
+      // off (no registry edition) → the counter, byte-identical to pre-fix behaviour.
+      h.edition = (MEME_WAVE2.includes(c.key) && _regEd) ? _regEd : _supplyNum;
+      // the SERVER rolled this species (pickMeme), so it counts as a witnessed hatch; the hatch id
+      // is the idem key — the `!h.char` guard above already makes a re-post roll nothing
+      chronicleAdd("meme_hatch", wallet, { sub: c.key, qty: 1, route: "/meme/hatched", idem: "meme:" + h.id,
+        data: { edition: h.edition }, agg: [["hatch:" + c.key, 1]] });
     }
     h.status = "pending"; h.hatchedAt = Date.now(); await saveMeme();
     censusInvalidate();        // status incubating -> pending is what makes this sale countable
@@ -5037,21 +5120,147 @@ let _founderCount = 0;                          // claims issued, 0..FOUNDER_CAP
 let _founderPerSp = Object.create(null);        // species -> issued (<= FOUNDER_PER_SPECIES each)
 const _founderActivity = new Map();             // wallet -> { ms, acts } — event-scoped, server-verified only
 let _founderLastSweep = 0;
+// A DRY POOL IS A STEADY STATE, NOT AN INCIDENT — so it must not be logged like one. Measured in
+// mdf_exhaust_probe.mjs: with the pool empty and the drop still running-and-unfilled, the refusal
+// logged 1.00 lines per attempt = 360/hour PER qualified wallet (the 10s presence sweep retries
+// every player over the bar), 7,200/hour with 20 of them online. That state is reachable without
+// any admin action: start a drop when fewer than FOUNDER_CAP Dynasty editions remain and the deal
+// totals short of the cap, so the drop fills to its deal and every further qualified player is
+// refused forever after. The REFUSAL is unchanged — it is the volume that is throttled.
+let _founderDryLoggedAt = 0;
+const FOUNDER_DRY_LOG_MS = 60000;
 // THE DROP'S SPECIES POOL, and the per-species share derived from it. A pool named at start wins;
 // then FOUNDER_SPECIES from the environment; then the game's existing legendaries as a last resort.
 // perSpecies is ALWAYS derived from the live pool so the cap divides evenly no matter how many
 // species the owner creates (5 species -> 10 each; 2 -> 25 each; 50 -> 1 each).
+//
+// SYMBOLIC POOLS (2026-08-12). The owner's ruling — "make the new meme dynasty chikimons the
+// subject to the NFT Drop" — is served by a TOKEN the server expands from the one live table, not
+// by the owner (or this file) re-typing eleven species keys:
+//   species:"meme_dynasty" | "dynasty" | "wave2"  ->  MEME_WAVE2  (the eleven, read off MEME_CHARS)
+//   species:"legendary"    | "legends"            ->  SPECIES_LEGEND (the uncapped roster)
+// Anything else is taken literally, exactly as before. NOTHING here changes the DEFAULT: an
+// unnamed drop still falls back to FOUNDER_SPECIES and then the game's legendaries, so a drop only
+// becomes a Dynasty drop when the owner starts it as one (or sets FOUNDER_SPECIES=meme_dynasty).
+const FOUNDER_GROUP_TOKENS_MEME = ["meme_dynasty", "memedynasty", "dynasty", "wave2", "meme_wave2", "meme"];
+const FOUNDER_GROUP_TOKENS_LEGEND = ["legendary", "legendaries", "legends", "legend"];
+function founderExpandPool(list) {
+  const out = [];
+  for (const raw of Array.isArray(list) ? list : []) {
+    const s = String(raw || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+    if (!s) continue;
+    if (FOUNDER_GROUP_TOKENS_MEME.includes(s)) { for (const k of MEME_WAVE2) out.push(k); continue; }
+    if (FOUNDER_GROUP_TOKENS_LEGEND.includes(s)) { for (const k of SPECIES_LEGEND) out.push(k); continue; }
+    // FINDING #1 (2026-08-12): an UNRECOGNISED literal is no longer taken as an uncapped phantom
+    // species. supplyOf() returns 0 for an unknown key, so a typo like "Ansem"/"wave-2"/"meme_dynsaty"
+    // used to mint UNCAPPED — 50 founder grants of a species with no cap, card or model — while the
+    // real creature stayed 0/10. A literal must now be an exact MEME_CHARS key or a game legendary,
+    // or the drop is REFUSED at the route so the owner sees the typo instead of shipping a phantom.
+    const lit = String(raw).trim().slice(0, 24);
+    if (!MEME_KEYS.has(lit) && !SPECIES_LEGEND.includes(lit)) {
+      const e = new Error(`unknown Founder Drop species "${lit}" — use a group token (${[...FOUNDER_GROUP_TOKENS_MEME, ...FOUNDER_GROUP_TOKENS_LEGEND].join(", ")}) or an exact species key: meme = [${[...MEME_KEYS].join(", ")}]; legendary = [${SPECIES_LEGEND.join(", ")}]`);
+      e.code = "FOUNDER_POOL_UNKNOWN";
+      e.validTokens = { groups: [...FOUNDER_GROUP_TOKENS_MEME, ...FOUNDER_GROUP_TOKENS_LEGEND], meme: [...MEME_KEYS], legendary: [...SPECIES_LEGEND] };
+      throw e;
+    }
+    out.push(lit);
+  }
+  // DE-DUPED: a species named twice would take two shares of the cap and reserve twice its supply.
+  return out.filter((s, i) => s && out.indexOf(s) === i).slice(0, 50);
+}
 function founderPool() {
   const named = Array.isArray(_founderEvent.pool) ? _founderEvent.pool.filter(Boolean) : [];
   if (named.length) return named;
-  const env = String(process.env.FOUNDER_SPECIES || "").split(",").map(s => s.trim()).filter(Boolean);
+  // a bad FOUNDER_SPECIES env value must not crash award-time — validate leniently and fall back.
+  let env = [];
+  try { env = founderExpandPool(String(process.env.FOUNDER_SPECIES || "").split(",")); }
+  catch (e) { if (!_founderEnvWarned) { _founderEnvWarned = true; console.error(`FOUNDER_SPECIES ignored — ${e.message}`); } env = []; }
   if (env.length) return env;
   return SPECIES_LEGEND;
 }
+let _founderEnvWarned = false;
 function founderPerSpecies() {
   const n = founderPool().length || 1;
   return Math.max(1, Math.ceil(FOUNDER_CAP / n));
 }
+
+// ============ A CAPPED POOL: RESERVE REAL SUPPLY, NEVER THE NOMINAL CAP ============
+// Legendaries are UNCAPPED, so the drop never had to ask how many were left. The eleven Meme
+// Dynasty characters are HARD-CAPPED per species (MEME_CHARS: 10..25, 180 total) and 50 founders is
+// 28% of the whole wave, so every line below exists to make two promises true at once:
+//   (a) a founder grant can never mint past a species cap — it is REROUTED to a species with real
+//       headroom, and refused outright only when the entire pool is spoken for; and
+//   (b) a normal buyer can never take the last copy of a species a founder is still owed — that
+//       copy is HELD, so the winner is never stranded by someone else's mint.
+// Both are computed from remainingOf()/issuedCount(), the ONE census counter every other mint path
+// already binds to, so there is no second tally to drift.
+//
+// FLAG-OFF / LEGENDARY-POOL IDENTITY: founderRoomOf reports Infinity for an uncapped species, so
+// with the legendary pool every reservation is zero, memeReservedOut is false everywhere, and the
+// award picks exactly the species the old round-robin picked. The whole block is a no-op unless the
+// owner starts a drop over capped creatures.
+//
+// how many founders this species could EVER supply = the ones it already gave + what is left of it
+function founderRoomOf(sp) {
+  const cap = supplyOf("chikimon", sp);
+  if (!(cap > 0)) return Infinity;                                  // uncapped species — endless
+  return Math.max(0, cap - issuedCount("chikimon", sp)) + (_founderPerSp[sp] || 0);
+}
+// THE DEAL: how many of the FOUNDER_CAP drops each species is planned to give, over the whole
+// series. A headroom-aware round robin — slot n prefers pool[n % len] and walks forward to the next
+// species with room — so with an uncapped pool it reproduces the old floor/ceil spread exactly
+// (cap 50 over 14 -> the first 8 species 4 each, the rest 3), and with a capped pool it simply
+// never deals a species more editions than actually remain.
+function founderDeal() {
+  const pool = founderPool();
+  const deal = Object.create(null);
+  if (!pool.length) return deal;
+  const room = Object.create(null);
+  for (const sp of pool) room[sp] = founderRoomOf(sp);
+  for (let n = 0; n < FOUNDER_CAP; n++) {
+    let picked = "";
+    for (let k = 0; k < pool.length; k++) {
+      const sp = pool[(n + k) % pool.length];
+      if ((deal[sp] || 0) < room[sp]) { picked = sp; break; }
+    }
+    if (!picked) break;                                             // the whole pool is out of supply
+    deal[picked] = (deal[picked] || 0) + 1;
+  }
+  return deal;
+}
+// WHAT IS HELD RIGHT NOW: species -> editions reserved for founders who have not claimed yet.
+// Only CAPPED species can be reserved (an uncapped one cannot run out), and the total can never
+// exceed the drops still unclaimed, so the reservation shrinks with every award and vanishes the
+// moment the drop ends or fills.
+function founderReserveMap() {
+  const out = Object.create(null);
+  if (!founderEventActive()) return out;
+  let slots = Math.max(0, FOUNDER_CAP - _founderCount);
+  if (!slots) return out;
+  const deal = founderDeal();
+  for (const sp of founderPool()) {
+    if (!slots) break;
+    const cap = supplyOf("chikimon", sp);
+    if (!(cap > 0)) continue;                                       // uncapped: nothing to hold
+    const left = Math.max(0, cap - issuedCount("chikimon", sp));
+    const want = Math.min(Math.max(0, (deal[sp] || 0) - (_founderPerSp[sp] || 0)), slots, left);
+    if (want > 0) { out[sp] = want; slots -= want; }
+  }
+  return out;
+}
+function founderReserveTotal() { const m = founderReserveMap(); let n = 0; for (const k in m) n += m[k]; return n; }
+function founderReserveOf(sp) { return Number(founderReserveMap()[String(sp)] || 0); }
+// IS THIS SPECIES OFF-LIMITS TO A NORMAL (non-founder) MINT? True only when every edition still
+// unissued is being held for a founder. A species with 6 left and 4 held stays freely buyable —
+// the hold is on the LAST copies, not on the character.
+function memeReservedOut(sp, map) {
+  const cap = supplyOf("chikimon", sp);
+  if (!(cap > 0)) return false;
+  const held = Number((map || founderReserveMap())[sp] || 0);
+  if (held <= 0) return false;
+  return Math.max(0, cap - issuedCount("chikimon", sp)) <= held;
+}
+const FOUNDER_HELD_MSG = "the last of that Meme Dynasty edition is being held for the Founder Drop — it opens up when the drop ends";
 function openGatesActive(now = Date.now()) { return now < Number(_openGates.ends); }
 function founderEventActive(now = Date.now()) { return now < Number(_founderEvent.ends); }
 function normEventKind(v) {
@@ -5186,18 +5395,48 @@ function founderAward(wallet) {
   // the game's existing legendaries only if no pool was named.
   const pool = founderPool();
   const perSp = founderPerSpecies();
-  let sp = pool[_founderCount % pool.length];
-  if ((_founderPerSp[sp] || 0) >= perSp) {
-    sp = pool.find((s) => (_founderPerSp[s] || 0) < perSp) || "";
-    if (!sp) return null;
+  const deal = founderDeal();
+  // REROUTE, NEVER OVERMINT (owner ruling 2026-08-12). Walk the round robin from this claim number
+  // and take the first species the DEAL still owes AND that genuinely has an edition left. Two
+  // reasons a species is skipped: its planned share is already given out (the old behaviour), or it
+  // has run out of supply since the drop started (new — legendaries could not run out). If the walk
+  // finds nothing, EVERY creature in the pool is spoken for and the grant is REFUSED: the claim slot
+  // stays unspent and _founderCount does not move, so nothing is minted past a cap and no wallet is
+  // marked as having claimed. Refusing the SPECIES instead (and handing the player nothing) would
+  // punish a founder for supply the server allocated — the species was never the player's choice.
+  let sp = "";
+  for (let k = 0; k < pool.length; k++) {
+    const c = pool[(_founderCount + k) % pool.length];
+    if ((_founderPerSp[c] || 0) >= (deal[c] || 0)) continue;
+    if (atSupplyCap("chikimon", c)) continue;                       // uncapped species: always false
+    sp = c; break;
   }
+  if (!sp) {
+    // throttled: see FOUNDER_DRY_LOG_MS. The refusal itself is not rate-limited — only its logging.
+    const _now = Date.now();
+    if (_now - _founderDryLoggedAt > FOUNDER_DRY_LOG_MS) {
+      _founderDryLoggedAt = _now;
+      console.error(`founder award: pool exhausted at #${_founderCount + 1}/${FOUNDER_CAP} — nothing minted (further refusals logged at most once per ${FOUNDER_DRY_LOG_MS / 1000}s)`);
+    }
+    return null;
+  }
+  const spDealt = Math.max(1, Number(deal[sp] || perSp));
+  // A Meme Dynasty character is a `meme` row everywhere else it is born (the paid sale and the
+  // in-game meme egg both mint kind:"meme"), so a founder's copy must be one too — a founder
+  // creature that read kind:"legendary" would sit outside the very tier its cap describes.
+  const spKind = MEME_KEYS.has(sp) ? "meme" : "legendary";
   const n = _founderCount + 1;
   let row;
   try {
-    // the grant chokepoint: unforgeable id, origin stored on the row, chronicle "mint" carrying the
-    // founder origin, census counted like any chikimon row. Legendaries are uncapped so this cannot
-    // refuse on supply; any other throw (registry capacity) leaves the claim slot UNSPENT.
-    row = mintAsset("chikimon", wallet, { sp, kind: "legendary", lvl: 1 }, FOUNDER_ORIGIN);
+    // THE GRANT GOES THROUGH THE SAME CHOKEPOINT AS EVERY OTHER MINT — unforgeable id, origin on the
+    // row, chronicle "mint", census counted like any chikimon row, and (the point of this change)
+    // mintAsset's OWN atSupplyCap check on the way in. `{ founder: true }` exempts the grant from the
+    // founder RESERVATION (a founder may of course take what is held for founders) and from nothing
+    // else: the hard per-species cap still binds here, so even if the walk above were wrong, the cap
+    // refuses rather than overmints. The edition number is assigned by nftEditionFor inside mintAsset
+    // — the same counter, in the same series, as a bought or hatched copy, so there are no gaps and
+    // no duplicates. A throw leaves the claim slot UNSPENT.
+    row = mintAsset("chikimon", wallet, { sp, kind: spKind, lvl: 1 }, FOUNDER_ORIGIN, null, { founder: true });
   } catch (e) { console.error("founder award: mint failed —", e?.message || e); return null; }
   _founderCount = n;
   _founderPerSp[sp] = (_founderPerSp[sp] || 0) + 1;
@@ -5208,11 +5447,12 @@ function founderAward(wallet) {
   const rec = assetRec(wallet);
   let luid;
   do { luid = "u9" + String(crypto.randomInt(100000000)).padStart(8, "0"); } while (has(rec.units, luid));
-  rec.units[luid] = { sp, kind: "legendary", lvl: 1, ts: Date.now(), origin: FOUNDER_ORIGIN, held: true };
-  regEvent(row, "founder", { number: n, of: FOUNDER_CAP, sp_number: _founderPerSp[sp], sp_of: perSp,
-                             luid, route: "founder-drop" });
+  rec.units[luid] = { sp, kind: spKind, lvl: 1, ts: Date.now(), origin: FOUNDER_ORIGIN, held: true };
+  regEvent(row, "founder", { number: n, of: FOUNDER_CAP, sp_number: _founderPerSp[sp], sp_of: spDealt,
+                             luid, route: "founder-drop", edition: row.edition || null,
+                             sp_cap: supplyOf("chikimon", sp) || 0 });
   row.arrivedAt = Date.now();
-  nftNewsPush(wallet, { kind: "arrived", id: row.id, type: "chikimon", sp, cls: "legendary", lvl: 1,
+  nftNewsPush(wallet, { kind: "arrived", id: row.id, type: "chikimon", sp, cls: spKind, lvl: 1,
     mint: null, other: null, dormant: false,
     text: `FOUNDER DROP — a special-edition ${sp} (founder #${n} of ${FOUNDER_CAP}) has been born to this wallet. It arrives in your satchel.` });
   // the chronicle award record — idem per wallet, so a retry can never double-record a founder
@@ -5234,6 +5474,16 @@ export function _founderEventActiveForTest(now) { return founderEventActive(now)
 export function _founderClaimForTest(w) { return _founderClaims[String(w)] || null; }
 export function _founderActivityForTest(w) { const a = _founderActivity.get(String(w)); return a ? { ms: a.ms, acts: a.acts } : null; }
 export function _founderTickForTest(now) { founderPresenceTick(now); }
+// the capped-pool seams: the derived wave-2 list, the allocation, the live hold, and the one
+// question every normal mint path asks ("is this species held for a founder right now?")
+export function _memeWave2ForTest() { return [...MEME_WAVE2]; }
+export function _memeCapsForTest() { return Object.fromEntries(MEME_CHARS.map((c) => [c.key, c.cap || MEME_CAP])); }
+export function _founderDealForTest() { return founderDeal(); }
+export function _founderReserveForTest() { return founderReserveMap(); }
+export function _founderReserveTotalForTest() { return founderReserveTotal(); }
+export function _memeReservedOutForTest(sp) { return memeReservedOut(String(sp)); }
+export function _memeSupplyForTest() { return memeSupply(); }
+export function _founderAwardForTest(w) { return founderAward(String(w)); }
 // stamp a presence row's ts so a sim can walk the 15-minute presence bar through the REAL tick
 // (TTL + proven + pubkey checks all live) without waiting 15 real minutes
 export function _stampPresenceForTest(wallet, ts) { const p = worldPlayers.get(String(wallet)); if (p) p.ts = Number(ts) || Date.now(); return !!p; }
@@ -8281,6 +8531,18 @@ function mintAsset(type, wallet, fields, origin, parent, opts) {
     e.code = "SUPPLY_EXHAUSTED";
     throw e;
   }
+  // THE FOUNDER RESERVATION, AT THE SAME CHOKEPOINT AS THE CAP (2026-08-12). A live Founder Drop
+  // over CAPPED creatures holds the last N editions of a species for winners who have not claimed
+  // yet; without this a normal buyer could mint the last copy mid-drop and strand a founder who had
+  // already met the bar. Enforced HERE, not only at the routes, for the same reason the cap is: a
+  // route that forgets to ask must still be refused. `opts.founder` is the grant itself, and it is
+  // the only caller exempt. ZERO EFFECT unless a drop is running over capped species — with an
+  // uncapped (legendary) pool founderReserveMap() is empty and this line never fires.
+  if (_issuing && _sp && type === "chikimon" && !(opts && opts.founder) && memeReservedOut(_sp)) {
+    const e = new Error(FOUNDER_HELD_MSG);
+    e.code = "SUPPLY_RESERVED";
+    throw e;
+  }
   // the cap is a cliff for EVERY player at once, so it must never arrive unannounced
   if (assetReg.size > ASSET_REG_MAX * 0.8 && Date.now() - _regWarnAt > 300000) {
     _regWarnAt = Date.now();
@@ -8514,7 +8776,8 @@ function eggPoolFor(wallet, kind) {
   }
   const have = ownedSpecies(wallet);
   let pool = (EGG_KIND_POOL[kind] || SPECIES_NORMAL).filter(s => !have.has(s));
-  if (kind === "meme") pool = pool.filter((sp) => !memeAtCap(sp));
+  // the cap AND the live Founder Drop reservation — a held edition simply is not in the roll
+  if (kind === "meme") { const rmap = founderReserveMap(); pool = pool.filter((sp) => !memeAtCap(sp) && !memeReservedOut(sp, rmap)); }
   return pool;
 }
 function eggPoolEmptyMsg(wallet, kind) {
@@ -8523,9 +8786,15 @@ function eggPoolEmptyMsg(wallet, kind) {
       ? "your stable is already full — every chikimount is yours"
       : "every remaining steed has been claimed — the stable is legendary now";
   }
-  return kind === "meme"
-    ? "every Meme Dynasty edition you could still receive has been claimed"
-    : "you already own every species that egg could hatch";
+  if (kind !== "meme") return "you already own every species that egg could hatch";
+  // HELD IS NOT SOLD OUT. If the only reason nothing is left for this wallet is the Founder Drop
+  // holding the last copies, say so — "claimed" would be a lie the player could check.
+  const rmap = founderReserveMap();
+  const have = ownedSpecies(wallet);
+  const held = (EGG_KIND_POOL.meme || []).some((sp) => !have.has(sp) && !memeAtCap(sp) && memeReservedOut(sp, rmap));
+  return held
+    ? "the Meme Dynasty editions you could still receive are being held for the Founder Drop — your egg is safe, hatch it again when the drop ends"
+    : "every Meme Dynasty edition you could still receive has been claimed";
 }
 
 // ============ EGGS AS NFTs — the hatch-time contract ============
@@ -8837,6 +9106,8 @@ app.post("/assets/egg/hatch", async (req, res) => {
     // again later" for a cap that will never move sends them into an endless retry and misdirects
     // support, so the two are answered separately.
     if (e && e.code === "SUPPLY_EXHAUSTED") return res.status(409).json({ error: `${e.message} — your egg is safe, hatch it again` });
+    // HELD FOR THE DROP is neither a cap nor a capacity fault: it clears when the drop ends.
+    if (e && e.code === "SUPPLY_RESERVED") return res.status(409).json({ error: `${e.message} — your egg is safe, hatch it again` });
     return res.status(503).json({ error: "the asset registry is at capacity — your egg is safe, try again later" });
   }
   // CONSUMED, NOT DELETED. The egg keeps its row and points at what came out of it, so the
@@ -8958,6 +9229,9 @@ app.post("/assets/egg/consume", async (req, res) => {
   if (row.kind === "meme" && memeAtCap(sp)) {
     return res.status(409).json({ error: "that Meme Dynasty edition is fully claimed — your egg is safe, hatch it again" });
   }
+  if (row.kind === "meme" && memeReservedOut(sp)) {
+    return res.status(409).json({ error: `${FOUNDER_HELD_MSG} — your egg is safe, hatch it again` });
+  }
   if (atSupplyCap(isMount ? "mount" : "chikimon", sp)) {
     return res.status(409).json({ error: `every ${sp} that will ever exist has been claimed — your egg is safe, hatch it again` });
   }
@@ -8971,6 +9245,7 @@ app.post("/assets/egg/consume", async (req, res) => {
     // genuinely run out was told to "try again later" and would retry forever. The egg survives
     // either way (nothing above this line mutates it) — only the sentence changes.
     if (e && e.code === "SUPPLY_EXHAUSTED") return res.status(409).json({ error: `${e.message} — your egg is safe, hatch it again` });
+    if (e && e.code === "SUPPLY_RESERVED") return res.status(409).json({ error: `${e.message} — your egg is safe, hatch it again` });
     return res.status(503).json({ error: "the asset registry is at capacity — your egg is safe, try again later" });
   }
   row.state = "consumed";
@@ -9458,6 +9733,12 @@ app.post("/admin/grant-collection", async (req, res, next) => {
       refused.push({ ...c, ...capInfo, remaining: 0 });
       continue;
     }
+    // the live Founder Drop's hold, refused the same way and reported in a dry run too
+    if (c.type === "chikimon" && cap > 0 && memeReservedOut(c.sp)) {
+      refused.push({ ...c, ...capInfo, remaining: remainingOf(c.type, c.sp),
+                     reservedForFounders: founderReserveOf(c.sp), why: "founder-drop-hold" });
+      continue;
+    }
     const upgrades = priorUnregistered(c.type, c.sp);  // report-only: an unregistered holding being registered
     if (dryRun) { granted.push({ ...c, ...capInfo, wouldGrant: true, ...(upgrades ? { upgrades } : {}) }); continue; }
     let row;
@@ -9468,6 +9749,14 @@ app.post("/admin/grant-collection", async (req, res, next) => {
     } catch (e) {
       if (e && e.code === "SUPPLY_EXHAUSTED") {        // raced past the pre-check — same honest answer
         refused.push({ ...c, cap, issued: issuedCount(c.type, c.sp), remaining: remainingOf(c.type, c.sp) });
+        continue;
+      }
+      // HELD FOR THE FOUNDER DROP is a per-species refusal like the cap, NOT a capacity fault. Left
+      // to fall through it would have set capacityFault and skipped the whole rest of the catalog —
+      // one reserved meme character would have cost the owner every species after it.
+      if (e && e.code === "SUPPLY_RESERVED") {
+        refused.push({ ...c, cap, issued: issuedCount(c.type, c.sp), remaining: remainingOf(c.type, c.sp),
+                       reservedForFounders: founderReserveOf(c.sp), why: "founder-drop-hold" });
         continue;
       }
       capacityFault = true;                            // ASSET_REG_MAX (a non-coded throw) is a server fault,
@@ -12195,6 +12484,10 @@ export function _mintHatchedForTest(type, wallet, fields) {
   return born;
 }
 export function _setMemeMintedForTest(key, n) { memeMinted[key] = n; censusInvalidate(); }
+// sim-only: reset the paid-sale hatch rows between sections. `_clearAssetReg`/`_clearAssetLedger` do
+// NOT touch memeHatches, so a paid sale/incubating egg leaks across sections (this is the gap behind
+// mdfatk_bar_ed_atk.mjs section P's false "counts 2"). No production caller.
+export function _clearMemeHatchesForTest() { memeHatches.length = 0; censusInvalidate(); }
 export function _clearAssetReg() { assetReg.clear(); assetsByOwner.clear(); eggRestitutionDone.clear(); nftNews.clear(); nftHandDebit.clear(); _nftNewsSeq = 0; _meMintIdx = null; censusInvalidate(); }
 // the WHOLE truth about one species: the consolidated count and where every number came from
 export function _trueIssued(type, sp) { return trueIssued(type, sp); }
@@ -12256,6 +12549,8 @@ export function _nftNewsForTest(w) { return (nftNews.get(String(w)) || []).map(n
 export function _nftHandDebitForTest(w) { const m = nftHandDebit.get(String(w)); return m ? Object.fromEntries(m) : {}; }
 export function _nftSettleForTest(id, to) { const r = assetReg.get(id); return r ? nftSettleHandover(r, to, Date.now(), false) : { ok: false, why: "no-row" }; }
 export function _nftRowForTest(id) { const r = assetReg.get(id); return r ? JSON.parse(JSON.stringify(r)) : null; }
+// every registry row, copied — the edition-series audit reads it (sims only)
+export function _regAllForTest() { return [...assetReg.values()].map((r) => JSON.parse(JSON.stringify(r))); }
 export function _nftOwnerSetForTest(w) { return [...(assetsByOwner.get(String(w)) || [])]; }
 export function _nftCollectionForTest() { return NFT_COLLECTION; }
 export function _nftMintOn() { return NFT_MINT_ON; }

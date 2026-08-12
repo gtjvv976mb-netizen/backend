@@ -44,8 +44,12 @@ console.log(`   legendaries (${ROSTER.length}): ${JSON.stringify(ROSTER)}`);
 chk(cat.status === 200 && ROSTER.length >= 5 && new Set(ROSTER).size === ROSTER.length,
     `roster read: ${ROSTER.length} distinct legendary species ${JSON.stringify(ROSTER)}`);
 
-const NEW_SET = ["aurox", "zephyra", "noctis", "verdant", "pyrion"];
-console.log("\n== the owner names a NEW legendary set at start ==");
+// FINDING #1 (2026-08-12): a named pool must be REGISTERED species (MEME_KEYS or SPECIES_LEGEND) —
+// an unregistered/typo'd key is now refused (it used to mint an UNCAPPED phantom). So the "owner's
+// named set" here is the five wave-2 Meme Dynasty species: valid keys, and distinct from the game's
+// LEGENDARY roster (they are kind:"meme", not legendaries), which is exactly what this sim needs.
+const NEW_SET = ["ansem", "successkid", "chloe", "grumpycat", "peanut"];
+console.log("\n== the owner names a valid REGISTERED set (the Meme Dynasty) at start ==");
 const s1 = await post("/admin/event/start", { key: KEY, event: "founder_drop", days: 7, species: NEW_SET });
 console.log(`   start -> ${s1.status} species=${JSON.stringify(s1.body.species)} perSpecies=${s1.body.perSpecies} cap=${s1.body.cap}`);
 const CAP = Number(s1.body.cap);
@@ -53,7 +57,7 @@ const ceilShare = (n) => Math.max(1, Math.ceil(CAP / (n || 1)));
 chk(s1.status === 200, "drop started");
 chk(JSON.stringify(s1.body.species) === JSON.stringify(NEW_SET), "the response reports the OWNER'S set, not the game's legendaries");
 chk(NEW_SET.every(sp => !ROSTER.includes(sp)),
-    `the named set is genuinely NOT the game's roster (overlap = ${JSON.stringify(NEW_SET.filter(sp => ROSTER.includes(sp)))})`);
+    `the named set is genuinely NOT the game's LEGENDARY roster (overlap = ${JSON.stringify(NEW_SET.filter(sp => ROSTER.includes(sp)))})`);
 chk(s1.body.perSpecies === ceilShare(NEW_SET.length),
     `perSpecies = ${s1.body.perSpecies} (cap ${CAP} / ${NEW_SET.length} named species = ${ceilShare(NEW_SET.length)})`);
 
@@ -63,7 +67,7 @@ console.log(`   /world/event = ${JSON.stringify(w.body).slice(0, 220)}`);
 chk(w.status === 200, "/world/event answers while the drop runs");
 
 console.log("\n== a 2-species set splits the cap 25/25 ==");
-const s2 = await post("/admin/event/start", { key: KEY, event: "founder_drop", days: 7, species: ["aurox", "zephyra"] });
+const s2 = await post("/admin/event/start", { key: KEY, event: "founder_drop", days: 7, species: ["stonks", "triplet"] });
 console.log(`   perSpecies = ${s2.body.perSpecies}`);
 chk(s2.body.perSpecies === ceilShare(2), `2-species pool -> ${s2.body.perSpecies} each (cap ${CAP} / 2 = ${ceilShare(2)})`);
 
@@ -76,7 +80,7 @@ console.log(`   roster   = ${JSON.stringify(ROSTER)}`);
 chk(Array.isArray(s3.body.species) && JSON.stringify(s3.body.species) === JSON.stringify(ROSTER),
     `no pool named -> the ${ROSTER.length} legendaries of the roster, in the roster's own order: ${JSON.stringify(s3.body.species)}`);
 chk(!(s3.body.species || []).some(sp => NEW_SET.includes(sp)),
-    `the previous drop's named set did NOT leak into the fallback (aurox present=${(s3.body.species || []).includes("aurox")})`);
+    `the previous drop's named set did NOT leak into the fallback (ansem present=${(s3.body.species || []).includes("ansem")})`);
 chk(s3.body.perSpecies === ceilShare(ROSTER.length),
     `the default pool's share is derived from the roster too: perSpecies=${s3.body.perSpecies} = ceil(${CAP}/${ROSTER.length}) = ${ceilShare(ROSTER.length)}`);
 const wDef = await get("/world/event");
