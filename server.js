@@ -7468,6 +7468,12 @@ const NFT_EXPLORER_BASE = String(process.env.NFT_EXPLORER_BASE || "https://solsc
 // How long a reserved-but-unconfirmed mint address holds its row before it may be abandoned. In-memory
 // `_nftMinting` dies with the process; `row.mintPending` is the CRASH-DURABLE half of the same claim.
 const NFT_PENDING_TTL_MS = Math.max(60000, Number(process.env.NFT_PENDING_TTL_MS || 600000) || 600000);
+// How long the reconcile sweep leaves a fresh reservation alone before it reads the chain for it.
+// A player-paid mint is a human approving a Phantom prompt, so a reservation seconds old is not
+// evidence of anything; below this age the sweep does not even spend a DAS read on it.
+const NFT_SWEEP_GRACE_MS = Math.max(30000, Number(process.env.NFT_SWEEP_GRACE_MS || 60000) || 60000);
+// Ceiling on DAS reads the sweep spends in one pass. Rows it does not reach are swept next pass.
+const NFT_SWEEP_MAX_READS = Math.max(1, Number(process.env.NFT_SWEEP_MAX_READS || 40) || 40);
 // Sequential, server-ASSIGNED edition per (type,species): assigned and recorded, NEVER recomputed, so
 // two wallets can never both hold "#1". Persisted with the rows; floored at max(row.edition) on restore.
 const nftEdition = Object.create(null);   // _censusKey(type,sp) -> highest edition issued
@@ -8163,6 +8169,58 @@ async function reconcileNftOwners() {
         }
       }
     }
+    // ---- RESERVED-BUT-UNCONFIRMED SWEEP (added 2026-08-12) ----------------------------------
+    // The loop above skips every row with no `row.mint`, and promotion to "minted" happened ONLY
+    // inside POST /assets/nft/mint — so nothing in the server ever revisited a reservation. Two
+    // live failures came out of that, both permanent for the player:
+    //   * a mint that LANDED but whose confirm never arrived (the client posts once and reads our
+    //     own 202 "confirm again in a moment" as a refusal) — the player paid, the Core asset is in
+    //     their wallet, and Chikoria showed "Minting…" forever with the card disabled;
+    //   * a mint the player CANCELLED in Phantom — the orphan marker froze eggNftHatchBlock, so the
+    //     egg could never hatch, be discarded or be consumed again.
+    // This sweep is the missing half: re-read the chain for every reserved row and settle it either
+    // way. It runs on the same 5-minute timer and, like the rest of reconcile, keeps running while
+    // NEW mints are paused — so pausing is a real stopgap, not a freeze on recovery.
+    //
+    // `obs.absent` — the reader ANSWERED "no such account" — is REQUIRED before abandoning, exactly
+    // as at the mint route's own abandon branch. `dasFailed` alone conflates "not there" with "I
+    // could not read", and abandoning on an outage is what produces a SECOND certificate for one
+    // creature. No answer => hold the reservation; a stuck row is recoverable, a duplicate is not.
+    let sweepReads = 0;
+    for (const row of assetReg.values()) {
+      if (row.mint || !row.mintPending) continue;
+      const pAddr = String(row.mintPending.addr || "");
+      const pAt = Number(row.mintPending.at) || 0;
+      // No addr, or no timestamp to age it by, and we cannot reason about it: HOLD. `pAt` falling back
+      // to 0 would read as infinitely old and abandon a reservation on its first pass — the opposite
+      // of safe. The mint route always writes `at`, and restoreAssetReg coerces it, so this is the
+      // in-memory-only edge; holding costs one skipped row, abandoning could cost a second mint.
+      if (!pAddr || !pAt) continue;
+      if (Date.now() - pAt < NFT_SWEEP_GRACE_MS) continue;   // still plausibly open in Phantom
+      // Bounded work per pass. A row whose reservation can never settle (e.g. the asset landed after
+      // the row changed hands, so it is neither ours nor absent) is re-read every pass forever, so the
+      // per-pass cost of a stuck set grows monotonically. The cap keeps one bad set from turning a
+      // 5-minute housekeeping pass into a DAS bill; the remainder is simply swept next pass.
+      if (sweepReads >= NFT_SWEEP_MAX_READS) break;
+      let sobs = null;
+      sweepReads++;
+      try { sobs = await _nftDasRead(pAddr); } catch (e) { sobs = null; }
+      if (nftVerifyOnchain(sobs, row.owner).ok) {            // it landed — record what the chain says
+        _nftCommitMint(row, pAddr);                          // sets _assetsDirty + censusInvalidate
+        // AN EGG CAN BE SPENT WHILE ITS MINT IS IN FLIGHT. Hatching does not clear the reservation
+        // (the freeze above only stops binding once it ages out), so a tx that lands afterwards would
+        // otherwise write a live, sellable certificate for an egg that no longer exists. The asset is
+        // real and must be recorded — losing track of it is what this whole sweep exists to prevent —
+        // but it is recorded RETIRED, exactly as an egg hatched through the normal path would be.
+        if (row.type === "egg" && row.state !== "active") eggNftRetire(row, null);
+        continue;
+      }
+      if (sobs && sobs.absent && Date.now() - pAt > NFT_PENDING_TTL_MS) {
+        regEvent(row, "mint_abandoned", { addr: pAddr, via: "sweep" });
+        delete row.mintPending; _assetsDirty = true;
+        if (row.clamped) censusInvalidate();                 // the row just SOFTENED back (regRowSoft)
+      }
+    }
     if (_assetsDirty) { try { await saveAssetLedger(true); } catch (e) {} }
   } finally { _nftSyncBusy = false; _nftSyncAt = Date.now(); }
 }
@@ -8831,7 +8889,18 @@ function eggNftHatchBlock(row) {
   // certificate for something that no longer exists. The reservation (mintPending) is the marker;
   // it clears on confirm, and the TTL+absent abandon reclaims a tx that is never submitted, so the
   // egg is never stuck for good. Flag-gated: flag-off, this branch does not exist.
-  if (MINT_AT_SALE_ON && row && !row.mint && row.mintPending)
+  //
+  // THE FREEZE MUST BE TIME-BOUNDED, and it was not (measured 2026-08-12): the reservation is
+  // persisted BEFORE the player signs, so one tap of Cancel in Phantom — or a compose that 502s
+  // before Phantom even opens — left `mintPending` standing forever, and this branch guards hatch,
+  // discard AND consume. The egg became unhatchable, undiscardable and unsellable for good, with
+  // the client greying the card so the player could not even retry. The comment above promised a
+  // reclaim that only ever ran inside the mint route (which re-reserves in the same request).
+  // A Solana blockhash dies in 60-90 s, so a transaction composed more than NFT_PENDING_TTL_MS ago
+  // physically cannot land — past that age the thing this freeze exists to prevent is impossible,
+  // and holding the egg hostage protects nobody. The reconcile sweep settles the row for real.
+  if (MINT_AT_SALE_ON && row && !row.mint && row.mintPending
+      && Date.now() - (Number(row.mintPending.at) || 0) < NFT_PENDING_TTL_MS)
     return { status: 409, body: { error: "this egg's first-sale listing is being signed — finish or abandon that sale first, then it can hatch", nftBusy: true } };
   if (!row || !row.mint) return null;                    // never minted -> nothing to protect
   if (row.pendingHandover)
@@ -10320,7 +10389,13 @@ app.post("/assets/nft/mint", async (req, res) => {
   if (row.mint) return res.json(_nftMintReply(row, true));
   const el = nftEligibility(row, who);
   if (el.code !== "ok") return res.status(el.status).json({ error: el.error });
-  if (NFT_MINT_PAUSED && !row.edition) return res.status(503).json({ error: "new mints are paused" });
+  // THE PAUSE MUST ACTUALLY PAUSE. The grace here is meant to let a player who is ALREADY mid-signature
+  // finish — but it keyed on `!row.edition`, and under CHIK_MINT_AT_SALE every row is stamped with an
+  // edition at ISSUANCE, so no player-paid mint ever met that condition and NFT_MINT_PAUSED=1 stopped
+  // nothing (measured 2026-08-12: /assets/nft/prepare 503s while POST /assets/nft/mint still returned a
+  // signable transaction). `row.mintPending` is what "already mid-signature" actually means: it exists
+  // only once a reservation has been made, and it is what the confirm and sweep paths settle.
+  if (NFT_MINT_PAUSED && !row.mintPending) return res.status(503).json({ error: "new mints are paused" });
   if (_nftBoardListed(row)) return res.status(409).json({ error: "asset is listed on the in-game board — unlist it first" });
   // Fail CLOSED on configuration: without a collection there is nothing to verify membership AGAINST,
   // and without the delegate there is no authority to sign a member create. Neither ever crashes.
