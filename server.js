@@ -7490,6 +7490,13 @@ const NFT_PENDING_TTL_MS = Math.max(60000, Number(process.env.NFT_PENDING_TTL_MS
 const NFT_SWEEP_GRACE_MS = Math.max(30000, Number(process.env.NFT_SWEEP_GRACE_MS || 60000) || 60000);
 // Ceiling on DAS reads the sweep spends in one pass. Rows it does not reach are swept next pass.
 const NFT_SWEEP_MAX_READS = Math.max(1, Number(process.env.NFT_SWEEP_MAX_READS || 40) || 40);
+// WHAT A PLAYER-PAID MINT REALLY COSTS. Measured on the live collection 2026-08-12: all nine mints
+// cost 5,363,880-5,517,000 lamports, against a client that promised "~0.004 SOL" in three places —
+// ~40% under, so a player who topped up to exactly the quoted figure still failed in Phantom. This is
+// the top of that range plus fee headroom. ONE constant serves both jobs on purpose: it is the number
+// quoted to the player AND the floor the balance pre-check enforces, so the game can never refuse a
+// wallet for holding less than it told them to bring. Re-measure if the attribute set grows.
+const NFT_MINT_COST_LAMPORTS = Math.max(1, Number(process.env.NFT_MINT_COST_LAMPORTS || 5700000) || 5700000);
 // Sequential, server-ASSIGNED edition per (type,species): assigned and recorded, NEVER recomputed, so
 // two wallets can never both hold "#1". Persisted with the rows; floored at max(row.edition) on restore.
 const nftEdition = Object.create(null);   // _censusKey(type,sp) -> highest edition issued
@@ -10488,6 +10495,25 @@ app.post("/assets/nft/mint", async (req, res) => {
         return res.status(409).json({ error: "that mint is still confirming — try again in a moment", pending: true });
       }
     }
+    // ---- CAN THEY ACTUALLY PAY? ASK BEFORE RESERVING ANYTHING -----------------------------------
+    // Under player-pays the payer is the PLAYER, and until now nothing anywhere read their balance:
+    // `getBalance` appeared in this file only for the treasury, the team wallet and a devnet airdrop.
+    // A player with too little SOL got a reservation written against their row, a composed
+    // transaction, and a Phantom "Not Enough Funds" dead end — and the row then sat pending until the
+    // sweep released it. Checking first costs one RPC read and means a wallet that cannot pay never
+    // strands a row. Measured 2026-08-12: all nine real mints cost 5,363,880-5,517,000 lamports, so
+    // the floor is set just above the top of that range and is env-overridable.
+    // Hoisted so the success reply QUOTES this read instead of making a second one — the player is
+    // waiting on this request, and two round-trips for one number is a round-trip too many.
+    let payerLamports = null;
+    if (playerPaid && who) {
+      try { payerLamports = await conn.getBalance(new PublicKey(who)); } catch (e) { payerLamports = null; }
+      // A read that FAILS must not block the mint — an RPC hiccup is not evidence of an empty wallet.
+      if (payerLamports !== null && payerLamports < NFT_MINT_COST_LAMPORTS)
+        return res.status(402).json({ error: "not enough SOL in your wallet to pay for this mint", code: "funds",
+          payerLamports, needLamports: NFT_MINT_COST_LAMPORTS,
+          payerSol: payerLamports / LAMPORTS_PER_SOL, needSol: NFT_MINT_COST_LAMPORTS / LAMPORTS_PER_SOL });
+    }
     // Reserve the edition and the address, and PERSIST BOTH before anything is submitted. A reserved
     // but unminted edition is reused by the very next retry of this row, so the series has no holes.
     if (!row.edition) row.edition = nftEditionFor(row);
@@ -10522,10 +10548,26 @@ app.post("/assets/nft/mint", async (req, res) => {
         return res.status(st).json({ error: (comp && comp.error) || "could not compose the mint transaction — try again",
           code: (comp && comp.code) || "compose", pending: true, id: row.id });
       }
+      // THE COST IS MEASURED, NOT ASSERTED. This reply used to promise "~0.004 SOL"; every one of the
+      // nine real mints on the live collection cost 5,363,880-5,517,000 lamports, so the quote was
+      // ~40% under and a player who topped up to exactly the quoted figure still failed. Rent scales
+      // with the account's size (longer species names cost more), so no constant can be right for
+      // every creature — `costLamports` is the account's true rent-exempt minimum for THIS asset plus
+      // a fee allowance, and the client shows that number rather than a literal of its own.
+      // Deliberately a measured CONSTANT, not a computed guess. Rent depends on the asset account's
+      // size, and the transaction's byte length is not that size — estimating from it would risk
+      // being wrong in exactly the direction this fixes. The figure below is the top of the measured
+      // range plus fee headroom, so it can over-quote by a fraction of a cent and can never under-
+      // quote. Re-measure and adjust the env if the attribute set grows.
+      const costLamports = NFT_MINT_COST_LAMPORTS;
+      // `payerLamports` is the pre-check's read, reused — see the hoist above. Null means that read
+      // failed, which the client renders as "we could not check" rather than as "you have nothing".
       return res.json({ ok: true, action: "mint", composed: "mint", id: row.id, tokenMint: key.addr,
         edition: row.edition, editionOf: masEditionOf(row), payer: who, mintPending: true,
         tx: comp.b64, ver: comp.ver, cosigned: false, bytes: comp.bytes || comp.b64.length,
-        note: "sign in Phantom and submit — you pay the mint rent (~0.004 SOL) and the network fee; the server co-signed only as collection authority and never pays. Then POST /assets/nft/mint/confirm {wallet, mktToken, id, signature}." });
+        costLamports, costSol: costLamports / LAMPORTS_PER_SOL,
+        payerLamports, payerSol: payerLamports === null ? null : payerLamports / LAMPORTS_PER_SOL,
+        note: "sign in Phantom and submit — you pay the mint rent and the network fee (see costSol); the server co-signed only as collection authority and never pays. Then POST /assets/nft/mint/confirm {wallet, mktToken, id, signature}." });
     }
     let out;
     try {
