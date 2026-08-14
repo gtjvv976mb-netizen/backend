@@ -7286,6 +7286,33 @@ const SPECIES_MEME   = Object.freeze(["popcat", "moodeng", "doge", "pepe", "chil
                                       "ansem", "successkid", "chloe", "grumpycat", "peanut",
                                       "cryingcat", "thisisfine", "babygoat", "triplet", "stonks",
                                       "nervousmonkey"]);
+// ELEMENT, mirrored from the client's Econ.ELEMENT / NORMALS[sp].el — the one fact about a chikimon
+// the NFT metadata could not state, and the trait collectors filter on hardest after rarity. All 41
+// species, matching the client exactly. A species missing here answers "" and the trait is OMITTED
+// rather than guessed: Econ.el_of defaults to Beast for GAMEPLAY, but a certificate must never
+// invent an attribute it does not know.
+const SPECIES_ELEMENT = Object.freeze(Object.assign(Object.create(null), {
+  // legendary
+  adalor: "Light", astragor: "Beast", astraya: "Light", bamboran: "Beast", borealon: "Water",
+  crysalune: "Water", dragonos: "Fire", galador: "Water", grovador: "Storm", horoxyn: "Storm",
+  rivaros: "Water", solvarex: "Fire", tyrannos: "Beast", vesperos: "Light",
+  // meme
+  alon: "Storm", ansem: "Beast", babygoat: "Light", chillguy: "Fire", chloe: "Storm",
+  cryingcat: "Water", doge: "Beast", grumpycat: "Beast", moodeng: "Water",
+  nervousmonkey: "Storm", peanut: "Beast", pepe: "Light", popcat: "Storm", stonks: "Storm",
+  successkid: "Light", thisisfine: "Fire", triplet: "Beast",
+  // normal
+  drolax: "Water", electrox: "Storm", firix: "Fire", forestle: "Beast", healix: "Light",
+  jellox: "Water", mushrow: "Beast", owzard: "Light", scorplex: "Storm", solarix: "Fire",
+}));
+// Avatar titles, mirrored from the client's Econ.AVATAR_TITLE. An avatar's NAME is its title —
+// "The Wanderer", not "classic" — and shipping the bare id is what made those tokens unreadable.
+const AVATAR_TITLE = Object.freeze(Object.assign(Object.create(null), {
+  classic: "The Wanderer", Knight: "The Gallant Knight", Mystic: "The Arcane Mystic",
+  Navigator: "The Pathfinder", Star: "The Popstar", chemist: "The Mad Alchemist",
+  electro: "The Storm Herald", fire: "The Emberlord", night: "The Nightblade",
+  sailor: "The Old Salt",
+}));
 // supply-weighted exactly as Econ.MOUNTS: the Mythic griffin is the longest shot, and rolling it
 // server-side is the point — a crafted save used to simply name it.
 const MOUNT_SUPPLY = Object.freeze([["chicken", 15], ["boar", 20], ["gator", 15],
@@ -7553,7 +7580,53 @@ function nftDelegate() {
 // An egg has no species (row.sp equals its KIND), so name it "<Kind> Egg #N" — distinct from the
 // hatchling's "<Species> #N", and keyed on a different edition counter (egg:<kind> vs chikimon:<sp>),
 // so egg editions can never collide with or seed a creature's. Only ever differs for type "egg".
-const nftAssetName = (row) => (row.type === "egg" ? `${_nftCap(row.kind)} Egg #${row.edition}` : `${_nftCap(row.sp)} #${row.edition}`);
+// THE DISPLAY NAME — what a wallet, a marketplace and a buyer actually read.
+// `_nftCap(sp)` capitalises the species ID, which is right for every legendary and every normal
+// (galador -> "Galador", drolax -> "Drolax") and WRONG for eleven of the seventeen Meme Dynasty,
+// whose ids are squashed: it shipped "Thisisfine", "Nervousmonkey", "Triplet", "Babygoat",
+// "Cryingcat", "Grumpycat", "Successkid", "Moodeng", "Chillguy", and bare "Chloe"/"Ansem"/"Peanut".
+// MEME_CHARS has carried the authored names the whole time ("This Is Fine Dog", "Triple T",
+// "Side-eye Chloe"); this reads them instead of re-deriving, so the caps table stays the one
+// authority and the two can never drift. An avatar's name is its TITLE ("The Wanderer") — the bare
+// id is meaningless to a buyer. Mounts keep the capitalised id, which is already correct for all six.
+function nftDisplayName(row) {
+  const sp = String(row.sp || "");
+  if (row.type === "egg") return `${_nftCap(row.kind || sp)} Egg`;
+  if (row.type === "avatar") return AVATAR_TITLE[sp] || _nftCap(sp);
+  const c = MEME_CHARS.find((x) => x.key === sp);
+  return (c && c.name) || _nftCap(sp);
+}
+const nftAssetName = (row) => `${nftDisplayName(row)} #${row.edition}`;
+// RARITY, the trait every marketplace sorts and filters on first. Derived, never stored, so it can
+// never disagree with the caps that are the actual law:
+//   meme chikimon   MEME_CHARS.rarity — "Meme Legendary", or Alon's own "Founder's Edition"
+//   chikimon        the roster list it belongs to (SPECIES_LEGEND / SPECIES_NORMAL)
+//   mount / avatar  the supply ladder, matching the client's Econ.avatar_rarity thresholds exactly
+//   egg             its kind ("Legendary Egg"), which is the only tier an egg has
+function nftRarityTier(row) {
+  const sp = String(row.sp || "");
+  if (row.type === "egg") return `${_nftCap(row.kind || sp)} Egg`;
+  if (row.type === "chikimon") {
+    const c = MEME_CHARS.find((x) => x.key === sp);
+    if (c) return c.rarity || "Meme Legendary";
+    if (SPECIES_LEGEND.includes(sp)) return "Legendary";
+    if (SPECIES_NORMAL.includes(sp)) return "Normal";
+    return "";
+  }
+  const cap = supplyOf(row.type, sp);
+  if (cap <= 0) return "";
+  if (cap <= 5) return "Immortal";
+  if (cap <= 10) return "Mythic";
+  if (cap <= 20) return "Legendary";
+  if (cap <= 30) return "Epic";
+  return "Rare";
+}
+// The asset CLASS as a buyer would say it, not as the database spells it.
+function nftTypeLabel(row) {
+  const t = String(row.type || "");
+  return t === "chikimon" ? "Chikimon" : t === "mount" ? "Mount"
+       : t === "avatar" ? "Avatar" : t === "egg" ? "Egg" : _nftCap(t);
+}
 const nftMetaUri = (row) => (NFT_META_BASE ? `${NFT_META_BASE}/assets/nft/meta/${encodeURIComponent(row.id)}` : "");
 // ---- mint-at-sale helpers (every one inert while CHIK_MINT_AT_SALE is off) ---------------------
 // Which ORIGINS may sell under owner ruling 1. ORIGIN_CLEAN (declared below with the ledger — read at
@@ -7587,6 +7660,31 @@ function nftAttributes(row) {
           { key: "kind", value: String(row.kind || "") }, { key: "origin", value: String(row.origin || "") },
           { key: "edition", value: String(row.edition || "") }, { key: "born", value: String(row.born || "") },
           { key: "hatcher", value: String(row.hatcher || row.owner || "") }];
+  // ---- THE COLLECTIBLE HALF (2026-08-15) --------------------------------------------------------
+  // Everything above is PROVENANCE — true, durable, and completely unbrowsable. A marketplace sorts
+  // and filters on what a collector actually cares about, and this collection published none of it:
+  // no rarity, no element, no readable name, no supply. Added here rather than only in the JSON so
+  // the Core Attributes plugin — the copy that outlives the metadata host — carries them too.
+  //
+  // APPENDED, and existing keys are untouched: /assets/cert, the sims and any already-minted asset
+  // all look attributes up BY KEY, so adding rows cannot move or reinterpret an old one.
+  //
+  // NOT behind MINT_AT_SALE_ON, unlike editionOf/witness below. Those two are part of that feature's
+  // staged rollout; these are a correctness fix for names and traits that are wrong on chain RIGHT
+  // NOW, with the flag off, which is exactly the state production runs in.
+  const disp = nftDisplayName(row);
+  const rarity = nftRarityTier(row);
+  const element = SPECIES_ELEMENT[String(row.sp || "")] || "";
+  const cap = supplyOf(row.type, String(row.sp || ""));
+  a.push({ key: "name", value: disp });
+  a.push({ key: "assetType", value: nftTypeLabel(row) });
+  if (rarity) a.push({ key: "rarity", value: rarity });
+  // Element belongs to CREATURES. A mount or an avatar has none, and inventing one would be a lie
+  // dressed as a filter; the species table simply has no row for them, so this stays absent.
+  if (element && row.type === "chikimon") a.push({ key: "element", value: element });
+  // The supply LAW, phrased the way the edition line reads: "#3 of 15", or an honest "Open" for the
+  // uncapped classes (normal and legendary chikimon, eggs). Never the minted-so-far count.
+  a.push({ key: "supply", value: cap > 0 ? String(cap) : "Open" });
   // Ruling 4: "Edition N of <cap>" — the registry census total, NEVER the minted count — plus the
   // honest witness class. Added ONLY under the flag so a flag-off mint/meta is byte-identical.
   if (MINT_AT_SALE_ON) {
@@ -10784,8 +10882,22 @@ app.get("/assets/nft/meta/:id", (req, res, next) => {
   if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
   const r = assetReg.get(String(req.params?.id || "").slice(0, 64));
   if (!r) return res.status(404).json({ error: "no such asset" });
-  const attrs = nftAttributes(r).map(a => ({ trait_type: a.key, value: a.value }));
-  attrs.push({ trait_type: "gameStatus", value: String(r.gameStatus || "good") });
+  // trait_type IS THE LABEL A BUYER READS. The on-chain plugin keys stay camelCase forever — they
+  // are the certificate, already written into every minted asset, and renaming them would orphan
+  // the ones on chain. The JSON is a presentation of the same facts, so it presents them: a
+  // marketplace filter reading "Registry ID" and "Game Status" is the same data as "registryId" and
+  // "gameStatus", spelled for a human. Anything not in the map falls through unchanged, so a trait
+  // added later is never silently dropped — it just shows its raw key until it is labelled here.
+  const TRAIT_LABEL = {
+    name: "Name", assetType: "Type", rarity: "Rarity", element: "Element", supply: "Supply",
+    species: "Species ID", kind: "Kind", origin: "Origin", edition: "Edition", born: "Born",
+    hatcher: "Hatched By", registryId: "Registry ID", editionOf: "Edition Of", witness: "Witness",
+  };
+  const attrs = nftAttributes(r).map(a => ({ trait_type: TRAIT_LABEL[a.key] || a.key, value: a.value }))
+    // A trait with an empty value is worse than an absent one: marketplaces render it as a filterable
+    // facet with a blank label, which is precisely the "unfinished collection" tell. Drop the blanks.
+    .filter(a => String(a.value ?? "") !== "");
+  attrs.push({ trait_type: "Game Status", value: String(r.gameStatus || "good") });
   // AN EGG IS NOT A CREATURE, and this JSON is the whole basis on which a buyer decides — it is what
   // every marketplace, wallet and aggregator shows about the token. The creature template rendered
   // "Legendary — a legendary of Chikoria, hatched in-world" for an UNHATCHED egg (r.sp IS the kind, so
@@ -10795,11 +10907,11 @@ app.get("/assets/nft/meta/:id", (req, res, next) => {
   // (A1-EGGMETA, and the honest half of A1-RETIRED-GRID)
   const isEgg = r.type === "egg";
   const eggSpent = isEgg && (r.state !== "active" || !!r.nftRetired);
-  if (isEgg) attrs.push({ trait_type: "hatched", value: eggSpent ? "yes" : "no" });
+  if (isEgg) attrs.push({ trait_type: "Hatched", value: eggSpent ? "yes" : "no" });
   const out = {
-    name: r.edition ? nftAssetName(r) : _nftCap(r.sp), symbol: "CHIKI",
+    name: r.edition ? nftAssetName(r) : nftDisplayName(r), symbol: "CHIKI",
     description: !isEgg
-      ? `${_nftCap(r.sp)} — a ${r.kind || r.type} of Chikoria, hatched in-world and certified by the Chikoria registry. Provenance is on-chain in this asset's Attributes.`
+      ? `${nftDisplayName(r)} — a ${r.kind || r.type} of Chikoria, hatched in-world and certified by the Chikoria registry. Provenance is on-chain in this asset's Attributes.`
       : (eggSpent
          ? `A ${_nftCap(r.kind)} Egg of Chikoria that has already hatched. This certificate is SPENT — the egg it names can never be hatched, tended or traded in Chikoria again. Provenance is on-chain in this asset's Attributes.`
          : `An unhatched ${_nftCap(r.kind)} Egg of Chikoria, issued and clocked by the Chikoria registry. Hatching it retires this certificate. Provenance is on-chain in this asset's Attributes.`),
@@ -12727,6 +12839,7 @@ export function _masHealEditionsForTest() { return masHealEditions(); }
 export function _masWitnessForTest(row) { return masWitness(row); }
 export function _masEditionOfForTest(row) { return masEditionOf(row); }
 export function _nftAttributesForTest(row) { return nftAttributes(row); }
+export function _nftNamesForTest(row) { return { name: nftAssetName(row), display: nftDisplayName(row), rarity: nftRarityTier(row), typeLabel: nftTypeLabel(row) }; }
 // drive the ledger audit (and its flag-gated avatar registry heal) directly, without a cloud save
 export function _auditAssetsForTest(wallet, mmo, firstSeen) { return auditAssets(wallet, mmo, firstSeen || 0); }
 // ---- CHIK_REG_ALL seams: drive the backfill directly and read the tallies. Never a chain/key. ----
