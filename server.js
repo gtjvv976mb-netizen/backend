@@ -2396,6 +2396,15 @@ function liveRarity(remaining, cap) {
 // cannot audit a scarcity number has to take it on faith, and so does every buyer.
 // Uncapped classes (normal/legendary chikimon, eggs) are published too, with cap 0: nothing the
 // world holds should be invisible just because nothing limits it.
+//
+// TWO CLASSES, BOTH PUBLISHED (owner ruling 2026-08-19). A species can hold N PLAYER editions plus a
+// separately sealed CREATOR EDITION that sits outside the cap. Netting the creator's copy into
+// `issued` would take an edition away from players; leaving it out silently would make `cap` a lie to
+// anyone who later meets the sixth copy. So both numbers ship, in one payload:
+//   cap / issued / remaining / rarity   the PLAYER run — what a player can still obtain
+//   creatorEditions                      how many sealed creator copies exist (0 for almost everything)
+//   existing                             issued + creatorEditions — every copy in the world
+//   supplyLabel                          the sentence: "5 player editions + 1 Creator Edition (6 in existence)"
 app.get("/world/rarity", (_req, res) => {
   const out = { avatar: {}, mount: {}, chikimon: {}, egg: {}, unlisted: [] };
   const done = new Set();
@@ -2406,9 +2415,17 @@ app.get("/world/rarity", (_req, res) => {
     const t = trueIssued(type, sp);
     const left = cap > 0 ? Math.max(0, cap - t.count) : -1;      // -1 = uncapped, nothing to run out of
     const bucket = out[type] || (out[type] = {});
+    // `cap`, `issued`, `remaining` and `rarity` are the PLAYER run, unchanged in meaning and in
+    // arithmetic: a Creator Edition never spends one of these slots, so a species the creator holds
+    // still offers players every edition it ever did. `creatorEditions` / `existing` / `supplyLabel`
+    // are what keep that from being a half-truth — the copy outside the run is named, counted and
+    // spelled out here, in the same payload, rather than left for a reader to discover on a
+    // marketplace. (owner ruling 2026-08-19)
     bucket[sp] = { cap, issued: t.count, remaining: left, rarity: cap > 0 ? liveRarity(left, cap) : "Uncapped",
+                   creatorEditions: t.creator, existing: t.count + t.creator,
+                   supplyLabel: supplyLabelOf(type, sp),
                    breakdown: { registry: t.registry, ledger: t.ledger, sales: t.sales,
-                                deduped: t.deduped, flagged: t.flagged } };
+                                deduped: t.deduped, flagged: t.flagged, creator: t.creator } };
   };
   for (const [type, tbl] of Object.entries(ASSET_SUPPLY)) for (const sp of Object.keys(tbl)) emit(type, sp, tbl[sp]);
   // RULING 5 — leave the supply/edition surface HONEST and MACHINE-READABLE for the NFT drop that
@@ -6477,7 +6494,12 @@ app.get("/assets/summary", (req, res) => {
 // FRESHNESS CAVEAT, stated in the payload: the ledger only knows what it has SEEN in cloud saves,
 // so these numbers start near zero after a database change and fill in as players sign in.
 function computeCensus() {
-  const mk = (list) => { const m = Object.create(null); for (const id of list) m[id] = { holders: 0, minted: 0, byOrigin: {} }; return m; };
+  // `creator` — the sealed CREATOR EDITION rows (owner ruling 2026-08-19). They are inside `minted`
+  // and inside `holders` exactly as before, because they really were minted and really are held; this
+  // third number is what says how many of that total sit OUTSIDE the player supply cap, so an owner
+  // reading minted 6 against a cap of 5 can see instantly that the sixth is the creator's own copy
+  // and not an overmint. Stays 0 everywhere no grant has run.
+  const mk = (list) => { const m = Object.create(null); for (const id of list) m[id] = { holders: 0, minted: 0, creator: 0, byOrigin: {} }; return m; };
   const chikimon = mk([...SPECIES_NORMAL, ...SPECIES_LEGEND, ...SPECIES_MEME]);
   const mounts   = mk(MOUNT_KEYS);                   // all twelve chikimounts, catalog order
   const avatars  = mk(AVATAR_IDS);
@@ -6510,6 +6532,8 @@ function computeCensus() {
   const eggs = { claimed: {}, hatched: {}, nesting: {} };
   for (const row of assetReg.values()) {
     if (!row) continue;
+    const _cTbl = row.type === "chikimon" ? chikimon : row.type === "mount" ? mounts : row.type === "avatar" ? avatars : null;
+    if (_cTbl && row.creatorEdition === true) bump(_cTbl, row.sp, "creator", null);   // no byOrigin bump: origin was already counted
     if (row.type === "chikimon") bump(chikimon, row.sp, "minted", row.origin);
     else if (row.type === "mount") bump(mounts, row.sp, "minted", row.origin);
     else if (row.type === "avatar") bump(avatars, row.sp, "minted", row.origin);
@@ -6525,14 +6549,18 @@ function computeCensus() {
   const rank = (tbl) => Object.keys(tbl)
     .map((sp) => ({ sp, ...tbl[sp] }))
     .sort((a, b) => (b.holders - a.holders) || (b.minted - a.minted) || a.sp.localeCompare(b.sp));
+  const creatorTot = (tbl) => Object.values(tbl).reduce((n, v) => n + v.creator, 0);
   const tot = (tbl) => Object.values(tbl).reduce((n, v) => n + v.holders, 0);
 
   return {
     generatedAt: Date.now(),
-    note: "holders = wallets observed holding one in a cloud save; minted = issued/adopted through the registry. " +
+    note: "holders = wallets observed holding one in a cloud save; minted = issued/adopted through the registry; " +
+          "creator = sealed Creator Edition rows, which are INSIDE minted/holders but OUTSIDE the player supply cap " +
+          "(so minted may legitimately exceed the cap by exactly the creator count — see /world/rarity for the split). " +
           "The ledger only knows what it has seen, so counts fill in as players sign in.",
     ledgerWallets: wallets, registryRows: assetReg.size,
     chikimon: rank(chikimon), mounts: rank(mounts), avatars: rank(avatars), eggs,
+    creatorEditions: { chikimon: creatorTot(chikimon), mounts: creatorTot(mounts), avatars: creatorTot(avatars) },
     totals: { chikimonHeld: tot(chikimon), mountsHeld: tot(mounts), avatarsHeld: tot(avatars),
               eggsClaimed: Object.values(eggs.claimed).reduce((a, b) => a + b, 0),
               eggsHatched: Object.values(eggs.hatched).reduce((a, b) => a + b, 0) },
@@ -6566,7 +6594,12 @@ app.get("/assets/dex", (_req, res) => {
   const now = Date.now();
   if (!_dexCache || now - _dexAt > DEX_TTL_MS) {
     const c = computeCensus();
-    const strip = (arr) => arr.map((x) => ({ sp: x.sp, owners: x.holders }));   // no origins, no minted
+    // no origins, no minted. `creator` IS published — it is the owner's own declared badge, not a
+    // provenance oracle (it says "the creator holds one of these", which every marketplace listing of
+    // that species already says), and leaving it out is exactly how a supply number becomes a lie.
+    // Absent when zero, so a realm where no grant has run serves a byte-identical payload.
+    const strip = (arr) => arr.map((x) => (x.creator > 0 ? { sp: x.sp, owners: x.holders, creator: x.creator }
+                                                         : { sp: x.sp, owners: x.holders }));
     _dexCache = {
       generatedAt: c.generatedAt, ttlMs: DEX_TTL_MS,
       chikimon: strip(c.chikimon), mounts: strip(c.mounts), avatars: strip(c.avatars),
@@ -7832,7 +7865,16 @@ function nftDisplayName(row) {
   const c = MEME_CHARS.find((x) => x.key === sp);
   return (c && c.name) || _nftCap(sp);
 }
-const nftAssetName = (row) => `${nftDisplayName(row)} #${row.edition}`;
+// "#7 Tyrannos", NOT "Tyrannos #7" — the ORDER is the whole point, and it is measured, not styled.
+// Magic Eden's collection grid renders a token's name from the "#" onward. That is sensible for a
+// PFP set where every name shares one prefix ("Foo #1", "Foo #2") and the prefix is noise; ours are
+// not that — the prefix IS the creature, so the grid showed a wall of bare "#7 #6 #1 #5" with every
+// identity thrown away. Verified on the live collection page 2026-08-20: every card read "#N"
+// except one asset carrying no hash, which rendered in full.
+// Leading the name with the hash satisfies both readers at once: the grid finds "#" at index 0 and
+// therefore keeps the entire string, so the card reads "#7 Tyrannos", while the edition still opens
+// the name the way the NFT convention expects. `Edition` also remains a trait in its own right.
+const nftAssetName = (row) => `#${row.edition} ${nftDisplayName(row)}`;
 // RARITY, the trait every marketplace sorts and filters on first. Derived, never stored, so it can
 // never disagree with the caps that are the actual law:
 //   meme chikimon   MEME_CHARS.rarity — "Meme Legendary", or Alon's own "Founder's Edition"
@@ -7881,6 +7923,10 @@ function masOriginClean(origin) { origin = String(origin || ""); return origin =
 // count. A capped kind states its cap ("Edition N of 5"); an uncapped kind (normal chikimon above
 // all) does NOT invent one — it states the open edition truthfully.
 function masEditionOf(row) {
+  // A Creator Edition is not the Nth of the player run — it is the only one of its own class, and
+  // saying "of 5" over it would put six things inside a series of five. Its denominator is its own
+  // class size, read off the census rather than asserted (one-of-each makes it 1 in practice).
+  if (row && row.creatorEdition === true) return String(Math.max(1, creatorIssued(row.type, String(row.sp || ""))));
   const cap = supplyOf(row.type, row.sp);
   return cap > 0 ? String(cap) : "open";
 }
@@ -7927,6 +7973,9 @@ function nftAttributes(row) {
   if (element && row.type === "chikimon") a.push({ key: "element", value: element });
   // The supply LAW, phrased the way the edition line reads: "#3 of 15", or an honest "Open" for the
   // uncapped classes (normal and legendary chikimon, eggs). Never the minted-so-far count.
+  // SINCE 2026-08-19 THIS IS THE PLAYER-EDITION LAW, and it is exactly the number a buyer needs:
+  // how many of these anyone can ever obtain. A Creator Edition is outside it, and is published
+  // beside it by the two traits at the end of this list — never netted into it, never hidden from it.
   a.push({ key: "supply", value: cap > 0 ? String(cap) : "Open" });
   // Ruling 4: "Edition N of <cap>" — the registry census total, NEVER the minted count — plus the
   // honest witness class. Added ONLY under the flag so a flag-off mint/meta is byte-identical.
@@ -7947,6 +7996,19 @@ function nftAttributes(row) {
   // already on chain keeps the plugin it was minted with — the seal reaches it through the metadata
   // JSON (/assets/nft/meta/:id), which is dynamic and re-read by every indexer.
   if (row.creatorEdition === true) a.push({ key: "creatorEdition", value: "Yes" });
+  // ============ AND WHAT THE SEAL COSTS THE SUPPLY NUMBER — SAID OUT LOUD ============
+  // Owner ruling 2026-08-19 puts the creator's copy OUTSIDE the cap, so strictly more of this species
+  // exist than `supply` states. A certificate that let a reader work that out only by accident would
+  // be the same quiet lie this collection refuses, so both classes are named on EVERY asset of the
+  // species — the creator's copy and each player's alike: "Supply 5 · Creator Editions 1 · Total In
+  // Existence 6". Present only where a Creator Edition actually exists (0 grants -> both absent ->
+  // byte-identical metadata for a server that never ran the grant), and appended AFTER every existing
+  // key so no already-minted Attributes plugin has an index or a meaning moved.
+  const _cre = creatorIssued(row.type, String(row.sp || ""));
+  if (_cre > 0) {
+    a.push({ key: "creatorEditions", value: String(_cre) });
+    if (cap > 0) a.push({ key: "totalEditions", value: String(cap + _cre) });
+  }
   return a;
 }
 // Build + submit the Core create. The SDK is imported LAZILY inside this function so a flag-off boot
@@ -8207,7 +8269,15 @@ function nftEligibility(row, wallet) {
   if (row.listedOffchain || row.pendingHandover) return { code: "busy", status: 409, error: "asset is listed on-chain or has a pending transfer" };
   return { code: "ok", status: 200 };
 }
-function nftEditionFor(row) { const k = _censusKey(row.type, row.sp); nftEdition[k] = (nftEdition[k] || 0) + 1; return nftEdition[k]; }
+// THE CREATOR EDITION RUNS ITS OWN SERIES (owner ruling 2026-08-19). Sharing the player counter was
+// an integrity break the moment the creator stopped spending a cap slot: grant + five sales over a
+// cap-5 species issued editions 1..6 while `editionOf` still said 5, and a buyer's certificate would
+// have read "Edition 6 of 5". Keyed separately, the player series stays 1..cap and the creator's copy
+// is "Edition 1 of 1" in a series of its own. Persistence needs nothing new — nftEdition is a plain
+// key->highest map, saved and floored by key — but the restore MUST seal the row before it floors the
+// counter, or a sealed row would floor the player series (see restoreAssetReg).
+function nftEditionKey(row) { return (row && row.creatorEdition === true ? "creator:" : "") + _censusKey(row.type, row.sp); }
+function nftEditionFor(row) { const k = nftEditionKey(row); nftEdition[k] = (nftEdition[k] || 0) + 1; return nftEdition[k]; }
 // A PREVIEW of the mint the server will submit — never a transaction the client signs. A Core member
 // mint (CreateV2 with `collection` set) requires a collection authority signature, so the SERVER signs
 // with a scoped UpdateDelegate (never TREASURY_SECRET, never the cold master key) and mints the asset
@@ -8727,7 +8797,7 @@ function buildCensus() {
   const slotOf = (type, sp) => {
     const k = _censusKey(type, sp);
     let s = byKey.get(k);
-    if (!s) { s = { type, sp, registry: 0, ledger: 0, sales: 0, deduped: 0, count: 0, flagged: 0, orphanSales: 0, w: new Map() }; byKey.set(k, s); }
+    if (!s) { s = { type, sp, registry: 0, ledger: 0, sales: 0, deduped: 0, count: 0, flagged: 0, creator: 0, orphanSales: 0, w: new Map() }; byKey.set(k, s); }
     return s;
   };
   // Each wallet keeps two parallel tallies of the same shape: `c` (clean — what binds the cap) and
@@ -8736,13 +8806,19 @@ function buildCensus() {
   // `Rs` counts the SOFT rows inside R — census-clamp-marked, unminted (regRowSoft). They ride in
   // R (and in the luid match) so the dedup lands exactly as before; only the quota arithmetic below
   // reads them out again. Zero everywhere no backfill has run, so the sums are byte-identical then.
-  const grp = () => ({ R: 0, Rs: 0, L: 0, luids: null, uids: null });
+  // `Rc` counts the CREATOR EDITION rows inside R (owner ruling 2026-08-19). They ride in R exactly
+  // like every other registry row — so the luid match, the absorption term and the clamp arithmetic
+  // are byte-identical to before, and the ledger arm the grant writes beside each sealed row is still
+  // absorbed rather than counted twice — and are read out again ONCE at the end of the reconcile, into
+  // `slot.creator` instead of `slot.count`. Zero on every wallet that holds no sealed row, which is
+  // every wallet but the creator's, so the sums below are unchanged for the whole live population.
+  const grp = () => ({ R: 0, Rs: 0, Rc: 0, L: 0, luids: null, uids: null });
   const wOf = (slot, wallet) => {
     let w = slot.w.get(wallet);
     if (!w) { w = { c: grp(), f: grp(), S: 0 }; slot.w.set(wallet, w); }
     return w;
   };
-  const addReg = (g, luid, soft) => { g.R++; if (soft) g.Rs++; if (luid) (g.luids || (g.luids = new Set())).add(String(luid)); };
+  const addReg = (g, luid, soft, sealed) => { g.R++; if (soft) g.Rs++; if (sealed) g.Rc++; if (luid) (g.luids || (g.luids = new Set())).add(String(luid)); };
   const addLed = (g, uid) => { g.L++; (g.uids || (g.uids = [])).push(String(uid)); };
   const distinctOf = (g) => {
     let matched = 0;
@@ -8760,7 +8836,11 @@ function buildCensus() {
     if (!type || !sp) continue;
     const slot = slotOf(type, sp), w = wOf(slot, String(r.owner || "?"));
     const bad = r.origin === "unverified";
-    addReg(bad ? w.f : w.c, r.luid, regRowSoft(r));
+    // THE SEAL IS THE ONLY NOTION OF "CREATOR" ANYWHERE IN THIS FILE. `creatorEdition` is written in
+    // exactly two places (regSealCreator, from mintAsset's `opts.creator` and from the row's own chain
+    // on restore), is structurally write-once, and is stripped out of `fields` before a row is built —
+    // so no request body, origin string or wallet claim can make a row read as the creator's here.
+    addReg(bad ? w.f : w.c, r.luid, regRowSoft(r), r.creatorEdition === true);
     if (!bad) slot.registry++;                     // `flagged` is filled in by the reconcile below
   }
   // ---- 2. the legacy ledger: what predates the registry -------------------------------------
@@ -8826,7 +8906,7 @@ function buildCensus() {
   // at most one ledger unit per wallet, so this is a no-op for them.
   for (const slot of byKey.values()) {
     const capped = supplyOf(slot.type, slot.sp) > 0;
-    let total = slot.orphanSales, flagged = 0, dropped = 0, gone = 0;
+    let total = slot.orphanSales, flagged = 0, dropped = 0, gone = 0, creator = 0;
     for (const [_wallet, w] of slot.w) {
       const base = distinctOf(w.c);                  // this wallet's TRUE distinct clean holdings
       let counted = base;
@@ -8859,11 +8939,33 @@ function buildCensus() {
       // clamped clean surplus is reported, not counted. A handed-over ghost is NOT flagged — nobody
       // forged anything, the creature simply lives in another wallet now — so it is excluded here.
       flagged += distinctOf(w.f) + (base - counted - left);
+      // ============ THE CREATOR EDITION IS A CLASS OF ITS OWN (owner ruling 2026-08-19) ============
+      // "every asset that lives in the admin/creator account will be off the rarity limit/cap and
+      // will have the creator edition badge". So a sealed row is REMOVED from `count` — the number
+      // the cap, `remaining` and every player-facing surface are computed from — and MOVED into
+      // `creator`, which is published beside it everywhere. The creator holding one Momota therefore
+      // leaves players the full five, and the world still says out loud that a sixth exists.
+      //
+      // MOVED, NEVER DELETED. `creator` is carried in the census slot, returned by trueIssued(),
+      // published by /world/rarity (`creatorEditions`, `existing`, `supplyLabel`), by /assets/census
+      // and /assets/dex, and written into the NFT metadata as "Creator Editions" / "Total In
+      // Existence". A supply number that quietly excluded a copy someone actually holds would be
+      // exactly the lie this registry refuses; two honestly labelled classes are not.
+      //
+      // SUBTRACTED HERE, AFTER `flagged` — a Creator Edition is not a forgery and must not land in
+      // the flagged line. The min() cannot bind (a sealed row is never soft, so it is inside Rhard,
+      // and neither the clamp nor the hand-off debit can eat below Rhard) and is kept as a floor so
+      // this can never drive a species count negative.
+      const cr = Math.min(w.c.Rc, counted);
+      creator += cr;
+      total -= cr;
     }
-    slot.count = total;
+    slot.count = total;                                         // PLAYER editions — what the cap binds
+    slot.creator = creator;                                     // Creator Editions — outside the cap, never hidden
     slot.flagged = flagged;
     slot.ledger = Math.max(0, slot.ledger - dropped - gone);    // dropped surplus no longer a ledger row
-    slot.deduped = Math.max(0, slot.registry + slot.ledger + slot.sales - slot.count);
+    // the audit identity still closes: registry + ledger + sales = count + creator + deduped
+    slot.deduped = Math.max(0, slot.registry + slot.ledger + slot.sales - slot.count - slot.creator);
     slot.w = null;                                    // working state, not a published record
   }
   _censusBuilds++;
@@ -8875,15 +8977,33 @@ function censusAll() {
 }
 // THE one counter. Everything that asks "how many of these exist" asks this, so there is a single
 // number to be right about rather than two that drift apart.
-const _CENSUS_ZERO = Object.freeze({ count: 0, registry: 0, ledger: 0, sales: 0, deduped: 0, flagged: 0 });
+const _CENSUS_ZERO = Object.freeze({ count: 0, registry: 0, ledger: 0, sales: 0, deduped: 0, flagged: 0, creator: 0 });
 function trueIssued(type, sp) {
   const c = censusAll().get(_censusKey(type, sp));
   if (!c) return _CENSUS_ZERO;
   return { count: c.count, registry: c.registry, ledger: c.ledger, sales: c.sales,
-           deduped: c.deduped, flagged: c.flagged };
+           deduped: c.deduped, flagged: c.flagged, creator: c.creator || 0 };
 }
-// live issuance for one species — the DEDUPED union of every record source, not the registry alone
+// live issuance for one species — the DEDUPED union of every record source, not the registry alone.
+// PLAYER editions only: a Creator Edition is a separately labelled class that never spends a player
+// slot (buildCensus's Rc term), so this is the number the cap, the rarity ladder and every "N left"
+// on screen are computed from, and it means exactly what a player thinks it means.
 function issuedCount(type, sp) { return trueIssued(type, sp).count; }
+// how many CREATOR EDITIONS of this species exist — the copies the ruling puts outside the cap. The
+// counterpart of issuedCount, published everywhere issuedCount is, so the exemption is never silent.
+function creatorIssued(type, sp) { return trueIssued(type, sp).creator; }
+// EVERY copy in the world, both classes — the number nothing is allowed to contradict.
+function existingCount(type, sp) { const t = trueIssued(type, sp); return t.count + t.creator; }
+// THE SENTENCE. One place builds the words every supply surface prints, so /world/rarity, the grant
+// report and the NFT description can never drift into telling three different stories.
+function supplyLabelOf(type, sp) {
+  const cap = supplyOf(type, sp), cre = creatorIssued(type, sp);
+  const ed = (n) => `${n} Creator Edition${n === 1 ? "" : "s"}`;
+  if (cap > 0) return cre > 0
+    ? `${cap} player editions + ${ed(cre)} (${cap + cre} in existence)`
+    : `${cap} editions`;
+  return cre > 0 ? `uncapped, plus ${ed(cre)}` : "uncapped";
+}
 function supplyOf(type, sp) {
   const t = ASSET_SUPPLY[type];
   if (t && Object.hasOwn(t, sp)) return t[sp];
@@ -8977,7 +9097,27 @@ function mintAsset(type, wallet, fields, origin, parent, opts) {
   // No production caller passes `opts` while the flag is off, so flag-off behaviour is unchanged.
   const _saleBacked = !!(opts && opts.saleBacked);
   const _issuing = !_adopting && !_saleBacked && !["legacy", "unverified", "restitution"].includes(String(origin || ""));
-  if (_issuing && _sp && atSupplyCap(type, _sp)) {
+  // ============ THE CREATOR EDITION IS NOT A PLAYER EDITION (owner ruling 2026-08-19) ============
+  // "every asset that lives in the admin/creator account will be off the rarity limit/cap and will
+  // have the creator edition badge — a quality check to ensure everything in the world is at its
+  // best." A quality-control set that eats player supply is a tax on players, and one that can be
+  // refused SUPPLY_EXHAUSTED is not a set at all. So the cap does not bind it — and, symmetrically,
+  // buildCensus does not count it toward the player figures the cap is measured against, so the
+  // creator holding one Momota still leaves players all five (the Rc term, :buildCensus).
+  //
+  // THE EXEMPTION IS THE SEAL, AND THE SEAL IS UNREACHABLE FROM A REQUEST. It reads `opts.creator` —
+  // a fifth-argument option only a SERVER-SIDE caller can pass, whose sole caller in this file is
+  // /admin/grant-collection (admin-gated), and which is the same single switch that sets the
+  // permanent seal three lines below. There is deliberately no second notion of "creator": no origin
+  // string ("issued", "grant", anything a body could name), no request field, no wallet address and
+  // no admin gift reaches this line, and `fields.creatorEdition` is deleted before the row is built.
+  // Adding a second caller is an edit to this file, reviewed like the seal's own caller list.
+  //
+  // SCOPE, EXACTLY: the SUPPLY CAP alone. The Founder Drop reservation below, the one-of-each rule,
+  // the satchel bound and the registry-capacity limit all still bind a creator grant — this is not a
+  // general bypass and must never grow into one.
+  const _creatorIssue = !!(opts && opts.creator);
+  if (_issuing && !_creatorIssue && _sp && atSupplyCap(type, _sp)) {
     const e = new Error(`every ${_sp} that will ever exist has been claimed`);
     e.code = "SUPPLY_EXHAUSTED";
     throw e;
@@ -10265,13 +10405,20 @@ function regBackfillAll(wallet, chikis) {
 // ============ THE OWNER'S FULL-COLLECTION GRANT — POST /admin/grant-collection (CHIK_REG_ALL) ============
 // THE OWNER ASK (2026-08-11, verbatim intent): "give the admin wallet all chikimons, mounts and
 // avatars, authenticated and server birthed and included in the rarity mechanism." So every grant
-// here is a REAL issuance through the mintAsset chokepoint: origin "issued", NO luid, NO saleBacked
-// — which is exactly the shape the cap test at mintAsset counts (_issuing), so a granted griffin
-// spends a real griffin slot and a species with no room is REFUSED per-species (SUPPLY_EXHAUSTED)
-// and reported with its cap numbers, never minted past, never silently skipped. The Wanderer grant's
-// luid:"classic" and the adoption arms' luid rows are the OPPOSITE of this mandate (cap-exempt) and
-// are deliberately not imitated; row.luid stays unset so masWitness reads "server-issued" and the
-// row counts HARD (full) in the census.
+// here is a REAL issuance through the mintAsset chokepoint: origin "issued", NO luid, NO saleBacked.
+// The Wanderer grant's luid:"classic" and the adoption arms' luid rows are the OPPOSITE of this
+// mandate (they adopt something that already exists) and are deliberately not imitated; row.luid
+// stays unset so masWitness reads "server-issued" and the row is a real, server-birthed record.
+//
+// AND SINCE OWNER RULING 2026-08-19, THE ONE THING THAT DOES *NOT* BIND IT IS THE SUPPLY CAP.
+// "every asset that lives in the admin/creator account will be off the rarity limit/cap and will have
+// the creator edition badge — a quality check to ensure everything in the world is at its best." The
+// grant used to spend a real griffin slot and be refused SUPPLY_EXHAUSTED on a full species; both are
+// gone. `opts.creator` — the same single switch that sets the permanent seal — exempts this path from
+// the cap at the chokepoint, and buildCensus counts a sealed row into `creator` instead of `issued`,
+// so the creator's copy takes nothing from players and the two classes are published side by side
+// (see the notes at the end of this handler for every surface that says so). Everything else still
+// binds: one-of-each, the Founder Drop reservation, registry capacity.
 //
 // ONE of every species the wallet does not already hold — "hold" meaning ANY record of the species:
 // a registry row in any state (an owner-burned row is still a held history — re-granting after a
@@ -10421,10 +10568,12 @@ app.post("/admin/grant-collection", async (req, res, next) => {
     if (capacityFault) { skipped.push({ ...c, why: "registry-capacity" }); continue; }
     const via = heldVia(c.type, c.sp);
     if (via) { already.push({ ...c, via, ...capInfo }); continue; }
-    if (cap > 0 && atSupplyCap(c.type, c.sp)) {        // honest per-species refusal, dry or real
-      refused.push({ ...c, ...capInfo, remaining: 0 });
-      continue;
-    }
+    // NO CAP REFUSAL HERE ANY MORE (owner ruling 2026-08-19). This route used to check atSupplyCap
+    // first and report a full species as `refused` — correct while a creator grant SPENT a player
+    // slot, and wrong the moment it stopped. A Creator Edition is a class of its own, so a species
+    // whose player run is entirely claimed is still granted, and the player run is untouched by it:
+    // `remaining` in the granted row below reads the same after the grant as before it. The
+    // SUPPLY_EXHAUSTED catch a few lines down is kept as a defensive path, not an expected one.
     // the live Founder Drop's hold, refused the same way and reported in a dry run too
     if (c.type === "chikimon" && cap > 0 && memeReservedOut(c.sp)) {
       refused.push({ ...c, ...capInfo, remaining: remainingOf(c.type, c.sp),
@@ -10482,7 +10631,13 @@ app.post("/admin/grant-collection", async (req, res, next) => {
     granted.push({ ...c, id: row.id, edition: row.edition || null, luid,
                    creatorEdition: row.creatorEdition === true,   // the seal, read back off the row itself
                    ...(upgrades ? { upgrades } : {}),   // this species was held but unregistered until now
-                   cap, issued: issuedCount(c.type, c.sp), remaining: remainingOf(c.type, c.sp) });
+                   // THE PROOF, PER SPECIES, IN THE RESPONSE ITSELF: `issued`/`remaining` are the
+                   // PLAYER run read back AFTER the grant, so the owner can see that granting the
+                   // creator a Momota left players all five; `creatorEditions`/`existing`/
+                   // `supplyLabel` are the other half — the copy that now exists outside that run.
+                   cap, issued: issuedCount(c.type, c.sp), remaining: remainingOf(c.type, c.sp),
+                   creatorEditions: creatorIssued(c.type, c.sp), existing: existingCount(c.type, c.sp),
+                   supplyLabel: supplyLabelOf(c.type, c.sp) });
     _assetsDirty = true;
   }
 
@@ -10497,6 +10652,7 @@ app.post("/admin/grant-collection", async (req, res, next) => {
     flags: { regAll: REG_ALL_ON, nftHandover: NFT_HANDOVER_ON, mintAtSale: MINT_AT_SALE_ON, chronicle: CHRONICLE_ON },
     notes: [
       `creator edition: every row granted here carries the PERMANENT "Creator Edition" seal — write-once at issuance, rebuilt from the row's own chain on every restore, and never cleared by a sale, a hand-over or a re-sync. It shows on Magic Eden as the trait "Creator Edition: Yes" (metadata JSON), and is written into the on-chain Attributes plugin of anything minted from now on.`,
+      `outside the cap, never outside the count: a Creator Edition does not spend a player slot (the mintAsset cap check exempts opts.creator, and the census counts sealed rows in 'creator', not in 'issued'), so the 'remaining' beside each granted species is what players still have — granting the creator one Momota leaves the player run at 5 of 5. It is not hidden either: /world/rarity publishes creatorEditions + existing + supplyLabel, /assets/census and /assets/dex publish a per-species creator count, and every NFT of the species carries "Creator Editions" and "Total In Existence" beside "Supply".`,
       NFT_HANDOVER_ON ? "arrivals live: the client materialises the grants at next sign-in (/assets/arrivals + /assets/news)"
                       : "CHIK_NFT_HANDOVER=0: /assets/arrivals and /assets/news 404 — chikimon/avatars are granted and counted but wait for the flag to materialise; mounts appear via /assets/mounts/sync regardless",
       MINT_AT_SALE_ON ? "editions stamped at issuance"
@@ -10993,7 +11149,9 @@ app.post("/assets/nft/prepare", async (req, res) => {
   if (_nftBoardListed(row)) return res.status(409).json({ error: "asset is listed on the in-game board — unlist it first" });
   // The number this row WOULD get, read without incrementing anything. Two previews can show the same
   // "#1"; only the mint route decides, and it decides once.
-  const previewEdition = (nftEdition[_censusKey(row.type, row.sp)] || 0) + 1;
+  // nftEditionKey, not _censusKey: a sealed row previews its own Creator series, so the preview and
+  // the number the commit actually assigns cannot disagree (they read the same counter).
+  const previewEdition = (nftEdition[nftEditionKey(row)] || 0) + 1;
   res.json({ ok: true, prepared: true, preview: true, edition: previewEdition,
              mintModel: "server-mints", collectionConfigured: !!NFT_COLLECTION, mintConfigured: !!nftDelegate(),
              intent: nftMintIntent(row, previewEdition) });
@@ -11439,6 +11597,9 @@ app.get("/assets/nft/meta/:id", (req, res, next) => {
     // The owner's PERMANENT SEAL, spelled for a human. This is the string Magic Eden prints as the
     // trait's label; the value is "Yes", so the marketplace facet reads "Creator Edition · Yes".
     creatorEdition: "Creator Edition",
+    // The honest arithmetic beside the Supply facet: how many copies sit OUTSIDE the player run, and
+    // how many exist in total once they are added back. Both are absent unless one really exists.
+    creatorEditions: "Creator Editions", totalEditions: "Total In Existence",
   };
   const attrs = nftAttributes(r).map(a => ({ trait_type: TRAIT_LABEL[a.key] || a.key, value: a.value }))
     // A trait with an empty value is worse than an absent one: marketplaces render it as a filterable
@@ -11455,10 +11616,20 @@ app.get("/assets/nft/meta/:id", (req, res, next) => {
   const isEgg = r.type === "egg";
   const eggSpent = isEgg && (r.state !== "active" || !!r.nftRetired);
   if (isEgg) attrs.push({ trait_type: "Hatched", value: eggSpent ? "yes" : "no" });
+  // THE SUPPLY SENTENCE, IN THE PROSE A BUYER ACTUALLY READS. A trait can be scrolled past; the
+  // description is the first thing on the page. Present only when a Creator Edition of this species
+  // really exists, so every asset of every other species keeps a byte-identical description, and
+  // written for BOTH classes — the creator's copy says what it is, a player's copy says what else
+  // exists — because the reader who must not be misled is the player, not the owner.
+  const _creSp = isEgg ? 0 : creatorIssued(r.type, String(r.sp || ""));
+  const _creLine = _creSp <= 0 ? ""
+    : (r.creatorEdition === true
+       ? ` THIS IS THE CREATOR EDITION — the creator's own sealed quality-control copy, held OUTSIDE the player run and never one of the editions a player can obtain (${supplyLabelOf(r.type, String(r.sp || ""))}).`
+       : ` Supply of this species: ${supplyLabelOf(r.type, String(r.sp || ""))} — the Creator Edition is the creator's own sealed copy, held outside the player run, and this asset is one of the player editions.`);
   const out = {
     name: r.edition ? nftAssetName(r) : nftDisplayName(r), symbol: "CHIKI",
     description: !isEgg
-      ? `${nftDisplayName(r)} — a ${r.kind || r.type} of Chikoria, hatched in-world and certified by the Chikoria registry. Provenance is on-chain in this asset's Attributes.`
+      ? `${nftDisplayName(r)} — a ${r.kind || r.type} of Chikoria, hatched in-world and certified by the Chikoria registry.${_creLine} Provenance is on-chain in this asset's Attributes.`
       : (eggSpent
          ? `A ${_nftCap(r.kind)} Egg of Chikoria that has already hatched. This certificate is SPENT — the egg it names can never be hatched, tended or traded in Chikoria again. Provenance is on-chain in this asset's Attributes.`
          : `An unhatched ${_nftCap(r.kind)} Egg of Chikoria, issued and clocked by the Chikoria registry. Hatching it retires this certificate. Provenance is on-chain in this asset's Attributes.`),
@@ -13329,9 +13500,6 @@ export function restoreAssetReg(v) {
     for (const c of _rawChain)
       if (c && c.what === "transferred" && (c.why === "nft-handover" || c.why === "tp-settle") && isPubkey(String(c.from || "")))
         nftDebitKeyAdd(String(c.from), row.type, row.sp, 1);
-    // Defensive: floor the edition counter at the highest edition ever issued, so a lost counter can
-    // never re-issue a live edition (mint rows are truncation-exempt, but a prepared row may be dropped).
-    if (row.edition) { const k = _censusKey(row.type, row.sp); if ((nftEdition[k] || 0) < row.edition) nftEdition[k] = row.edition; }
     // THE CREATOR EDITION SEAL, rebuilt the way `burned` and `consumed` are — from the row's OWN
     // append-only chain, not from the persisted flag alone. A Render redeploy, a cold spin-up and a
     // ledger restore all land here, and all three must leave a sealed row sealed. Two independent
@@ -13342,6 +13510,13 @@ export function restoreAssetReg(v) {
     // in the other direction: `creatorEdition:false` is simply not a witness, and nothing in this
     // function removes a seal the chain vouches for.
     if (src.creatorEdition === true || regChainSaysCreator(_rawChain)) regSealCreator(row);
+    // Defensive: floor the edition counter at the highest edition ever issued, so a lost counter can
+    // never re-issue a live edition (mint rows are truncation-exempt, but a prepared row may be dropped).
+    // AFTER THE SEAL, DELIBERATELY (2026-08-19): nftEditionKey reads row.creatorEdition, so flooring
+    // before the re-seal would have poured a Creator Edition's number into the PLAYER series — a
+    // restart could then skip player editions (or, on a full species, refuse none but renumber the
+    // next one) purely because the creator holds a copy. Sealed first, keyed right, floored once.
+    if (row.edition) { const k = nftEditionKey(row); if ((nftEdition[k] || 0) < row.edition) nftEdition[k] = row.edition; }
     assetReg.set(id, row); ownerSet(owner).add(id); n++;
   }
   // Every `mint` this pass restored is a key the mint->row index does not have. Drop it; the next

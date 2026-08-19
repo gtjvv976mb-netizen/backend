@@ -58,7 +58,9 @@ for (const sp of [...LEGEND, ...NORMAL]) {
 // an avatar reads as its TITLE, not its id
 chk(N(row({ type: "avatar", sp: "classic" })).display === "The Wanderer",
   `avatar classic reads "The Wanderer", got "${N(row({ type: "avatar", sp: "classic" })).display}"`);
-chk(N(row({ type: "egg", sp: "legendary", kind: "legendary" })).name === "Legendary Egg #3",
+// NAME ORDER FLIPPED 2026-08-20 (owner): the edition now LEADS, because Magic Eden's grid
+// renders a name from the "#" onward and "Legendary Egg #3" was being cut to a bare "#3".
+chk(N(row({ type: "egg", sp: "legendary", kind: "legendary" })).name === "#3 Legendary Egg",
   `egg name unchanged: got "${N(row({ type: "egg", sp: "legendary", kind: "legendary" })).name}"`);
 
 // ---- 2. every asset is browsable: rarity, type, supply, and element on creatures ----------------
@@ -100,11 +102,18 @@ chk(A(row({ type: "chikimon", sp: "doge", kind: "meme" }))[0].key === "registryI
 console.log("== supply ==");
 chk(traits(row({ type: "chikimon", sp: "doge", kind: "meme" })).supply === "15", `doge supply 15`);
 chk(traits(row({ type: "chikimon", sp: "alon", kind: "meme" })).supply === "10", `alon supply 10`);
-chk(traits(row({ type: "mount", sp: "griffin", kind: "mount" })).supply === "5", `griffin supply 5`);
+// MOUNTS WERE UNCAPPED 2026-08-19 (owner): the original six are cap 0 and the caps now sit on the
+// six Viranimals instead. Griffin says "Open"; momota is the capped one worth asserting.
+chk(traits(row({ type: "mount", sp: "griffin", kind: "mount" })).supply === "Open", `griffin is uncapped`);
+chk(traits(row({ type: "mount", sp: "momota", kind: "mount" })).supply === "5", `momota supply 5`);
 chk(traits(row({ type: "chikimon", sp: "galador", kind: "legendary" })).supply === "Open",
   `an uncapped legendary says "Open", not a fake cap`);
-chk(N(row({ type: "mount", sp: "griffin", kind: "mount" })).rarity === "Immortal",
-  `griffin (cap 5) is Immortal, got "${N(row({ type: "mount", sp: "griffin", kind: "mount" })).rarity}"`);
+// Rarity for a mount now reads MOUNT_CHARS.rarity, not a cap ladder — otherwise every uncapped
+// mount would report "". Griffin is the design-tier Mythic; momota the capped Immortal.
+chk(N(row({ type: "mount", sp: "griffin", kind: "mount" })).rarity === "Mythic",
+  `griffin is Mythic, got "${N(row({ type: "mount", sp: "griffin", kind: "mount" })).rarity}"`);
+chk(N(row({ type: "mount", sp: "momota", kind: "mount" })).rarity === "Immortal",
+  `momota is Immortal, got "${N(row({ type: "mount", sp: "momota", kind: "mount" })).rarity}"`);
 
 console.log(`\nNFTMETA_NAMES_SIM  pass=${pass} fail=${fail}`);
 process.exit(fail ? 1 : 0);
