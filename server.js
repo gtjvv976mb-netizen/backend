@@ -2411,6 +2411,21 @@ app.get("/world/rarity", (_req, res) => {
                                 deduped: t.deduped, flagged: t.flagged } };
   };
   for (const [type, tbl] of Object.entries(ASSET_SUPPLY)) for (const sp of Object.keys(tbl)) emit(type, sp, tbl[sp]);
+  // RULING 5 — leave the supply/edition surface HONEST and MACHINE-READABLE for the NFT drop that
+  // will sit over it. An uncapped chikimount has no edition ceiling to publish, so publish the
+  // thing that IS its rarity: the pull it carries in the Chikimount Egg roll, that pull as a
+  // percentage of the whole catalog, its wave and its authored tier. All read off MOUNT_CHARS, so
+  // none of them can drift from the roll the server actually performs.
+  { const wtot = MOUNT_CHARS.reduce((a, c) => a + c.weight, 0) || 1;
+    for (const c of MOUNT_CHARS) {
+      const r = out.mount[c.key];
+      if (!r) continue;
+      r.weight = c.weight;
+      r.hatchPct = Math.round(c.weight / wtot * 1e6) / 1e4;   // % of a fresh wallet's full-pool roll
+      r.wave = c.wave;
+      r.designRarity = c.rarity;
+      r.uncapped = !(c.cap > 0);
+    } }
   for (const c of MEME_CHARS) emit("chikimon", c.key, c.cap || MEME_CAP);
   for (const sp of SPECIES_NORMAL) emit("chikimon", sp, 0);
   for (const sp of SPECIES_LEGEND) emit("chikimon", sp, 0);
@@ -5404,11 +5419,18 @@ function founderAward(wallet) {
   // stays unspent and _founderCount does not move, so nothing is minted past a cap and no wallet is
   // marked as having claimed. Refusing the SPECIES instead (and handing the player nothing) would
   // punish a founder for supply the server allocated — the species was never the player's choice.
+  // ONE OF EACH (owner ruling 2026-08-18): a founder who ALREADY HOLDS a species is rerouted to the
+  // next one the deal owes, exactly as the supply walk reroutes. Without this the chokepoint's
+  // duplicate refusal would throw on the same species every accrual and the founder could never
+  // claim at all — a reroute is the difference between "you get a different creature" and "you get
+  // nothing, forever".
+  const _fHave = ownedSpecies(wallet);
   let sp = "";
   for (let k = 0; k < pool.length; k++) {
     const c = pool[(_founderCount + k) % pool.length];
     if ((_founderPerSp[c] || 0) >= (deal[c] || 0)) continue;
     if (atSupplyCap("chikimon", c)) continue;                       // uncapped species: always false
+    if (_fHave.has(c)) continue;                                    // already theirs — one of each
     sp = c; break;
   }
   if (!sp) {
@@ -5478,6 +5500,12 @@ export function _founderTickForTest(now) { founderPresenceTick(now); }
 // question every normal mint path asks ("is this species held for a founder right now?")
 export function _memeWave2ForTest() { return [...MEME_WAVE2]; }
 export function _memeCapsForTest() { return Object.fromEntries(MEME_CHARS.map((c) => [c.key, c.cap || MEME_CAP])); }
+// The chikimount collection as the server actually holds it — cap AND weight, separately, so a sim
+// can assert the two never collapse back into one number. Read-only copy; nothing here is live state.
+export function _mountTableForTest() {
+  return MOUNT_CHARS.map((c) => ({ key: c.key, name: c.name, cap: c.cap, weight: c.weight,
+                                   rarity: c.rarity, wave: c.wave }));
+}
 export function _founderDealForTest() { return founderDeal(); }
 export function _founderReserveForTest() { return founderReserveMap(); }
 export function _founderReserveTotalForTest() { return founderReserveTotal(); }
@@ -6451,7 +6479,7 @@ app.get("/assets/summary", (req, res) => {
 function computeCensus() {
   const mk = (list) => { const m = Object.create(null); for (const id of list) m[id] = { holders: 0, minted: 0, byOrigin: {} }; return m; };
   const chikimon = mk([...SPECIES_NORMAL, ...SPECIES_LEGEND, ...SPECIES_MEME]);
-  const mounts   = mk(MOUNT_SUPPLY.map((m) => m[0]));
+  const mounts   = mk(MOUNT_KEYS);                   // all twelve chikimounts, catalog order
   const avatars  = mk(AVATAR_IDS);
   const bump = (tbl, sp, field, origin) => {
     if (!sp || !Object.hasOwn(tbl, sp)) return;
@@ -7313,16 +7341,180 @@ const AVATAR_TITLE = Object.freeze(Object.assign(Object.create(null), {
   electro: "The Storm Herald", fire: "The Emberlord", night: "The Nightblade",
   sailor: "The Old Salt",
 }));
-// supply-weighted exactly as Econ.MOUNTS: the Mythic griffin is the longest shot, and rolling it
-// server-side is the point — a crafted save used to simply name it.
-const MOUNT_SUPPLY = Object.freeze([["chicken", 15], ["boar", 20], ["gator", 15],
-                                    ["horse", 10], ["wolf", 10], ["griffin", 5]]);
+// ===== THE CHIKIMOUNT COLLECTION — ONE TABLE, TWO INDEPENDENT NUMBERS =====
+// `weight` decides the HATCH ROLL. `cap` decides SUPPLY. Until 2026-08-18 those were ONE number
+// (MOUNT_SUPPLY = [[id, n]]), which works only while every mount is capped — and the owner's
+// rulings of that day made the two jobs contradict each other outright:
+//   ruling 3   the six original chikimounts are UNLIMITED   ->  cap 0
+//   ruling 4   rarity still governs the ODDS of a hatch     ->  weight stays 15/20/15/10/10/5
+// One number cannot be both 0 and 15. Split into two fields, both rulings hold at once: the six
+// keep the exact pull they have always had (unchanged to the digit, so nobody's odds moved among
+// them), while supplyOf() reads their cap 0 as "uncapped" and atSupplyCap() can never refuse them.
+//
+// THE VIRANIMAL LEGACY (wave 2, 2026-08-18) joins THIS collection — owner ruling 1: they are
+// chikimounts, not a second collection, and the Chikimount Egg the shop already sells hatches them.
+// Their caps are the owner's exact numbers and are the ONLY authority: ASSET_SUPPLY.mount below is
+// DERIVED from this table, so the cap the roll honours and the cap the registry enforces cannot
+// drift apart, and the client's Econ.MOUNTS mirrors it for display.
+//
+// THE WEIGHTS ARE cap / 5, DELIBERATELY. Setting weight = cap (the MEME_CHARS precedent, where
+// every character is capped and the trade-off never arises) would have handed a 10-edition
+// Viranimal the same pull as the uncapped horse and put 40% of every mount hatch onto 50 total
+// editions worldwide — the collection would have been extinct in days and the originals starved.
+// At cap/5 the six newcomers pull 10 against the originals' 75. Measured, not asserted (va_hatch
+// sim, fresh wallet, full pool): boar 23.5294%, chicken 17.6471%, gator 17.6471%, horse 11.7647%,
+// wolf 11.7647%, griffin 5.8824%, emmanuel/pesto/tillman/wrinkle 2.3529% each, momota/snowball
+// 1.1765% each. Every Viranimal is a longer shot than every original, and the two 5-edition ones
+// are the longest shots in the game — exactly five times rarer than the Griffin.
+//
+// APPEND ONLY — never insert into or re-sort this list. MOUNT_KEYS below is the catalog ORDER the
+// census, the /assets/egg/consume whitelist and the admin grant catalog all read.
+const MOUNT_CHARS = Object.freeze([
+  { key: "chicken",  name: "Chiki Roost", cap: 0,  weight: 15, rarity: "Epic",      wave: 1 },
+  { key: "boar",     name: "Rumble Boar", cap: 0,  weight: 20, rarity: "Rare",      wave: 1 },
+  { key: "gator",    name: "Swamp Gator", cap: 0,  weight: 15, rarity: "Epic",      wave: 1 },
+  { key: "horse",    name: "Royal Steed", cap: 0,  weight: 10, rarity: "Legendary", wave: 1 },
+  { key: "wolf",     name: "Dire Wolf",   cap: 0,  weight: 10, rarity: "Legendary", wave: 1 },
+  { key: "griffin",  name: "Griffin",     cap: 0,  weight: 5,  rarity: "Mythic",    wave: 1 },
+  // ---- WAVE 2 — THE VIRANIMAL LEGACY (2026-08-18): six real internet-famous animals, hatched
+  // from the same Chikimount Egg as the six above. Caps are the owner's exact numbers.
+  { key: "emmanuel", name: "Emmanuel", cap: 10, weight: 2, rarity: "Mythic",   wave: 2 },
+  { key: "momota",   name: "Momota",   cap: 5,  weight: 1, rarity: "Immortal", wave: 2 },
+  { key: "pesto",    name: "Pesto",    cap: 10, weight: 2, rarity: "Mythic",   wave: 2 },
+  { key: "snowball", name: "Snowball", cap: 5,  weight: 1, rarity: "Immortal", wave: 2 },
+  { key: "tillman",  name: "Tillman",  cap: 10, weight: 2, rarity: "Mythic",   wave: 2 },
+  { key: "wrinkle",  name: "Wrinkle",  cap: 10, weight: 2, rarity: "Mythic",   wave: 2 },
+]);
+// DERIVED, NEVER RE-TYPED — the shapes the rest of the file consumes. A hand-written second
+// copy of any of these is exactly how a cap or an id list drifts (see MEME_WAVE2's note).
+const MOUNT_KEYS   = Object.freeze(MOUNT_CHARS.map((c) => c.key));                             // catalog order
+const MOUNT_POOL   = Object.freeze(MOUNT_CHARS.map((c) => Object.freeze([c.key, c.weight])));  // pickWeighted pairs
+const mountRow     = (key) => MOUNT_CHARS.find((c) => c.key === key) || null;
 const AVATAR_IDS = Object.freeze(["classic", "Knight", "Mystic", "Navigator", "Star",
                                   "chemist", "electro", "fire", "night", "sailor"]);
 const EGG_KIND_POOL = Object.freeze(Object.assign(Object.create(null), {
   normal: SPECIES_NORMAL, legendary: SPECIES_LEGEND, meme: SPECIES_MEME,
 }));
-const AVATARS_MAX = 2;                  // the client's own hard cap (GameHUD._azulon_buy)
+// ============ THE SATCHEL IS THE ONE CAPACITY (owner ruling, 2026-08-18) ============
+// "all these capacity are dependent on the satchel level" — chikimon, chikimounts AND avatars.
+// These three tables are the EXACT mirror of Econ.gd SATCHEL_CAP / STABLE_CAP / WARDROBE_CAP, keyed
+// by the same gear.satchel tier 0..10. If either side is edited the other MUST be edited with it;
+// satchel_cap_sim.mjs asserts the two files agree element-by-element rather than trusting this note.
+//
+// WHAT TIER 10 HAS TO HOLD, counted from the live catalogs in this file (not guessed):
+//   chikimon  SPECIES_NORMAL 10 + SPECIES_LEGEND + SPECIES_MEME = 41  -> 3 party + 38 bench
+//   mounts    MOUNT_KEYS = 12   (six originals + the six Viranimal Legacy steeds)
+//   avatars   AVATAR_IDS = 10
+// TIER 0 IS A FLOOR, NOT A TIGHTENING — nobody is worse off than they were:
+//   bench 3 beats the client's old tier-0 2; avatars 2 EQUALS the flat AVATARS_MAX this replaces;
+//   mounts 6 is the COMPLETE pre-Viranimal stable, so no account that predates 2026-08-18 can be
+//   holding more than the tier-0 floor allows.
+const SATCHEL_PARTY_SLOTS   = 3;                                                  // Econ.gd PARTY_MAX
+const SATCHEL_BENCH_CAP     = Object.freeze([3, 5, 8, 11, 14, 18, 22, 26, 30, 34, 38]);
+const SATCHEL_STABLE_CAP    = Object.freeze([6, 7, 7,  8,  8,  9, 10, 10, 11, 11, 12]);
+const SATCHEL_WARDROBE_CAP  = Object.freeze([2, 3, 4,  4,  5,  6,  7,  8,  8,  9, 10]);
+const SATCHEL_TIER_MAX      = SATCHEL_BENCH_CAP.length - 1;                       // 10
+// The flat "you already carry two looks" ceiling is gone; this is now the TOP of the wardrobe
+// ladder, kept under its old name because /assets/scroll/redeem and the sims read it.
+const AVATARS_MAX = SATCHEL_WARDROBE_CAP[SATCHEL_TIER_MAX];   // 10 (was a flat 2)
+
+// ============ HOW THE SERVER KNOWS THE TIER — the SAME channel it learns a roster from ============
+// NOT a new client-declared field, and never read off the request body: a cap a request can name is
+// not a cap. `gear.satchel` rides the SIGNED cloud save (/profile, sig-gated) that auditAssets
+// already parses for units / mounts / avatars, and it is recorded on the wallet's ledger record
+// exactly like `mtNow` — re-typed, clamped, written only when the save actually declares it, and
+// persisted through serializeAssetLedger. Every cap question below is then answered from the
+// SERVER's own record.
+//
+// HONEST LIMIT, STATED: the save is authored by the client, so an edited client can overstate its
+// satchel tier exactly as it can overstate a roster — and the ledger grades that the same way it
+// grades everything else (recorded, gradeable, never trusted as provenance). What the tier CANNOT
+// do is unlock anything absolute: the one-of-each rule, the per-species supply caps and the roster
+// ceilings (41 / 12 / 10) below are enforced independently of it, so the worst a forged tier buys
+// is the capacity the game had yesterday — which is why this change is a tightening even against a
+// forged save, and why it is never the thing standing between a cheater and a duplicate.
+//
+// UNKNOWN TIER FAILS OPEN, deliberately, on the standing policy of this file ("refusing on missing
+// data is how a migration destroys a real player's afternoon" — the _ownReady skip). A wallet whose
+// save has never declared a satchel is treated as tier max, i.e. exactly today's behaviour.
+function satchelTierOf(wallet) {
+  const rec = assetLedger.get(String(wallet || ""));
+  const t = rec && Number.isFinite(Number(rec.gearSat)) ? Math.floor(Number(rec.gearSat)) : -1;
+  if (t < 0) return SATCHEL_TIER_MAX;
+  return Math.max(0, Math.min(SATCHEL_TIER_MAX, t));
+}
+// How many of `type` this wallet may HOLD at its current satchel tier.
+// chikimon counts party + bench together, because the save has one roster and the server has one
+// registry — the 3/38 split is a client-side layout, never an ownership boundary.
+function satchelHoldCap(wallet, type) {
+  const t = satchelTierOf(wallet);
+  if (type === "mount")  return SATCHEL_STABLE_CAP[t];
+  if (type === "avatar") return SATCHEL_WARDROBE_CAP[t];
+  return SATCHEL_PARTY_SLOTS + SATCHEL_BENCH_CAP[t];        // chikimon
+}
+// The absolute ceiling for a type, whatever the tier says — the whole catalog, and no more. This is
+// what makes a forged tier worthless: it is applied at the same chokepoint and it does not move.
+function satchelWorldCap(type) {
+  if (type === "mount")  return MOUNT_KEYS.length;
+  if (type === "avatar") return AVATAR_IDS.length;
+  return SPECIES_NORMAL.length + SPECIES_LEGEND.length + SPECIES_MEME.length;
+}
+// What this wallet HOLDS right now, from the server's own records (registry ∪ ledger, minus what
+// the wallet's own latest save says it let go). The chikimon/mount arms reuse the existing
+// ownedSpecies/ownedMounts definitions verbatim so the cap and the hatch roll can never disagree.
+function ownedAvatars(wallet) {
+  const own = new Set();
+  const lrec = assetLedger.get(String(wallet || ""));
+  // the same "recorded, then let go" tiebreak ownedMounts uses, on the avatar half (`avNow`)
+  const worn = Array.isArray(lrec?.avNow) ? new Set(lrec.avNow) : null;
+  // THE REGISTRY OUTRANKS THE SAVE HERE TOO — the avatar twin of the ownedMounts note above.
+  // MEASURED (satchel_attack_sim, section D): a tier-0 wallet holding its 2 looks was correctly
+  // refused by /assets/scroll/redeem ("carries 2 of a possible 2"); it then saved `avatars: []`,
+  // held.avatar fell 2 -> 0, and the very same redeem was ALLOWED — 3 avatar registry rows on a
+  // wallet whose wardrobe cap is 2. A look cannot be listed on the Trading Post or auctioned
+  // (listItemOk has no "avatar" arm), so a save that stops listing one is not evidence of a
+  // disposal; the only disposal that exists moves the row and leaves regOwned by itself.
+  // Add-only, exactly as above: more refusals of new acquisition, never a removal.
+  for (const r of regOwned(wallet, "avatar")) own.add(r.sp);
+  if (lrec) for (const id of Object.keys(lrec.avatars || {})) {
+    if (worn && !worn.has(id)) continue;
+    own.add(id);
+  }
+  return own;
+}
+function satchelHeld(wallet, type) {
+  if (type === "mount")  return ownedMounts(wallet);
+  if (type === "avatar") return ownedAvatars(wallet);
+  return ownedSpecies(wallet);
+}
+// The one refusal, in the house voice, shared by every acquisition route. Returns null (allowed) or
+// { status, body } — NEVER a mutation, and NEVER a removal: a wallet already past its cap keeps
+// every creature and is simply told it cannot take on another (mintAsset's own rule, applied to
+// capacity: "refuses at the cap and never revokes").
+const SATCHEL_TYPE_WORD = Object.freeze({ chikimon: "chikimon", mount: "chikimount", avatar: "avatar look" });
+function satchelCapRefusal(wallet, type, sp) {
+  const held = satchelHeld(wallet, type);
+  const word = SATCHEL_TYPE_WORD[type] || type;
+  // ONE OF EACH, FIRST — a duplicate is refused whatever the capacity says.
+  if (sp && held.has(String(sp))) {
+    return { status: 409, code: "duplicate", body: { error: type === "mount"
+      ? "that steed already waits in your stable — one of each is the rule"
+      : `you already carry that ${word} — one of each is the rule`, duplicate: true, sp: String(sp) } };
+  }
+  const n = held.size;
+  const world = satchelWorldCap(type);
+  if (n >= world) {
+    return { status: 409, code: "complete", body: { error: `every ${word} in Chikoria is already yours`, complete: true, held: n } };
+  }
+  const cap = satchelHoldCap(wallet, type);
+  if (n >= cap) {
+    const tier = satchelTierOf(wallet);
+    return { status: 409, code: "satchel", body: {
+      error: `your satchel (Lv ${tier}) carries ${n} of a possible ${cap} ${word}s — craft a bigger satchel at the forge and come back`,
+      satchelFull: true, held: n, cap, tier, world } };
+  }
+  return null;
+}
 
 let _regSeq = 0;
 function mintAssetId(type) {
@@ -7359,6 +7551,50 @@ function regOwned(wallet, type, state = "active") {
 // Append-only history. Nothing in this file ever rewrites or removes a chain entry — the chain IS
 // the provenance, and a mutable provenance is not one.
 function regEvent(row, what, extra) { row.chain.push(Object.assign({ at: Date.now(), what }, extra || {})); }
+
+// ============ THE CREATOR EDITION SEAL — server-issued, write-once, permanent ============
+// THE OWNER'S RULING (2026-08-18): the assets this SERVER issues to the creator carry a "Creator
+// Edition" badge — "a special kind of label used only for the server-issued creator NFTs of the
+// game ... it should also be visible in the magic eden collection when listed, its a PERMANENT SEAL."
+//
+// UNFORGEABLE. `creatorEdition` is written in exactly TWO places in this file: here, called from the
+// mintAsset chokepoint when the CALLER (never a request) passes `opts.creator`; and from
+// restoreAssetReg, which re-derives it from the row's own append-only chain. No route reads it off a
+// body, no save payload carries it, no market settle or sync writes it — and mintAsset DELETES any
+// `creatorEdition` arriving in `fields` before this runs, so even a future caller that forwarded a
+// request object could not smuggle one in.
+//
+// PERMANENT, STRUCTURALLY — not by convention. The property is defined non-writable and
+// non-configurable, and this module is ESM (strict mode everywhere), so `row.creatorEdition = false`
+// throws TypeError, `delete row.creatorEdition` throws TypeError, and a defineProperty that tries to
+// change the value throws TypeError. The object model itself refuses: there is no line of code —
+// present or future, admin or otherwise — that can quietly un-seal a sealed row. The seal is a fact
+// about how the asset came into EXISTENCE, never about who holds it, so a change of owner cannot
+// touch it: transferAsset and nftSettleHandover move `owner` and nothing else.
+//
+// enumerable:true so JSON.stringify carries it into the persisted blob (serializeAssetReg emits the
+// live row objects) — the first half of surviving a Render redeploy. restoreAssetReg is the second.
+//
+// Idempotent: sealing an already-sealed row is a no-op rather than a throw, so a re-grant, a repeated
+// restore or a double call can never crash a boot.
+function regSealCreator(row) {
+  if (!row || typeof row !== "object") return false;
+  if (row.creatorEdition === true) return false;              // already sealed — never re-defined
+  Object.defineProperty(row, "creatorEdition",
+    { value: true, writable: false, enumerable: true, configurable: false });
+  return true;
+}
+// The chain is the durable witness the seal is rebuilt from at every boot, so "was this row issued to
+// the creator" is answered in ONE place. /admin/grant-collection writes its `granted` event one event
+// after `minted`, which puts it in the GENESIS half of the chain — the half restoreAssetReg's 32+32
+// truncation ALWAYS keeps — so this is durable at any chain depth, however many times the asset is
+// later sold. Matching the ROUTE as well as the explicit flag retro-seals rows granted BEFORE this
+// build shipped: their provenance already says what they are, and the seal only reads it back.
+function regChainSaysCreator(chain) {
+  if (!Array.isArray(chain)) return false;
+  return chain.some(c => c && c.what === "granted"
+                      && (c.creator === true || String(c.route || "") === "/admin/grant-collection"));
+}
 
 // SELF-HEAL A CLIPPED ORIGIN. The restore sanitizer used to slice origin at 16 chars, which silently
 // truncated "open-gates-founder" (18) to "open-gates-found" on every cold boot and then persisted it
@@ -7613,6 +7849,13 @@ function nftRarityTier(row) {
     if (SPECIES_NORMAL.includes(sp)) return "Normal";
     return "";
   }
+  // A CHIKIMOUNT NAMES ITS OWN TIER. Deriving it from the cap used to be equivalent, but since
+  // owner ruling 3 (2026-08-18) six mounts are UNCAPPED, and a cap of 0 through the ladder below
+  // answers "" — i.e. the rarity trait, the first thing a marketplace sorts on, would simply
+  // vanish from every Chiki Roost, Rumble Boar, Swamp Gator, Royal Steed, Dire Wolf and Griffin.
+  // MOUNT_CHARS carries the authored tier (the same string the client's Econ.MOUNTS prints), so
+  // this reads it rather than re-deriving, and server and client can no longer disagree.
+  if (row.type === "mount") { const c = mountRow(sp); if (c) return c.rarity || ""; }
   const cap = supplyOf(row.type, sp);
   if (cap <= 0) return "";
   if (cap <= 5) return "Immortal";
@@ -7691,6 +7934,19 @@ function nftAttributes(row) {
     a.push({ key: "editionOf", value: masEditionOf(row) });
     a.push({ key: "witness", value: masWitness(row) });
   }
+  // ============ THE CREATOR EDITION SEAL — the badge, on chain and on the marketplace ============
+  // Owner ruling 2026-08-18. LAST in the list on purpose: every existing key keeps not just its name
+  // but its INDEX, so an already-minted asset's Attributes plugin and /assets/cert read exactly what
+  // they read before this line existed. Present ONLY on a sealed row — an absent trait is a clean
+  // marketplace facet ("Creator Edition · Yes"), while a present-but-"No" trait is a blank filter
+  // spanning 100% of the collection and the "unfinished collection" tell the blank-value filter in
+  // the meta route already exists to avoid.
+  // NOT flag-gated, unlike editionOf/witness: a sealed row cannot EXIST unless CHIK_REG_ALL was on
+  // and the owner ran the grant, so a flag-off server's attributes are byte-identical to today's.
+  // ASYMMETRY, STATED: this list is written into the Core Attributes plugin AT MINT, so an asset
+  // already on chain keeps the plugin it was minted with — the seal reaches it through the metadata
+  // JSON (/assets/nft/meta/:id), which is dynamic and re-read by every indexer.
+  if (row.creatorEdition === true) a.push({ key: "creatorEdition", value: "Yes" });
   return a;
 }
 // Build + submit the Core create. The SDK is imported LAZILY inside this function so a flag-off boot
@@ -8067,6 +8323,15 @@ function nftSettleHandover(row, to, now, dormant) {
   if (!isPubkey(to)) return { ok: false, why: "bad-destination" };
   const from = String(row.owner || "");
   if (to === from) return { ok: false, why: "already-owner" };
+  // ============ THE SATCHEL CAPS DO NOT APPLY HERE, DELIBERATELY (2026-08-18) ============
+  // A settle is not an acquisition request — it is the server catching up with a purchase that has
+  // ALREADY happened on chain, and it can be a purchase made on magiceden.io where this server was
+  // never asked. Refusing it would leave a real buyer's paid-for asset owned by the seller in our
+  // records: a revocation, which is the one thing this file never does. So a settle always
+  // completes and the buyer may land over their cap, grandfathered exactly like any other over-cap
+  // holding — they keep it, and simply cannot acquire another until their satchel catches up.
+  // The gate that CAN refuse for free is /nft/market/buy, which asks before it even builds the
+  // transaction; this is downstream of the money and must stay so.
   now = now || Date.now();
   const moved = transferAsset(row.id, from, to, "nft-handover", { mint: row.mint });
   if (!moved) return { ok: false, why: "transfer-refused" };
@@ -8384,7 +8649,14 @@ const ASSET_SUPPLY = Object.freeze({
   // stops — nothing is ever taken back.
   avatar: Object.freeze({ classic: 100, Knight: 40, Mystic: 20, Navigator: 60, Star: 40,
                           chemist: 10, electro: 60, fire: 60, night: 20, sailor: 40 }),
-  mount:  Object.freeze({ chicken: 15, boar: 20, gator: 15, horse: 10, wolf: 10, griffin: 5 }),
+  // MOUNTS ARE DERIVED FROM MOUNT_CHARS (the collection table above) — the cap the hatch roll
+  // honours and the cap the registry enforces are the SAME NUMBER or they are a bug. Owner ruling
+  // 2026-08-18: the six original chikimounts are UNLIMITED (cap 0, which is exactly what supplyOf
+  // returns for an unlisted class), and the six Viranimal Legacy chikimounts carry the owner's
+  // exact caps — momota 5, snowball 5, emmanuel/pesto/tillman/wrinkle 10 each.
+  // Grandfathering runs the safe way here: LOWERING a cap to 0 can only ever allow issuance, never
+  // revoke a holding, so no existing mount owner is affected by the six going uncapped.
+  mount:  Object.freeze(Object.fromEntries(MOUNT_CHARS.map((c) => [c.key, c.cap]))),
 });
 // ============ ONE CENSUS, THREE RECORD SOURCES ============
 // A cap is only as true as its DENOMINATOR, and the denominator used to be the registry alone —
@@ -8722,6 +8994,46 @@ function mintAsset(type, wallet, fields, origin, parent, opts) {
     e.code = "SUPPLY_RESERVED";
     throw e;
   }
+  // ============ ONE OF EACH, AND THE SATCHEL'S CAPACITY — AT THE SAME CHOKEPOINT ============
+  // (owner ruling 2026-08-18.) Every route that ISSUES a creature comes through here, so a route
+  // that forgets to ask is still refused. The routes ask anyway, because they can say it better and
+  // because a refusal must arrive BEFORE an egg is consumed or a barter is taken — this is the
+  // brace, not the belt.
+  //
+  // WHAT IS EXEMPT, and why each one has to be:
+  //   * `_adopting` (row.luid set) — /assets/*/sync, the avatar heal and regBackfillAll RECORD a
+  //     creature the wallet already holds. Refusing there would deny a player the registration of
+  //     their own property, and CHIK_REG_ALL deliberately mints one row per individual, so the
+  //     duplicate test does not even apply to it.
+  //   * `_saleBacked` — the row is already counted by a paid-sale record; same reasoning.
+  //   * origins legacy / unverified / restitution (they fail `_issuing`) — history and make-goods.
+  //     A make-good must never be refused for space; that is the whole point of a make-good.
+  // NOTHING HERE EVER REMOVES ANYTHING. Over-cap wallets keep every creature and simply stop
+  // acquiring, which is this file's standing rule for caps.
+  if (["chikimon", "mount", "avatar"].includes(type) && !_adopting && !_saleBacked) {
+    const _held = satchelHeld(wallet, type);
+    if (_sp && _held.has(_sp)) {
+      const e = new Error(`this wallet already holds a ${SATCHEL_TYPE_WORD[type] || type} of that kind — one of each is the rule`);
+      e.code = "ALREADY_OWNED";
+      throw e;
+    }
+    // A GRANT IS NOT AN ACQUISITION. The Founder Drop award and /admin/grant-collection are the
+    // OWNER handing something over — a founder who met the bar inside a timed window, or the owner
+    // seeding a wallet with the whole catalog. Refusing either for satchel space would take
+    // something away that was already decided, so they are capacity-exempt and duplicate-bound:
+    // `opts.founder`/`opts.grant` skip THIS test and nothing else (the supply cap, the reservation
+    // and the one-of-each rule above all still bind them).
+    const _capExempt = !!(opts && (opts.founder || opts.grant));
+    if (_issuing && !_capExempt) {        // capacity binds ISSUANCE only (see the exemptions above)
+      const _cap = Math.min(satchelHoldCap(wallet, type), satchelWorldCap(type));
+      if (_held.size >= _cap) {
+        const e = new Error(`your satchel (Lv ${satchelTierOf(wallet)}) already carries ${_held.size} of a possible ${_cap} — craft a bigger satchel`);
+        e.code = "SATCHEL_FULL";
+        e.cap = _cap; e.held = _held.size;
+        throw e;
+      }
+    }
+  }
   // the cap is a cliff for EVERY player at once, so it must never arrive unannounced
   if (assetReg.size > ASSET_REG_MAX * 0.8 && Date.now() - _regWarnAt > 300000) {
     _regWarnAt = Date.now();
@@ -8732,6 +9044,27 @@ function mintAsset(type, wallet, fields, origin, parent, opts) {
     id, type, owner: wallet, born: Date.now(), origin, state: "active",
     parent: parent || null, chain: [],
   }, fields || {});
+  // THE CREATOR SEAL IS NEVER AN INPUT. Whatever `fields` carried is discarded here — no caller passes
+  // one today and none ever should, so a future route that forwarded a request body could not smuggle
+  // a Creator Edition in. Deleted BEFORE regSealCreator runs, while the property is still an ordinary
+  // configurable one (deleting the sealed property would itself throw).
+  if ("creatorEdition" in row) delete row.creatorEdition;
+  // AND THE OTHER WITNESS, which the line above alone did NOT cover (2026-08-18, adversarial finding
+  // X9). The seal has TWO witnesses — the field, and a `granted` event in the row's own chain that
+  // restoreAssetReg re-seals from. `chain: []` is set in the base object, so `Object.assign(base,
+  // fields)` lets a `fields.chain` WIN: a row born with a hand-made chain carrying
+  // {what:"granted", route:"/admin/grant-collection"} is unsealed at issuance and then seals ITSELF
+  // at the next restart, when regChainSaysCreator reads that forged event back. Measured before this
+  // line existed: creatorEdition=undefined at mint, `true` after one serialize->restore, and the
+  // metadata JSON then served {"trait_type":"Creator Edition","value":"Yes"}. No caller passes a
+  // `chain` today (all 20 mintAsset call sites use literal field objects, and no HTTP route reached
+  // it — measured), so this is a no-op for every live path; it exists so the strip above is a real
+  // belt rather than a half of one, and a future route that forwards a body cannot mint provenance.
+  row.chain = [];
+  // ...and the ONE way it is ever set at issuance: an explicit `opts.creator` from a server-side
+  // caller. Today that is /admin/grant-collection alone — see the census of issuance paths in that
+  // route's header. Adding a second caller is a deliberate act, not something a body can cause.
+  if (opts && opts.creator) regSealCreator(row);
   // RULING 4(b): the edition/serial is assigned AT ISSUANCE from the registry census counter — an
   // unminted creature occupies its numbered slot exactly like a minted one, so the on-chain series
   // can never misrepresent scarcity. O(1) (one counter bump, no census build, no chain read), so the
@@ -8858,6 +9191,81 @@ function pickWeighted(pairs) {
 // is too WIDE turns a stuck egg into a lost one. Nothing here deletes, retires or re-owns a row;
 // the census, the sale gate, provenance and NFT eligibility all read regOwned directly and are
 // byte-identical.
+// ============ 2026-08-18 ADVERSARIAL AUDIT — A CLAIM IS NOT A DISPOSAL ============
+// Everything above describes the tiebreak as it stood, and the tiebreak was BYPASSABLE. Because the
+// skip is driven by the wallet's own save, a client that simply stops listing a species un-owns it:
+//   MEASURED on the real routes (adv1/adv2, real server in-process, throwaway wallets, memory store):
+//     * a wallet hatched `healix` through /assets/egg/consume, saved ONCE declaring it and ONCE
+//       without it — held.chikimon fell 1 -> 0 with the ACTIVE registry row still sitting there —
+//       then consumed a second egg as `healix` and finished with TWO active healix rows (ids
+//       cmsyl3yvx2c516fc8f5584 + cmsyl44344a469dc6e0150). One-of-each, defeated by two saves.
+//     * the CAPACITY resets the same way: a tier-0 wallet (cap 6) minted 6, saved `units:{}`,
+//       and minted 6 more — 12 server-minted rows on a wallet whose cap says 6. Repeatable.
+// This is the exact hole the mount and avatar arms closed above ("THE REGISTRY OUTRANKS THE SAVE"),
+// left open on the chikimon arm because a chikimon — unlike a steed — really can be SOLD, and with
+// CHIK_TP_ESCROW dormant (default OFF) a settled sale leaves the seller's row active and owned. So
+// the answer is not to believe the client and not to ignore the seller: it is to require the
+// disposal to be one the SERVER witnessed.
+//
+// TWO SOURCES, BOTH SERVER-SIDE, AND NOTHING ELSE COUNTS:
+//   1. GRANDFATHER — at restore, every species this ledger ALREADY read as "recorded, then let go"
+//      is frozen into chikiGone with the number of rows it was writing off at that instant. So on
+//      the deploy that lands this, every existing account keeps EXACTLY the pool and the count it
+//      had a minute earlier: no player's hatch pool narrows, no egg becomes unhatchable, nobody is
+//      newly refused. (This is why the fix is not just "make the arm unconditional" — that would
+//      resurrect the stuck-egg bug documented above for every trader who has ever sold.)
+//   2. SETTLE — from here on, the two places a chikimon is actually sold (/market/buy-onchain and
+//      the auction hammer) record the seller's disposal themselves, so an honest seller is released
+//      by the SALE rather than by their save.
+// NOTHING HERE REMOVES, HIDES OR RETIRES A ROW: chikiGone only ever RELAXES a refusal. A wallet
+// that never sells simply cannot un-own what the server minted it.
+const chikiGone = new Map();          // wallet -> { sp: n } — disposals this server witnessed
+const CHIKI_GONE_MAX = 4000;          // bounded like every other per-wallet map in this file
+function chikiGoneOf(wallet, sp) {
+  const m = chikiGone.get(String(wallet || ""));
+  const n = m ? Number(m[sp]) : 0;
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+// Record ONE witnessed disposal. Called only from a settled sale (and from the restore grandfather),
+// never from anything a request can assert.
+function recordChikiGone(wallet, sp, n) {
+  wallet = String(wallet || ""); sp = String(sp || "");
+  if (!isPubkey(wallet) || !CHIKIMON_IDS.has(sp)) return 0;
+  let m = chikiGone.get(wallet);
+  if (!m) {
+    if (chikiGone.size >= CHIKI_GONE_MAX) { let d = 200; for (const k of chikiGone.keys()) { if (d-- <= 0) break; chikiGone.delete(k); } }
+    m = Object.create(null); chikiGone.set(wallet, m);
+  }
+  m[sp] = Math.min((Number(m[sp]) || 0) + (Math.max(1, Number(n) || 1)), 999);
+  _assetsDirty = true;
+  return m[sp];
+}
+// THE SETTLE HALF THE NOTE ABOVE PROMISED, WHICH WAS NEVER WIRED (2026-08-18 adversarial audit).
+// `recordChikiGone` had ZERO call sites, so the only thing that ever released a seller was the
+// one-time restore grandfather. MEASURED (_adv_satchel_bypass4.mjs, CHIK_TP_ESCROW=0 — the live
+// flag position): a tier-0 seller filled its satchel 6/6, sold THREE creatures on the verified
+// on-chain rail (three 200s), and its held.chikimon was still 6 of 6 afterwards with all six rows
+// intact — the next acquisition was refused "your satchel (Lv 0) already carries 6 of a possible
+// 6". Every sale left a phantom holding that ate a slot forever and locked the seller out of that
+// species for good. (With CHIK_TP_ESCROW=1 the row transfers and held falls 6 -> 5 -> 4 -> 3 by
+// itself, which is why this only bites the flag position we ship.)
+//
+// THE CLAMP IS THE WHOLE SAFETY, AND WITHOUT IT THIS FIX IS ITSELF AN EXPLOIT. With the row still
+// sitting on the seller (escrow off) the registry keeps vouching the species, so the seller can
+// list and settle the SAME creature again and again; an unclamped credit per sale would soon
+// outnumber their rows, ownedSpecies would stop seeing a species they really do hold, and the
+// hatch/buy gates would hand them a fresh one each time — a duplicate factory wearing a release's
+// clothes. So a sale may only write off a row that is ACTUALLY THERE and NOT ALREADY written off:
+// credits can never exceed rows, which is the invariant chikiGone's own note states ("the count can
+// never go more negative than the evidence"). Returns 0 when there is nothing left to write off.
+function recordChikiSale(wallet, sp) {
+  wallet = String(wallet || ""); sp = String(sp || "");
+  if (!isPubkey(wallet) || !CHIKIMON_IDS.has(sp)) return 0;
+  let rows = 0;
+  for (const r of regOwned(wallet, "chikimon")) if (r.sp === sp) rows++;
+  if (chikiGoneOf(wallet, sp) >= rows) return 0;      // nothing un-written-off left to release
+  return recordChikiGone(wallet, sp, 1);
+}
 function ownedSpecies(wallet) {
   const own = new Set();
   const lrec = assetLedger.get(wallet);
@@ -8870,11 +9278,41 @@ function ownedSpecies(wallet) {
     everSp.add(sp);
     if (u.held !== false) heldSp.add(sp);
   }
+  // A REGISTRY ROW COUNTS UNLESS THE SERVER ITSELF SAW ONE LEAVE. `budget` spends one grandfathered
+  // or settled disposal per row, so a wallet with two rows and one recorded sale still HOLDS the
+  // species — the count can never go more negative than the evidence.
+  const budget = Object.create(null);
   for (const r of regOwned(wallet, "chikimon")) {
-    if (everSp.has(r.sp) && !heldSp.has(r.sp)) continue;   // recorded, then let go — not held now
+    if (!(r.sp in budget)) budget[r.sp] = chikiGoneOf(wallet, r.sp);
+    if (budget[r.sp] > 0) { budget[r.sp]--; continue; }    // this row is one the server saw go
     own.add(r.sp);
   }
   for (const sp of heldSp) own.add(sp);
+  // ============ A VERIFIED PURCHASE IS A HOLDING (2026-08-18 adversarial audit) ============
+  // THE ONE-OF-EACH RULE HAD NO GRIP ON THE TRADING POST AT ALL on the flag position we actually
+  // ship (MARKET_ONCHAIN=1, CHIK_TP_ESCROW=0 — "built, verified, dormant", TP_ESCROW_SPEC.md:1).
+  // MEASURED, _adv_satchel_bypass3.mjs, and it is not a race: ONE wallet fired FIVE SEQUENTIAL
+  // /market/buy-onchain settles of `solarix` against five different sellers and every one answered
+  // 200 — statuses [200,200,200,200,200] — while its held.chikimon read 0 at every step and its
+  // registry row list stayed []. A settled sale moved nothing the server could see, so the gate at
+  // the top of that route (and the post-await re-ask below it) had no holding to refuse. With
+  // CHIK_TP_ESCROW=1 the seller's row transfers and the identical five buys measure
+  // [200,409,409,409,409] — so the hole is exactly the flag gap, and this closes it for the flag
+  // position that is live.
+  //
+  // `assetBuys` is already the server's OWN witness of that purchase: written only after
+  // txMarketSplit confirmed a real 75/20/5 on-chain split, marked `used` by claimAssetBuy the
+  // moment the buyer's next save presents the unit (:13523), and TTL'd at 30 days. Reading it here
+  // mints nothing, moves nothing and leaves the census untouched — like the mount and avatar arms
+  // above, it can only ever ADD to the held set, i.e. refuse a further acquisition. It never
+  // removes, hides or truncates a holding, so nothing is revoked.
+  for (const b of (assetBuys.get(String(wallet || "")) || [])) {
+    if (!b || b.used) continue;
+    const sp = String(b.sp || "");
+    if (!sp || !CHIKIMON_IDS.has(sp)) continue;
+    if (Date.now() - (Number(b.ts) || 0) > BUYS_TTL_MS) continue;   // the same window claimAssetBuy honours
+    own.add(sp);
+  }
   return own;
 }
 function ownedMounts(wallet) {
@@ -8888,11 +9326,20 @@ function ownedMounts(wallet) {
   // Absent when the save declared no `mounts` key at all, and then this falls back to the old
   // behaviour rather than reading a partial body as "they sold everything".
   const stable = Array.isArray(lrec?.mtNow) ? new Set(lrec.mtNow) : null;
-  const everMt = lrec ? new Set(Object.keys(lrec.mounts || {})) : new Set();
-  for (const r of regOwned(wallet, "mount")) {
-    if (stable && everMt.has(r.sp) && !stable.has(r.sp)) continue;
-    own.add(r.sp);
-  }
+  // A REGISTRY ROW IS THE SERVER'S OWN EVIDENCE, AND IT OUTRANKS THE SAVE'S CLAIM (2026-08-18 audit).
+  // The `stable` tiebreak used to skip a registry row whenever the wallet's latest save stopped
+  // listing it — i.e. the client could say "I let that steed go" and the server believed it. MEASURED
+  // (satchel_attack_sim, section C): a wallet minted `chicken`, saved `mounts:["chicken"]`, then saved
+  // `mounts:[]`, and held.mount fell 1 -> 0; the next mount egg was allowed to produce a SECOND
+  // chicken, leaving two active chicken rows on one wallet — one-of-each defeated by one save.
+  // Unlike a chikimon, a steed has NO in-game sale path at all (listItemOk refuses kind "mount", and
+  // the auction house only ever takes chikimon), so a save that stops listing one is not evidence of
+  // a disposal — and the one real disposal there is (an NFT hand-over) MOVES the row, which drops it
+  // out of regOwned by itself. So the registry arm is now unconditional. This can only ever ADD to
+  // the held set: it refuses a further acquisition and never removes, hides or truncates a holding.
+  // The LEDGER arm below still honours the save, because a ledger-only entry is nothing but the
+  // client's own claim in the first place.
+  for (const r of regOwned(wallet, "mount")) own.add(r.sp);
   if (lrec) for (const [id, m] of Object.entries(lrec.mounts)) {
     if (!m || m.held === false) continue;
     if (stable && !stable.has(id)) continue;               // recorded, then let go — not in the stable
@@ -8950,8 +9397,13 @@ const _lastEggClaim = new Map();
 // selling something the nest cannot deliver.
 function eggPoolFor(wallet, kind) {
   if (kind === "mount") {
+    // WEIGHT pairs, not cap pairs (MOUNT_POOL) — since 2026-08-18 the two are different numbers.
+    // The cap still binds the roll through atSupplyCap: a Viranimal whose last edition is claimed
+    // simply is not in the pool, exactly as a capped Meme Dynasty character is not. The six
+    // originals are uncapped, so atSupplyCap is permanently false for them and they can never
+    // vanish from the roll — which is ruling 3 and ruling 4 holding at the same time.
     const have = ownedMounts(wallet);
-    return MOUNT_SUPPLY.filter(([mid]) => !have.has(mid) && !atSupplyCap("mount", mid));
+    return MOUNT_POOL.filter(([mid]) => !have.has(mid) && !atSupplyCap("mount", mid));
   }
   const have = ownedSpecies(wallet);
   let pool = (EGG_KIND_POOL[kind] || SPECIES_NORMAL).filter(s => !have.has(s));
@@ -8961,7 +9413,7 @@ function eggPoolFor(wallet, kind) {
 }
 function eggPoolEmptyMsg(wallet, kind) {
   if (kind === "mount") {
-    return ownedMounts(wallet).size >= MOUNT_SUPPLY.length
+    return ownedMounts(wallet).size >= MOUNT_KEYS.length      // twelve since the Viranimal Legacy
       ? "your stable is already full — every chikimount is yours"
       : "every remaining steed has been claimed — the stable is legendary now";
   }
@@ -9167,6 +9619,15 @@ app.post("/assets/egg/claim", (req, res) => {
   if (!eggPoolFor(wallet, kind).length) {
     return res.status(409).json({ error: eggPoolEmptyMsg(wallet, kind) + " — nothing was taken", poolEmpty: true });
   }
+  // ...AND IT HAS TO HAVE SOMEWHERE TO GO (owner ruling 2026-08-18). Same placement and the same
+  // reasoning as the pool test directly above: BEFORE a single material is charged, so a player at
+  // their satchel's capacity is told to widen it rather than paying Mithra for an egg they cannot
+  // hatch. Nothing has been taken at this line.
+  {
+    const _cr = satchelCapRefusal(wallet, kind === "mount" ? "mount" : "chikimon");
+    if (_cr) return res.status(_cr.status).json(Object.assign({}, _cr.body,
+      { error: `${_cr.body.error} — nothing was taken` }));
+  }
   // CAN THIS WALLET AFFORD MITHRA'S PRICE? Fails OPEN while the book is loading — refusing a claim on
   // missing data would strand a real player's progression, which is worse than the egg.
   const _recipe = Object.hasOwn(EGG_RECIPE_MATS, kind) ? EGG_RECIPE_MATS[kind] : null;
@@ -9284,6 +9745,14 @@ app.post("/assets/egg/hatch", async (req, res) => {
   // running out; /assets/egg/discard is the way out for one that can never hatch again.
   const pool = eggPoolFor(wallet, row.kind);
   if (!pool.length) return res.status(409).json({ error: eggPoolEmptyMsg(wallet, row.kind), poolEmpty: true });
+  // THE SATCHEL'S CAPACITY, BEFORE THE ROLL AND BEFORE THE EGG IS CONSUMED (owner ruling
+  // 2026-08-18). Same shape as the pool-empty refusal directly above: nothing has been mutated at
+  // this line, so the egg survives the refusal and hatches the moment the satchel is bigger.
+  {
+    const _cr = satchelCapRefusal(wallet, row.kind === "mount" ? "mount" : "chikimon");
+    if (_cr) return res.status(_cr.status).json(Object.assign({}, _cr.body,
+      { error: `${_cr.body.error} — your egg is safe, hatch it again`, eggSafe: true }));
+  }
   if (row.kind === "mount") {
     born = mintAsset("mount", wallet, { sp: pickWeighted(pool), kind: "mount" }, "hatched", row.id);
   } else {
@@ -9298,6 +9767,11 @@ app.post("/assets/egg/hatch", async (req, res) => {
     if (e && e.code === "SUPPLY_EXHAUSTED") return res.status(409).json({ error: `${e.message} — your egg is safe, hatch it again` });
     // HELD FOR THE DROP is neither a cap nor a capacity fault: it clears when the drop ends.
     if (e && e.code === "SUPPLY_RESERVED") return res.status(409).json({ error: `${e.message} — your egg is safe, hatch it again` });
+    // THE SATCHEL'S TWO REFUSALS. The route already asked (satchelCapRefusal, above the roll), so
+    // reaching these means the answer moved between the two lines — a second device hatching in the
+    // same second. Same shape as the cap: the egg is untouched and hatches again once there is room.
+    if (e && e.code === "ALREADY_OWNED") return res.status(409).json({ error: `${e.message} — your egg is safe, hatch it again`, duplicate: true, eggSafe: true });
+    if (e && e.code === "SATCHEL_FULL") return res.status(409).json({ error: `${e.message} — your egg is safe, hatch it again`, satchelFull: true, cap: e.cap, held: e.held, eggSafe: true });
     return res.status(503).json({ error: "the asset registry is at capacity — your egg is safe, try again later" });
   }
   // CONSUMED, NOT DELETED. The egg keeps its row and points at what came out of it, so the
@@ -9398,7 +9872,7 @@ app.post("/assets/egg/consume", async (req, res) => {
   const sp = String(req.body?.sp || "").slice(0, 24);
   const isMount = row.kind === "mount";
   // THE POOL IS THE ONE /assets/egg/hatch ROLLS FROM, NOT THE WHOLE CATALOG.
-  // This used to be `MOUNT_SUPPLY.map(m => m[0])` / the raw species list, i.e. the client NAMED the
+  // This used to be the raw mount id list / the raw species list, i.e. the client NAMED the
   // prize and the only test was "is that a thing this egg can produce". Two consequences, both
   // measured (hatching_consume_sim.mjs): five brand-new wallets took all five griffins — a 5/75
   // weighted Mythic roll turned into a deterministic pick — and one wallet consumed three legendary
@@ -9406,14 +9880,21 @@ app.post("/assets/egg/consume", async (req, res) => {
   // filter below are exactly what /hatch already applies before it rolls; this route now offers the
   // same set, so the only thing it still concedes is WHICH of the legal outcomes was drawn.
   const owned = isMount ? ownedMounts(wallet) : ownedSpecies(wallet);
-  const catalog = isMount ? MOUNT_SUPPLY.map(m => m[0]) : (EGG_KIND_POOL[row.kind] || SPECIES_NORMAL);
+  const catalog = isMount ? MOUNT_KEYS : (EGG_KIND_POOL[row.kind] || SPECIES_NORMAL);
   if (!catalog.includes(sp)) return res.status(400).json({ error: "that is not something this egg can produce" });
   // ONE OF EACH SPECIES. /hatch filters the roll by ownedSpecies/ownedMounts; without the same
   // filter here a wallet mints the same legendary as often as it can find eggs.
   if (owned.has(sp)) {
     return res.status(409).json({ error: isMount
       ? "that steed already waits in your stable — your egg is safe, hatch it again"
-      : "you already carry that one — your egg is safe, hatch it again" });
+      : "you already carry that one — your egg is safe, hatch it again", duplicate: true });
+  }
+  // ...AND THE SATCHEL'S CAPACITY, the same gate /assets/egg/hatch applies before its roll. Nothing
+  // above this line has mutated the egg, so a refusal here costs the player nothing.
+  {
+    const _cr = satchelCapRefusal(wallet, isMount ? "mount" : "chikimon", sp);
+    if (_cr) return res.status(_cr.status).json(Object.assign({}, _cr.body,
+      { error: `${_cr.body.error} — your egg is safe, hatch it again`, eggSafe: true }));
   }
   // the client picked this species itself, so the cap has to be checked rather than assumed
   if (row.kind === "meme" && memeAtCap(sp)) {
@@ -9436,6 +9917,8 @@ app.post("/assets/egg/consume", async (req, res) => {
     // either way (nothing above this line mutates it) — only the sentence changes.
     if (e && e.code === "SUPPLY_EXHAUSTED") return res.status(409).json({ error: `${e.message} — your egg is safe, hatch it again` });
     if (e && e.code === "SUPPLY_RESERVED") return res.status(409).json({ error: `${e.message} — your egg is safe, hatch it again` });
+    if (e && e.code === "ALREADY_OWNED") return res.status(409).json({ error: `${e.message} — your egg is safe, hatch it again`, duplicate: true, eggSafe: true });
+    if (e && e.code === "SATCHEL_FULL") return res.status(409).json({ error: `${e.message} — your egg is safe, hatch it again`, satchelFull: true, cap: e.cap, held: e.held, eggSafe: true });
     return res.status(503).json({ error: "the asset registry is at capacity — your egg is safe, try again later" });
   }
   row.state = "consumed";
@@ -9472,7 +9955,7 @@ app.post("/assets/egg/consume", async (req, res) => {
 // catalog steed it already holds. Given that guard, a wiped or stale save recovers its steeds from
 // the registry, and a full registry simply defers recovery to a later sync — never a wipe. That is
 // "cannot be erased" made real, and it is the two halves together, not this route alone.
-const MOUNT_IDS = new Set(MOUNT_SUPPLY.map((m) => m[0]));
+const MOUNT_IDS = new Set(MOUNT_KEYS);
 let _mountsAdopted = 0;
 app.post("/assets/mounts/sync", (req, res) => {
   if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
@@ -9828,6 +10311,25 @@ function regBackfillAll(wallet, chikis) {
 //   CHIK_CHRONICLE=1     the chokepoint's "mint" chronicle rows actually record (flag-off no-op).
 // The response names which of these were off at grant time so the owner sees what still rides.
 //
+// ============ THE CREATOR EDITION SEAL — THIS ROUTE IS THE ONLY PLACE IT IS EVER APPLIED ============
+// Owner ruling 2026-08-18: the creator's own chikimons, mounts and avatars carry a PERMANENT
+// "Creator Edition" seal, and only a server-issued creator asset may ever have one. This route is
+// the only caller that passes `opts.creator` to mintAsset, which is the only way the seal is set at
+// issuance (regSealCreator, beside regEvent, is the whole mechanism).
+//
+// EVERY OTHER ISSUANCE PATH WAS EXAMINED AND DELIBERATELY DOES NOT SEAL — the seal would be a lie in
+// a certificate anywhere else, and this route is what makes "only the server, only for the creator"
+// literally true rather than a claim:
+//   adminGiftChiki (admin wallet signature)   a GIFT TO A PLAYER. Admin-authored, but the asset is
+//                                             the player's, not the creator's issue. NOT sealed.
+//   founderAward (Founder Drop)               a player who met a published bar wins it. NOT sealed.
+//   egg hatch / meme sale / scroll / ceremony  player-earned or player-paid births. NOT sealed.
+//   /assets/*/sync, regBackfillAll, the avatar heal   ADOPTIONS of holdings a player already had —
+//                                             client-declared by definition. NEVER sealed.
+//   egg restitution / roster recovery         server make-goods for a server fault. NOT sealed.
+// Adding a second sealing caller is a deliberate edit to this list plus an `opts.creator`; nothing a
+// request body contains can reach it (mintAsset strips `creatorEdition` out of `fields` first).
+//
 // GATE: cupAdminOk (the /assets/audit pattern — ?key=ADMIN_KEY or a fresh-signature admin wallet).
 // The target wallet is a PARAMETER; nothing is hardcoded. ?dryRun=1 (or body dryRun) reports what
 // WOULD happen without writing anything — not even an empty ledger record (assetRec creates one, so
@@ -9848,7 +10350,7 @@ app.post("/admin/grant-collection", async (req, res, next) => {
     ...SPECIES_NORMAL.map((sp) => ({ type: "chikimon", sp, kind: "normal" })),
     ...SPECIES_LEGEND.map((sp) => ({ type: "chikimon", sp, kind: "legendary" })),
     ...SPECIES_MEME.map((sp) => ({ type: "chikimon", sp, kind: "meme" })),
-    ...MOUNT_SUPPLY.map(([sp]) => ({ type: "mount", sp, kind: "mount" })),
+    ...MOUNT_KEYS.map((sp) => ({ type: "mount", sp, kind: "mount" })),
     ...AVATAR_IDS.map((sp) => ({ type: "avatar", sp, kind: "avatar" })),
   ];
 
@@ -9935,10 +10437,17 @@ app.post("/admin/grant-collection", async (req, res, next) => {
     try {
       row = mintAsset(c.type, wallet,
         c.type === "chikimon" ? { sp: c.sp, kind: c.kind, lvl: 1 } : { sp: c.sp, kind: c.kind },
-        "issued");                                     // the chokepoint: cap, id, edition, chronicle, provenance
-    } catch (e) {
-      if (e && e.code === "SUPPLY_EXHAUSTED") {        // raced past the pre-check — same honest answer
+        "issued", null, { grant: true, creator: true }); // the chokepoint: cap, id, edition, chronicle, provenance, SEAL
+    } catch (e) {                                       // `grant` exempts the SATCHEL cap only — the owner
+      if (e && e.code === "SUPPLY_EXHAUSTED") {         // granting a full collection is not an acquisition
         refused.push({ ...c, cap, issued: issuedCount(c.type, c.sp), remaining: remainingOf(c.type, c.sp) });
+        continue;
+      }
+      // ONE OF EACH — the chokepoint saw a holding heldVia() could not (a ledger-only or old-record
+      // creature the registry has no row for). Reported as `already`, not as a fault: nothing is
+      // wrong, the wallet simply has one, which is exactly what this endpoint is trying to achieve.
+      if (e && e.code === "ALREADY_OWNED") {
+        already.push({ ...c, via: "held", ...capInfo });
         continue;
       }
       // HELD FOR THE FOUNDER DROP is a per-species refusal like the cap, NOT a capacity fault. Left
@@ -9963,12 +10472,15 @@ app.post("/admin/grant-collection", async (req, res, next) => {
       if (!has(rec.mounts, c.sp)) rec.mounts[c.sp] = { ts: now, origin: "issued" };
     } else if (!has(rec.avatars, c.sp)) rec.avatars[c.sp] = { ts: now };
     // the grant record + the arrival: the exact materialisation channel a settled hand-off uses
-    regEvent(row, "granted", { route: "/admin/grant-collection", luid });
+    // `creator: true` is the chain's own record of the seal — the witness restoreAssetReg rebuilds
+    // from, so the seal survives even a blob that lost the field. Append-only, like every event here.
+    regEvent(row, "granted", { route: "/admin/grant-collection", luid, creator: true });
     row.arrivedAt = now;
     nftNewsPush(wallet, { kind: "arrived", id: row.id, type: row.type, sp: row.sp,
       cls: row.kind || null, lvl: row.lvl || null, mint: null, other: null, dormant: false,
       text: `${row.sp} (${row.type === "mount" ? "mount" : (row.kind || row.type)}) has been granted to this wallet — it is yours to play.` });
     granted.push({ ...c, id: row.id, edition: row.edition || null, luid,
+                   creatorEdition: row.creatorEdition === true,   // the seal, read back off the row itself
                    ...(upgrades ? { upgrades } : {}),   // this species was held but unregistered until now
                    cap, issued: issuedCount(c.type, c.sp), remaining: remainingOf(c.type, c.sp) });
     _assetsDirty = true;
@@ -9984,6 +10496,7 @@ app.post("/admin/grant-collection", async (req, res, next) => {
     // which materialisation/recording legs were live at grant time — stated, never assumed
     flags: { regAll: REG_ALL_ON, nftHandover: NFT_HANDOVER_ON, mintAtSale: MINT_AT_SALE_ON, chronicle: CHRONICLE_ON },
     notes: [
+      `creator edition: every row granted here carries the PERMANENT "Creator Edition" seal — write-once at issuance, rebuilt from the row's own chain on every restore, and never cleared by a sale, a hand-over or a re-sync. It shows on Magic Eden as the trait "Creator Edition: Yes" (metadata JSON), and is written into the on-chain Attributes plugin of anything minted from now on.`,
       NFT_HANDOVER_ON ? "arrivals live: the client materialises the grants at next sign-in (/assets/arrivals + /assets/news)"
                       : "CHIK_NFT_HANDOVER=0: /assets/arrivals and /assets/news 404 — chikimon/avatars are granted and counted but wait for the flag to materialise; mounts appear via /assets/mounts/sync regardless",
       MINT_AT_SALE_ON ? "editions stamped at issuance"
@@ -10155,11 +10668,26 @@ app.post("/assets/scroll/redeem", (req, res) => {
   if (!_assetsReady) return res.status(503).json({ error: "asset registry is still loading" });
   const wallet = regWallet(req);
   if (!wallet) return res.status(403).json({ error: "prove this wallet first" });
+  // THE WARDROBE IS SATCHEL-SIZED NOW (owner ruling 2026-08-18), and the flat "two looks" ceiling
+  // is gone. Two corrections at once:
+  //   * the CAP is this wallet's satchel tier, not a constant — a Lv10 trainer may carry all ten;
+  //   * it is counted from `ownedAvatars` (registry ∪ ledger, minus what the save let go), not from
+  //     `regOwned(...,"avatar").length` alone. The old count read REGISTRY ROWS, so a ceremony look
+  //     or a roulette look that had never been registered did not count at all — and, in the other
+  //     direction, two rows of one species (an old duplicate) counted twice.
+  // Checked BEFORE any material is debited, which is the standing rule on this route.
   const held = regOwned(wallet, "avatar");
-  if (held.length >= AVATARS_MAX) return res.status(409).json({ error: "you already carry two looks" });
+  {
+    const _cr = satchelCapRefusal(wallet, "avatar");
+    if (_cr) return res.status(_cr.status).json(Object.assign({}, _cr.body,
+      { error: `${_cr.body.error} — nothing was taken` }));
+  }
   const nowS = Date.now();
   if (nowS - (_lastScrollRedeem.get(wallet) || 0) < SCROLL_REDEEM_MIN_MS) return res.status(429).json({ error: "too fast" });
-  const have = new Set(held.map(a => a.sp));
+  // ONE OF EACH LOOK: the pool must exclude everything the wallet holds by EITHER record, or the
+  // roll can hand back a face the player is already wearing.
+  const have = ownedAvatars(wallet);
+  for (const a of held) have.add(a.sp);
   // the ceremony look every player is awarded is theirs whether or not it was ever registered
   const pool = AVATAR_IDS.filter(a => !have.has(a) && a !== "classic");
   if (!pool.length) return res.status(409).json({ error: "no looks left" });
@@ -10203,7 +10731,14 @@ app.post("/assets/scroll/redeem", (req, res) => {
   const availA = pool.filter((a) => !atSupplyCap("avatar", a));
   if (!availA.length) return res.status(409).json({ error: "every avatar of the looks you lack has been claimed" });
   try { row = mintAsset("avatar", wallet, { sp: availA[crypto.randomInt(availA.length)], kind: "avatar" }, "scroll"); }
-  catch (e) { return res.status(503).json({ error: "the asset registry is at capacity — this is a server fault, not yours; nothing was consumed" }); }
+  catch (e) {
+    // The satchel's wardrobe refusals, answered honestly and BEFORE anything is debited (the charge
+    // below only runs on success) — never as "server fault", which would send the player into a
+    // retry loop against a wall only a bigger satchel moves.
+    if (e && e.code === "SATCHEL_FULL") return res.status(409).json({ error: `${e.message} — nothing was taken`, satchelFull: true, cap: e.cap, held: e.held });
+    if (e && e.code === "ALREADY_OWNED") return res.status(409).json({ error: `${e.message} — nothing was taken`, duplicate: true });
+    return res.status(503).json({ error: "the asset registry is at capacity — this is a server fault, not yours; nothing was consumed" });
+  }
   // charged after the mint, for the same reason the egg claim is: a capacity fault must never take
   // material and then answer "nothing was consumed"
   if (_chargeS) {
@@ -10237,6 +10772,10 @@ app.get("/assets/mine", (req, res) => {
     // ordinary consumed egg on a flag-off server is a shape that predates all of this and keeps it.
     // (A1-BURNED-CARD)
     if (r.state !== "active" && r.mint) card.retired = true;
+    // THE CREATOR EDITION SEAL, so the in-game satchel and certificate pop-up can badge it the same
+    // way the marketplace does (that client pass is separate; this is the field it will read).
+    // Present only on a sealed row, so every card a flag-off server can produce is unchanged.
+    if (r.creatorEdition === true) card.creatorEdition = true;
     // Mint eligibility is SERVER-decided and served here so the client never re-implements a single
     // rule of the gate (and an old client, which never asks, is unaffected). Flag-gated: with
     // CHIK_NFT_MINT off this block adds no key and the reply is byte-identical to today's.
@@ -10318,6 +10857,11 @@ app.get("/assets/cert", (req, res) => {
   // owner is public here on purpose: a certificate nobody can check is not a certificate.
   const out = { id: r.id, type: r.type, sp: r.sp, kind: r.kind, born: r.born, origin: r.origin,
                 state: r.state, owner: r.owner, lineage, chain: r.chain.slice(0, 64) };
+  // THE CREATOR EDITION SEAL rides OUTSIDE the NFT_MINT_ON gate, with the other birth facts, because
+  // it is provenance rather than a mint fact — the certificate of an unminted creator asset must say
+  // so too. A flag-off server can never hold a sealed row (the grant route 404s without CHIK_REG_ALL),
+  // so this adds no key to any response a flag-off server can produce.
+  if (r.creatorEdition === true) out.creatorEdition = true;
   // The mint facts, served LIVE off the cert URI (gated so flag-off is byte-identical to today):
   // origin/edition/hatcher are immutable provenance; gameStatus is mutable and can flip post-mint (F6).
   if (NFT_MINT_ON) {
@@ -10892,6 +11436,9 @@ app.get("/assets/nft/meta/:id", (req, res, next) => {
     name: "Name", assetType: "Type", rarity: "Rarity", element: "Element", supply: "Supply",
     species: "Species ID", kind: "Kind", origin: "Origin", edition: "Edition", born: "Born",
     hatcher: "Hatched By", registryId: "Registry ID", editionOf: "Edition Of", witness: "Witness",
+    // The owner's PERMANENT SEAL, spelled for a human. This is the string Magic Eden prints as the
+    // trait's label; the value is "Yes", so the marketplace facet reads "Creator Edition · Yes".
+    creatorEdition: "Creator Edition",
   };
   const attrs = nftAttributes(r).map(a => ({ trait_type: TRAIT_LABEL[a.key] || a.key, value: a.value }))
     // A trait with an empty value is worse than an absent one: marketplaces render it as a filterable
@@ -10920,9 +11467,26 @@ app.get("/assets/nft/meta/:id", (req, res, next) => {
   // an egg has no species (r.sp IS its kind), so its art path is named outright rather than landing on
   // the right file by coincidence of the per-species convention
   if (NFT_IMAGE_BASE) {
+    // THE SEALED MASTER. A server-issued creator chikimon or mount has a companion image with the
+    // owner's seal composited into it (repo nft/sealed/<type>/<sp>.png — a filename-for-filename
+    // mirror of the unsealed masters), and THAT sealed card is what the asset's Magic Eden listing
+    // must show. Swapped in for a sealed CREATURE and a sealed MOUNT only:
+    //   * an AVATAR has no site art at all (nft/avatar is empty), so a sealed avatar keeps the trait
+    //     and today's (already-absent) default URL rather than pointing at a sealed file that also
+    //     does not exist — the ruling is "trait only, no image switch";
+    //   * an EGG is never sealed (the grant catalog issues no eggs), so isEgg wins first and its path
+    //     is untouched.
+    // Every UNSEALED row keeps today's URL BYTE-FOR-BYTE — the sealed branch is reached only when
+    // r.creatorEdition === true, which a flag-off server can never produce (the grant route 404s
+    // without CHIK_REG_ALL), so a flag-off server's metadata is identical to today's. The sealed
+    // set is a filename-identical mirror of the unsealed set (verified), so this only ever changes
+    // the directory — a sealed row whose unsealed image resolved keeps a resolving sealed image.
+    const _sealedArt = r.creatorEdition === true && (r.type === "chikimon" || r.type === "mount");
     out.image = isEgg
       ? `${NFT_IMAGE_BASE}/egg/${encodeURIComponent(String(r.kind || r.sp))}.png`
-      : `${NFT_IMAGE_BASE}/${encodeURIComponent(r.type)}/${encodeURIComponent(r.sp)}.png`;
+      : _sealedArt
+        ? `${NFT_IMAGE_BASE}/sealed/${encodeURIComponent(r.type)}/${encodeURIComponent(r.sp)}.png`
+        : `${NFT_IMAGE_BASE}/${encodeURIComponent(r.type)}/${encodeURIComponent(r.sp)}.png`;
     // A TOP-LEVEL `image` IS NOT ENOUGH — DAS indexers read properties.files, and Magic Eden reads DAS.
     // Measured 2026-08-13: DAS had already fetched Galador #6's metadata successfully (json_uri right,
     // name right, all 10 attributes stored) yet recorded content.files = [] and no links.image, so ME
@@ -11953,6 +12517,16 @@ app.post("/nft/market/buy", async (req, res, next) => {
   const gate = meMintGate(mint);
   if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
   if (gate.row.owner === wallet) return res.status(409).json({ error: "that one is already yours" });
+  // ONE OF EACH, AND THE SATCHEL'S CAPACITY — BEFORE THE TRANSACTION IS EVEN BUILT (2026-08-18).
+  // This is the one buy path where the gate genuinely lands before the money: nothing is signed
+  // until this route hands back a transaction, so refusing here costs the buyer nothing at all.
+  // Eggs are exempt: an egg is not a creature, it occupies a nest slot and the caps bind when it
+  // HATCHES (/assets/egg/hatch asks the same question), so refusing an egg purchase here would
+  // block a trade the game has somewhere to put.
+  if (["chikimon", "mount", "avatar"].includes(String(gate.row.type))) {
+    const _cr = satchelCapRefusal(wallet, String(gate.row.type), String(gate.row.sp || ""));
+    if (_cr) return res.status(_cr.status).json(Object.assign({}, _cr.body, { notBuilt: true }));
+  }
   // THE CEILING. A Phantom approval dialog is not a price display anybody reads carefully, so the
   // price the player was SHOWN comes up with the request and the server refuses to build a purchase
   // above it. It is never an input to the instruction — only a veto on one.
@@ -12584,10 +13158,21 @@ export function _meSetMintForTest(id, addr) {
 // earliest rows at capacity would delete the FIRST-minted NFTs. Keep every minted row, then fill the
 // remainder to `max` with the NEWEST unminted rows. Under capacity this returns `all` unchanged, so a
 // no-mint blob is byte-identical to the old `.slice(-ASSET_REG_MAX)`.
+//
+// CREATOR EDITION ROWS ARE EXEMPT FOR THE SAME REASON (2026-08-18, adversarial finding X1). The seal
+// is PERMANENT by owner ruling, and a permanence that a capacity sweep can delete is not one. The
+// exemption above only covers MINTED rows, and a creator row is unminted in production (CHIK_NFT=0)
+// — worse, the grant runs ONCE and early, so the creator's collection is the OLDEST unminted set in
+// the registry and therefore the FIRST thing `rest.slice(-fill)` throws away. Measured before this
+// line existed (_adv_seal_strip.mjs X1): 103 rows partitioned to max 40 kept 1 of 63 sealed rows —
+// the one that happened to be minted — and restoring that blob left the row GONE, not merely
+// unsealed. Nothing else changes: `all.length <= max` still returns `all` untouched, which is every
+// registry that has ever existed, so this is a no-op until the day the cap is actually reached.
 export function _partitionAssetRows(all, max) {
   if (all.length <= max) return all;
-  const minted = all.filter(r => r && r.mint);
-  const rest = all.filter(r => !(r && r.mint));
+  const _exempt = (r) => !!(r && (r.mint || r.creatorEdition === true));
+  const minted = all.filter(_exempt);
+  const rest = all.filter(r => !_exempt(r));
   // fill the REMAINING capacity with the newest unminted rows. NB: `rest.slice(-0)` returns the WHOLE
   // array (-0 === 0), so a zero fill must short-circuit — otherwise minted rows past cap keep every
   // unminted row too. When minted already meets/exceeds `max`, keep ALL minted (exempt) and 0 unminted.
@@ -12747,6 +13332,16 @@ export function restoreAssetReg(v) {
     // Defensive: floor the edition counter at the highest edition ever issued, so a lost counter can
     // never re-issue a live edition (mint rows are truncation-exempt, but a prepared row may be dropped).
     if (row.edition) { const k = _censusKey(row.type, row.sp); if ((nftEdition[k] || 0) < row.edition) nftEdition[k] = row.edition; }
+    // THE CREATOR EDITION SEAL, rebuilt the way `burned` and `consumed` are — from the row's OWN
+    // append-only chain, not from the persisted flag alone. A Render redeploy, a cold spin-up and a
+    // ledger restore all land here, and all three must leave a sealed row sealed. Two independent
+    // witnesses, either sufficient: the persisted field, and a surviving grant event (read off the
+    // UNTRUNCATED blob chain, the same discipline the census debit uses). The chain half is what
+    // makes this PERMANENT rather than merely persisted — a blob hand-edited to drop the field, or
+    // one written by a build that predates it, still comes back sealed. There is deliberately no path
+    // in the other direction: `creatorEdition:false` is simply not a witness, and nothing in this
+    // function removes a seal the chain vouches for.
+    if (src.creatorEdition === true || regChainSaysCreator(_rawChain)) regSealCreator(row);
     assetReg.set(id, row); ownerSet(owner).add(id); n++;
   }
   // Every `mint` this pass restored is a key the mint->row index does not have. Drop it; the next
@@ -12786,7 +13381,31 @@ export function restoreAssetReg(v) {
 }
 // test seams for the meme cap sim: mint a creature exactly as an in-game egg hatch does, and set
 // the paid-sale tally, so the two routes can be exercised independently
-export function _mintAssetForTest(type, wallet, fields, origin, parent) { return mintAsset(type, wallet, fields, origin, parent); }
+export function _mintAssetForTest(type, wallet, fields, origin, parent, opts) { return mintAsset(type, wallet, fields, origin, parent, opts); }
+// test seam for the satchel-capacity sim: the three catalogs the caps are measured against, read
+// out of this file's own tables so a sim can never drift from the roster it is asserting on.
+export function _speciesCatalogForTest() {
+  return { chikimon: [...SPECIES_NORMAL, ...SPECIES_LEGEND, ...SPECIES_MEME], mounts: [...MOUNT_KEYS], avatars: [...AVATAR_IDS] };
+}
+// test seam for the satchel-capacity sim: read back exactly what the caps say for a wallet, from
+// the SERVER's own records, so a sim can print the measured number instead of restating the table.
+export function _satchelStateForTest(wallet) {
+  return {
+    tier: satchelTierOf(wallet),
+    caps: { chikimon: satchelHoldCap(wallet, "chikimon"), mount: satchelHoldCap(wallet, "mount"), avatar: satchelHoldCap(wallet, "avatar") },
+    held: { chikimon: satchelHeld(wallet, "chikimon").size, mount: satchelHeld(wallet, "mount").size, avatar: satchelHeld(wallet, "avatar").size },
+    world: { chikimon: satchelWorldCap("chikimon"), mount: satchelWorldCap("mount"), avatar: satchelWorldCap("avatar") },
+    tables: { bench: [...SATCHEL_BENCH_CAP], stable: [...SATCHEL_STABLE_CAP], wardrobe: [...SATCHEL_WARDROBE_CAP], party: SATCHEL_PARTY_SLOTS },
+  };
+}
+// The refusal ITSELF, including its `code`, so a sim can print which arm fired rather than deducing
+// it from held/cap. The loss audit needs this: /market/buy-onchain's post-payment re-check now acts
+// on `duplicate` alone, and "which code does this wallet state produce" is the whole assertion.
+// Read-only — satchelCapRefusal never mutates.
+export function _satchelRefusalForTest(wallet, type, sp) {
+  const r = satchelCapRefusal(String(wallet || ""), String(type), sp ? String(sp) : undefined);
+  return r ? { status: r.status, code: r.code, body: r.body } : null;
+}
 // A creature born the way the REAL hatch routes make one: a server-minted egg row, consumed into it,
 // leaving the `parent` link that is the mint gate's only unforgeable witness of a witnessed birth
 // (see nftEligibility's no-lineage guard). A sim that mints a bare `origin:"hatched"` row is asking
@@ -12816,6 +13435,11 @@ export function _censusStats() { return { builds: _censusBuilds, keys: censusAll
 // test seam: age an egg past its incubation window without waiting real hours
 export function _ageAsset(id, ms) { const r = assetReg.get(id); if (r) { r.born -= ms; return true; } return false; }
 export function _transferAssetForTest(id, from, to, why) { return transferAsset(id, from, to, why); }
+// THE CHIKIMOUNT EGG ROLL, exactly as /assets/egg/hatch performs it — the SAME eggPoolFor and the
+// SAME pickWeighted, never a re-implementation. A hatch distribution measured through a copy of the
+// maths is a measurement of the sim, not of the server.
+export function _eggPoolForTest(wallet, kind) { return eggPoolFor(String(wallet), String(kind)); }
+export function _pickWeightedForTest(pairs) { return pickWeighted(pairs); }
 // NFT-mint test seams: drive the pure classifier/gate directly, stub DAS, inspect edition + royalty +
 // review flags, and run a reconcile deterministically — never a live chain.
 export function _nftClassifyForTest(row, obs) { return nftClassifyHolder(row, obs); }
@@ -13130,9 +13754,11 @@ function auditAssets(wallet, mmo, walletFirstSeen = 0) {
     // identically to appending all six ids. Same test as units — it is the same act.
     //
     // RARITY IS THE VALUE, exactly as on the unit path (see the `commonEnough` gate above): the
-    // fresh-wallet grandfather never covers a capped asset. EVERY mount is capped (griffin 5 is the
-    // rarest thing in the game), so — unlike normal chikimon, which are UNCAPPED and legitimately
-    // grandfathered a couple at a time — there is no "common enough" mount to grandfather. A brand-new
+    // fresh-wallet grandfather never covers a capped asset. Six chikimounts became UNCAPPED on
+    // 2026-08-18 (owner ruling 3) but the other six — the Viranimal Legacy — are the scarcest
+    // things in the game at 5 and 10 editions, and a save names a species by STRING with no way to
+    // tell the halves apart at this point, so there is still no "common enough" mount to
+    // grandfather and this stays exactly as strict as it was. A brand-new
     // keypair (firstEver but NOT preExisting) that first-saves a mount could conjure one "legacy" per
     // wallet into the CLEAN census, and a handful of free throwaway wallets would then Extinct a
     // capped species and lock honest players out permanently (grandfathering is absolute, never
@@ -13176,6 +13802,25 @@ function auditAssets(wallet, mmo, walletFirstSeen = 0) {
   // the look they are WEARING counts too — a ceremony avatar can be worn without ever being listed
   const worn = String(mmo.avatar || "").slice(0, 24);
   if (worn && !has(rec.avatars, worn)) { rec.avatars[worn] = { ts: now }; newAvatars++; }
+  // ---- THE WARDROBE THIS SAVE IS ACTUALLY CARRYING (`avNow`) — the avatar twin of `mtNow` ----
+  // rec.avatars is append-only, so without this a look that left the wallet counted against its
+  // owner's wardrobe cap forever. Same rules as mtNow: written ONLY when the save declared an
+  // `avatars` array (a partial body leaves the previous answer standing rather than reading as
+  // "they lost everything"), additive, and ignored by every existing reader.
+  if (Array.isArray(mmo.avatars)) {
+    const _av = allAv.slice(0, 40).map((a) => String(a).slice(0, 24)).filter(Boolean);
+    if (worn) _av.push(worn);                       // the worn look is held whether or not it is listed
+    rec.avNow = [...new Set(_av)];
+  }
+  // ---- THE SATCHEL TIER — the ONE number three capacities read (owner ruling 2026-08-18) ----
+  // Recorded here, from the SIGNED save this function already parses, for exactly the reason mtNow
+  // is: the cap has to be answerable from the server's own record rather than from a request. Only
+  // written when the save actually declares gear.satchel, so a partial body never demotes a player
+  // to tier 0 (and satchelTierOf() treats "never declared" as tier max, not tier 0).
+  const _gear = (mmo.gear && typeof mmo.gear === "object") ? mmo.gear : null;
+  if (_gear && Number.isFinite(Number(_gear.satchel))) {
+    rec.gearSat = Math.max(0, Math.min(SATCHEL_TIER_MAX, Math.floor(Number(_gear.satchel))));
+  }
   // ============ REGISTRY COMPLETENESS FOR AVATARS (CHIK_MINT_AT_SALE) ============
   // Owner ruling 1 makes avatars sellable, and a sale needs a registry row — but the ceremony grant
   // and the onboarding roulette are CLIENT-side, so most held avatars exist only in this ledger.
@@ -13242,7 +13887,8 @@ export function serializeAssetLedger() {
                     || (b[1].seen || b[1].first) - (a[1].seen || a[1].first));
     all.length = ASSET_LEDGER_MAX;
   }
-  return { w: all, buys: [...assetBuys.entries()].slice(-5000), gather: [...gatherCount.entries()].slice(-GATHER_WALLETS_MAX),
+  return { w: all, gone: [...chikiGone.entries()].slice(-CHIKI_GONE_MAX),
+           buys: [...assetBuys.entries()].slice(-5000), gather: [...gatherCount.entries()].slice(-GATHER_WALLETS_MAX),
            spent: [...matSpent.entries()].slice(-GATHER_WALLETS_MAX), gained: [...matGained.entries()].slice(-GATHER_WALLETS_MAX),
            // the weekly raid gate MUST survive a deploy — otherwise every restart hands the whole
            // playerbase a fresh claim, which is the very leak this gate exists to close
@@ -13289,6 +13935,12 @@ export function restoreAssetLedger(v) {
     // on its pre-fix behaviour until the wallet's next save re-records it — a restart can never
     // widen or narrow a pool on its own.
     if (Array.isArray(src.mtNow)) rec.mtNow = src.mtNow.slice(0, 40).map((m) => String(m).slice(0, 24));
+    // The wardrobe + the satchel tier, re-typed and re-clamped exactly like everything else here —
+    // a blob that came back from a database is as attacker-shaped as a request. Both ADDITIVE:
+    // absent from every blob written before 2026-08-18, and absent leaves the pre-change behaviour
+    // (satchelTierOf answers tier max, ownedAvatars falls back to the append-only record).
+    if (Array.isArray(src.avNow)) rec.avNow = src.avNow.slice(0, 40).map((a) => String(a).slice(0, 24));
+    if (Number.isFinite(Number(src.gearSat))) rec.gearSat = Math.max(0, Math.min(SATCHEL_TIER_MAX, Math.floor(Number(src.gearSat))));
     // avatars are census-only, so there is no origin to re-type and nothing here can raise a flag
     const sa = (src.avatars && typeof src.avatars === "object") ? src.avatars : {};
     for (const id of Object.keys(sa).filter(k => has(sa, k)).slice(0, 40)) {
@@ -13301,6 +13953,50 @@ export function restoreAssetLedger(v) {
                                            firstSeen: Number(g.firstSeen) || rec.first };
     }
     assetLedger.set(w, rec); n++;
+  }
+  // ---- WITNESSED DISPOSALS, AND THE ONE-TIME GRANDFATHER (2026-08-18 audit; see chikiGone) ----
+  // Re-typed and clamped like everything else here. When the blob CARRIES a `gone` array it is the
+  // truth and nothing is re-snapshotted — re-taking the snapshot every boot would hand the exploit
+  // straight back (a save that drops a species would become a disposal again one restart later).
+  const _goneSeen = Array.isArray(v.gone);
+  if (_goneSeen) {
+    for (const e of v.gone) {
+      if (!Array.isArray(e) || !e[1] || typeof e[1] !== "object") continue;
+      const w = String(e[0] || "").slice(0, 64);
+      if (!isPubkey(w)) continue;
+      const m = Object.create(null);
+      for (const sp of Object.keys(e[1]).filter(k => has(e[1], k)).slice(0, 64)) {
+        if (!CHIKIMON_IDS.has(sp)) continue;
+        const q = Math.floor(Number(e[1][sp]));
+        if (Number.isFinite(q) && q > 0) m[sp] = Math.min(q, 999);
+      }
+      if (Object.keys(m).length) chikiGone.set(w, m);
+    }
+  } else {
+    // FIRST BOOT AFTER THIS CHANGE. Freeze what the OLD rule was already writing off, exactly as it
+    // was writing it off, so no live account's pool narrows and no live account is newly refused.
+    // restoreAssetReg runs BEFORE this function (see the restore block), so regOwned is populated
+    // and the row count is the real one rather than a guess. A cheater cannot shape this: it is
+    // computed from the pre-deploy blob before any post-deploy save can touch it.
+    let _gfW = 0, _gfRows = 0;
+    for (const [w, rec] of assetLedger) {
+      if (!isPubkey(w)) continue;
+      const everSp = new Set(), heldSp = new Set();
+      for (const u of Object.values(rec.units || {})) {
+        if (!u) continue;
+        const sp = String(u.sp || "");
+        if (!sp || sp === "?") continue;
+        everSp.add(sp);
+        if (u.held !== false) heldSp.add(sp);
+      }
+      const m = Object.create(null);
+      for (const r of regOwned(w, "chikimon")) {
+        if (!(everSp.has(r.sp) && !heldSp.has(r.sp))) continue;   // the OLD rule's exact predicate
+        m[r.sp] = Math.min((m[r.sp] || 0) + 1, 999); _gfRows++;
+      }
+      if (Object.keys(m).length) { chikiGone.set(w, m); _gfW++; }
+    }
+    if (_gfW) console.log(`chikimon disposals grandfathered: ${_gfRows} row(s) across ${_gfW} wallet(s) — nobody's pool narrows on this deploy`);
   }
   for (const e of (Array.isArray(v.gather) ? v.gather : [])) {
     if (!Array.isArray(e) || !e[1] || typeof e[1] !== "object") continue;
@@ -14756,6 +15452,24 @@ app.post("/market/buy-onchain", async (req, res) => {
   const sellerWallet = String(row.wallet || "");
   if (!isPubkey(sellerWallet)) return res.status(409).json({ error: "seller has no on-chain wallet on this listing" });
   if (sellerWallet === buyer) return res.status(400).json({ error: "that is your own listing" });
+  // ============ ONE OF EACH, AND THE SATCHEL'S CAPACITY, ON THE BUY PATH (2026-08-18) ============
+  // A chikimon listing is the one Trading Post good that is a CREATURE, and buying was the last
+  // acquisition path with no ownership test at all: a wallet holding dragonos could buy a second
+  // dragonos, which is the rule this ruling makes absolute. `kind` has never accepted "mount" or
+  // "avatar" here (listItemOk), so chikimon is the whole surface.
+  //
+  // PLACED AS EARLY AS THE ROUTE ALLOWS — above the _usedTxSigs claim and above txMarketSplit — so
+  // the refusal costs the buyer nothing that is recoverable any other way, and the listing stays on
+  // the board for someone who can actually take it. It cannot be earlier than this in THIS file:
+  // the money moves on chain before the server is ever called, which is why the client must not
+  // offer the button (Market.gd reads the same rule) and why the sentence below names the recovery
+  // in the same words the double-buy refusal uses.
+  if (String(row.kind) === "chikimon") {
+    const _cr = satchelCapRefusal(buyer, "chikimon", String(row.item || ""));
+    if (_cr) return res.status(_cr.status).json(Object.assign({}, _cr.body, {
+      error: `${_cr.body.error} — this listing was NOT consumed; if you have already paid, that payment is recorded against this listing and recoverable`,
+      listingIntact: true }));
+  }
   // CLAIM the sig BEFORE the async verify so two concurrent requests can't both settle it (TOCTOU),
   // BOUND to this listing so ONE payment can never settle a second listing. Released again if verify fails.
   _usedTxSigs.set(sig, { listingId: id, buyer, ts: Date.now() });
@@ -14774,6 +15488,41 @@ app.post("/market/buy-onchain", async (req, res) => {
   // payment is recoverable, a duplicated capped creature is not.
   if (!marketListings.some(x => x.id === id) || _soldListings.has(id))
     return res.status(409).json({ error: "another buyer completed this purchase first — the payment is recorded against this listing; contact support to recover it", soldOut: true });
+  // ...AND THE SAME RE-CHECK FOR THE SATCHEL (2026-08-18 audit). The one-of-each gate at the top of
+  // this route runs BEFORE `await txMarketSplit`, and the re-find above only re-reads the LISTING —
+  // so two buys of the SAME species from two DIFFERENT sellers both passed the gate while empty,
+  // both parked in the split, and both settled. MEASURED (satchel_attack_sim, section F): a buyer
+  // holding zero fired two concurrent /market/buy-onchain against two healix listings and 2/2 got
+  // past satchelCapRefusal (both then failed only on the dead RPC's split, not on the rule). The
+  // answer is the one the double-buy TOCTOU directly above already chose, for the identical reason
+  // it gives: everything from the re-find to _consumeListing runs synchronously, so re-asking HERE
+  // is atomic with the transfer — "a wrong payment is recoverable, a duplicated capped creature is
+  // not". The listing is left intact and the payment stays bound to it by _usedTxSigs.
+  // ...AND ONLY THE ONE-OF-EACH ARM OF IT (2026-08-18 loss audit). The gate at the top of this route
+  // runs before any money is committed and refuses for BOTH reasons, which is right — it is free
+  // there. THIS one is downstream of a CONFIRMED on-chain payment, and the two reasons are not the
+  // same kind of thing:
+  //   * `duplicate` is a world-integrity violation. Two of one species on one wallet is the exact
+  //     thing owner ruling 2 forbids, it cannot be undone, and it must be refused whatever it costs.
+  //   * `satchel` (and `complete`, unreachable here because a named species that is not held cannot
+  //     also be the whole catalog) is CAPACITY, and capacity has never been a scarcity rule in this
+  //     file — every over-cap wallet in the game is grandfathered and keeps everything. Refusing for
+  //     it here burns a real payment (75% already at the seller, 20% at the pool, 5% burned) to
+  //     prevent a state the server tolerates everywhere else.
+  // MEASURED (_aud3_lossline.mjs §L12): a Lv0 buyer holding 5 of a possible 6 fires two buys for two
+  // DIFFERENT normals from two DIFFERENT sellers. Both clear the free gate (5 < 6, neither owned),
+  // both pay, the first settles to 6, and the second reaches this line with code "satchel" — not
+  // "duplicate". Under the old line that buyer's $CHIKI was gone with nothing to show for it.
+  // This is nftSettleHandover's own stated rule, applied to the rail next door: "a settle always
+  // completes and the buyer may land over their cap, grandfathered exactly like any other over-cap
+  // holding". One over the cap is survivable; a burned payment is not.
+  if (String(row.kind) === "chikimon") {
+    const _cr2 = satchelCapRefusal(buyer, "chikimon", String(row.item || ""));
+    if (_cr2 && _cr2.code === "duplicate") return res.status(_cr2.status).json(Object.assign({}, _cr2.body, {
+      error: `${_cr2.body.error} — this listing was NOT consumed; your payment is recorded against it and recoverable`,
+      listingIntact: true }));
+    if (_cr2) console.warn(`satchel: ${buyer.slice(0, 8)} settles ${row.item} past its cap (${_cr2.body.held}/${_cr2.body.cap}) — paid on chain, grandfathered`);
+  }
   // ESCROW SETTLE (CHIK_TP_ESCROW): capture the sold individual's uid from its reservation BEFORE
   // _consumeListing clears it — this is a permanent transfer, and the seller's registry row moves
   // to the buyer below (see tpeSettleChikimon). No-op field-read when the flag is off.
@@ -14788,8 +15537,14 @@ app.post("/market/buy-onchain", async (req, res) => {
   // THE PERMANENT TRANSFER (CHIK_TP_ESCROW): a settled chikimon sale moves the seller's registry row
   // to the buyer and retires the seller's census ghost — so a capped species is counted ONCE, not
   // twice. Idempotent + crash-durable; no-op flag-off and for non-registry-backed goods.
-  if (TP_ESCROW_ON && String(row.kind) === "chikimon")
-    tpeSettleChikimon(sellerWallet, buyer, String(row.item || ""), _tpeRes ? _tpeRes.uid : "", row.id);
+  const _tpeMoved = (TP_ESCROW_ON && String(row.kind) === "chikimon")
+    ? tpeSettleChikimon(sellerWallet, buyer, String(row.item || ""), _tpeRes ? _tpeRes.uid : "", row.id)
+    : null;
+  // AND THE SELLER'S RELEASE WHEN THE ROW DID NOT MOVE (see recordChikiSale). Only reached after
+  // txMarketSplit confirmed a real split, so this is a disposal the SERVER witnessed — the one thing
+  // chikiGone accepts. Skipped when the escrow already moved the row, because then regOwned has
+  // dropped it by itself and a credit on top would be the laundering vector the clamp exists to stop.
+  if (!_tpeMoved && String(row.kind) === "chikimon") recordChikiSale(sellerWallet, String(row.item || ""));
   // THE ACQUISITION BOUND. Reached only after txMarketSplit confirmed a real on-chain $CHIKI split,
   // so this is a settled sale: it counts against the seller's lifetime total, and the buyer genuinely
   // acquired the goods HERE, which is the strongest provenance a material can have.
@@ -15640,7 +16395,27 @@ function queueAuctionRefund(sid, id, amt) {
 function sweepAuctions(now) {
   marketAuctions = marketAuctions.filter(a => {
     if (now < (a.endsAt || 0)) return true;
-    if (a.curSid && a.curBid > 0) {
+    // ============ ONE OF EACH + THE SATCHEL, AT THE HAMMER (2026-08-18 adversarial audit) ============
+    // The gate added on auction_bid asks while the bidder is still empty, and NOTHING re-asked
+    // between the bid and the settle. MEASURED (_adv_satchel_bypass1.mjs §A, run at MARKET_ONCHAIN=0
+    // — the kill-switch position that re-opens this house): a wallet holding nothing bid on a
+    // `healix` auction (accepted:true, cur 500), then acquired a healix through a witnessed hatch,
+    // and the hammer still delivered a SECOND healix into its fills queue — one fill, item "healix",
+    // with held.chikimon reading 1 at hammer time. A sweep has nobody to answer 409 to, so the
+    // refusal resolves the way this house already resolves an auction nobody can take: the creature
+    // walks home to its SELLER and the winner's escrow goes back through the refunds queue. Nothing
+    // is destroyed, nothing is revoked, and the winner keeps every creature they already hold.
+    // `why:"noBids"` is deliberate: the DEPLOYED Market.gd restores the seller's stashed unit intact
+    // only on that exact string (Market.gd:1833), so any other value would cost the seller their
+    // creature's nickname and bond. `winnerFull` rides alongside for a future client to word it
+    // properly; the shipped one ignores unknown keys.
+    const _wBlocked = (a.curSid && a.curBid > 0 && isPubkey(String(a.curWallet || "")))
+      ? satchelCapRefusal(String(a.curWallet), "chikimon", String(a.species || "")) : null;
+    if (_wBlocked) {
+      queueAuctionRefund(a.curSid, a.id, a.curBid);   // the winner's escrow is returned in full
+      console.log(`auction ${a.id}: winner ${String(a.curWallet).slice(0, 8)} cannot hold ${a.species} (${_wBlocked.code}) — creature returned to seller, ${a.curBid} escrow refunded`);
+    }
+    if (a.curSid && a.curBid > 0 && !_wBlocked) {
       const farr = marketFills[a.curSid] || (marketFills[a.curSid] = []);
       if (!farr.some(f => f.id === a.id)) {
         farr.push({ id: a.id, item: a.species, kind: "chikimon", qty: 1, lvl: a.lvl, xp: a.xp, price: a.curBid, fillerName: a.seller, ts: now });
@@ -15651,10 +16426,13 @@ function sweepAuctions(now) {
         // ESCROW SETTLE (CHIK_TP_ESCROW): the hammer is a permanent transfer too — move the seller's
         // registry row to the winner + retire the ghost, before releaseUnitFor below clears the uid.
         // (The house is shut while MARKET_ONCHAIN, so this fires only for pre-flip/dev auctions.)
+        let _aMoved = null;
         if (TP_ESCROW_ON) {
           const _ar = _tpeReservedUidFor(a.id);
-          tpeSettleChikimon(String(a.wallet || ""), String(a.curWallet || ""), String(a.species || ""), _ar ? _ar.uid : "", a.id);
+          _aMoved = tpeSettleChikimon(String(a.wallet || ""), String(a.curWallet || ""), String(a.species || ""), _ar ? _ar.uid : "", a.id);
         }
+        // the hammer is a settled sale too — release the seller when the row stayed behind
+        if (!_aMoved) recordChikiSale(String(a.wallet || ""), String(a.species || ""));
       }
       const sarr = marketSales[a.sid] || (marketSales[a.sid] = []);
       if (!sarr.some(s => s.id === a.id))
@@ -15665,11 +16443,11 @@ function sweepAuctions(now) {
     } else {
       const rarr = marketFills[a.sid] || (marketFills[a.sid] = []);
       if (!rarr.some(f => f.id === a.id)) {
-        rarr.push({ id: a.id, item: a.species, kind: "chikimon", qty: 1, lvl: a.lvl, xp: a.xp, price: 0, fillerName: a.seller, returned: true, why: "noBids", ts: now });
+        rarr.push({ id: a.id, item: a.species, kind: "chikimon", qty: 1, lvl: a.lvl, xp: a.xp, price: 0, fillerName: a.seller, returned: true, why: "noBids", winnerFull: !!_wBlocked, ts: now });
         // a no-bid return puts the creature back in the SELLER's hands — same reasoning as above
         recordAssetBuy(a.wallet, "chikimon", a.species, a.lvl);
         chronicleAdd("auction_return", String(a.wallet || ""), { sub: a.species, qty: 1, route: "sweepAuctions",
-          idem: "aucr:" + a.id, data: { why: "noBids" } });
+          idem: "aucr:" + a.id, data: { why: _wBlocked ? "winnerFull" : "noBids" } });
       }
     }
     releaseUnitFor(a.id);   // the auction is over: its creature can be listed again
@@ -15998,6 +16776,30 @@ app.post("/market/op", async (req, res) => {
     if (row && row.sid && row.sid === sid) {
       return res.status(409).json({ error: "that's your own listing — cancel it to put the goods back in your bag" });
     }
+    // ONE OF EACH + the satchel's capacity on the SOFT rail too (owner ruling 2026-08-18). op:buy is
+    // deliberately unauthenticated (see the long note above), so the buyer is only knowable when
+    // they happen to present a market token — when they do, the same rule the on-chain rail
+    // enforces applies here, and nothing has been consumed at this line so a refusal is free.
+    if (row && String(row.kind) === "chikimon") {
+      const _bw = mktWallet(b);
+      if (isPubkey(String(_bw || ""))) {
+        const _cr = satchelCapRefusal(_bw, "chikimon", String(row.item || ""));
+        if (_cr) return res.status(_cr.status).json(Object.assign({}, _cr.body, { listingIntact: true }));
+      } else {
+        // ...AND "WHEN THEY HAPPEN TO PRESENT ONE" WAS THE WHOLE GATE (2026-08-18 adversarial audit).
+        // MEASURED (_adv_satchel_bypass1.mjs §B, MARKET_ONCHAIN=0 — the kill-switch position): the
+        // SAME buyer, already holding `drolax`, was refused 409 "you already carry that chikimon"
+        // WITH its market token and answered 200 WITHOUT it — the listing was consumed and the
+        // creature released. Declining to identify yourself skipped one-of-each entirely.
+        // The file's standing reason for keeping "buy" out of _AUTH_OPS is a real one — an
+        // unauthenticated 401 locked cached clients out of the whole Trading Post — so this does
+        // NOT re-add it. It refuses exactly one kind: a CREATURE. Every material, potion and fish
+        // buy is untouched, so no cached client loses the trade it actually depends on, and a
+        // creature buy is made by the same client that signs in to list one. Nothing has been
+        // consumed at this line: the listing stays on the board and the goods stay escrowed.
+        return res.status(401).json({ error: "sign in with your wallet to buy a chikimon — one of each is the rule, and the server has to know whose satchel it is going into", needAuth: true, listingIntact: true });
+      }
+    }
     // SECURITY: when on-chain trading is live, a wallet-backed listing MUST settle through the
     // verified /market/buy-onchain path — never through this unauthenticated soft op:buy, or a
     // seller could POST a fake buy against their own listing to mint soft $CHIKI for nothing.
@@ -16240,6 +17042,21 @@ app.post("/market/op", async (req, res) => {
     const row = marketAuctions.find(x => x.id === aid);
     if (!row || Date.now() >= row.endsAt) return res.json({ ok: true, accepted: false, reason: "auction ended" });
     if (row.sid === sid) return res.status(409).json({ error: "you can't bid on your own auction" });
+    // ONE OF EACH + THE SATCHEL, ON THE HAMMER TOO (2026-08-18 audit). sweepAuctions hands the
+    // winner the creature through the fills queue with recordAssetBuy stamping it "purchased", and
+    // nothing on that path ever asked whether the winner may hold it — so the auction house was an
+    // acquisition path with no ownership test at all. auction_bid is in _AUTH_OPS, so the bidder's
+    // wallet is PROVEN here, and this is the last moment before money is on the table: nothing has
+    // been escrowed or queued at this line, so the refusal is free. (Latent today — the house is
+    // shut while MARKET_ONCHAIN, which is the branch directly above — but the kill-switch is exactly
+    // what re-opens it, so the gate cannot live only on the on-chain rail.)
+    {
+      const _aw = mktWallet(b);
+      if (isPubkey(String(_aw || ""))) {
+        const _cr = satchelCapRefusal(_aw, "chikimon", String(row.species || ""));
+        if (_cr) return res.status(_cr.status).json(Object.assign({}, _cr.body, { accepted: false }));
+      }
+    }
     const need = Math.max(row.minBid, row.curBid + Math.max(1, Math.ceil(row.curBid * 0.05)));
     if (amt < need) return res.json({ ok: true, accepted: false, need });
     if (row.curSid) queueAuctionRefund(row.curSid, row.id, row.curBid);
