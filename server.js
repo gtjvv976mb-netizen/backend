@@ -7923,10 +7923,12 @@ function masOriginClean(origin) { origin = String(origin || ""); return origin =
 // count. A capped kind states its cap ("Edition N of 5"); an uncapped kind (normal chikimon above
 // all) does NOT invent one — it states the open edition truthfully.
 function masEditionOf(row) {
-  // A Creator Edition is not the Nth of the player run — it is the only one of its own class, and
-  // saying "of 5" over it would put six things inside a series of five. Its denominator is its own
-  // class size, read off the census rather than asserted (one-of-each makes it 1 in practice).
-  if (row && row.creatorEdition === true) return String(Math.max(1, creatorIssued(row.type, String(row.sp || ""))));
+  // ONE DENOMINATOR FOR EVERYONE. This used to special-case a Creator Edition as "the only one of
+  // its own class", which printed "Edition 7 of 1" — nonsense on its face. It came from the
+  // 2026-08-19 design where creator copies sat OUTSIDE the cap; the owner reversed that the same
+  // day. A creator grant carries origin "issued", which is not in mintAsset's exempt list, so it
+  // consumes a cap slot exactly like a player's. There is only one series, and the denominator is
+  // the cap for everybody.
   const cap = supplyOf(row.type, row.sp);
   return cap > 0 ? String(cap) : "open";
 }
@@ -8004,11 +8006,13 @@ function nftAttributes(row) {
   // Existence 6". Present only where a Creator Edition actually exists (0 grants -> both absent ->
   // byte-identical metadata for a server that never ran the grant), and appended AFTER every existing
   // key so no already-minted Attributes plugin has an index or a meaning moved.
-  const _cre = creatorIssued(row.type, String(row.sp || ""));
-  if (_cre > 0) {
-    a.push({ key: "creatorEditions", value: String(_cre) });
-    if (cap > 0) a.push({ key: "totalEditions", value: String(cap + _cre) });
-  }
+  // The "creatorEditions" / "totalEditions" pair lived here until 2026-08-20. Both were built for
+  // the brief window when creator assets sat OUTSIDE the rarity cap and the supply line needed an
+  // asterisk explaining the extra copies. The owner cancelled that design the day after it was
+  // proposed — creator grants consume cap slots like anyone else's — which left the pair not merely
+  // redundant but WRONG: totalEditions computed cap + creatorEditions, and since the cap already
+  // contains those copies it advertised 6 of a species capped at 5.
+  // They are gone. `supply` is the one true count and needs no companion.
   return a;
 }
 // Build + submit the Core create. The SDK is imported LAZILY inside this function so a flag-off boot
