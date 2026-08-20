@@ -11652,7 +11652,13 @@ app.get("/assets/nft/meta/:id", (req, res, next) => {
     // without CHIK_REG_ALL), so a flag-off server's metadata is identical to today's. The sealed
     // set is a filename-identical mirror of the unsealed set (verified), so this only ever changes
     // the directory — a sealed row whose unsealed image resolved keeps a resolving sealed image.
-    const _sealedArt = r.creatorEdition === true && (r.type === "chikimon" || r.type === "mount");
+    // AVATARS JOINED THE SEALED SET 2026-08-20, when their art landed. This used to exclude them for
+    // a good reason — nft/avatar/ was EMPTY, so pointing a sealed avatar at /sealed/avatar/<id>.png
+    // would have produced exactly the dead image URL that gets a token flagged as spam in Phantom.
+    // All TEN now have art (classic arrived last), so the carve-out is gone and every asset type
+    // that can be sealed serves its sealed portrait.
+    const _sealedArt = r.creatorEdition === true
+      && (r.type === "chikimon" || r.type === "mount" || r.type === "avatar");
     out.image = isEgg
       ? `${NFT_IMAGE_BASE}/egg/${encodeURIComponent(String(r.kind || r.sp))}.png`
       : _sealedArt
