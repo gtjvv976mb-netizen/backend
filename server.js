@@ -7758,6 +7758,21 @@ const NFT_COLLECTION = String(process.env.NFT_COLLECTION || "").trim() || null;
 // Where a minted asset's on-chain `uri` points — this backend's public origin. The metadata JSON is
 // served live at GET /assets/nft/meta/:id, so a marketplace reads the same provenance the cert does.
 const NFT_META_BASE = String(process.env.NFT_META_BASE || "").trim().replace(/\/+$/, "");
+
+// ART REVISION — the ONE lever that makes a marketplace re-read an image it already cached.
+//
+// MEASURED 2026-08-23. chikimonsters.com/nft/mount/chicken.png has served the correct scenic art
+// since Aug 15 (byte-identical to the owner's master in ~/Desktop/Chikimount NFT/), yet Magic Eden's
+// item page still rendered the Aug 7 FRAMED "CHIKI ROOST" case. Nothing was wrong with the metadata,
+// the URL, or the file — ME had cached the bytes for that URL in its own image CDN and had no reason
+// to look again. A URL is a cache key, and ours never changed when the art behind it did.
+//
+// Appending a revision makes the URL a NEW resource to every indexer, so the next metadata read
+// fetches the current picture instead of serving what it kept. BUMP THIS whenever art is REPLACED at
+// an existing path (new art at a new path needs no bump). It is invisible to the file server — the
+// query is ignored by GitHub Pages and Cloudflare alike — and never changes which file is served,
+// only what a cache calls it.
+const NFT_ART_REV = "?rev=2026-08-23";
 // Per-species art for the metadata `image` (display only; omitted when unset — never a broken guess).
 const NFT_IMAGE_BASE = String(process.env.NFT_IMAGE_BASE || "").trim().replace(/\/+$/, "");
 // ---- the COLLECTION document's own facts (served at GET /assets/nft/collection) ----------------
@@ -11554,7 +11569,10 @@ app.get("/assets/nft/collection", (req, res, next) => {
   // Same "never a broken guess" rule the per-asset route follows: an image key is emitted only when a
   // base to build it from is configured. An empty `image` is worse than an absent one — it is exactly
   // the field whose emptiness Phantom reads as spam.
-  const img = NFT_COLLECTION_IMAGE || (NFT_IMAGE_BASE ? `${NFT_IMAGE_BASE}/collection.png` : "");
+  // The revision rides the DERIVED url only. An explicit NFT_COLLECTION_IMAGE is the owner's own
+  // string and is passed through untouched — if they ever point it at a host that treats a query as
+  // part of the path, appending to a URL we did not build would break it.
+  const img = NFT_COLLECTION_IMAGE || (NFT_IMAGE_BASE ? `${NFT_IMAGE_BASE}/collection.png${NFT_ART_REV}` : "");
   if (img) {
     out.image = img;
     // The Metaplex `properties.files` block. Aggregators that predate Core still look here for the
@@ -11664,10 +11682,10 @@ app.get("/assets/nft/meta/:id", (req, res, next) => {
     const _sealedArt = r.creatorEdition === true
       && (r.type === "chikimon" || r.type === "mount" || r.type === "avatar");
     out.image = isEgg
-      ? `${NFT_IMAGE_BASE}/egg/${encodeURIComponent(String(r.kind || r.sp))}.png`
+      ? `${NFT_IMAGE_BASE}/egg/${encodeURIComponent(String(r.kind || r.sp))}.png${NFT_ART_REV}`
       : _sealedArt
-        ? `${NFT_IMAGE_BASE}/sealed/${encodeURIComponent(r.type)}/${encodeURIComponent(r.sp)}.png`
-        : `${NFT_IMAGE_BASE}/${encodeURIComponent(r.type)}/${encodeURIComponent(r.sp)}.png`;
+        ? `${NFT_IMAGE_BASE}/sealed/${encodeURIComponent(r.type)}/${encodeURIComponent(r.sp)}.png${NFT_ART_REV}`
+        : `${NFT_IMAGE_BASE}/${encodeURIComponent(r.type)}/${encodeURIComponent(r.sp)}.png${NFT_ART_REV}`;
     // A TOP-LEVEL `image` IS NOT ENOUGH — DAS indexers read properties.files, and Magic Eden reads DAS.
     // Measured 2026-08-13: DAS had already fetched Galador #6's metadata successfully (json_uri right,
     // name right, all 10 attributes stored) yet recorded content.files = [] and no links.image, so ME
