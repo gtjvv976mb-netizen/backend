@@ -1765,6 +1765,11 @@ async function getStats() {
     const evs = liveEventsWire();
     if (evs) out.events = evs;
     if (_founderCount > 0 || founderEventActive()) { out.founderClaimed = _founderCount; out.founderCap = FOUNDER_CAP; out.founderSpecies = founderPool(); }
+    // the same additive, separately-keyed Viranimal block /world/event carries — see the note there
+    if (MOUNT_DROP_ON && (_mdCount > 0 || mdActive())) {
+      out.mountDropClaimed = _mdCount; out.mountDropCap = mdCap();
+      out.mountDropEach = mdPer(); out.mountDropSpecies = mdPool();
+    }
   } catch (e) {}
   _statsCache = { t: Date.now(), data: out };
   return out;
@@ -2489,6 +2494,13 @@ app.get("/world/event", (_req, res) => {
                                                    // the creatures THIS drop hands out — the client shows them, and it is
                                                    // the only way to SEE that a redeploy kept the owner's named set
                                                    extra.founderSpecies = founderPool(); }
+  // ADDITIVE AND SEPARATE. Never founderClaimed/founderCap/founderSpecies: InfoBar parses those into
+  // the Meme-Dynasty-worded Founder banner, so reusing them would announce the wrong prize to every
+  // live player. An un-updated client reads these four keys and ignores them.
+  if (MOUNT_DROP_ON && (_mdCount > 0 || mdActive())) {
+    extra.mountDropClaimed = _mdCount; extra.mountDropCap = mdCap();
+    extra.mountDropEach = mdPer(); extra.mountDropSpecies = mdPool();
+  }
   if (!fishEventActive()) return res.json(Object.assign({ active: false }, extra));
   res.json(Object.assign({ active: true, mult: _fishEvent.mult, ends: _fishEvent.ends, label: _fishEvent.label,
              remainingMs: Math.max(0, Number(_fishEvent.ends) - Date.now()) }, extra));
@@ -2523,7 +2535,7 @@ app.post("/admin/event/start", async (req, res) => {
   const key = String(req.body?.key ?? req.query?.key ?? "");
   if (!process.env.ADMIN_KEY || key !== process.env.ADMIN_KEY) return res.status(403).json({ error: "admin key required" });
   const kind = normEventKind(req.body?.event ?? req.query?.event);
-  if (!kind) return res.status(400).json({ error: "event must be one of open_gates | fishing_festival | founder_drop" });
+  if (!kind) return res.status(400).json({ error: eventKindsMsg() });
   const days = Math.min(EVENT_MAX_DAYS, Math.max(0, Number(req.body?.days ?? req.query?.days) || 0));
   if (!(days > 0)) return res.status(400).json({ error: `days required (0 < days <= ${EVENT_MAX_DAYS}) — use /admin/event/stop to end an event` });
   const ends = Date.now() + Math.round(days * 86400000);
@@ -2539,8 +2551,52 @@ app.post("/admin/event/start", async (req, res) => {
       idem: "fest:" + ends, data: { mult, days, ends } });
     return res.json({ ok: true, event: kind, active: true, days, mult, label: _fishEvent.label, ends });
   }
+  // hoisted so the response tail can report them: the feasibility shortfall the start refused (or was
+  // forced past), and the counters a stop is about to report before the pool is cleared.
+  let mdShort = [];
   if (kind === "open_gates") {
     _openGates = { ends, label: label || "Open Gates" };
+  } else if (kind === "mount_drop") {
+    // ============ THE VIRANIMAL LEGACY DROP ============
+    // {species:"viranimal"} expands to the wave-2 keys DERIVED from MOUNT_CHARS; exact chikimount keys
+    // are also accepted, and ANYTHING ELSE is a 400 carrying the valid tokens. The typo is refused
+    // HERE, with nothing minted, mutated or persisted — the founder side learned that the hard way, and
+    // for a mount it is worse: supplyOf("mount", <unknown>) is 0, which reads as UNCAPPED rather than
+    // as an error, so a phantom key would be dealt the entire drop.
+    const rawSp = req.body?.species ?? req.query?.species;
+    let pool;
+    try { pool = mountDropExpandPool(Array.isArray(rawSp) ? rawSp : String(rawSp || "").split(",")); }
+    catch (e) {
+      if (e && e.code === "MOUNT_POOL_UNKNOWN") return res.status(400).json({ error: e.message, validTokens: e.validTokens });
+      throw e;
+    }
+    // NO FALLBACK EXISTS BY DESIGN, so an empty pool is a refusal and never a silent default roster.
+    if (!pool.length) return res.status(400).json({ error: `species required — name the drop's chikimounts with a group token (${MOUNT_DROP_GROUP_TOKENS.join(", ")}) or exact keys: [${MOUNT_KEYS.join(", ")}]`,
+                                                    validTokens: { groups: MOUNT_DROP_GROUP_TOKENS, all: MOUNT_DROP_ALL_TOKENS, mounts: [...MOUNT_KEYS] } });
+    const per = Math.max(1, Math.min(MOUNT_DROP_PER_MAX, Math.floor(Number(req.body?.each ?? req.query?.each) || MOUNT_DROP_PER_DEFAULT)));
+    // FEASIBILITY IS DECIDED AT START, NOT DISCOVERED AN HOUR IN. A chikimount with fewer editions left
+    // than this drop still owes it can only ever deliver fewer, and today the owner's only signal for
+    // that would be a 60s-throttled console line — after players had been told twelve were coming.
+    // "need" subtracts what THIS drop has already granted, so stopping and re-starting a half-finished
+    // drop is not refused for supply it has itself consumed.
+    for (const sp of pool) {
+      const cap = supplyOf("mount", sp);
+      if (!(cap > 0)) continue;                                  // uncapped original: never short
+      const issued = issuedCount("mount", sp);
+      const left = Math.max(0, cap - issued);
+      const need = Math.max(0, per - (_mdPerSp[sp] || 0));
+      if (left < need) mdShort.push({ sp, cap, issued, left, need });
+    }
+    if (mdShort.length && !(req.body?.force === true || String(req.query?.force ?? req.body?.force ?? "") === "1")) {
+      return res.status(409).json({
+        error: `not enough editions left to give ${per} of each — ${mdShort.map((x) => `${x.sp} needs ${x.need} and has ${x.left}`).join("; ")}. Pass force:true to start anyway and hand out fewer.`,
+        short: mdShort, each: per, species: pool });
+    }
+    _mdDrop = { ends, label: label || "Viranimal Legacy Drop", pool, per };
+    _mdBase = _mdCount;            // this series counts from HERE, so a later wave is not born full
+    _mdPerSpBase = Object.assign(Object.create(null), _mdPerSp);   // ...and so does every species
+    _mdLastSweep = Date.now();     // accrual starts at the START, never from a pre-event sweep
+    _mdResCache = { k: "", v: null };
   } else {
     // THE POOL IS NAMED HERE. {species:["aurox","zephyra",...]} (or a comma-separated string) picks
     // the exact creatures this drop hands out — the owner's NEW legendary set. Omitted, it falls back
@@ -2564,7 +2620,51 @@ app.post("/admin/event/start", async (req, res) => {
   chronicleAdd("event", "*", { sub: kind + ":on", route: "/admin/event/start",
     idem: "ev:" + kind + ":" + ends, data: { days, ends, label: label || null } });
   const out = { ok: true, event: kind, active: true, days, ends,
-                label: kind === "open_gates" ? _openGates.label : _founderEvent.label };
+                label: kind === "open_gates" ? _openGates.label
+                     : (kind === "mount_drop" ? _mdDrop.label : _founderEvent.label) };
+  if (kind === "mount_drop") {
+    // THE WHOLE PICTURE, ANSWERED AT START so the owner sees it before any player is told anything.
+    // supply is read with supplyOf("mount", sp) — the founder branch's hard-coded "chikimon" would
+    // print pure fiction here (0 = uncapped for all six Viranimals).
+    out.cap = mdCap(); out.each = mdPer(); out.claimed = _mdCount; out.species = mdPool();
+    out.origin = MOUNT_DROP_ORIGIN;
+    out.granted = { ..._mdPerSp };                 // what THIS drop has already handed out, per species
+    out.deal = mdDeal();
+    out.dealTotal = Object.values(out.deal).reduce((a, b) => a + b, 0);
+    // WHAT IS STILL TO COME, separately from the plan. `deal` is the plan for the WHOLE SERIES and so
+    // includes grants already made (founderDeal has the identical semantics), which means dealTotal
+    // alone cannot tell the owner whether a re-started drop will hand out anything at all.
+    out.dealRemaining = mdPool().reduce((a, sp) => a + Math.max(0, (out.deal[sp] || 0) - (_mdPerSp[sp] || 0)), 0);
+    out.reserved = mdReserveMap();
+    out.reservedTotal = mdReserveTotal();
+    out.supply = Object.fromEntries(mdPool().map((sp) => {
+      const cap = supplyOf("mount", sp), issued = issuedCount("mount", sp);
+      return [sp, cap > 0 ? { cap, issued, left: Math.max(0, cap - issued) } : { cap: 0, issued, left: -1 }];
+    }));
+    out.bar = { minutes: FOUNDER_MIN_MS / 60000, actions: FOUNDER_MIN_ACTIONS };
+    // THE ONE-OF-EACH BLIND SPOT, MADE VISIBLE. mintAsset does NOT exempt a grant from one-of-each
+    // (measured on the founder side: a second wrinkle to the same wallet threw ALREADY_OWNED even with
+    // founder:true), so a wallet already holding every chikimount in the pool crosses the bar and is
+    // refused forever, with a throttled log line and no player-visible explanation. Six species is a
+    // small pool, so this counts how many currently-online PROVEN wallets are already that close.
+    let poolComplete = 0, oneShort = 0;
+    const _pl = mdPool(), _now2 = Date.now();
+    for (const [w, p] of worldPlayers) {
+      if (!dropPresenceEligible(_now2, w, p)) continue;
+      const h = satchelHeld(w, "mount");
+      const n2 = _pl.filter((sp) => h.has(sp)).length;
+      if (n2 >= _pl.length) poolComplete++; else if (n2 >= _pl.length - 1) oneShort++;
+    }
+    out.onlineHolders = { poolComplete, oneShort,
+      note: "poolComplete wallets can never claim — one-of-each binds a grant too" };
+    out.warnings = mdShort.map((x) => `${x.sp}: ${x.left} left but ${x.need} needed — forced start, this drop will deliver fewer than ${out.cap}`);
+    // THE RE-RUN FOOTGUN, SAID OUT LOUD. _mdPerSp is permanent by design (two of each EVER, not two
+    // per run), so re-starting a completed drop with the same `each` deals nothing at all and every
+    // qualified player would be refused forever behind a throttled log line. Raise `each` or name
+    // different chikimounts.
+    if (out.dealRemaining === 0) out.warnings.push(`this drop has already granted ${mdPer()} of every chikimount in the pool — it will hand out NOTHING. Raise "each" or name different chikimounts.`);
+    if (!out.warnings.length) delete out.warnings;
+  }
   if (kind === "founder_drop") { out.cap = FOUNDER_CAP; out.perSpecies = founderPerSpecies(); out.claimed = _founderCount;
                                  out.species = founderPool();   // the creatures THIS drop hands out
                                  // THE ALLOCATION, ANSWERED AT START so the owner sees it before players do:
@@ -2589,20 +2689,33 @@ app.post("/admin/event/stop", async (req, res) => {
   const key = String(req.body?.key ?? req.query?.key ?? "");
   if (!process.env.ADMIN_KEY || key !== process.env.ADMIN_KEY) return res.status(403).json({ error: "admin key required" });
   const kind = normEventKind(req.body?.event ?? req.query?.event);
-  if (!kind) return res.status(400).json({ error: "event must be one of open_gates | fishing_festival | founder_drop" });
+  if (!kind) return res.status(400).json({ error: eventKindsMsg() });
   if (kind === "fishing_festival") {
     _fishEvent = { mult: 1, ends: 0, label: "" };
     await saveFishEvent();
     chronicleAdd("festival", "*", { sub: "off", route: "/admin/event/stop" });
     return res.json({ ok: true, event: kind, active: false });
   }
+  let mdStop = null;
   if (kind === "open_gates") _openGates = { ends: 0, label: "" };
+  else if (kind === "mount_drop") {
+    // Read the counters BEFORE the pool is cleared — mdCap() is derived from the pool, so reporting it
+    // afterwards would tell the owner the series cap was 0.
+    mdStop = { claimed: _mdCount, cap: mdCap(), each: mdPer(), granted: { ..._mdPerSp } };
+    // The pool is dropped exactly as the founder stop drops its own, so a restarted drop must be
+    // explicitly re-named rather than silently resuming a stale set. The claim book, the counter and
+    // the per-species tallies are KEPT — permanent by design, which is what makes one-per-wallet-ever
+    // survive a stop and a re-run, and what a shared founder book could never have given this drop.
+    _mdDrop = { ends: 0, label: "", pool: [], per: MOUNT_DROP_PER_DEFAULT };
+    _mdResCache = { k: "", v: null };
+  }
   else _founderEvent = { ends: 0, label: "" };          // the claim book stays — permanent by design
   _evWireCache = { t: 0, v: null };
   await saveLiveEvents(true);
   chronicleAdd("event", "*", { sub: kind + ":off", route: "/admin/event/stop" });
   const out = { ok: true, event: kind, active: false };
   if (kind === "founder_drop") { out.claimed = _founderCount; out.cap = FOUNDER_CAP; }
+  if (kind === "mount_drop" && mdStop) Object.assign(out, mdStop);
   res.json(out);
 });
 
@@ -4975,7 +5088,7 @@ app.post("/world/node/claim", (req, res) => {
       markNodesDirty();
       const drop1 = nodeDrop(kind);
       recordGather(b.wallet, kind, drop1);
-      if (claimProven) founderNoteAction(b.wallet);   // founder bar: a PROVEN gather is a verified action
+      if (claimProven) dropNoteAction(b.wallet);   // drop bar (both drops, one wrapper): a PROVEN gather is a verified action
       return res.json({ ok: true, taken: false, left, felled: false, drop: drop1 });
     }
     worldNodeUses.delete(id);
@@ -4983,7 +5096,7 @@ app.post("/world/node/claim", (req, res) => {
     markNodesDirty();
     const drop2 = nodeDrop(kind);
     recordGather(b.wallet, kind, drop2);
-    if (claimProven) founderNoteAction(b.wallet);
+    if (claimProven) dropNoteAction(b.wallet);
     return res.json({ ok: true, taken: false, left: 0, felled: true, until: now + cd, drop: drop2 });
   }
 
@@ -4991,7 +5104,7 @@ app.post("/world/node/claim", (req, res) => {
   markNodesDirty();
   const drop3 = nodeDrop(kind);   // the SINGLE-USE path — every node except wood comes through here
   recordGather(b.wallet, kind, drop3);
-  if (claimProven) founderNoteAction(b.wallet);      // grace-window (unproven) claims never feed the bar
+  if (claimProven) dropNoteAction(b.wallet);      // grace-window (unproven) claims never feed the bar
   res.json({ ok: true, taken: false, until: now + cd, drop: drop3 });
 });
 
@@ -5127,6 +5240,10 @@ async function saveFishEvent() { try { await store.kvSet("fish_event", _fishEven
 // pattern): a mid-event redeploy must not end or restart an event, and must never forget who
 // already claimed a founder drop.
 const FOUNDER_CAP = Math.max(1, Math.floor(Number(process.env.FOUNDER_CAP || 50)));
+// DEAD CONSTANT, KEPT ONLY SO NOBODY TRUSTS IT: founderPerSpecies() derives the share from the LIVE
+// pool and has never read this value, and nothing else in this file references it. It does NOT cap a
+// species at 10, and the Viranimal drop deliberately derives its own cap instead of adding a second
+// env that could disagree with the per-species number.
 const FOUNDER_PER_SPECIES = Math.max(1, Math.floor(Number(process.env.FOUNDER_PER_SPECIES || 10)));
 // THE BAR: 30 MINUTES **AND** 10 ACTIONS (owner ruling 2026-08-11, tightened from 15-or-3).
 // WHY BOTH: sign-in is free — the forensics lens generated 200 valid wallets in seconds — so with an
@@ -5300,7 +5417,21 @@ function normEventKind(v) {
   if (["open_gates", "opengates", "gates"].includes(s)) return "open_gates";
   if (["fishing_festival", "fishing", "festival", "fish"].includes(s)) return "fishing_festival";
   if (["founder_drop", "founder", "founders"].includes(s)) return "founder_drop";
+  // THE VIRANIMAL LEGACY DROP IS A SEPARATE KIND, and it is gated on the flag so a flag-off server
+  // answers `mount_drop` with the identical 400 it answers today. The KIND is what carries the asset
+  // TYPE: mount_drop can only ever reach mintAsset("mount", ...), so no restore path, clipped blob or
+  // renamed pool can mis-type a grant into a chikimon called "momota". That is not available to a
+  // widened founder pool, whose persisted pool is bare species keys with no type attached — and the
+  // mis-type would be SILENT, because supplyOf("chikimon", "momota") is 0, which reads as UNCAPPED.
+  if (MOUNT_DROP_ON && ["mount_drop", "mountdrop", "mounts", "viranimal", "viranimals", "viranimal_legacy"].includes(s)) return "mount_drop";
   return "";
+}
+// The admin 400 is built from THIS list rather than a literal, so the flag-off sentence stays
+// character-identical to the one the owner's runbook quotes today while the flag-on one names the
+// new kind. Two routes print it; one definition means they cannot disagree.
+function eventKindsMsg() {
+  return "event must be one of " + ["open_gates", "fishing_festival", "founder_drop"]
+    .concat(MOUNT_DROP_ON ? ["mount_drop"] : []).join(" | ");
 }
 // what the client banners read — one additive shape for every surface (/verify, /world/event,
 // /stats, the move-reply `events` key). The frozen fishing `event` move-reply key is untouched.
@@ -5313,6 +5444,16 @@ function liveEventsWire(now = Date.now()) {
   if (founderEventActive(now)) ev.founder = { ends: Number(_founderEvent.ends), label: _founderEvent.label || "Founder Drop",
                                               remainingMs: Math.max(0, Number(_founderEvent.ends) - now),
                                               claimed: _founderCount, cap: FOUNDER_CAP, full: _founderCount >= FOUNDER_CAP };
+  // A NEW KEY, DELIBERATELY NOT ev.founder. InfoBar.gd picks the founder event with
+  // _ev_pick(src, ["founder", "founderDrop", "founder_drop"]) and its copy is hard-coded Meme Dynasty
+  // ("a special-edition FOUNDER legendary", "one of the N new Meme Dynasty legendaries"). Reusing that
+  // key would light the Founder banner and tell live players a chikimon is coming. "mountDrop" matches
+  // none of those aliases, so an un-updated client ignores it and shows nothing — which is why this
+  // change is safe to ship BEFORE the client pass rather than after it.
+  if (mdActive(now)) ev.mountDrop = { ends: Number(_mdDrop.ends), label: _mdDrop.label || "Viranimal Legacy Drop",
+                                      remainingMs: Math.max(0, Number(_mdDrop.ends) - now),
+                                      claimed: _mdCount, cap: mdCap(), each: mdPer(),
+                                      full: _mdCount >= mdCap() };
   return Object.keys(ev).length ? ev : null;
 }
 // the move reply builds this on EVERY ping — cache the wire object for a second so a quiet island
@@ -5327,8 +5468,14 @@ function liveEventsSnapshot() {
   const act = {};
   let n = 0;
   for (const [w, a] of _founderActivity) { if (++n > FOUNDER_ACTIVITY_MAX) break; act[w] = { ms: Math.round(a.ms), acts: a.acts }; }
-  return { openGates: _openGates, founder: _founderEvent, founderClaims: _founderClaims,
-           founderCount: _founderCount, founderPerSp: _founderPerSp, activity: act };
+  const snap = { openGates: _openGates, founder: _founderEvent, founderClaims: _founderClaims,
+                 founderCount: _founderCount, founderPerSp: _founderPerSp, activity: act };
+  // SIBLING KEYS, and only when there is something to remember. A flag-off server that has never run a
+  // Viranimal drop writes the value byte-identical to today's, so a rollback reads exactly what it
+  // wrote; once a drop HAS run the keys persist even flag-off, because dropping the claim book from
+  // the blob would let a flag off-and-on cycle re-award a wallet that already claimed.
+  if (mdSnapshotWanted()) Object.assign(snap, mdSnapshot());
+  return snap;
 }
 let _liveEvSavedAt = 0;
 async function saveLiveEvents(force = false) {
@@ -5365,6 +5512,10 @@ async function restoreLiveEvents() {
         _founderActivity.set(w, { ms: Number(a && a.ms) || 0, acts: Number(a && a.acts) || 0 });
       }
     }
+    // The Viranimal drop restores AFTER the founder's and inside its OWN nested try/catch: a corrupt
+    // mount blob must degrade that drop to a cold start without taking the founder restore — and the
+    // permanent founder claim book with it — down too.
+    mdRestore(le);
   } catch (e) {}
 }
 // ---- the ACTIVITY BAR: server-verified signals only, demo and puppets excluded by construction ----
@@ -5386,14 +5537,24 @@ function founderNoteAction(wallet) {
   founderMaybeAward(wallet, a);
   void saveLiveEvents();
 }
+// WHO MAY ACCRUE AT ALL — the ONE definition, called by both drops' sweeps. Extracted rather than
+// copied because this is a POLICY rule: it is what keeps demo sessions, net_id sessions and a wallet
+// a stranger read off /world/roster out of every drop this server will ever run. A second copy of a
+// policy rule is exactly how a ruling drifts between two events. Same three tests, same order, same
+// short-circuit as the loop it came out of, so founderPresenceTick is behaviour-identical — and the
+// four existing founder sims are the regression oracle for that claim, not this comment.
+function dropPresenceEligible(now, w, p) {
+  if (now - p.ts > WORLD_TTL_MS) return false;         // expired — the sweep is about to drop it
+  if (!p.proven || !isPubkey(w)) return false;         // demo/net_id sessions and unproven pubkeys never accrue
+  return true;
+}
 function founderPresenceTick(now = Date.now()) {
   const dt = _founderLastSweep ? Math.min(Math.max(0, now - _founderLastSweep), 30000) : 0;
   _founderLastSweep = now;
   if (!founderEventActive(now) || dt <= 0) return;
   let touched = false;
   for (const [w, p] of worldPlayers) {
-    if (now - p.ts > WORLD_TTL_MS) continue;            // expired — the sweep is about to drop it
-    if (!p.proven || !isPubkey(w)) continue;            // demo/net_id sessions and unproven pubkeys never accrue
+    if (!dropPresenceEligible(now, w, p)) continue;     // the ONE definition — see above
     if (_founderClaims[w]) continue;
     if (!_founderActivity.has(w) && _founderActivity.size >= FOUNDER_ACTIVITY_MAX) continue;
     const a = _founderActivity.get(w) || { ms: 0, acts: 0 };
@@ -5502,6 +5663,518 @@ function founderAward(wallet) {
   console.log(`FOUNDER DROP: #${n}/${FOUNDER_CAP} ${sp} -> ${wallet}`);
   return { n, sp, id: row.id };
 }
+// ============ THE VIRANIMAL LEGACY DROP — a SECOND event kind, CHIK_MOUNT_DROP (default OFF) =======
+// Owner ask: hand out the six Viranimal Legacy chikimounts, TWO OF EACH — twelve grants.
+//
+// WHY A SEPARATE KIND AND NOT A WIDER FOUNDER DROP. Three reasons, none of them tidiness, all read off
+// the code above rather than assumed:
+//
+//  1. THE FOUNDER POOL CARRIES NO ASSET TYPE. founderPool() returns bare species keys and every
+//     consumer hard-codes "chikimon" — founderRoomOf, founderReserveMap and founderAward's mint. A
+//     shared pool would mean threading a type through all of them AND persisting it, and any restore
+//     path that dropped the field would award a CHIKIMON named "momota". Worse, the failure is silent:
+//     supplyOf("chikimon", "momota") is 0, which this file reads as UNCAPPED, never as an error — so
+//     founderRoomOf would report Infinity for a 5-edition steed and the deal/reserve report shown to
+//     the owner would be fiction. Here the kind IS the type, so a corrupt blob can only fail closed.
+//  2. THE FOUNDER CLAIM BOOK IS GLOBAL AND PERMANENT. _founderClaims/_founderCount carry no event id
+//     and founderAward refuses on "if (_founderClaims[wallet])". Reusing them would bar every wallet
+//     that already claimed a Meme Dynasty founder from this drop FOREVER, and _founderCount would
+//     start at whatever the last drop reached — a 12-grant drop that hands out ZERO, whose only signal
+//     is a 60s-throttled console line.
+//  3. THE ACTIVITY MAP CANNOT BE SHARED EITHER, and that one is forced rather than chosen:
+//     founderNoteAction early-returns for any wallet in _founderClaims, and founderAward DELETES the
+//     wallet's activity row. A founder claimant sharing the accumulator would accrue exactly zero
+//     mount progress, forever.
+//
+// WHAT IS SHARED, BY DIRECT CALL AND NEVER BY COPY: founderBarMet (30-minutes-AND-10-actions exists
+// once in this file), dropPresenceEligible (who may accrue at all), MOUNT_CHARS/MOUNT_KEYS (the
+// catalog), and issuedCount/atSupplyCap/remainingOf (the one census). The POLICY is single-sourced and
+// only the BOOKKEEPING below is a sibling of the founder's — a deliberate trade whose cost is real:
+// mdAward is a near-copy of founderAward, and if someone later hardens one, nothing in this file makes
+// them notice the other. Bookkeeping drift shows up as a wrong count in a sim; policy drift shows up
+// as a wrong ruling in production, and that is the half that has been removed.
+//
+// SIBLING FUNCTIONS: founderAward / founderPresenceTick / founderNoteAction. Edit one, read the other.
+const MOUNT_DROP_ON = String(process.env.CHIK_MOUNT_DROP ?? "0") === "1";
+const MOUNT_DROP_ORIGIN = "viranimal-legacy-drop";     // forever-distinguishable, NOT the founder's "open-gates-founder"
+const MOUNT_DROP_PER_DEFAULT = Math.max(1, Math.min(5, Math.floor(Number(process.env.MOUNT_DROP_EACH || 2))));
+const MOUNT_DROP_PER_MAX = 5;
+const MOUNT_DROP_HELD_MSG = "the last of that chikimount is being held for the Viranimal Legacy Drop — it opens up when the drop ends";
+// "pool" and "per" are frozen into the event at START and restored with it. mdCap() is DERIVED from
+// them (pool.length * per), so a redeploy that lost either would silently recompute a different quota
+// mid-drop — the exact shape of the origin-clipping bug the founder restore's comment warns about.
+let _mdDrop = { ends: 0, label: "", pool: [], per: MOUNT_DROP_PER_DEFAULT };
+let _mdClaims = Object.create(null);     // wallet -> { n, sp, id, ts } — permanent, exactly like the founder book
+let _mdCount = 0;                        // grants issued, LIFETIME across every series ever run
+// WHERE THIS SERIES STARTED. _mdCount is permanent (floored by the registry, which never forgets)
+// while mdCap() is recomputed from the CURRENT pool — so testing one against the other only holds
+// for a single, never-restarted drop. Measured by the adversarial pass: a second wave over different
+// chikimounts was silently DEAD ON ARRIVAL (200 OK, a cap it could never pay, /world/event
+// publishing claimed=12 cap=6 full=true), and a second wave at a raised `each` UNDER-HELD its
+// reserve, leaving editions the drop still owed freely mintable by normal hatchers — unrecoverable
+// on a live NFT game. Every series-progress test now goes through mdDone().
+let _mdBase = 0;                         // _mdCount at the moment THIS series started
+// AND THE PER-SPECIES TWIN. _mdPerSp is lifetime for exactly the same reason _mdCount is, so
+// mdReserveMap's `deal[sp] - _mdPerSp[sp]` under-holds on a second wave by however many that
+// chikimount gave in the first. Measured: a second wave at each=5 reserved 3 where it owed 5, and a
+// normal hatcher then took wrinkle to 7/10 while the drop still owed 3 — editions promised to
+// winners, mintable by anyone, unrecoverable. mdDoneOf() is the per-series count.
+let _mdPerSpBase = Object.create(null);  // _mdPerSp at the moment THIS series started
+let _mdPerSp = Object.create(null);      // chikimount -> granted BY THIS DROP (<= per)
+const _mdActivity = new Map();           // wallet -> { ms, acts } — its own map; see reason 3 above
+let _mdLastSweep = 0;
+let _mdDryLoggedAt = 0;
+
+// THE POOL IS DERIVED FROM MOUNT_CHARS — never a hand-typed seventh copy of the Viranimal list. A
+// hand-written copy is how a key drifts from the caps ASSET_SUPPLY.mount is derived from, and an
+// unrecognised key is the phantom-mint hazard FINDING #1 closed on the founder side: supplyOf("mount",
+// <unknown>) is 0 = uncapped, so a typo would be dealt the whole drop and mint a species with no cap,
+// card or model. Exact membership, or a 400 at the route.
+// DERIVED LAZILY, and it has to be: MOUNT_CHARS is declared ~2,000 lines further down, so a
+// module-level const here reads it inside its temporal dead zone and the whole server fails to boot
+// with "Cannot access 'MOUNT_CHARS' before initialization" (measured — the four founder sims all
+// refused to import). Memoised on first call; the table is frozen and append-only, so one read is all
+// of it. The alternative — a hand-typed list of the six — is the drift this file forbids.
+let _mountWave2Memo = null;
+function mountWave2() {
+  if (!_mountWave2Memo) _mountWave2Memo = Object.freeze(MOUNT_CHARS.filter((c) => c.wave === 2).map((c) => c.key));
+  return _mountWave2Memo;
+}
+const MOUNT_DROP_GROUP_TOKENS = ["viranimal", "viranimals", "viranimal_legacy", "legacy", "wave2_mounts", "wave2"];
+const MOUNT_DROP_ALL_TOKENS = ["mounts", "chikimounts", "all"];
+function mountDropExpandPool(list) {
+  const out = [];
+  for (const raw of Array.isArray(list) ? list : []) {
+    const t = String(raw || "").trim().toLowerCase().replace(/[\s-]+/g, "_").slice(0, 24);
+    if (!t) continue;
+    if (MOUNT_DROP_GROUP_TOKENS.includes(t)) { for (const k of mountWave2()) out.push(k); continue; }
+    if (MOUNT_DROP_ALL_TOKENS.includes(t)) { for (const k of MOUNT_KEYS) out.push(k); continue; }
+    // THE NORMALISED FORM IS WHAT IS TESTED — a latent asymmetry the founder side still carries:
+    // founderExpandPool normalises for its group match but tests the RAW literal against MEME_KEYS, so
+    // "Momota" fails there where "momota" passes. Here case and hyphens are forgiving while an unknown
+    // key is still refused, so the owner sees the typo instead of shipping a phantom species.
+    if (!MOUNT_KEYS.includes(t)) {
+      const e = new Error(`unknown Viranimal Legacy Drop chikimount "${t}" — use a group token (${[...MOUNT_DROP_GROUP_TOKENS, ...MOUNT_DROP_ALL_TOKENS].join(", ")}) or an exact chikimount key: [${MOUNT_KEYS.join(", ")}]`);
+      e.code = "MOUNT_POOL_UNKNOWN";
+      e.validTokens = { groups: MOUNT_DROP_GROUP_TOKENS, all: MOUNT_DROP_ALL_TOKENS, mounts: [...MOUNT_KEYS] };
+      throw e;
+    }
+    out.push(t);
+  }
+  // DE-DUPED: a chikimount named twice would take two shares of the cap and hold twice its supply.
+  return out.filter((k, i) => k && out.indexOf(k) === i).slice(0, MOUNT_KEYS.length);
+}
+// THE SINGLE ON/OFF: the flag AND a live deadline. Nothing auto-starts, on any flag setting.
+function mdActive(now = Date.now()) { return MOUNT_DROP_ON && now < Number(_mdDrop.ends); }
+// NO ENV FALLBACK AND NO DEFAULT ROSTER. founderPool()'s three-tier fallback (named -> FOUNDER_SPECIES
+// -> SPECIES_LEGEND) is precisely what made a typo dangerous, and a mount drop quietly falling back to
+// a chikimon roster would be strictly worse. Only what the owner named at start — re-filtered to live
+// MOUNT_KEYS membership on EVERY read, so a restored blob can never reintroduce a phantom key.
+function mdPool() { return (Array.isArray(_mdDrop.pool) ? _mdDrop.pool : []).filter((k) => MOUNT_KEYS.includes(k)); }
+function mdPer() { return Math.max(1, Math.min(MOUNT_DROP_PER_MAX, Math.floor(Number(_mdDrop.per) || MOUNT_DROP_PER_DEFAULT))); }
+// THE CAP IS DERIVED, NEVER CONFIGURED. FOUNDER_CAP is one global env and FOUNDER_PER_SPECIES is dead
+// code that caps nothing, so a second env here could set a series cap that disagrees with the
+// per-species number — start a 12-cap drop over five species and every "2 each" promise becomes 2.4.
+// Six Viranimals at 2 each is 12 by construction, and there is no way to say otherwise.
+function mdCap() { return mdPool().length * mdPer(); }
+// grants made BY THE RUNNING SERIES — never the lifetime total. Clamped at 0 because a rollback can
+// leave the registry-floored _mdCount above a base restored from an older blob.
+function mdDone() { return Math.max(0, _mdCount - _mdBase); }
+// THE RULE, STATED ONCE: the SERIES CAP is per-series (mdDone), every PER-SPECIES number is
+// LIFETIME (_mdPerSp). They must not be mixed, and mixing them is exactly the bug this pass caught
+// in its own first attempt: making the advertised deal/reserve per-series while layers 2 and 3 of
+// mdAward stayed lifetime produced a drop that advertised dealRemaining=12 and granted 0 — it
+// promised editions its own ledger would refuse. Two-of-each is PERMANENT; only the series counter
+// resets, so a later wave over DIFFERENT chikimounts is not born full.
+// mdDoneOf is kept for diagnostics only — nothing that gates or advertises may read it.
+function mdDoneOf(sp) { return Math.max(0, (Number(_mdPerSp[sp]) || 0) - (Number(_mdPerSpBase[sp]) || 0)); }
+// How many grants this chikimount could supply = what is left of it + what this drop already gave,
+// CLAMPED BY per. Two differences from founderRoomOf and both matter: the type is "mount" (measured:
+// supplyOf("mount","momota") = 5 where supplyOf("chikimon","momota") = 0 reads as uncapped), and the
+// per clamp means even the six UNCAPPED original chikimounts can never be dealt a third copy.
+function mdRoomOf(sp) {
+  const cap = supplyOf("mount", sp);
+  const left = cap > 0 ? Math.max(0, cap - issuedCount("mount", sp)) : Infinity;
+  return Math.min(mdPer(), left + (_mdPerSp[sp] || 0));
+}
+// THE PLAN: chikimount -> how many of mdCap() it is scheduled to give over the whole series. The
+// founder's headroom-aware round robin, bounded by mdCap() and by mdRoomOf, so it simply deals less
+// when a species has run short rather than promising editions that do not exist.
+function mdDeal() {
+  const pool = mdPool();
+  const deal = Object.create(null);
+  if (!pool.length) return deal;
+  const room = Object.create(null);
+  for (const sp of pool) room[sp] = mdRoomOf(sp);
+  const cap = mdCap();
+  for (let n = 0; n < cap; n++) {
+    let picked = "";
+    for (let k = 0; k < pool.length; k++) {
+      const sp = pool[(n + k) % pool.length];
+      if ((deal[sp] || 0) < room[sp]) { picked = sp; break; }
+    }
+    if (!picked) break;                                          // the whole pool is out of supply
+    deal[picked] = (deal[picked] || 0) + 1;
+  }
+  return deal;
+}
+// WHAT IS HELD RIGHT NOW: chikimount -> editions kept back for winners who have not claimed. The
+// mdActive() early return is load-bearing and not decoration — without it a FLAG-ON server with no
+// drop running would hold editions out of every Chikimount Egg in the game (founderReserveMap carries
+// the identical guard for the identical reason).
+function mdReserveMap() {
+  const out = Object.create(null);
+  if (!mdActive()) return out;
+  let slots = Math.max(0, mdCap() - mdDone());
+  if (!slots) return out;
+  const deal = mdDeal();
+  const per = mdPer();
+  for (const sp of mdPool()) {
+    if (!slots) break;
+    const cap = supplyOf("mount", sp);
+    if (!(cap > 0)) continue;                                    // uncapped original: nothing can run out
+    const left = Math.max(0, cap - issuedCount("mount", sp));
+    const owed = Math.min(Math.max(0, (deal[sp] || 0) - (_mdPerSp[sp] || 0)),
+                          Math.max(0, per - (_mdPerSp[sp] || 0)));
+    const want = Math.min(owed, slots, left);
+    if (want > 0) { out[sp] = want; slots -= want; }
+  }
+  return out;
+}
+// MEMOISED ON THE CENSUS VERSION, NOT ON A CLOCK. eggPoolFor asks this on every mount hatch and mdDeal
+// is an O(cap x pool) walk, so it must not be rebuilt per species. A TIME-keyed cache would fail in
+// the UNSAFE direction — it could go on NOT holding a species for up to a second AFTER a grant, which
+// is exactly the window in which a hatcher takes the last copy a claimant is owed. The key is stamped
+// AFTER the build so the census rebuild this call itself triggers is already folded in and the cache
+// settles in one recompute instead of two.
+let _mdResCache = { k: "", v: null };
+function _mdResKey() { return `${_censusBuilds}|${_census ? 1 : 0}|${_mdCount}|${Number(_mdDrop.ends)}|${mdPool().length}|${mdPer()}`; }
+function mdReserveMapCached() {
+  if (_mdResCache.k && _mdResCache.k === _mdResKey()) return _mdResCache.v;
+  const v = mdReserveMap();
+  _mdResCache = { k: _mdResKey(), v };
+  return v;
+}
+// IS THIS CHIKIMOUNT OFF-LIMITS TO A NORMAL (non-drop) MINT? True ONLY when every edition still
+// unissued is held — the hold is on the LAST copies, not on the character, so momota (cap 5) stays
+// freely hatchable until exactly 2 remain. Mirrors memeReservedOut line for line, including the
+// consequence: a slow drop can legitimately lose momota #4 to an honest hatcher and then deliver one
+// instead of two. mdDeal shrinks to match, and /admin/event/start refuses the start rather than
+// advertising twelve it cannot deliver.
+function mountReservedOut(sp, map) {
+  if (!MOUNT_DROP_ON) return false;                              // flag-off: dead on a module const
+  const cap = supplyOf("mount", sp);
+  if (!(cap > 0)) return false;
+  const held = Number((map || mdReserveMapCached())[sp] || 0);
+  if (held <= 0) return false;
+  return Math.max(0, cap - issuedCount("mount", sp)) <= held;
+}
+function mdReserveTotal() { const m = mdReserveMap(); let n = 0; for (const k in m) n += m[k]; return n; }
+function mdReserveOf(sp) { return Number(mdReserveMapCached()[String(sp)] || 0); }
+// AN INDEPENDENT TALLY, DERIVED FROM THE REGISTRY AND NOT FROM THE KV BLOB. _mdPerSp is restored from
+// live_events, and "the counter came back wrong after a redeploy" is a failure this file has already
+// lived through. One pass over assetReg counting rows stamped with THIS drop's origin, so a clipped,
+// rolled-back or under-counting blob still cannot produce a third copy of anything. Rows in any state
+// count: a grant that was later burned still spent its edition, and over-counting refuses where
+// under-counting would overmint.
+// SYNCHRONOUS BY MANDATE — making this a store read would put an await between mdAward's claim check
+// and its mint, and that absent await is the whole of the concurrency guarantee. See mdAward.
+// WHO ALREADY WON, read from the REGISTRY rather than the blob. The claim book is the whole of
+// one-per-wallet-ever, and restoreLiveEvents could only read it from the new `mdClaims` key — a key
+// no PREVIOUS build writes. Roll back one deploy mid-drop (entirely plausible: the deployed build
+// predates this feature) and the old build rewrites live_events with every md* key stripped; roll
+// forward and _mdCount/_mdPerSp self-heal off the registry while the BOOK returns empty, so every
+// past winner is eligible again and takes a second NFT. There is no un-mint and no un-claim.
+// Measured by the adversarial pass: 3/3 past winners awarded a second Viranimal ([1,1,1] -> [2,2,2]).
+// The registry is the durable record — it survives the rollback the blob does not — so the book is
+// floored against it exactly as _mdPerSp already is.
+function mdClaimsFromRegistry() {
+  const out = Object.create(null);
+  for (const [wallet, ids] of assetsByOwner) {
+    if (!isPubkey(wallet)) continue;
+    for (const id of ids) {
+      const r = assetReg.get(id);
+      if (!r || r.type !== "mount" || r.origin !== MOUNT_DROP_ORIGIN) continue;
+      const ts = Number(r.born) || 0;
+      const prev = out[wallet];
+      if (!prev || ts < prev.ts) out[wallet] = { n: 0, sp: String(r.sp || ""), id: r.id, ts };
+    }
+  }
+  return out;
+}
+function mdRegistryTally() {
+  const out = Object.create(null);
+  for (const r of assetReg.values()) {
+    if (!r || r.type !== "mount" || r.origin !== MOUNT_DROP_ORIGIN) continue;
+    const k = String(r.sp || "");
+    if (k) out[k] = (out[k] || 0) + 1;
+  }
+  return out;
+}
+function mdNoteAction(wallet) {
+  wallet = String(wallet || "");
+  if (!mdActive() || !isPubkey(wallet)) return;
+  if (_mdClaims[wallet] || mdDone() >= mdCap()) return;
+  if (!_mdActivity.has(wallet) && _mdActivity.size >= FOUNDER_ACTIVITY_MAX) return;   // one bound, two consumers
+  const a = _mdActivity.get(wallet) || { ms: 0, acts: 0 };
+  a.acts += 1;
+  _mdActivity.set(wallet, a);
+  mdMaybeAward(wallet, a);
+  void saveLiveEvents();
+}
+// BOTH DROPS SEE THE SAME THREE WITNESSED CHOKEPOINTS AND NOTHING ELSE. One wrapper rather than a
+// second call sprinkled at six sites, so that invariant lives in one place: a proven node claim, a
+// counted fish report and a witnessed mob kill feed the bar, while the self-declared
+// /world/kill/report and /world/mat/flow still feed neither. Flag-off this IS founderNoteAction
+// followed by a branch that short-circuits on a module const.
+function dropNoteAction(wallet) {
+  founderNoteAction(wallet);
+  if (MOUNT_DROP_ON) mdNoteAction(wallet);
+}
+// THE BAR IS THE FOUNDER'S OWN FUNCTION, CALLED and not copied — 30 minutes AND 10 actions exists once
+// in this file, so the two drops cannot drift into two different rulings about who counts as a real
+// player. Tuning FOUNDER_MIN_MINUTES/FOUNDER_MIN_ACTIONS moves both, deliberately.
+function mdMaybeAward(wallet, a) { return founderBarMet(a) ? mdAward(wallet) : null; }
+function mdPresenceTick(now = Date.now()) {
+  // ITS OWN SWEEP CURSOR, and it has to be. founderPresenceTick writes _founderLastSweep BEFORE its
+  // inactive early return, so a shared cursor would zero this drop's dt on every tick the other drop
+  // is not running and presence minutes would never accrue at all.
+  const dt = _mdLastSweep ? Math.min(Math.max(0, now - _mdLastSweep), 30000) : 0;
+  _mdLastSweep = now;
+  if (!mdActive(now) || dt <= 0) return;
+  let touched = false;
+  for (const [w, p] of worldPlayers) {
+    if (!dropPresenceEligible(now, w, p)) continue;              // the ONE definition, shared with the founder sweep
+    if (_mdClaims[w]) continue;
+    if (!_mdActivity.has(w) && _mdActivity.size >= FOUNDER_ACTIVITY_MAX) continue;
+    const a = _mdActivity.get(w) || { ms: 0, acts: 0 };
+    a.ms += dt;
+    _mdActivity.set(w, a);
+    touched = true;
+    mdMaybeAward(w, a);
+  }
+  if (touched) void saveLiveEvents();
+}
+// ---- THE GRANT: exactly TWO of each chikimount, one per wallet ever, race-safe by construction ----
+// FOUR LAYERS ENFORCE "TWO OF EACH", three of them independent of one another, and the strongest is
+// code this change does not write:
+//   1  THE PLAN      mdCap() = pool.length * per, and mdDeal() never deals a species past mdRoomOf,
+//                    which is itself clamped to per. No env can contradict it.
+//   2  THE LEDGER    the (_mdPerSp[sp] || 0) >= per skip below — the literal "exactly 2" line. Its
+//                    weakness is that it trusts an in-memory counter restored from a kv blob.
+//   3  THE RECOUNT   mdRegistryTally() — a tally off assetReg BY ORIGIN, derived from the registry and
+//                    not from the blob, so an under-counting restore still cannot mint a third.
+//   4  THE GAME'S OWN CAP  mintAsset re-applies atSupplyCap("mount", sp) at its own chokepoint, with
+//                    the right type. MEASURED: the 6th momota mint throws SUPPLY_EXHAUSTED. So the
+//                    promise "never past a chikimount's own supply" does not rest on a line of this
+//                    function being correct. Layer 4 enforces 5/10; the drop-level 2 is layers 1-3.
+//
+// RACE-SAFE BY CONSTRUCTION, NOT BY LOCK. From the claim/cap reads, through the reroute walk and the
+// recount, through mintAsset (a fully synchronous function), to the counter writes, there is NO await
+// — so wallets crossing the bar in the same presence sweep (the NORMAL case: the sweep awards every
+// qualified wallet in one synchronous pass over worldPlayers) serialise on the event loop and can
+// never both read _mdPerSp.momota === 1. Three easy edits would silently destroy that, and each is
+// named here so it is refused on sight: making the recount a store read, awaiting saveLiveEvents
+// before the counter writes, awaiting anything inside the walk. vmd_drop_sim.mjs asserts the token
+// "await" does not appear in this function's source, so the guarantee is checked, not commented.
+// THE HONEST LIMIT: all of this holds inside ONE Node process, exactly as the founder drop already
+// does. Run the service at two instances and both drops over-award — kv is a mirror, not a lock.
+function mdAward(wallet) {
+  if (!mdActive()) return null;
+  if (!_assetsReady) return null;                    // registry still loading — retried on the next accrual
+  if (_mdClaims[wallet]) return null;                // one drop per wallet, ever — its OWN book (reason 2)
+  if (mdDone() >= mdCap()) return null;              // THIS series is complete (not the lifetime total)
+  const pool = mdPool();
+  const per = mdPer();
+  const deal = mdDeal();
+  const reg = mdRegistryTally();
+  // REROUTE, NEVER OVERMINT, and never refuse a qualified player for a reason that is not theirs.
+  // satchelHeld(wallet, "mount") is ownedMounts — NOT ownedSpecies, which is what founderAward calls
+  // and which for a chikimount would compute the wrong already-held set and reroute around the wrong
+  // species. It is also the same oracle mintAsset's own one-of-each test uses, so the walk and the
+  // chokepoint agree instead of the walk picking something the chokepoint will throw on.
+  const have = satchelHeld(wallet, "mount");
+  let sp = "";
+  for (let k = 0; k < pool.length; k++) {
+    const c = pool[(_mdCount + k) % pool.length];
+    // LAYERS 2 AND 3 STAY LIFETIME, DELIBERATELY, while the reserve/deal maths above went per-series.
+    // The asymmetry is the point: the reserve was UNDER-holding (a normal hatcher took editions the
+    // drop still owed), which is a live loss and had to be fixed; these two are the over-mint floor,
+    // and layer 3 in particular is the one the adversarial pass found carries the guarantee — it
+    // survives a zeroed blob AND a burn of every granted row. Making them per-series would trade a
+    // proven exploit defence for the convenience of re-running a series over the SAME chikimount.
+    // The cost is that such a repeat is refused rather than served: it can only under-award, never
+    // over-award, which is the correct direction to fail on a live NFT with no un-mint.
+    if ((_mdPerSp[c] || 0) >= per) continue;                     // layer 2: exactly per of each, EVER
+    if ((_mdPerSp[c] || 0) >= (deal[c] || 0)) continue;          // its planned share is already spent
+    if ((reg[c] || 0) >= per) continue;                          // layer 3: the registry's own tally
+    if (atSupplyCap("mount", c)) continue;                       // it ran out since the drop started
+    if (have.has(c)) continue;                                   // already theirs — one of each
+    sp = c; break;
+  }
+  if (!sp) {
+    // A DRY POOL IS A STEADY STATE, NOT AN INCIDENT — the founder drop's measured lesson: 1.00 log
+    // lines per attempt = 360/hour PER qualified wallet, because the 10s sweep retries everyone over
+    // the bar forever. The REFUSAL is unchanged; only its logging is throttled.
+    const _now = Date.now();
+    if (_now - _mdDryLoggedAt > FOUNDER_DRY_LOG_MS) {
+      _mdDryLoggedAt = _now;
+      console.error(`viranimal drop: nothing left to award at #${_mdCount + 1}/${mdCap()} — nothing minted (further refusals logged at most once per ${FOUNDER_DRY_LOG_MS / 1000}s)`);
+    }
+    return null;
+  }
+  const n = _mdCount + 1;
+  let row;
+  try {
+    // THE SAME CHOKEPOINT AS EVERY OTHER MINT: unforgeable id, origin on the row, an edition from the
+    // same counter as a hatched or bought steed, census counted like any mount row, and mintAsset's
+    // OWN atSupplyCap on the way in. "mountDrop: true" exempts the grant from THIS drop's reservation
+    // (a winner may of course take what is held for winners) and from nothing else. "grant: true" is
+    // deliberate and free: opts.grant is read at exactly ONE line in this file (_capExempt), so it
+    // buys the stable-capacity exemption a grant needs without editing mintAsset's capacity block at
+    // all. One-of-each still binds a grant — measured on the founder side, where a second wrinkle to
+    // the same wallet threw ALREADY_OWNED even with founder:true — which is why the walk checks it
+    // first. A throw here leaves the claim slot UNSPENT and nothing incremented.
+    row = mintAsset("mount", wallet, { sp, kind: "mount" }, MOUNT_DROP_ORIGIN, null, { mountDrop: true, grant: true });
+  } catch (e) { console.error("viranimal drop: mint failed —", e?.message || e); return null; }
+  _mdCount = n;
+  _mdPerSp[sp] = (_mdPerSp[sp] || 0) + 1;
+  _mdClaims[wallet] = { n, sp, id: row.id, ts: Date.now() };
+  _mdActivity.delete(wallet);
+  _mdResCache = { k: "", v: null };                  // the hold just shrank — never serve it stale
+  // THE LEDGER BUCKET IS rec.mounts, KEYED BY SPECIES — copied from /admin/grant-collection's mount
+  // arm and NOT from founderAward. founderAward writes rec.units[luid], and a mount left in "units" is
+  // counted as a CHIKIMON by buildCensus (which reads mounts from rec.mounts), never appears in the
+  // stable, and makes ownedMounts — the one-of-each oracle — wrong. Nothing throws: it is silent
+  // corruption of the very denominator the deal and the reservation are computed against.
+  const rec = assetRec(wallet);
+  if (!has(rec.mounts, sp)) rec.mounts[sp] = { ts: Date.now(), origin: MOUNT_DROP_ORIGIN };
+  regEvent(row, "mount_drop", { number: n, of: mdCap(), sp_number: _mdPerSp[sp], sp_of: per,
+                                luid: sp, route: "viranimal-legacy-drop", edition: row.edition || null,
+                                sp_cap: supplyOf("mount", sp) || 0 });
+  row.arrivedAt = Date.now();
+  nftNewsPush(wallet, { kind: "arrived", id: row.id, type: "mount", sp, cls: "mount", lvl: null,
+    mint: null, other: null, dormant: false,
+    text: `VIRANIMAL LEGACY DROP — ${sp} (#${n} of ${mdCap()}) has been born to this wallet. The steed waits in your stable.` });
+  // A DISTINCT IDEM PREFIX so one wallet can hold both a Meme Dynasty founder chikimon and a Viranimal
+  // chikimount without either chronicle record colliding with the other ("founder:" + wallet).
+  chronicleAdd("mount_drop", wallet, { sub: sp, qty: 1, route: "viranimal-legacy-drop", idem: "mountdrop:" + wallet,
+    data: { n, of: mdCap(), sp, origin: MOUNT_DROP_ORIGIN, id: row.id } });
+  _assetsDirty = true;
+  void saveLiveEvents(true);
+  console.log(`VIRANIMAL LEGACY DROP: #${n}/${mdCap()} ${sp} -> ${wallet}`);
+  return { n, sp, id: row.id };
+}
+// ---- persistence: SIBLING KEYS in the same live_events value, never the founder's ----------------
+// New keys are forward-compatible in both directions: restoreLiveEvents reads NAMED keys only, so an
+// older server rolled back onto a new blob ignores them rather than failing.
+function mdSnapshot() {
+  const act = {};
+  let n = 0;
+  for (const [w, a] of _mdActivity) { if (++n > FOUNDER_ACTIVITY_MAX) break; act[w] = { ms: Math.round(a.ms), acts: a.acts }; }
+  return { mountDrop: _mdDrop, mdClaims: _mdClaims, mdCount: _mdCount, mdBase: _mdBase,
+           mdPerSp: _mdPerSp, mdPerSpBase: _mdPerSpBase, mdActivity: act };
+}
+// Written whenever there is something to remember, and NOT on a flag-off server that has never run a
+// drop — so the blob a rollback reads is byte-identical to today's. It is deliberately still written
+// once a drop HAS run, even flag-off: dropping the book from the blob would let a flag off-and-on
+// cycle re-award a wallet that already claimed.
+function mdSnapshotWanted() { return MOUNT_DROP_ON || _mdCount > 0 || Object.keys(_mdClaims).length > 0; }
+// The mount restore runs in its OWN nested try/catch inside restoreLiveEvents' shared one: a corrupt
+// mount blob must degrade THIS drop to a cold start without taking the founder restore down with it.
+function mdRestore(le) {
+  try {
+    if (le.mountDrop) _mdDrop = {
+      ends: Number(le.mountDrop.ends) || 0,
+      label: String(le.mountDrop.label || "").slice(0, 60),
+      // re-filtered to LIVE MOUNT_KEYS membership: a blob can never reintroduce a phantom key
+      pool: (Array.isArray(le.mountDrop.pool) ? le.mountDrop.pool : [])
+              .map((k) => String(k || "").trim().slice(0, 24))
+              .filter((k) => MOUNT_KEYS.includes(k)).slice(0, MOUNT_KEYS.length),
+      per: Math.max(1, Math.min(MOUNT_DROP_PER_MAX, Math.floor(Number(le.mountDrop.per) || MOUNT_DROP_PER_DEFAULT))),
+    };
+    _mdClaims = Object.create(null);
+    if (le.mdClaims && typeof le.mdClaims === "object") {
+      for (const w of Object.keys(le.mdClaims)) if (isPubkey(w)) _mdClaims[w] = le.mdClaims[w];
+    }
+    // NEVER RESTORE BELOW THE TRUTH — the same floor _mdPerSp gets, applied to the BOOK. A wallet
+    // holding a mount-drop row won, whatever the blob says, so a blob that lost the md* keys can no
+    // longer hand that wallet a second one. Union, never replace: the blob may legitimately hold a
+    // claim whose registry row has since been transferred away.
+    for (const [w, c] of Object.entries(mdClaimsFromRegistry())) if (!_mdClaims[w]) _mdClaims[w] = c;
+    // NEVER RESTORE BELOW THE TRUTH. The founder counter floors itself at the size of its claim book;
+    // this one is additionally floored at the REGISTRY's own tally by origin, because the PER-SPECIES
+    // number is what "exactly 2" rests on and the blob is the one input that can come back wrong.
+    // Boot-ordering caveat, stated rather than assumed: if the asset registry has not been restored
+    // yet when this runs, the tally is empty and this floor is a no-op — which is why mdAward does the
+    // same recount live, at award time, where the registry is certainly loaded.
+    const reg = mdRegistryTally();
+    _mdPerSp = Object.create(null);
+    if (le.mdPerSp && typeof le.mdPerSp === "object")
+      for (const sp of Object.keys(le.mdPerSp)) _mdPerSp[sp] = Number(le.mdPerSp[sp]) || 0;
+    for (const sp of Object.keys(reg)) _mdPerSp[sp] = Math.max(Number(_mdPerSp[sp]) || 0, reg[sp]);
+    let spTot = 0; for (const k in _mdPerSp) spTot += Number(_mdPerSp[k]) || 0;
+    _mdCount = Math.max(Number(le.mdCount) || 0, Object.keys(_mdClaims).length, spTot);
+    // A blob without mdBase (any pre-feature build, or a rollback) restores 0, which makes mdDone()
+    // the lifetime count — the OLD behaviour, i.e. conservative: the series can only end early, never
+    // over-award. Clamped to _mdCount so a corrupt base can never manufacture free slots.
+    _mdBase = Math.max(0, Math.min(_mdCount, Number(le.mdBase) || 0));
+    _mdPerSpBase = Object.create(null);
+    if (le.mdPerSpBase && typeof le.mdPerSpBase === "object")
+      for (const sp of Object.keys(le.mdPerSpBase))
+        _mdPerSpBase[sp] = Math.max(0, Math.min(Number(_mdPerSp[sp]) || 0, Number(le.mdPerSpBase[sp]) || 0));
+    if (le.mdActivity && typeof le.mdActivity === "object") {
+      _mdActivity.clear();
+      for (const w of Object.keys(le.mdActivity)) {
+        if (_mdActivity.size >= FOUNDER_ACTIVITY_MAX) break;
+        const a = le.mdActivity[w];
+        _mdActivity.set(w, { ms: Number(a && a.ms) || 0, acts: Number(a && a.acts) || 0 });
+      }
+    }
+    // A FLAG-OFF SERVER MUST NEVER REINTERPRET A PERSISTED DROP, only end it. The claims and tallies
+    // still rehydrate — so flipping the flag off and back on can never re-award a wallet that already
+    // claimed — but the deadline is zeroed and said out loud. A running process does not re-read env,
+    // so the operator's order is STOP THE DROP, THEN FLIP; this is where a flip lands if they do not.
+    if (!MOUNT_DROP_ON && Number(_mdDrop.ends) > Date.now()) {
+      console.log(`CHIK_MOUNT_DROP=0 with a live Viranimal Legacy Drop persisted — the drop is ENDED at boot (${_mdCount} already granted; the claim book is kept).`);
+      _mdDrop = { ends: 0, label: _mdDrop.label, pool: _mdDrop.pool, per: _mdDrop.per };
+    }
+    _mdResCache = { k: "", v: null };
+  } catch (e) { console.error("viranimal drop restore failed —", e?.message || e); }
+}
+// sim seams — in-process verification only, matching the founder seams' naming
+export function _mdStateForTest() {
+  return { on: MOUNT_DROP_ON, drop: { ..._mdDrop }, active: mdActive(), pool: mdPool(), per: mdPer(),
+           cap: mdCap(), count: _mdCount, perSp: { ..._mdPerSp }, claims: Object.keys(_mdClaims).length,
+           origin: MOUNT_DROP_ORIGIN };
+}
+export function _mdClaimForTest(w) { return _mdClaims[String(w)] || null; }
+export function _mdActivityForTest(w) { const a = _mdActivity.get(String(w)); return a ? { ms: a.ms, acts: a.acts } : null; }
+export function _mdTickForTest(now) { mdPresenceTick(now); }
+export function _mdReserveMapForTest() { return mdReserveMap(); }
+export function _mountReservedOutForTest(sp) { return mountReservedOut(String(sp)); }
+export function _mdDealForTest() { return mdDeal(); }
+export function _mdRegistryTallyForTest() { return mdRegistryTally(); }
+export function _mountWave2ForTest() { return [...mountWave2()]; }
+export function _mdAwardForTest(w) { return mdAward(String(w)); }
+export function _mdSnapshotForTest() { return mdSnapshot(); }
+// CORRUPTION SEAM — in-process only. The whole point of layer 3 is that the per-species tally survives
+// a kv blob that came back wrong, and that claim cannot be tested without being able to MAKE it wrong.
+// Nothing in the server calls this; no route can reach it.
+export function _mdSetCountersForTest(count, perSp) {
+  _mdCount = Math.max(0, Math.floor(Number(count) || 0));
+  _mdPerSp = Object.create(null);
+  for (const k of Object.keys(perSp || {})) _mdPerSp[k] = Number(perSp[k]) || 0;
+  _mdResCache = { k: "", v: null };
+  return { count: _mdCount, perSp: { ..._mdPerSp } };
+}
+export function _mdRestoreForTest(le) { return mdRestore(le || {}); }
+export function _mdResetForTest() {
+  _mdDrop = { ends: 0, label: "", pool: [], per: MOUNT_DROP_PER_DEFAULT };
+  _mdClaims = Object.create(null); _mdCount = 0; _mdPerSp = Object.create(null);
+  _mdActivity.clear(); _mdLastSweep = 0; _mdResCache = { k: "", v: null }; _evWireCache = { t: 0, v: null };
+}
+
 // sim seams — in-process verification only
 export function _liveEventsForTest() {
   return { openGates: { ..._openGates }, founder: { ..._founderEvent }, fishing: { ..._fishEvent },
@@ -5730,7 +6403,7 @@ app.post("/world/fish/report", (req, res) => {
     for (const [k, t] of _lastFishRec) { if (now - t > 120000) _lastFishRec.delete(k); }
   }
   recordGather(String(b.wallet), "fish", ["fish"]);   // pubkey-only inside; net_id catches are ignored
-  founderNoteAction(String(b.wallet));                // founder bar: a COUNTED catch behind presenceOk
+  dropNoteAction(String(b.wallet));                // drop bar (both drops, one wrapper): a COUNTED catch behind presenceOk
   // NOTE: recordGather already credits the book one "fish" per entry (creditOwn defaults true), so
   // there is deliberately no ownCredit for the ordinary catch here — adding one double-counted it.
   // THE SERVER ROLLS THE LEGEND. tier and rod are client-asserted and only clamped (see the note at
@@ -6748,7 +7421,7 @@ app.post("/world/mob/hit", (req, res) => {
     // a WITNESSED kill (the server's own health pool hit zero) — per-species counter, island ceiling
     // ~16/min shared, so an aggregate is generous and a raw row would be noise
     if (CHRONICLE_ON) chronicleBump(String(b.wallet), "kill:" + spec[0], 1);
-    founderNoteAction(String(b.wallet));   // founder bar: a witnessed kill behind presenceOk
+    dropNoteAction(String(b.wallet));   // drop bar (both drops, one wrapper): a witnessed kill behind presenceOk
     const _fst = MOB_STATS[spec[0]];
     const ess = _fst ? _fst.essence : 1;
     const paid = [];
@@ -6793,7 +7466,7 @@ app.post("/world/mob/hit", (req, res) => {
     m.deadAt = now;
     _mobKills++;
     if (CHRONICLE_ON) chronicleBump(wallet, "kill:" + spec[0], 1);   // witnessed: the pool the server owns reached zero
-    founderNoteAction(wallet);   // founder bar: same witnessed-kill fact, damage path
+    dropNoteAction(wallet);   // drop bar (both drops, one wrapper): same witnessed-kill fact, damage path
     // 6. THE REWARD IS THE SERVER'S, ONCE PER LIFE, SPLIT ACROSS EVERYONE WHO REALLY FOUGHT IT. The
     //    client never names it. Everyone who landed a hit on THIS generation gets the mob's own
     //    essence value — co-op pays both trainers rather than racing them for a last hit.
@@ -9153,6 +9826,18 @@ function mintAsset(type, wallet, fields, origin, parent, opts) {
     e.code = "SUPPLY_RESERVED";
     throw e;
   }
+  // THE SAME BRACE FOR THE VIRANIMAL LEGACY DROP — a SEPARATE line, not a widening of the one above.
+  // The line above is read on the PAID Meme Dynasty path (memeBuyableSupply, memeSupply, pickMeme, and
+  // /meme/hatch, which consults the hold AFTER the on-chain $CHIKI payment has been verified), so a
+  // bug introduced by rewriting it answers 409 "sold out for now" to a wallet that has already paid.
+  // Its diff stays zero. Flag-off this new line short-circuits on a module const before evaluating
+  // anything. Exempts ONLY opts.mountDrop: a chikimon founder grant never mints a mount, and
+  // opts.creator is not exempt here either, exactly as it is not exempt from the chikimon hold.
+  if (MOUNT_DROP_ON && _issuing && _sp && type === "mount" && !(opts && opts.mountDrop) && mountReservedOut(_sp)) {
+    const e = new Error(MOUNT_DROP_HELD_MSG);
+    e.code = "SUPPLY_RESERVED";
+    throw e;
+  }
   // ============ ONE OF EACH, AND THE SATCHEL'S CAPACITY — AT THE SAME CHOKEPOINT ============
   // (owner ruling 2026-08-18.) Every route that ISSUES a creature comes through here, so a route
   // that forgets to ask is still refused. The routes ask anyway, because they can say it better and
@@ -9562,7 +10247,13 @@ function eggPoolFor(wallet, kind) {
     // originals are uncapped, so atSupplyCap is permanently false for them and they can never
     // vanish from the roll — which is ruling 3 and ruling 4 holding at the same time.
     const have = ownedMounts(wallet);
-    return MOUNT_POOL.filter(([mid]) => !have.has(mid) && !atSupplyCap("mount", mid));
+    // ...and the live Viranimal Legacy Drop's hold: a held steed simply is not in the roll. Without
+    // this the roll could pick a reserved chikimount and mintAsset would throw SUPPLY_RESERVED at a
+    // player who did nothing wrong. The map is computed ONCE and passed down, exactly as the meme arm
+    // below does — mountReservedOut is asked per species and mdDeal is an O(cap x pool) walk.
+    // Flag-off the map is empty and mountReservedOut is false, so this filters nothing.
+    const mres = mdReserveMapCached();
+    return MOUNT_POOL.filter(([mid]) => !have.has(mid) && !atSupplyCap("mount", mid) && !mountReservedOut(mid, mres));
   }
   const have = ownedSpecies(wallet);
   let pool = (EGG_KIND_POOL[kind] || SPECIES_NORMAL).filter(s => !have.has(s));
@@ -9572,8 +10263,15 @@ function eggPoolFor(wallet, kind) {
 }
 function eggPoolEmptyMsg(wallet, kind) {
   if (kind === "mount") {
-    return ownedMounts(wallet).size >= MOUNT_KEYS.length      // twelve since the Viranimal Legacy
-      ? "your stable is already full — every chikimount is yours"
+    const have = ownedMounts(wallet);
+    if (have.size >= MOUNT_KEYS.length) return "your stable is already full — every chikimount is yours";   // twelve since the Viranimal Legacy
+    // HELD IS NOT SOLD OUT — the mount mirror of the Meme Dynasty sentence below. "Every remaining
+    // steed has been claimed" would be a lie the player can check against /world/rarity, and a player
+    // who believes a Viranimal is extinct has no reason to come back when the drop ends.
+    const mres = mdReserveMapCached();
+    const held = MOUNT_KEYS.some((mid) => !have.has(mid) && !atSupplyCap("mount", mid) && mountReservedOut(mid, mres));
+    return held
+      ? "the steeds you could still receive are being held for the Viranimal Legacy Drop — your egg is safe, hatch it again when the drop ends"
       : "every remaining steed has been claimed — the stable is legendary now";
   }
   if (kind !== "meme") return "you already own every species that egg could hatch";
@@ -10061,6 +10759,12 @@ app.post("/assets/egg/consume", async (req, res) => {
   }
   if (row.kind === "meme" && memeReservedOut(sp)) {
     return res.status(409).json({ error: `${FOUNDER_HELD_MSG} — your egg is safe, hatch it again` });
+  }
+  // THE MOUNT MIRROR. This route lets the CLIENT NAME the species, so eggPoolFor's filter does not
+  // cover it — without this line the Viranimal Legacy Drop's hold is one HTTP call away from being
+  // walked around by an ordinary player picking momota by hand. Nothing above has mutated the egg.
+  if (isMount && mountReservedOut(sp)) {
+    return res.status(409).json({ error: `${MOUNT_DROP_HELD_MSG} — your egg is safe, hatch it again` });
   }
   if (atSupplyCap(isMount ? "mount" : "chikimon", sp)) {
     return res.status(409).json({ error: `every ${sp} that will ever exist has been claimed — your egg is safe, hatch it again` });
@@ -10599,6 +11303,13 @@ app.post("/admin/grant-collection", async (req, res, next) => {
                      reservedForFounders: founderReserveOf(c.sp), why: "founder-drop-hold" });
       continue;
     }
+    // the same refusal for a chikimount held by a live Viranimal Legacy Drop, reported under its own
+    // key so the owner can tell WHICH drop is holding the edition rather than guessing
+    if (c.type === "mount" && cap > 0 && mountReservedOut(c.sp)) {
+      refused.push({ ...c, ...capInfo, remaining: remainingOf(c.type, c.sp),
+                     reservedForDrop: mdReserveOf(c.sp), why: "mount-drop-hold" });
+      continue;
+    }
     const upgrades = priorUnregistered(c.type, c.sp);  // report-only: an unregistered holding being registered
     if (dryRun) { granted.push({ ...c, ...capInfo, wouldGrant: true, ...(upgrades ? { upgrades } : {}) }); continue; }
     let row;
@@ -10621,9 +11332,15 @@ app.post("/admin/grant-collection", async (req, res, next) => {
       // HELD FOR THE FOUNDER DROP is a per-species refusal like the cap, NOT a capacity fault. Left
       // to fall through it would have set capacityFault and skipped the whole rest of the catalog —
       // one reserved meme character would have cost the owner every species after it.
+      // TYPE-AWARE, because this branch was already reporting the wrong thing for anything but a
+      // chikimon: it read the CHIKIMON hold unconditionally, so a mount throw printed
+      // reservedForFounders: 0 — a refusal with no stated reason at all. Still a PER-SPECIES refusal
+      // and still NOT a capacityFault: left to fall through, one reserved species cost the owner every
+      // species after it in the catalog, which is the bug the comment above records.
       if (e && e.code === "SUPPLY_RESERVED") {
         refused.push({ ...c, cap, issued: issuedCount(c.type, c.sp), remaining: remainingOf(c.type, c.sp),
-                       reservedForFounders: founderReserveOf(c.sp), why: "founder-drop-hold" });
+                       ...(c.type === "mount" ? { reservedForDrop: mdReserveOf(c.sp), why: "mount-drop-hold" }
+                                              : { reservedForFounders: founderReserveOf(c.sp), why: "founder-drop-hold" }) });
         continue;
       }
       capacityFault = true;                            // ASSET_REG_MAX (a non-coded throw) is a server fault,
@@ -15109,7 +15826,9 @@ app.get("/world/roster", (_q, res) => {
   }
   res.json({ users, count: users.length });
 });
-setInterval(() => { const now = Date.now(); founderPresenceTick(now); for (const [w, p] of worldPlayers) if (now - p.ts > WORLD_TTL_MS) worldPlayers.delete(w); }, 10000);
+// Both drops accrue proven presence in this one sweep, each with its OWN cursor (see mdPresenceTick).
+// Flag-off the second call is skipped on a module const and the line behaves exactly as it did.
+setInterval(() => { const now = Date.now(); founderPresenceTick(now); if (MOUNT_DROP_ON) mdPresenceTick(now); for (const [w, p] of worldPlayers) if (now - p.ts > WORLD_TTL_MS) worldPlayers.delete(w); }, 10000);
 // THE WORLD TICK. Every other interval in this file is housekeeping — flush a ledger, prune a map.
 // This one advances the world: a monster killed anywhere comes back for everyone when its clock runs
 // out, whether or not a single client is polling. One second is plenty for a 90 s respawn and it costs
