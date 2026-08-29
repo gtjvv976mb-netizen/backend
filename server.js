@@ -6589,6 +6589,250 @@ app.post("/world/raid/claim", (req, res) => {
   res.json({ ok: true, granted: true, week, prize: { chiki: RAID_PRIZE_CHIKI, mat: "crystal", qty: RAID_PRIZE_CRYSTAL } });
 });
 
+// ============ THE PURGE AT THE WICKED TEMPLE — THE SERVER PAYS, THE CLIENT ONLY ASKS ============
+// Three rounds. Each round reveals a corrupted elemental sigil and the player sends one chikimon;
+// the element matchup (Econ.PENTAGON, x1.5 strong / x0.7 weak) plus level decides whether the sigil
+// is purified. Entry costs an offering of TEMPLE_OFFERING essence (Dark Energy). Score is 0..3.
+//
+// THE SPLIT: the CLIENT runs the fight, because Econ.PENTAGON and the roster live there. The SERVER
+// decides the money, because a reward the client computes is a reward a save editor sets. So the
+// client reports {purified, rounds} and asks; the reply's `chiki` is the ONLY number it may credit.
+// Nothing here reads an amount from the body — there is no amount field to read.
+//
+// WHY THIS ONE IS CAPPED AND THE OLD FAUCETS WERE NOT. The economy was measured: net +1,578 $CHIKI
+// per player-week, soft-sink recovery only 19.2%, and the UNCAPPED task board is the faucet doing
+// the damage. Adding a second uncapped source is that mistake twice. So the ceiling is per WALLET
+// per UTC DAY, in two dimensions (money and runs), and it DEGRADES INSTEAD OF REFUSING — exactly
+// the shape of the fantasy-fish daily legend ceiling (FFISH_DAILY_MAX and its `_row.n >= _cap`
+// block): a player who reaches it is still paid the remainder and told `left:0`, never handed an
+// error for playing well. Under the cap, six perfect runs would be 720; TEMPLE_DAILY_CHIKI stops
+// the day's total at 240, i.e. two perfect runs' worth however the runs actually fall.
+//
+// THIS PAYS THE SOFT PURSE ONLY. No treasury, no sendChikiRaw, no on-chain path is reachable from
+// this route. The number in the reply is credited by the client to the local purse and stays bound
+// by the save signature and the CHIKI ceilings downstream, exactly like every other soft reward.
+//
+// gateFlipMode() cannot express this flag: its unset default is "grace" (i.e. live), and a brand new
+// money source must ship dark. So it uses the strict on/off form the other default-OFF CHIK_* flags
+// use (CHIK_NFT_MINT, CHIK_TP_ESCROW, CHIK_MOUNT_DROP). NOTE, measured on the mount drop: this form
+// is STRICT — "true", "yes", "on", " 1" and "1 " all parse to OFF. Only the exact string "1" is on.
+const TEMPLE_ON = String(process.env.CHIK_TEMPLE ?? "0") === "1";
+const TEMPLE_ROUNDS = 3;             // the mini-game IS three rounds; any other count is a different game
+const TEMPLE_OFFERING = 3;           // essence per entry — held in the client's satchel, see the note below
+// Env-tunable, each falling back to the shipped default on garbage (Number("x") is NaN, and NaN
+// silently poisons a Math.max chain — the ffish ceiling's own `Number(env || 60)` has that hole).
+const _tNum = (name, dflt, min) => { const v = Number(process.env[name]); return Number.isFinite(v) && v >= min ? Math.floor(v) : dflt; };
+const TEMPLE_CHIKI_PER   = _tNum("TEMPLE_CHIKI_PER", 40, 0);        // per purified sigil -> a perfect 3/3 is 120
+const TEMPLE_DAILY_CHIKI = _tNum("TEMPLE_DAILY_CHIKI", 240, 0);     // the day's money ceiling for one wallet
+const TEMPLE_DAILY_RUNS  = _tNum("TEMPLE_DAILY_RUNS", 6, 0);        // the day's run ceiling for one wallet
+const TEMPLE_MIN_GAP_MS  = _tNum("TEMPLE_MIN_GAP_MS", 90000, 0);    // one run per wallet per gap (QUEST_MIN_GAP_MS's shape)
+const TEMPLE_BOOK_MAX = 20000;       // the same bound every per-wallet map in this file carries
+// wallet -> { day, runs, chiki } for the CURRENT UTC day. Persisted (see below) because a Render
+// deploy or an idle spin-down would otherwise hand the whole playerbase a fresh daily allowance —
+// the same leak the weekly raid gate exists to close, at daily frequency.
+const templeBook = new Map();
+const _lastTemple = new Map();       // wallet -> last ACCEPTED run ms (the pace gate + the replay bound)
+const templeDay = (ms) => Math.floor(ms / 86400000);                 // UTC day index — the ffish ceiling's own clock
+const templeResetMs = (ms) => (templeDay(ms) + 1) * 86400000 - ms;   // ms to the next UTC midnight
+// A PURE READ. Reading someone's state must not create a row for them, or /world/temple/state would
+// be a free way to fill a 20,000-entry map from the outside.
+function templeRead(w, day) { const r = templeBook.get(w); return (r && r.day === day) ? r : { day, runs: 0, chiki: 0 }; }
+// Drop only rows for a day that has already ended: a past day's row gates nothing (the check only
+// ever compares against today), while today's row IS the record and is never evicted. Same doctrine
+// as evictRaidClaims — evicting a live row hands that wallet its allowance twice.
+function templeEvict(now) {
+  if (templeBook.size <= TEMPLE_BOOK_MAX) return 0;
+  const day = templeDay(now); let n = 0;
+  for (const [k, r] of templeBook) if (r.day !== day) { templeBook.delete(k); n++; }
+  if (_lastTemple.size > TEMPLE_BOOK_MAX) for (const [k, t] of _lastTemple) if (now - t > TEMPLE_MIN_GAP_MS * 4) _lastTemple.delete(k);
+  return n;
+}
+// Number() is far too willing to describe a run: Number(null), Number(""), Number(false) and
+// Number([]) are all 0 and Number("0x7") is 7 — the exact class that let {idx:null} name a real
+// monster on /world/mob/hit. Only a real number, or a plain decimal string, may describe a purge.
+function templeInt(v) {
+  if (typeof v === "number") return Number.isFinite(v) ? Math.floor(v) : null;
+  if (typeof v === "string" && /^-?\d+(\.\d+)?$/.test(v.trim())) { const n = Number(v.trim()); return Number.isFinite(n) ? Math.floor(n) : null; }
+  return null;
+}
+// ---- PERSISTENCE: its own kv key, through the same store abstraction as world_feed / live_events --
+let _templeReady = false, _templeSavedAt = 0, _templeSaveTimer = null;
+// Only TODAY's rows are worth storing; yesterday's gate nothing and would grow the blob forever.
+function templeSnapshot() {
+  const day = templeDay(Date.now()); const rows = [];
+  for (const [w, r] of templeBook) {
+    if (r.day !== day) continue;
+    rows.push([w, r.day, r.runs, r.chiki]);
+    if (rows.length >= TEMPLE_BOOK_MAX) break;
+  }
+  return { d: day, w: rows };
+}
+// Restoring trusts NOTHING — this blob came back from a database — and it MERGES rather than
+// replaces, taking the larger of each counter. The port is open before the boot read lands, so a run
+// can be paid inside the restore window; a bare overwrite would forget that payment and hand the
+// wallet its cap a second time. Taking the max can only ever pay a player LESS, which is the safe
+// direction for a ceiling. (Same lesson as the market-session restore above.)
+function restoreTempleBook(v) {
+  if (!v || typeof v !== "object" || !Array.isArray(v.w)) return 0;
+  const day = templeDay(Date.now());
+  let n = 0;
+  for (const e of v.w) {
+    if (!Array.isArray(e)) continue;
+    const w = String(e[0] || "").slice(0, 44);
+    if (!isPubkey(w)) continue;
+    const d = Math.floor(Number(e[1]));
+    if (!Number.isFinite(d) || d !== day) continue;                  // a stored row from another day gates nothing
+    const runs  = Math.max(0, Math.min(1e6, Math.floor(Number(e[2])) || 0));
+    const chiki = Math.max(0, Math.min(1e9, Math.floor(Number(e[3])) || 0));
+    const cur = templeBook.get(w);
+    if (cur && cur.day === day) { cur.runs = Math.max(cur.runs, runs); cur.chiki = Math.max(cur.chiki, chiki); }
+    else { if (templeBook.size >= TEMPLE_BOOK_MAX) break; templeBook.set(w, { day, runs, chiki }); }
+    n++;
+  }
+  return n;
+}
+// THE WRITE SIDE REFUSES UNTIL THE RESTORE HAS LANDED. A boot whose read has not answered yet holds
+// an EMPTY book, and writing that over the stored one would erase the day's ceiling for everybody —
+// the identical failure that took market_sid_owner 8 -> 0 on a SIGTERM inside the restore window.
+// Refusing to write is survivable (the ceiling still holds in memory for this process); writing an
+// empty book is not.
+function saveTempleBookNow(strict = false) {
+  _templeSavedAt = Date.now();
+  if (!_templeReady) { console.error("temple: NOT persisting the Purge day-book (boot restore has not landed) — refusing to overwrite the stored ceiling"); return Promise.resolve(); }
+  return store.kvSet("world_temple", templeSnapshot()).catch(e => { if (strict) throw e; });
+}
+function saveTempleBook() {
+  const now = Date.now();
+  if (now - _templeSavedAt < 5000) {          // batch bursts, like world_feed…
+    if (!_templeSaveTimer) {                  // …with a trailing write so a burst's TAIL is never the run a restart forgets
+      _templeSaveTimer = setTimeout(() => { _templeSaveTimer = null; saveTempleBookNow(); }, 5000);
+      if (_templeSaveTimer.unref) _templeSaveTimer.unref();
+    }
+    return;
+  }
+  saveTempleBookNow();
+}
+// Boot restore RETRIES. This read runs at import time, before store.init() has created `kv`; on a
+// fresh or newly-swapped database the first attempt throws "relation kv does not exist", which is
+// exactly how the asset registry once suspended itself for a whole process life. A read that never
+// succeeds leaves _templeReady false, so nothing is ever written over the stored book — fail closed
+// in the direction that protects the ceiling.
+async function bootRestoreTempleBook() {
+  for (let i = 1; i <= 20; i++) {
+    try {
+      const n = restoreTempleBook(await store.kvGet("world_temple"));
+      _templeReady = true;
+      if (n) console.log(`temple: Purge day-book restored (${n} wallets with a run today)`);
+      return n;
+    } catch (e) {
+      if (i === 20) { console.error("temple: Purge day-book restore FAILED — the daily ceiling is in-memory only for this process and the stored book will NOT be overwritten:", e && e.message); return 0; }
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+  return 0;
+}
+bootRestoreTempleBook();
+// test seams — the node_persist doctrine: a sim round-trips the REAL save/restore, never a copy
+export function _templeRowForTest(w) { const r = templeBook.get(String(w)); return r ? { ...r } : null; }
+export function _templeStateForTest() { return { on: TEMPLE_ON, per: TEMPLE_CHIKI_PER, dailyChiki: TEMPLE_DAILY_CHIKI, dailyRuns: TEMPLE_DAILY_RUNS, gapMs: TEMPLE_MIN_GAP_MS, rounds: TEMPLE_ROUNDS, offering: TEMPLE_OFFERING, size: templeBook.size, ready: _templeReady }; }
+export function _clearTempleBookForTest() { templeBook.clear(); _lastTemple.clear(); return 0; }
+export function _templeClearGapForTest(w) { return _lastTemple.delete(String(w)); }
+export function _saveTempleBookForTest() { return saveTempleBookNow(true); }
+export async function _bootRestoreTempleForTest() { return bootRestoreTempleBook(); }
+export function _templeSnapshotForTest() { return templeSnapshot(); }
+
+app.post("/world/temple/purge", (req, res) => {
+  const b = req.body || {};
+  // THE FLAG GATES THE WHOLE ROUTE and nothing below it runs. 200 with ok:false rather than a 4xx:
+  // an unflipped flag is an operator state, not a client mistake, and the client must be able to
+  // read "no reward" as an ordinary answer instead of something its retry queue keeps re-sending.
+  if (!TEMPLE_ON) return res.json({ ok: false, reason: "off", chiki: 0 });
+  const w = String(b.wallet || "");
+  // PUBKEY ONLY. The book is a per-wallet daily ceiling that must survive a restart, and a per-install
+  // net_id has no durable identity to key one on — answering a net_id would be an unlimited faucet.
+  if (!isPubkey(w)) return res.status(400).json({ error: "valid wallet required" });
+  if (isBanned(w)) return res.status(403).json({ error: "this wallet is excluded from rewards" });
+  // A credential is OPTIONAL here (the fleet has none for this route yet) but a WRONG one is ALWAYS
+  // refused — the rule /quest/complete follows. Sending a stale token must never be safer than
+  // sending none. Whether the run was proven is recorded on the chronicle row as `claim`.
+  const tok = String(b.mktToken || "");
+  if (tok && !mktTokenOk(w, tok)) return res.status(401).json({ error: "sign in again — that market token is stale" });
+  const proven = (!!tok && mktTokenOk(w, tok)) || verifyWalletSig(w, b.authMsg, b.authSig);
+  if (b.authSig && !proven) return res.status(401).json({ error: "that signature does not prove this wallet" });
+  // ROUNDS ARE EXACTLY THREE — rejected, not clamped. A body claiming any other count is not
+  // describing this mini-game, and quietly rewriting it to 3 would pay for a shape we do not know.
+  const rounds = templeInt(b.rounds);
+  if (rounds !== TEMPLE_ROUNDS) return res.status(400).json({ error: `a purge is exactly ${TEMPLE_ROUNDS} rounds`, rounds: TEMPLE_ROUNDS });
+  // ...and you cannot purify more sigils than were revealed. CLAMPED, not rejected: 0..rounds is the
+  // only meaning the field has, and an over-count is the one thing an honest client could get wrong.
+  const pRaw = templeInt(b.purified);
+  const purified = Math.max(0, Math.min(rounds, pRaw === null ? 0 : pRaw));
+  const now = Date.now();
+  // ONE RUN PER TEMPLE_MIN_GAP_MS. The stamp is taken only by a run that is ACCEPTED below, so a
+  // refusal never consumes the window. This is also the REPLAY bound: a client re-posting the same
+  // run (lost reply, retry queue, or a copied curl) lands inside the gap and is paid nothing.
+  const last = _lastTemple.get(w) || 0;
+  if (now - last < TEMPLE_MIN_GAP_MS)
+    return res.status(429).json({ error: "the sigils are still cooling — pace yourself", retryInMs: TEMPLE_MIN_GAP_MS - (now - last) });
+  const day = templeDay(now);
+  const row = templeRead(w, day);
+  const resetMs = templeResetMs(now);
+  // THE RUN CEILING. Six runs at a 90 s pace is already well past an honest visit, so the seventh is
+  // paid nothing — but it is still answered 200 with the truth (`runsLeft:0`, `resetMs`), because the
+  // player really did play it and the client needs to say so rather than show a network error.
+  // `left` is "how much more $CHIKI today", and with no runs left the honest answer is 0 whatever the
+  // money ceiling still holds — the run that would have spent it can no longer be played.
+  if (row.runs >= TEMPLE_DAILY_RUNS) {
+    templeBook.set(w, row);
+    return res.json({ ok: true, chiki: 0, purified, capped: true, left: 0, runsLeft: 0, resetMs, reason: "daily_runs" });
+  }
+  // THE MONEY CEILING, DEGRADED NOT REFUSED: pay whatever of the day's allowance is left.
+  const earned = purified * TEMPLE_CHIKI_PER;
+  const roomLeft = Math.max(0, TEMPLE_DAILY_CHIKI - row.chiki);
+  const chiki = Math.min(earned, roomLeft);
+  const capped = chiki < earned;
+  // BOOK BEFORE ANSWERING — the raid claim's rule: two requests racing the same allowance must not
+  // both be told the same money. The handler is synchronous to here, so they cannot interleave.
+  row.runs += 1;
+  row.chiki += chiki;
+  templeBook.set(w, row);
+  _lastTemple.set(w, now);
+  templeEvict(now);
+  saveTempleBook();
+  const left = Math.max(0, TEMPLE_DAILY_CHIKI - row.chiki);
+  const runsLeft = Math.max(0, TEMPLE_DAILY_RUNS - row.runs);
+  // One run N of day D per wallet is the natural key, so a retry that somehow reaches here records
+  // nothing. `val` is the $CHIKI, which is what makes this a VALUE event in the chronicle. The
+  // offering is recorded rather than debited: the satchel is in the client save, so the server
+  // cannot take the 3 essence — it is stated here as a KNOWN LIMIT, not implied to be enforced.
+  chronicleAdd("temple", w, { sub: `purge:${purified}/${rounds}`, qty: purified, val: chiki,
+    route: "/world/temple/purge", idem: `temple:${w}:${day}:${row.runs}`,
+    data: { purified, rounds, run: row.runs, capped, offering: TEMPLE_OFFERING, claim: !proven } });
+  res.json({ ok: true, chiki, purified, capped, left, runsLeft, resetMs });
+});
+
+// What is left of today, for the wallet the caller names. Public in the same way /quest/state is
+// (which serves far more: chapter progress, earned and paid amounts, the payout signature) — this
+// answers two remaining-allowance integers and a countdown and names nothing else. A token is not
+// required, but a WRONG one is refused here too, so a stale credential never reads as fine.
+app.get("/world/temple/state", (req, res) => {
+  const w = String((req.query && req.query.wallet) || "");
+  if (!isPubkey(w)) return res.status(400).json({ error: "valid wallet required" });
+  const tok = String((req.query && req.query.mktToken) || "");
+  if (tok && !mktTokenOk(w, tok)) return res.status(401).json({ error: "sign in again — that market token is stale" });
+  const now = Date.now();
+  const row = templeRead(w, templeDay(now));
+  // Flag off: nothing is claimable, so the allowances read 0 and `on:false` says why. The client
+  // shows the temple without the reward line rather than promising a payout it will not get.
+  res.json({ on: TEMPLE_ON,
+    runsLeft:  TEMPLE_ON ? Math.max(0, TEMPLE_DAILY_RUNS - row.runs) : 0,
+    chikiLeft: TEMPLE_ON ? Math.max(0, TEMPLE_DAILY_CHIKI - row.chiki) : 0,
+    resetMs: templeResetMs(now),
+    // read-only constants so the client never hardcodes a number the server owns
+    runsMax: TEMPLE_DAILY_RUNS, chikiMax: TEMPLE_DAILY_CHIKI, chikiPer: TEMPLE_CHIKI_PER,
+    rounds: TEMPLE_ROUNDS, offering: TEMPLE_OFFERING, gapMs: TEMPLE_MIN_GAP_MS });
+});
+
 // ============ STEP 6: the FULL material flow becomes observable (observe-only) ============
 // gatherCount (+ the fish/kill reports) now covers every material SOURCE with a world event. What the
 // server still could not see: materials LEAVING a wallet (crafting, egg tending, barters, feeding)
@@ -18155,6 +18399,8 @@ async function flushDurableState() {
     ["world mobs", () => saveWorldMobs(true)],
     ["asset ledger", () => Promise.resolve(_assetsFlush).then(() => saveAssetLedger(true))],
     ["world feed", () => saveWorldFeedNow(true)],
+    // the Purge day-book: a deploy that forgot it would hand every wallet a second daily allowance
+    ["temple book", () => saveTempleBookNow(true)],
     ["world chat", () => store.kvSet("world_chat", worldChat.slice(-1000))],
     ["world DMs", () => store.kvSet("world_dm", shutdownDmSnapshot())],
     ["parties", () => store.kvSet("world_parties", serializeParties())],
