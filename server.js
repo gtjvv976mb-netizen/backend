@@ -4776,7 +4776,7 @@ export function _setFfishAuthorityForTest(on) { _ffishAuth = !!on; if (_ffishAut
 export function _grantOwnForTest(w, item, n, kind = "mat") { ownCredit(String(w), kind, item, n); return n; }
 export function _clearOwnBook() { ownBook.clear(); _ownWorst.clear(); _ownRefusals = 0; _ownSkipped = 0; _ownSnapshots = 0; _ownReady = true; _ownEnforce = true;
                                   _matFlags.clear(); _matSaveClamps = 0; _matSaveObserved = 0; _matSaveSkipped = 0; _matBaselines = 0; }
-export function _ownFor(w) { const r = ownBook.get(String(w)); return r ? { open: r.open, cred: r.cred, sold: r.sold, used: r.used, openSrc: r.openSrc, ffishOpenSrc: r.ffishOpenSrc || 0, base: r.base, baseSrc: r.baseSrc } : null; }
+export function _ownFor(w) { const r = ownBook.get(String(w)); return r ? { open: r.open, cred: r.cred, sold: r.sold, used: r.used, openSrc: r.openSrc, ffishOpenSrc: r.ffishOpenSrc || 0, base: r.base, baseSrc: r.baseSrc, temple: ownTempleMarkers(r.temple) } : null; }
 export function _ownAvailFor(w, kind, item) { return ownAvailable(String(w), kind, item); }
 // Step 7 seams: read-only views so the flip sim can print the actual bound and counters.
 export function _matFlipStateForTest() { return { clamps: _matSaveClamps, observedOnly: _matSaveObserved, skipped: _matSaveSkipped, baselines: _matBaselines, flagged: _matFlags.size }; }
@@ -6590,9 +6590,9 @@ app.post("/world/raid/claim", (req, res) => {
 });
 
 // ============ THE PURGE AT THE WICKED TEMPLE — THE SERVER PAYS, THE CLIENT ONLY ASKS ============
-// Three rounds. Each round reveals a corrupted elemental sigil and the player sends one chikimon;
+// Five rounds. Each round reveals a corrupted elemental sigil and the player sends one chikimon;
 // the element matchup (Econ.PENTAGON, x1.5 strong / x0.7 weak) plus level decides whether the sigil
-// is purified. Entry costs an offering of TEMPLE_OFFERING essence (Dark Energy). Score is 0..3.
+// is purified. Entry costs an offering of TEMPLE_OFFERING essence (Dark Energy). Score is 0..5.
 //
 // THE SPLIT: the CLIENT runs the fight, because Econ.PENTAGON and the roster live there. The SERVER
 // decides the money, because a reward the client computes is a reward a save editor sets. So the
@@ -6617,23 +6617,212 @@ app.post("/world/raid/claim", (req, res) => {
 // use (CHIK_NFT_MINT, CHIK_TP_ESCROW, CHIK_MOUNT_DROP). NOTE, measured on the mount drop: this form
 // is STRICT — "true", "yes", "on", " 1" and "1 " all parse to OFF. Only the exact string "1" is on.
 const TEMPLE_ON = String(process.env.CHIK_TEMPLE ?? "0") === "1";
-const TEMPLE_ROUNDS = 3;             // the mini-game IS three rounds; any other count is a different game
+// Loot is a second, STRICT default-off gate. Operators can leave the existing $CHIKI Purge live
+// while the client rollout catches up; no omitted, padded, or human-readable truthy value grants an
+// item. Both gates must be exactly "1" before the route can reach a loot mutator.
+//
+// SECURITY HOLD: durability and wallet proof do NOT make a client-reported 5/5 victory authoritative,
+// and one wallet is not a Sybil-resistant eligibility decision. Durable loot must remain OFF until a
+// server-authoritative run validator and an operator-approved eligibility policy exist. The warning
+// below is deliberately impossible to miss if somebody overrides that hold in an environment.
+const TEMPLE_LOOT_ON = String(process.env.CHIK_TEMPLE_LOOT ?? "0") === "1";
+if (TEMPLE_ON && TEMPLE_LOOT_ON) console.warn(
+  "⚠ WICKED TEMPLE DURABLE LOOT IS ENABLED, BUT RUN VICTORY IS STILL CLIENT-ASSERTED AND ELIGIBILITY IS NOT SYBIL-RESISTANT. KEEP CHIK_TEMPLE_LOOT=0 OUTSIDE A CONTROLLED TEST UNTIL AUTHORITATIVE RUN VALIDATION + ELIGIBILITY EXIST."
+);
+const TEMPLE_ROUNDS = 5;             // the expanded mini-game is five rounds; reject mismatched clients
 const TEMPLE_OFFERING = 3;           // essence per entry — held in the client's satchel, see the note below
 // Env-tunable, each falling back to the shipped default on garbage (Number("x") is NaN, and NaN
 // silently poisons a Math.max chain — the ffish ceiling's own `Number(env || 60)` has that hole).
 const _tNum = (name, dflt, min) => { const v = Number(process.env[name]); return Number.isFinite(v) && v >= min ? Math.floor(v) : dflt; };
-const TEMPLE_CHIKI_PER   = _tNum("TEMPLE_CHIKI_PER", 40, 0);        // per purified sigil -> a perfect 3/3 is 120
+const TEMPLE_CHIKI_PER   = _tNum("TEMPLE_CHIKI_PER", 24, 0);        // per purified sigil -> a perfect 5/5 stays 120
 const TEMPLE_DAILY_CHIKI = _tNum("TEMPLE_DAILY_CHIKI", 240, 0);     // the day's money ceiling for one wallet
 const TEMPLE_DAILY_RUNS  = _tNum("TEMPLE_DAILY_RUNS", 6, 0);        // the day's run ceiling for one wallet
 const TEMPLE_MIN_GAP_MS  = _tNum("TEMPLE_MIN_GAP_MS", 90000, 0);    // one run per wallet per gap (QUEST_MIN_GAP_MS's shape)
 const TEMPLE_BOOK_MAX = 20000;       // the same bound every per-wallet map in this file carries
-// wallet -> { day, runs, chiki } for the CURRENT UTC day. Persisted (see below) because a Render
+const TEMPLE_LOOT_TOTAL = 10000;
+// Shipped cap 6 -> eight receipts (six accepted runs + one cap reply + one spare). Operator overrides
+// scale with the run ceiling, but hostile blobs can never exceed 64 receipts per wallet.
+const TEMPLE_RECEIPT_MAX = Math.max(8, Math.min(64, TEMPLE_DAILY_RUNS + 2));
+// Current-day counters may roll at UTC midnight while a client is retrying a response lost seconds
+// earlier. Keep a separate two-day run journal so that boundary cannot turn one runId into a fresh
+// roll. The cap is above the shipped day-book maximum (20k wallets x 8 receipts); if it ever fills,
+// new loot fails closed rather than evicting a live idempotency key.
+const TEMPLE_JOURNAL_MAX = 200000;
+const TEMPLE_LOOT_TABLE = Object.freeze([
+  Object.freeze({ rewardKey: "fantasy_fish", weight: 6000, type: "ffish" }),
+  Object.freeze({ rewardKey: "normal_egg", weight: 2500, type: "egg", kind: "normal" }),
+  Object.freeze({ rewardKey: "legendary_egg", weight: 800, type: "egg", kind: "legendary" }),
+  Object.freeze({ rewardKey: "chikimount_egg", weight: 500, type: "egg", kind: "mount" }),
+  Object.freeze({ rewardKey: "meme_dynasty_egg", weight: 200, type: "egg", kind: "meme" }),
+]);
+const TEMPLE_FISH_TABLE = Object.freeze([
+  Object.freeze({ species: "golden_chikifish", weight: 6700 }),
+  Object.freeze({ species: "crystal_koi", weight: 2300 }),
+  Object.freeze({ species: "mystic_eel", weight: 800 }),
+  Object.freeze({ species: "rainbow_fish", weight: 200 }),
+]);
+const TEMPLE_EGG_KINDS = new Set(["normal", "legendary", "mount", "meme"]);
+const TEMPLE_LOOT_REASONS = new Set(["capped", "victory_required", "identity_proof_required", "reward_store_unavailable", "issuance_failed", "valid_run_id_required"]);
+
+// Pure, half-open selector. Its inputs are the two exact integers a caller would have received from
+// crypto.randomInt(10000), which lets a sim enumerate all 10,000 slots without ever stubbing crypto.
+// A fish sub-roll is required only for the fish branch. There is deliberately no Leviathan slot.
+function templeLootPick(outerRoll, fishRoll) {
+  if (!Number.isInteger(outerRoll) || outerRoll < 0 || outerRoll >= TEMPLE_LOOT_TOTAL)
+    throw new RangeError("outer temple-loot roll must be an integer in [0,10000)");
+  let cursor = outerRoll, picked = null;
+  for (const entry of TEMPLE_LOOT_TABLE) {
+    if (cursor < entry.weight) { picked = entry; break; }
+    cursor -= entry.weight;
+  }
+  if (!picked) throw new Error("temple-loot table does not cover its roll domain");
+  if (picked.type !== "ffish") return { rewardKey: picked.rewardKey, type: "egg", kind: picked.kind };
+  if (!Number.isInteger(fishRoll) || fishRoll < 0 || fishRoll >= TEMPLE_LOOT_TOTAL)
+    throw new RangeError("fantasy-fish sub-roll must be an integer in [0,10000)");
+  cursor = fishRoll;
+  for (const fish of TEMPLE_FISH_TABLE) {
+    if (cursor < fish.weight) return { rewardKey: picked.rewardKey, type: "ffish", species: fish.species };
+    cursor -= fish.weight;
+  }
+  throw new Error("temple fish table does not cover its roll domain");
+}
+
+// Production falls through to crypto.randomInt. A finite queue exists only as a narrow imported-test
+// seam so the HTTP sim can prove the real grant/replay route without making a chance-based assertion.
+let _templeLootRollQueueForTest = null;
+function templeLootRandom() {
+  if (_templeLootRollQueueForTest && _templeLootRollQueueForTest.length)
+    return _templeLootRollQueueForTest.shift();
+  return crypto.randomInt(TEMPLE_LOOT_TOTAL);
+}
+function templeRunId(v) {
+  return typeof v === "string" && v.length >= 8 && v.length <= 64 && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(v) ? v : "";
+}
+function templeLootSafe(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  if (raw.type === "ffish" && raw.rewardKey === "fantasy_fish" && FFISH_SET.has(raw.species))
+    return { schema: "wicked_temple_loot_v1", rewardKey: "fantasy_fish", type: "ffish", species: raw.species, qty: 1 };
+  if (raw.type !== "egg" || !TEMPLE_EGG_KINDS.has(raw.kind) || raw.sp !== raw.kind) return null;
+  const id = typeof raw.id === "string" && raw.id.length > 0 && raw.id.length <= 96 ? raw.id : "";
+  const born = Number(raw.born), readyAt = Number(raw.readyAt);
+  if (!id || !Number.isFinite(born) || !Number.isFinite(readyAt) || readyAt < born) return null;
+  const expectedKey = raw.kind === "normal" ? "normal_egg" : raw.kind === "legendary" ? "legendary_egg"
+    : raw.kind === "mount" ? "chikimount_egg" : "meme_dynasty_egg";
+  if (raw.rewardKey !== expectedKey) return null;
+  return { schema: "wicked_temple_loot_v1", rewardKey: expectedKey, id, type: "egg", sp: raw.kind,
+    kind: raw.kind, born: Math.floor(born), readyAt: Math.floor(readyAt) };
+}
+// The durable PREPARE record stores the random decision before either entitlement book is touched.
+// Fish can already be represented by the final wire card; an egg cannot, because its registry id and
+// birthday do not exist until mintAsset succeeds. Keep that intent deliberately smaller than a loot
+// card and re-type it independently on restore.
+function templeGrantSafe(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  if (raw.type === "ffish" && raw.rewardKey === "fantasy_fish" && FFISH_SET.has(raw.species))
+    return { rewardKey: "fantasy_fish", type: "ffish", species: raw.species };
+  if (raw.type !== "egg" || !TEMPLE_EGG_KINDS.has(raw.kind)) return null;
+  const expectedKey = raw.kind === "normal" ? "normal_egg" : raw.kind === "legendary" ? "legendary_egg"
+    : raw.kind === "mount" ? "chikimount_egg" : "meme_dynasty_egg";
+  if (raw.rewardKey !== expectedKey) return null;
+  return { rewardKey: expectedKey, type: "egg", kind: raw.kind };
+}
+function templeReceiptSafe(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const id = templeRunId(raw.id);
+  const at = Math.floor(Number(raw.at));
+  const rounds = Math.floor(Number(raw.rounds));
+  const purified = Math.floor(Number(raw.purified));
+  const r = raw.result;
+  if (!id || !Number.isFinite(at) || at <= 0 || rounds !== TEMPLE_ROUNDS || purified < 0 || purified > rounds || !r || typeof r !== "object") return null;
+  const safeCount = (v, max) => { const n = Number(v); return Number.isFinite(n) ? Math.max(0, Math.min(max, Math.floor(n))) : 0; };
+  const chiki = safeCount(r.chiki, TEMPLE_DAILY_CHIKI);
+  const left = safeCount(r.left, TEMPLE_DAILY_CHIKI);
+  const runsLeft = safeCount(r.runsLeft, TEMPLE_DAILY_RUNS);
+  const capped = r.capped === true;
+  let loot = templeLootSafe(r.loot);
+  let lootReason = TEMPLE_LOOT_REASONS.has(r.lootReason) ? r.lootReason : "";
+  const reason = r.reason === "daily_runs" ? "daily_runs" : "";
+  // A corrupt persisted blob cannot manufacture a value-bearing contradiction. Only a flawless,
+  // uncapped, ordinary accepted run may carry loot, and a real loot result has no refusal reason.
+  if (loot && (purified !== rounds || capped || reason)) { loot = null; lootReason = "issuance_failed"; }
+  else if (loot) lootReason = "";
+  const grant = raw.grantState === "prepared" ? templeGrantSafe(raw.grant) : null;
+  // A prepared row is a durable roll decision, never a response. It may exist only for a flawless,
+  // uncapped ordinary run and carries no final card/reason yet. Rejecting any contradictory shape on
+  // restore is the safe direction: it can never manufacture an entitlement from a damaged blob.
+  if (raw.grantState === "prepared") {
+    if (!grant || loot || lootReason || reason || capped || purified !== rounds) return null;
+    return { id, at, rounds, purified, grantState: "prepared", grant,
+      result: { chiki, capped, left, runsLeft, loot: null, lootReason: "", reason: "" } };
+  }
+  // Missing grantState is COMMITTED for backward compatibility. Pre-journal receipts may already
+  // have paid their entitlement; attempting to "reconcile" them would be a duplicate-value migration.
+  return { id, at, rounds, purified, result: { chiki, capped, left, runsLeft, loot, lootReason, reason } };
+}
+function templeReceiptList(raw) {
+  const out = [], seen = new Set();
+  for (const value of (Array.isArray(raw) ? raw : [])) {
+    const receipt = templeReceiptSafe(value);
+    if (!receipt || seen.has(receipt.id)) continue;
+    seen.add(receipt.id); out.push(receipt);
+    if (out.length >= TEMPLE_RECEIPT_MAX) break;
+  }
+  return out;
+}
+function templeFindReceipt(row, runId) {
+  return runId && Array.isArray(row.receipts) ? row.receipts.find((r) => r.id === runId) || null : null;
+}
+function templeReceiptReply(receipt, now, replay) {
+  const r = receipt.result;
+  const body = { ok: true, chiki: r.chiki, purified: receipt.purified, capped: r.capped, left: r.left,
+    runsLeft: r.runsLeft, resetMs: templeResetMs(now), runId: receipt.id, loot: r.loot, replay: !!replay };
+  if (r.lootReason) body.lootReason = r.lootReason;
+  if (r.reason) body.reason = r.reason;
+  return body;
+}
+function templePlanLoot() {
+  // Both durable entitlement books must have restored before ANY roll. restoreOwnBook replaces rows
+  // rather than merging, so crediting a fish during its boot window could otherwise be erased; the
+  // registry and Temple journal have equivalent readiness perimeters. Never consume/reroll while any
+  // one is unavailable.
+  if (!_assetsReady || !_ownReady || !_templeReady)
+    return { grant: null, lootReason: "reward_store_unavailable" };
+  const outer = templeLootRandom();
+  const outerEntry = templeLootPick(outer, 0);
+  const picked = outerEntry.type === "ffish" ? templeLootPick(outer, templeLootRandom()) : outerEntry;
+  return { grant: templeGrantSafe(picked), lootReason: "" };
+}
+// wallet -> { day, runs, chiki, receipts[] } for the CURRENT UTC day. Persisted (see below) because a Render
 // deploy or an idle spin-down would otherwise hand the whole playerbase a fresh daily allowance —
 // the same leak the weekly raid gate exists to close, at daily frequency.
 const templeBook = new Map();
+const templeRunJournal = new Map(); // wallet + runId -> receipt, current and previous UTC day
 const _lastTemple = new Map();       // wallet -> last ACCEPTED run ms (the pace gate + the replay bound)
 const templeDay = (ms) => Math.floor(ms / 86400000);                 // UTC day index — the ffish ceiling's own clock
 const templeResetMs = (ms) => (templeDay(ms) + 1) * 86400000 - ms;   // ms to the next UTC midnight
+const templeJournalKey = (wallet, runId) => `${wallet}\n${runId}`;
+let _templeJournalPrunedDay = -1;
+function templeJournalPrune(now = Date.now()) {
+  const today = templeDay(now);
+  if (_templeJournalPrunedDay === today) return;
+  _templeJournalPrunedDay = today;
+  const floor = today - 1;
+  for (const [key, value] of templeRunJournal) if (templeDay(value.receipt.at) < floor) templeRunJournal.delete(key);
+}
+function templeJournalPut(wallet, raw) {
+  const receipt = templeReceiptSafe(raw);
+  if (!isPubkey(wallet) || !receipt) return null;
+  const d = templeDay(receipt.at), today = templeDay(Date.now());
+  if (d < today - 1 || d > today) return null;
+  const key = templeJournalKey(wallet, receipt.id);
+  if (!templeRunJournal.has(key) && templeRunJournal.size >= TEMPLE_JOURNAL_MAX) return null;
+  templeRunJournal.set(key, { wallet, receipt });
+  return receipt;
+}
+function templeJournalGet(wallet, runId) {
+  const entry = templeRunJournal.get(templeJournalKey(wallet, runId));
+  return entry ? entry.receipt : null;
+}
 // A PURE READ. Reading someone's state must not create a row for them, or /world/temple/state would
 // be a free way to fill a 20,000-entry map from the outside.
 function templeRead(w, day) { const r = templeBook.get(w); return (r && r.day === day) ? r : { day, runs: 0, chiki: 0 }; }
@@ -6641,6 +6830,7 @@ function templeRead(w, day) { const r = templeBook.get(w); return (r && r.day ==
 // ever compares against today), while today's row IS the record and is never evicted. Same doctrine
 // as evictRaidClaims — evicting a live row hands that wallet its allowance twice.
 function templeEvict(now) {
+  templeJournalPrune(now);
   if (templeBook.size <= TEMPLE_BOOK_MAX) return 0;
   const day = templeDay(now); let n = 0;
   for (const [k, r] of templeBook) if (r.day !== day) { templeBook.delete(k); n++; }
@@ -6657,15 +6847,24 @@ function templeInt(v) {
 }
 // ---- PERSISTENCE: its own kv key, through the same store abstraction as world_feed / live_events --
 let _templeReady = false, _templeSavedAt = 0, _templeSaveTimer = null;
+let _templeFlush = Promise.resolve();
 // Only TODAY's rows are worth storing; yesterday's gate nothing and would grow the blob forever.
 function templeSnapshot() {
   const day = templeDay(Date.now()); const rows = [];
+  templeJournalPrune();
   for (const [w, r] of templeBook) {
     if (r.day !== day) continue;
-    rows.push([w, r.day, r.runs, r.chiki]);
+    rows.push([w, r.day, r.runs, r.chiki, templeReceiptList(r.receipts)]);
     if (rows.length >= TEMPLE_BOOK_MAX) break;
   }
-  return { d: day, w: rows };
+  const journal = [];
+  for (const { wallet, receipt } of templeRunJournal.values()) {
+    journal.push([wallet, receipt]);
+    if (journal.length >= TEMPLE_JOURNAL_MAX) break;
+  }
+  const out = { d: day, w: rows };
+  if (journal.length) out.j = journal;        // additive; a loot-off/legacy snapshot keeps its old shape
+  return out;
 }
 // Restoring trusts NOTHING — this blob came back from a database — and it MERGES rather than
 // replaces, taking the larger of each counter. The port is open before the boot read lands, so a run
@@ -6676,17 +6875,38 @@ function restoreTempleBook(v) {
   if (!v || typeof v !== "object" || !Array.isArray(v.w)) return 0;
   const day = templeDay(Date.now());
   let n = 0;
+  for (const e of (Array.isArray(v.j) ? v.j : [])) {
+    if (templeRunJournal.size >= TEMPLE_JOURNAL_MAX) break;
+    if (!Array.isArray(e) || !isPubkey(String(e[0] || ""))) continue;
+    templeJournalPut(String(e[0]), e[1]);
+  }
   for (const e of v.w) {
     if (!Array.isArray(e)) continue;
     const w = String(e[0] || "").slice(0, 44);
     if (!isPubkey(w)) continue;
     const d = Math.floor(Number(e[1]));
-    if (!Number.isFinite(d) || d !== day) continue;                  // a stored row from another day gates nothing
+    if (!Number.isFinite(d)) continue;
+    const restoredReceipts = templeReceiptList(e[4]);
+    // Counters from yesterday gate nothing, but their run receipts still gate a retry straddling UTC
+    // midnight. This also migrates the pre-journal world_temple shape without rerolling old value.
+    if (d === day - 1) {
+      for (const receipt of restoredReceipts) templeJournalPut(w, receipt);
+      continue;
+    }
+    if (d !== day) continue;
     const runs  = Math.max(0, Math.min(1e6, Math.floor(Number(e[2])) || 0));
     const chiki = Math.max(0, Math.min(1e9, Math.floor(Number(e[3])) || 0));
+    for (const receipt of restoredReceipts) templeJournalPut(w, receipt);
     const cur = templeBook.get(w);
-    if (cur && cur.day === day) { cur.runs = Math.max(cur.runs, runs); cur.chiki = Math.max(cur.chiki, chiki); }
-    else { if (templeBook.size >= TEMPLE_BOOK_MAX) break; templeBook.set(w, { day, runs, chiki }); }
+    if (cur && cur.day === day) {
+      cur.runs = Math.max(cur.runs, runs); cur.chiki = Math.max(cur.chiki, chiki);
+      // Current-process receipts win an id collision: they may describe an accepted request that
+      // landed while the boot read was in flight. Stored non-colliding receipts fill the tail.
+      cur.receipts = templeReceiptList([...(cur.receipts || []), ...restoredReceipts]);
+    } else {
+      if (templeBook.size >= TEMPLE_BOOK_MAX) break;
+      templeBook.set(w, { day, runs, chiki, receipts: restoredReceipts });
+    }
     n++;
   }
   return n;
@@ -6698,8 +6918,17 @@ function restoreTempleBook(v) {
 // empty book is not.
 function saveTempleBookNow(strict = false) {
   _templeSavedAt = Date.now();
-  if (!_templeReady) { console.error("temple: NOT persisting the Purge day-book (boot restore has not landed) — refusing to overwrite the stored ceiling"); return Promise.resolve(); }
-  return store.kvSet("world_temple", templeSnapshot()).catch(e => { if (strict) throw e; });
+  if (!_templeReady) {
+    const e = new Error("temple: NOT persisting the Purge day-book (boot restore has not landed) — refusing to overwrite the stored ceiling");
+    console.error(e.message);
+    return strict ? Promise.reject(e) : Promise.resolve();
+  }
+  // Whole-book JSON writes must be ordered. Once the route became async, two wallets could otherwise
+  // take different snapshots and let the slower, older write erase the newer prepared/committed row.
+  // Build the snapshot INSIDE the queue so every later write sees all mutations that preceded it.
+  const run = _templeFlush.catch(() => {}).then(() => store.kvSet("world_temple", templeSnapshot()));
+  _templeFlush = run;
+  return strict ? run : run.catch(e => console.error("temple: Purge day-book persist failed:", e && e.message));
 }
 function saveTempleBook() {
   const now = Date.now();
@@ -6710,7 +6939,7 @@ function saveTempleBook() {
     }
     return;
   }
-  saveTempleBookNow();
+  return saveTempleBookNow();
 }
 // Boot restore RETRIES. This read runs at import time, before store.init() has created `kv`; on a
 // fresh or newly-swapped database the first attempt throws "relation kv does not exist", which is
@@ -6733,15 +6962,158 @@ async function bootRestoreTempleBook() {
 }
 bootRestoreTempleBook();
 // test seams — the node_persist doctrine: a sim round-trips the REAL save/restore, never a copy
-export function _templeRowForTest(w) { const r = templeBook.get(String(w)); return r ? { ...r } : null; }
-export function _templeStateForTest() { return { on: TEMPLE_ON, per: TEMPLE_CHIKI_PER, dailyChiki: TEMPLE_DAILY_CHIKI, dailyRuns: TEMPLE_DAILY_RUNS, gapMs: TEMPLE_MIN_GAP_MS, rounds: TEMPLE_ROUNDS, offering: TEMPLE_OFFERING, size: templeBook.size, ready: _templeReady }; }
-export function _clearTempleBookForTest() { templeBook.clear(); _lastTemple.clear(); return 0; }
+export function _templeRowForTest(w) { const r = templeBook.get(String(w)); return r ? JSON.parse(JSON.stringify(r)) : null; }
+export function _templeStateForTest() { return { on: TEMPLE_ON, lootOn: TEMPLE_ON && TEMPLE_LOOT_ON, per: TEMPLE_CHIKI_PER, dailyChiki: TEMPLE_DAILY_CHIKI, dailyRuns: TEMPLE_DAILY_RUNS, gapMs: TEMPLE_MIN_GAP_MS, rounds: TEMPLE_ROUNDS, offering: TEMPLE_OFFERING, size: templeBook.size, ready: _templeReady }; }
+export function _clearTempleBookForTest() { templeBook.clear(); templeRunJournal.clear(); _lastTemple.clear(); return 0; }
 export function _templeClearGapForTest(w) { return _lastTemple.delete(String(w)); }
+export function _templeDropDayRowForTest(w) { _lastTemple.delete(String(w)); return templeBook.delete(String(w)); }
 export function _saveTempleBookForTest() { return saveTempleBookNow(true); }
 export async function _bootRestoreTempleForTest() { return bootRestoreTempleBook(); }
 export function _templeSnapshotForTest() { return templeSnapshot(); }
+export function _templeLootPickForTest(outerRoll, fishRoll = 0) { return templeLootPick(outerRoll, fishRoll); }
+export function _templeSetLootRollsForTest(rolls) {
+  if (rolls === null) { _templeLootRollQueueForTest = null; return 0; }
+  if (!Array.isArray(rolls) || rolls.some((n) => !Number.isInteger(n) || n < 0 || n >= TEMPLE_LOOT_TOTAL))
+    throw new RangeError("test loot rolls must all be integers in [0,10000)");
+  _templeLootRollQueueForTest = rolls.slice();
+  return _templeLootRollQueueForTest.length;
+}
+export function _templeLootTablesForTest() {
+  return { outer: TEMPLE_LOOT_TABLE.map((r) => ({ ...r })), fish: TEMPLE_FISH_TABLE.map((r) => ({ ...r })),
+    total: TEMPLE_LOOT_TOTAL, receiptMax: TEMPLE_RECEIPT_MAX };
+}
 
-app.post("/world/temple/purge", (req, res) => {
+// Async persistence introduces yield points, so serialize every request for one wallet. This guards
+// both different run ids racing the daily counters and duplicate run ids racing the PREPARE record.
+// Locks exist only while work is active and are removed by identity, so the map is naturally bounded.
+const _templeWalletLocks = new Map();
+async function templeWalletSerial(wallet, work) {
+  const prior = _templeWalletLocks.get(wallet) || Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  _templeWalletLocks.set(wallet, gate);
+  await prior.catch(() => {});
+  try { return await work(); }
+  finally {
+    release();
+    if (_templeWalletLocks.get(wallet) === gate) _templeWalletLocks.delete(wallet);
+  }
+}
+
+// Imported-sim-only crash boundaries. No request, flag or production timer can set this variable.
+let _templeCrashPointForTest = "";
+function templeMaybeCrashForTest(point) {
+  if (_templeCrashPointForTest !== point) return;
+  _templeCrashPointForTest = "";
+  const e = new Error(`simulated Temple crash after ${point}`); e.code = "TEMPLE_TEST_CRASH"; throw e;
+}
+export function _templeSetCrashPointForTest(point) {
+  if (point === null || point === "") { _templeCrashPointForTest = ""; return ""; }
+  if (!["prepare", "entitlement", "commit"].includes(point)) throw new RangeError("unknown Temple crash point");
+  _templeCrashPointForTest = point; return point;
+}
+
+function templeEggForRun(wallet, receipt, grant) {
+  const day = templeDay(receipt.at);
+  for (const row of assetReg.values()) {
+    if (!row || row.owner !== wallet || row.type !== "egg") continue;
+    if (!Array.isArray(row.chain) || !row.chain.some((e) => e && e.what === "temple_reward" &&
+        e.runId === receipt.id && Number(e.day) === day)) continue;
+    return row.kind === grant.kind && row.sp === grant.kind ? row : false;
+  }
+  return null;
+}
+
+async function templePersistEntitlement(wallet, receipt) {
+  const grant = templeGrantSafe(receipt.grant);
+  if (!grant) return { loot: null, lootReason: "issuance_failed" };
+  if (grant.type === "ffish") {
+    const applied = ownTempleCredit(wallet, receipt.id, receipt.at, grant.species);
+    if (!applied.ok) return { loot: null, lootReason: "issuance_failed" };
+    // The fish count and its run marker are fields of the SAME own_book JSON row. Awaiting this write
+    // makes a persisted marker impossible without its fish, and vice versa.
+    await saveOwnBookNow(true);
+    return { loot: { schema: "wicked_temple_loot_v1", rewardKey: grant.rewardKey, type: "ffish",
+      species: grant.species, qty: 1 }, lootReason: "" };
+  }
+  let egg = templeEggForRun(wallet, receipt, grant);
+  if (egg === false) return { loot: null, lootReason: "issuance_failed" };
+  if (!egg) {
+    try {
+      egg = mintAsset("egg", wallet, { kind: grant.kind, sp: grant.kind }, "issued");
+      // This event is the registry's durable per-run marker. It is appended synchronously before the
+      // registry write, survives restore in the genesis half of the chain, and lets PREPARE replay
+      // recover the original id instead of minting another egg.
+      regEvent(egg, "temple_reward", { route: "/world/temple/purge", runId: receipt.id,
+        day: templeDay(receipt.at) });
+    } catch (e) {
+      console.error("temple: loot issuance refused:", e && (e.code || e.message));
+      return { loot: null, lootReason: "issuance_failed" };
+    }
+  }
+  // A strict asset flush drains a dirty tail that appeared behind an older in-flight registry write.
+  // Only then may the Temple journal move PREPARE -> committed.
+  await saveAssetLedger(true);
+  return { loot: { schema: "wicked_temple_loot_v1", rewardKey: grant.rewardKey, id: egg.id,
+    type: "egg", sp: grant.kind, kind: grant.kind, born: egg.born, readyAt: eggReadyAt(egg) }, lootReason: "" };
+}
+
+function templeCommitReceipt(prepared, issue) {
+  const receipt = templeReceiptSafe({ id: prepared.id, at: prepared.at, rounds: prepared.rounds,
+    purified: prepared.purified, result: { ...prepared.result, loot: issue.loot || null,
+      lootReason: issue.loot ? "" : String(issue.lootReason || "issuance_failed") } });
+  if (!receipt) throw new Error("Temple could not construct a committed receipt");
+  return receipt;
+}
+
+async function templeFinalizePrepared(wallet, row, receipts, prepared) {
+  const inCurrentRow = receipts.some((r) => r.id === prepared.id);
+  // Re-write PREPARE before touching value. This also handles a database call that threw after an
+  // ambiguous network outcome: retrying the journal write is harmless; granting before it is not.
+  row.receipts = receipts;
+  if (inCurrentRow) templeBook.set(wallet, row);
+  if (!templeJournalPut(wallet, prepared)) throw new Error("Temple run journal could not retain PREPARE");
+  await saveTempleBookNow(true);
+  const issue = await templePersistEntitlement(wallet, prepared);
+  templeMaybeCrashForTest("entitlement");
+  const committed = templeCommitReceipt(prepared, issue);
+  const committedReceipts = receipts.map((r) => r.id === prepared.id ? committed : r);
+  row.receipts = committedReceipts;
+  if (inCurrentRow) templeBook.set(wallet, row);
+  if (!templeJournalPut(wallet, committed)) throw new Error("Temple run journal could not retain COMMIT");
+  try { await saveTempleBookNow(true); }
+  catch (e) {
+    // Persistence failed but the entitlement may be durable. Keep PREPARE in live memory so the next
+    // retry reconciles through own_book/asset_registry instead of treating an unjournalled card final.
+    row.receipts = receipts;
+    if (inCurrentRow) templeBook.set(wallet, row);
+    templeJournalPut(wallet, prepared);
+    throw e;
+  }
+  templeMaybeCrashForTest("commit");
+  return committed;
+}
+
+// A real persistence round trip used only by temple_loot_sim. It models a hard process loss: discard
+// all relevant in-memory maps, then rebuild them from the exact kv blobs the production boot reads.
+const _templeClone = (v) => (v === null || v === undefined) ? v : JSON.parse(JSON.stringify(v));
+export async function _templeRestartDurableForTest() {
+  await Promise.allSettled([Promise.resolve(_templeFlush), Promise.resolve(_ownFlush), Promise.resolve(_assetsFlush)]);
+  const [tv, ov, rv, lv] = await Promise.all([store.kvGet("world_temple"), store.kvGet("own_book"),
+    store.kvGet("asset_registry"), store.kvGet("asset_ledger")]);
+  if (_templeSaveTimer) { clearTimeout(_templeSaveTimer); _templeSaveTimer = null; }
+  templeBook.clear(); templeRunJournal.clear(); _lastTemple.clear(); _templeReady = false; _templeSavedAt = 0;
+  _clearOwnBook(); _ownReady = false; _ownDirty = false;
+  _clearAssetReg(); _clearAssetLedger(); _assetsReady = false; _assetsDirty = false;
+  const own = restoreOwnBook(_templeClone(ov));
+  const reg = restoreAssetReg(_templeClone(rv));
+  const ledger = restoreAssetLedger(_templeClone(lv)); _assetsReady = true;
+  const temple = restoreTempleBook(_templeClone(tv)); _templeReady = true;
+  _templeFlush = Promise.resolve(); _ownFlush = Promise.resolve(); _assetsFlush = null;
+  return { temple, own, reg, ledger };
+}
+
+app.post("/world/temple/purge", async (req, res) => {
   const b = req.body || {};
   // THE FLAG GATES THE WHOLE ROUTE and nothing below it runs. 200 with ok:false rather than a 4xx:
   // an unflipped flag is an operator state, not a client mistake, and the client must be able to
@@ -6759,56 +7131,149 @@ app.post("/world/temple/purge", (req, res) => {
   if (tok && !mktTokenOk(w, tok)) return res.status(401).json({ error: "sign in again — that market token is stale" });
   const proven = (!!tok && mktTokenOk(w, tok)) || verifyWalletSig(w, b.authMsg, b.authSig);
   if (b.authSig && !proven) return res.status(401).json({ error: "that signature does not prove this wallet" });
-  // ROUNDS ARE EXACTLY THREE — rejected, not clamped. A body claiming any other count is not
-  // describing this mini-game, and quietly rewriting it to 3 would pay for a shape we do not know.
+  // ROUNDS ARE EXACTLY FIVE — rejected, not clamped. A body claiming any other count is not
+  // describing this mini-game, and quietly rewriting it would pay for a shape we do not know.
   const rounds = templeInt(b.rounds);
   if (rounds !== TEMPLE_ROUNDS) return res.status(400).json({ error: `a purge is exactly ${TEMPLE_ROUNDS} rounds`, rounds: TEMPLE_ROUNDS });
   // ...and you cannot purify more sigils than were revealed. CLAMPED, not rejected: 0..rounds is the
   // only meaning the field has, and an over-count is the one thing an honest client could get wrong.
   const pRaw = templeInt(b.purified);
   const purified = Math.max(0, Math.min(rounds, pRaw === null ? 0 : pRaw));
-  const now = Date.now();
-  // ONE RUN PER TEMPLE_MIN_GAP_MS. The stamp is taken only by a run that is ACCEPTED below, so a
-  // refusal never consumes the window. This is also the REPLAY bound: a client re-posting the same
-  // run (lost reply, retry queue, or a copied curl) lands inside the gap and is paid nothing.
-  const last = _lastTemple.get(w) || 0;
-  if (now - last < TEMPLE_MIN_GAP_MS)
-    return res.status(429).json({ error: "the sigils are still cooling — pace yourself", retryInMs: TEMPLE_MIN_GAP_MS - (now - last) });
-  const day = templeDay(now);
-  const row = templeRead(w, day);
-  const resetMs = templeResetMs(now);
-  // THE RUN CEILING. Six runs at a 90 s pace is already well past an honest visit, so the seventh is
-  // paid nothing — but it is still answered 200 with the truth (`runsLeft:0`, `resetMs`), because the
-  // player really did play it and the client needs to say so rather than show a network error.
-  // `left` is "how much more $CHIKI today", and with no runs left the honest answer is 0 whatever the
-  // money ceiling still holds — the run that would have spent it can no longer be played.
-  if (row.runs >= TEMPLE_DAILY_RUNS) {
-    templeBook.set(w, row);
-    return res.json({ ok: true, chiki: 0, purified, capped: true, left: 0, runsLeft: 0, resetMs, reason: "daily_runs" });
+  // A run id is required for VALUE-bearing loot, but not for the legacy $CHIKI-only client. Validate
+  // only while the loot flag is live so flag-off behavior remains byte-for-byte compatible.
+  let runId = "";
+  if (TEMPLE_LOOT_ON && b.runId !== undefined && b.runId !== null && b.runId !== "") {
+    runId = templeRunId(b.runId);
+    if (!runId) return res.status(400).json({ error: "runId must be 8-64 URL-safe characters" });
   }
-  // THE MONEY CEILING, DEGRADED NOT REFUSED: pay whatever of the day's allowance is left.
-  const earned = purified * TEMPLE_CHIKI_PER;
-  const roomLeft = Math.max(0, TEMPLE_DAILY_CHIKI - row.chiki);
-  const chiki = Math.min(earned, roomLeft);
-  const capped = chiki < earned;
-  // BOOK BEFORE ANSWERING — the raid claim's rule: two requests racing the same allowance must not
-  // both be told the same money. The handler is synchronous to here, so they cannot interleave.
-  row.runs += 1;
-  row.chiki += chiki;
-  templeBook.set(w, row);
-  _lastTemple.set(w, now);
-  templeEvict(now);
-  saveTempleBook();
-  const left = Math.max(0, TEMPLE_DAILY_CHIKI - row.chiki);
-  const runsLeft = Math.max(0, TEMPLE_DAILY_RUNS - row.runs);
-  // One run N of day D per wallet is the natural key, so a retry that somehow reaches here records
-  // nothing. `val` is the $CHIKI, which is what makes this a VALUE event in the chronicle. The
-  // offering is recorded rather than debited: the satchel is in the client save, so the server
-  // cannot take the 3 essence — it is stated here as a KNOWN LIMIT, not implied to be enforced.
-  chronicleAdd("temple", w, { sub: `purge:${purified}/${rounds}`, qty: purified, val: chiki,
-    route: "/world/temple/purge", idem: `temple:${w}:${day}:${row.runs}`,
-    data: { purified, rounds, run: row.runs, capped, offering: TEMPLE_OFFERING, claim: !proven } });
-  res.json({ ok: true, chiki, purified, capped, left, runsLeft, resetMs });
+  try {
+    return await templeWalletSerial(w, async () => {
+      const now = Date.now();
+      const day = templeDay(now);
+      const row = templeRead(w, day);
+      const resetMs = templeResetMs(now);
+      let receipts = TEMPLE_LOOT_ON && runId ? templeReceiptList(row.receipts) : [];
+      // RECEIPT BEFORE PACE. A committed retry returns the exact card; PREPARE means a previous
+      // process died somewhere between journalling and the final reply, so reconcile it first.
+      if (TEMPLE_LOOT_ON && runId) {
+        templeJournalPrune(now);
+        const rowPrior = templeFindReceipt({ receipts }, runId);
+        const prior = rowPrior || templeJournalGet(w, runId);
+        if (prior) {
+          if (prior.rounds !== rounds || prior.purified !== purified)
+            return res.status(409).json({ error: "runId already belongs to a different purge result", runId });
+          if (prior.grantState === "prepared") {
+            // A prepared grant is not a bearer credential. Keep the durable intent private until its
+            // wallet owner proves control; the proved retry performs reconciliation below.
+            if (!proven) {
+              const hidden = templeReceiptReply(prior, now, true);
+              hidden.loot = null; hidden.lootReason = "identity_proof_required";
+              return res.json(hidden);
+            }
+            const committed = await templeFinalizePrepared(w, row, receipts, prior);
+            return res.json(templeReceiptReply(committed, now, true));
+          }
+          // Re-persist before answering. This is cheap on an ordinary restored replay and closes an
+          // ambiguous prior write failure where the committed row survived only in live memory.
+          if (rowPrior) { row.receipts = receipts; templeBook.set(w, row); }
+          if (!templeJournalPut(w, prior)) throw new Error("Temple run journal could not retain replay");
+          await saveTempleBookNow(true);
+          const replay = templeReceiptReply(prior, now, true);
+          if (replay.loot && !proven) { replay.loot = null; replay.lootReason = "identity_proof_required"; }
+          return res.json(replay);
+        }
+        if (templeRunJournal.size >= TEMPLE_JOURNAL_MAX)
+          return res.status(503).json({ error: "temple run journal is full; durable loot is paused", runId, loot: null });
+        if (receipts.length >= TEMPLE_RECEIPT_MAX)
+          return res.status(503).json({ error: "temple receipt book is full until UTC reset", runId, loot: null });
+      }
+      // ONE RUN PER TEMPLE_MIN_GAP_MS. The stamp is taken only by an accepted run below. Wallet
+      // serialization makes the check and stamp one critical section despite the later awaits.
+      const last = _lastTemple.get(w) || 0;
+      if (now - last < TEMPLE_MIN_GAP_MS)
+        return res.status(429).json({ error: "the sigils are still cooling — pace yourself", retryInMs: TEMPLE_MIN_GAP_MS - (now - last) });
+      if (row.runs >= TEMPLE_DAILY_RUNS) {
+        if (TEMPLE_LOOT_ON && runId) {
+          const receipt = templeReceiptSafe({ id: runId, at: now, rounds, purified,
+            result: { chiki: 0, capped: true, left: 0, runsLeft: 0, loot: null,
+              lootReason: "capped", reason: "daily_runs" } });
+          receipts.push(receipt); row.receipts = receipts; templeBook.set(w, row);
+          if (!templeJournalPut(w, receipt)) throw new Error("Temple run journal is full");
+          await saveTempleBookNow(true);
+          return res.json(templeReceiptReply(receipt, now, false));
+        }
+        templeBook.set(w, row);
+        const body = { ok: true, chiki: 0, purified, capped: true, left: 0, runsLeft: 0,
+          resetMs, reason: "daily_runs" };
+        if (TEMPLE_LOOT_ON) { body.runId = null; body.loot = null;
+          body.lootReason = "valid_run_id_required"; body.replay = false; }
+        return res.json(body);
+      }
+
+      // Preserve the shipped soft-$CHIKI arithmetic exactly. The only change below is its durability
+      // ordering when the loot protocol is enabled.
+      const earned = purified * TEMPLE_CHIKI_PER;
+      const roomLeft = Math.max(0, TEMPLE_DAILY_CHIKI - row.chiki);
+      const chiki = Math.min(earned, roomLeft);
+      const capped = chiki < earned;
+      row.runs += 1;
+      row.chiki += chiki;
+      const left = Math.max(0, TEMPLE_DAILY_CHIKI - row.chiki);
+      const runsLeft = Math.max(0, TEMPLE_DAILY_RUNS - row.runs);
+      let loot = null, lootReason = "", grant = null, receipt = null;
+      if (TEMPLE_LOOT_ON) {
+        if (!runId) lootReason = "valid_run_id_required";
+        else if (!proven) lootReason = "identity_proof_required";
+        else if (capped) lootReason = "capped";
+        else if (purified !== rounds) lootReason = "victory_required";
+        else ({ grant, lootReason } = templePlanLoot());
+        if (runId) {
+          const raw = { id: runId, at: now, rounds, purified,
+            result: { chiki, capped, left, runsLeft, loot: null, lootReason } };
+          if (grant) { raw.grantState = "prepared"; raw.grant = grant; raw.result.lootReason = ""; }
+          receipt = templeReceiptSafe(raw);
+          if (!receipt) throw new Error("Temple could not construct its run receipt");
+          receipts.push(receipt); row.receipts = receipts;
+          if (!templeJournalPut(w, receipt)) throw new Error("Temple run journal is full");
+        }
+      }
+      templeBook.set(w, row);
+      _lastTemple.set(w, now);
+      templeEvict(now);
+
+      if (TEMPLE_LOOT_ON) {
+        // PREPARE (and the daily counters beside it) is durable before an entitlement mutator runs.
+        await saveTempleBookNow(true);
+        if (receipt && receipt.grantState === "prepared") {
+          templeMaybeCrashForTest("prepare");
+          receipt = await templeFinalizePrepared(w, row, receipts, receipt);
+          loot = receipt.result.loot; lootReason = receipt.result.lootReason;
+        }
+      } else {
+        // Strictly preserve the old, flag-off path: no loot fields, no entitlement wait, same response.
+        saveTempleBook();
+      }
+
+      // One run N of day D per wallet is the natural key. This remains the existing soft-value event;
+      // the durable loot marker lives in the entitlement books, not in telemetry.
+      chronicleAdd("temple", w, { sub: `purge:${purified}/${rounds}`, qty: purified, val: chiki,
+        route: "/world/temple/purge", idem: `temple:${w}:${day}:${row.runs}`,
+        data: { purified, rounds, run: row.runs, runId: runId || undefined, capped,
+          offering: TEMPLE_OFFERING, claim: !proven, loot: loot ? loot.rewardKey : undefined } });
+      const body = { ok: true, chiki, purified, capped, left, runsLeft, resetMs };
+      if (TEMPLE_LOOT_ON) {
+        body.runId = runId || null; body.loot = loot; body.replay = false;
+        if (lootReason) body.lootReason = lootReason;
+      }
+      return res.json(body);
+    });
+  } catch (e) {
+    const why = String(e && (e.code || e.message) || "persistence failed");
+    if (e && e.code === "TEMPLE_TEST_CRASH") console.warn("temple:", why);
+    else console.error("temple: durable purge failed before reply:", why);
+    if (!res.headersSent) return res.status(503).json({ error: "temple reward persistence unavailable; retry this run",
+      runId: runId || null, retryable: true });
+  }
 });
 
 // What is left of today, for the wallet the caller names. Public in the same way /quest/state is
@@ -6824,7 +7289,7 @@ app.get("/world/temple/state", (req, res) => {
   const row = templeRead(w, templeDay(now));
   // Flag off: nothing is claimable, so the allowances read 0 and `on:false` says why. The client
   // shows the temple without the reward line rather than promising a payout it will not get.
-  res.json({ on: TEMPLE_ON,
+  res.json({ on: TEMPLE_ON, lootOn: TEMPLE_ON && TEMPLE_LOOT_ON,
     runsLeft:  TEMPLE_ON ? Math.max(0, TEMPLE_DAILY_RUNS - row.runs) : 0,
     chikiLeft: TEMPLE_ON ? Math.max(0, TEMPLE_DAILY_CHIKI - row.chiki) : 0,
     resetMs: templeResetMs(now),
@@ -6933,16 +7398,40 @@ let _ownEnforce = true;                     // test-only switch (see _setOwnEnfo
 let _ownRefusals = 0, _ownSkipped = 0, _ownSnapshots = 0;
 const _ownWorst = new Map();                // wallet -> {short, item, asked, had} (bounded)
 const ownKey = (kind, item) => `${kind}:${item}`;
+const TEMPLE_OWN_MARKER_MAX = 128;           // > two full shipped Temple days; bounded per wallet
+function ownTempleMarkers(raw) {
+  const out = [], seen = new Set();
+  for (const value of (Array.isArray(raw) ? raw.slice(-TEMPLE_OWN_MARKER_MAX * 2) : [])) {
+    if (!value || typeof value !== "object") continue;
+    const id = templeRunId(value.id), day = Math.floor(Number(value.day)), sp = String(value.sp || "");
+    if (!id || !Number.isFinite(day) || day <= 0 || !FFISH_SET.has(sp)) continue;
+    const key = `${day}:${id}`;
+    if (seen.has(key)) continue;
+    seen.add(key); out.push({ id, day, sp });
+  }
+  return out.slice(-TEMPLE_OWN_MARKER_MAX);
+}
+function ownTempleLive(row, day = templeDay(Date.now())) {
+  return ownTempleMarkers(row && row.temple).some((m) => m.day === day);
+}
 function _ownRow(w) {
   let r = ownBook.get(w);
   if (r) return r;
   if (ownBook.size >= GATHER_WALLETS_MAX) {   // same evict-oldest policy as every per-wallet map here
     let drop = Math.max(1, Math.floor(GATHER_WALLETS_MAX * 0.05));
-    for (const k of ownBook.keys()) { if (drop-- <= 0) break; ownBook.delete(k); }
+    // A current-day Temple marker is an entitlement receipt. Evicting it can make a retry credit the
+    // same fish again, so only unprotected rows are candidates. If every row is protected, grow until
+    // UTC rollover rather than trade a memory bound for duplicate value.
+    for (const [k, value] of ownBook) {
+      if (drop <= 0) break;
+      if (ownTempleLive(value)) continue;
+      ownBook.delete(k); drop--;
+    }
   }
   r = { open: Object.create(null), cred: Object.create(null), sold: Object.create(null), used: Object.create(null), openSrc: 0,
         ffishOpenSrc: 0,                           // the fish flip's own once-marker (see OWN_FFISH_EPOCH_MS)
-        base: Object.create(null), baseSrc: 0 };   // Step 7: the save-path grandfather baseline (see matSaveBaseline)
+        base: Object.create(null), baseSrc: 0,     // Step 7: the save-path grandfather baseline (see matSaveBaseline)
+        temple: [] };                              // durable runId->fish markers; same row as cred
   ownBook.set(w, r);
   return r;
 }
@@ -6963,6 +7452,22 @@ function ownCredit(wallet, kind, item, n) {
   // The economy-flow aggregates ride the acquisition book's own mutators — the exact numbers
   // enforcement reads, at the only lines that move them. Counters only; never a raw row.
   if (CHRONICLE_ON) chronicleBump(w, "credit:" + k, q);
+}
+// Idempotent Temple fish credit. The marker and count are mutated synchronously in one ownBook row
+// and persisted together by saveOwnBookNow; a crash can therefore restore both or neither.
+function ownTempleCredit(wallet, runId, at, species) {
+  const w = String(wallet || ""), id = templeRunId(runId), day = templeDay(Number(at));
+  if (!isPubkey(w) || !id || !Number.isFinite(day) || day <= 0 || !FFISH_SET.has(species))
+    return { ok: false, already: false };
+  const r = _ownRow(w);
+  r.temple = ownTempleMarkers(r.temple);
+  const prior = r.temple.find((m) => m.id === id && m.day === day);
+  if (prior) return { ok: prior.sp === species, already: true };
+  ownCredit(w, "ffish", species, 1);
+  r.temple.push({ id, day, sp: species });
+  r.temple = ownTempleMarkers(r.temple);
+  _ownDirty = true;
+  return { ok: true, already: false };
 }
 // Record a completed SALE against the seller's lifetime total.
 function ownSold(wallet, kind, item, n) {
@@ -15244,19 +15749,36 @@ let _assetsReady = false;
 // asset the player paid fantasy fish for, gone, on a GRACEFUL shutdown.
 let _assetsFlush = null;
 async function saveAssetLedger(strict = false) {
-  if (_assetsFlush) return _assetsFlush;          // re-entry joins the write already running
-  if (!_assetsDirty || !_assetsReady) return;
+  // Join an older pass, then CHECK THE DIRTY TAIL AGAIN. The old early return let a Temple mint that
+  // happened behind someone else's in-flight write await that OLD snapshot and answer 200 while its
+  // own egg still existed only in RAM.
+  while (_assetsFlush) {
+    try { await _assetsFlush; }
+    catch (e) { if (strict) throw e; else return; }
+  }
+  if (!_assetsReady) {
+    if (strict) throw new Error("asset registry restore has not landed");
+    return;
+  }
+  if (!_assetsDirty) return;
   _assetsDirty = false;
-  _assetsFlush = (async () => {
-    try {
-      // The REGISTRY goes first. It holds minted assets that exist nowhere else — losing a row
-      // destroys a player's property, which the ledger (a derived record) can never do.
-      await store.kvSet("asset_registry", serializeAssetReg());
-      await store.kvSet("asset_ledger", serializeAssetLedger());
-    } catch (e) { _assetsDirty = true; if (strict) throw e; }          // a failed write must not silently drop the record
-    finally { _assetsFlush = null; }
+  const run = (async () => {
+    // The REGISTRY goes first. It holds minted assets that exist nowhere else — losing a row
+    // destroys a player's property, which the ledger (a derived record) can never do.
+    await store.kvSet("asset_registry", serializeAssetReg());
+    await store.kvSet("asset_ledger", serializeAssetLedger());
   })();
-  return _assetsFlush;
+  _assetsFlush = run;
+  try { await run; }
+  catch (e) {
+    _assetsDirty = true;
+    if (strict) throw e;
+    console.warn("asset ledger persist failed:", String(e?.message || e));
+  } finally {
+    if (_assetsFlush === run) _assetsFlush = null;
+  }
+  // A strict value path drains mutations that arrived during this pass before it may answer.
+  if (strict && _assetsDirty) return saveAssetLedger(true);
 }
 // A crash is the same loss as a kill. There is an unhandledRejection handler already; without this
 // an uncaught throw takes up to a full flush interval of minted assets with it.
@@ -16981,11 +17503,32 @@ function _capAuctions() {
   return marketAuctions.slice(-AUCTION_PERSIST_MAX);
 }
 function serializeOwnBook() {
-  const out = [];
-  for (const [w, r] of ownBook) out.push([w, { open: r.open, cred: r.cred, sold: r.sold, used: r.used, openSrc: r.openSrc || 0,
-                                               ffishOpenSrc: r.ffishOpenSrc || 0,
-                                               base: r.base || {}, baseSrc: r.baseSrc || 0 }]);
-  return out.slice(-GATHER_WALLETS_MAX);
+  const protectedRows = [], rest = [];
+  for (const [w, r] of ownBook) {
+    const body = { open: r.open, cred: r.cred, sold: r.sold, used: r.used, openSrc: r.openSrc || 0,
+      ffishOpenSrc: r.ffishOpenSrc || 0, base: r.base || {}, baseSrc: r.baseSrc || 0 };
+    const markers = ownTempleMarkers(r.temple);
+    if (markers.length) body.temple = markers;         // additive; flag-off/legacy rows stay byte-shaped as before
+    const entry = [w, body];
+    (ownTempleLive(r) ? protectedRows : rest).push(entry);
+  }
+  // Never truncate a current-day idempotency marker. In the pathological all-protected case the blob
+  // may temporarily exceed the ordinary wallet cap; that is safer than persisting a duplicate-fish
+  // opening, and every marker ages out of protection at UTC rollover.
+  const room = Math.max(0, GATHER_WALLETS_MAX - protectedRows.length);
+  return protectedRows.concat(room ? rest.slice(-room) : []);
+}
+let _ownFlush = Promise.resolve();
+function saveOwnBookNow(strict = false) {
+  if (!_ownReady) {
+    const e = new Error("own_book restore has not landed; refusing to overwrite entitlement state");
+    return strict ? Promise.reject(e) : Promise.resolve();
+  }
+  // Serialize at execution time, not call time: an older queued market snapshot can never land after
+  // and erase a Temple marker that a newer request already persisted.
+  const run = _ownFlush.catch(() => {}).then(() => store.kvSet("own_book", serializeOwnBook()));
+  _ownFlush = run;
+  return strict ? run : run.catch(e => console.warn("own_book persist failed:", String(e?.message || e)));
 }
 // RESTORE TRUSTS NOTHING. This blob came out of a database a future bug could corrupt, and it now
 // carries SELLING RIGHTS, so it gets the same rules the live paths enforce: keys must be a real kind
@@ -17001,7 +17544,7 @@ export function restoreOwnBook(v) {
     if (!isPubkey(w)) continue;
     const r = { open: Object.create(null), cred: Object.create(null), sold: Object.create(null), used: Object.create(null), openSrc: 0,
                 ffishOpenSrc: 0,
-                base: Object.create(null), baseSrc: 0 };
+                base: Object.create(null), baseSrc: 0, temple: ownTempleMarkers(e[1].temple) };
     for (const bucket of ["open", "cred", "sold", "used"]) {
       const src = e[1][bucket];
       if (!src || typeof src !== "object") continue;
@@ -17140,7 +17683,7 @@ async function saveMarket(strict = false) {
   if (!_mktReady) await _mktRestore;          // never persist the empty boot state over a live board
   if (!_mktReady) {
     // restore never landed: persist ONLY what is not at risk of erasing player value
-    try { await store.kvSet("own_book", serializeOwnBook()); } catch (e) { if (strict) throw e; }
+    try { await saveOwnBookNow(strict); } catch (e) { if (strict) throw e; }
     console.error("saveMarket: market collections NOT persisted (restore incomplete) — refusing to overwrite the board with an empty one");
     return;
   }
@@ -17166,7 +17709,7 @@ async function saveMarket(strict = false) {
       // THE BOOK RIDES WITH THE BOARD. Escrow is derived from marketListings, so a book persisted on a
       // different schedule than the listings it is read against would restore inconsistent. /market/op
       // awaits this on every op, including list.
-      store.kvSet("own_book", serializeOwnBook()),
+      saveOwnBookNow(strict),
     ]);
     _mktLastPersisted = _boardOut;   // what is actually in the database now — the backup compares to this
   } catch (e) { console.warn("saveMarket persist failed:", String(e?.message || e)); if (strict) throw e; }
