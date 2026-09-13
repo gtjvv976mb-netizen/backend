@@ -1,0 +1,13 @@
+{
+  "activation_authorized": false,
+  "checks": 372,
+  "elapsed_seconds": 2.5117794170510024,
+  "failures": [],
+  "fixture_sha256": "e52721e263f70771f8a46537c91cfb2b4228fcefbd5866d1bcd11aa0effde8d2",
+  "input_sha256": "ff3dc460edd66adf1fe2b00bb8e727117f93eb9fb922692db9d12bfb8bf178d7",
+  "max_travel_delta_m": 9.1335990992647e-09,
+  "oracle": "original48-prefix exact concave segment distance; no analytic helpers for expected first contact",
+  "reference_arena_sha256": "1090165d2174ca45602970251c9340d8e34ef3e05778b0d5bf7ee8dfbaed557b",
+  "schema": "chikiseum.full-floor-analytic-prefix-oracle/v1",
+  "sweep_count": 124
+}

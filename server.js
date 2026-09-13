@@ -16,6 +16,8 @@ import { createMatch as pvpCreate, submit as pvpSubmit, tick as pvpTick, viewFor
 import { getAssociatedTokenAddressSync, createTransferCheckedInstruction, createAssociatedTokenAccountIdempotentInstruction, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";   // $CHIKI quest-reward payouts ($CHIKI is TOKEN-2022 — the legacy program rejects its accounts with InvalidAccountData)
 import { loadTerrain, terrainInfo, terrainReady, surfaceHeight, SEA } from "./world_terrain.js";     // the island heightfield — the server's copy of the floor
 import * as PhysMod from "./world_physics.js";                     // server-side movement simulation (CHIK_PHYS=1; OFF by default)
+import { installChikiseumLive } from "./chikiseum-live-service.js";
+import { acquireChikiseumLease } from "./chikiseum-live-lease.js";
 
 dotenv.config();
 const {
@@ -399,6 +401,7 @@ function pgStore() {
   });
   return {
     kind: "postgres",
+    async chikiseumLease() { return acquireChikiseumLease(pool); },
     async ping() { await pool.query("SELECT 1 FROM players LIMIT 0"); return true; },
     async init() {
       await pool.query(`
@@ -18932,6 +18935,7 @@ async function flushDurableState() {
   // Ownership and the market are one save because escrow is derived from the board. The asset
   // ledger first joins any write already in flight, then performs one final dirty pass.
   const jobs = [
+    ["Chikiseum free PvP", () => chikiseumLive.stop()],
     // CHIK_SYNC_RT: a coalesced /profile payload waiting for its 600ms window must not be the write
     // a deploy forgets — drain the pending slots FIRST (they are the newest player state we hold).
     ["pending saves", () => flushAllPendingSaves(true)],
@@ -19016,7 +19020,46 @@ async function gracefulShutdown(sig, httpServer) {
 
 // Open the port FIRST so Render detects it immediately (no "No open ports" timeout on a cold DB),
 // then initialize the DB in the background (errors logged, not fatal — the server stays up and recovers).
-const httpServer = app.listen(Number(PORT), () => {
+// NEW namespace only: never reuse the legacy asserted-wallet/private-hand PvP contract.
+// A proven /verify session and the authoritative active asset registry are required EVERY time.
+// Free PvP has its own durable XP book; it never reads client-authored MMO levels or pays funds.
+const chikiseumLive = installChikiseumLive(app, {
+  enabled: process.env.CHIKISEUM_LIVE_ENABLED === "1",
+  available: () => !_draining && _assetsReady && _ownReady
+    && !(_rosterGuard.tripped && ROSTER_GUARD_MODE === "refuse"),
+  authenticate: (body) => {
+    const wallet = mktWallet(body);
+    if (!wallet || bannedWallets.has(wallet) || typeof body.sessionId !== "string"
+      || !body.sessionId || liveSession.get(wallet)?.sid !== body.sessionId
+      || !Number.isSafeInteger(body.sessionEpoch) || body.sessionEpoch < 0
+      || (syncRtOn() ? body.sessionEpoch !== (sessionEpoch.get(wallet) || 0) : body.sessionEpoch !== 0)) return null;
+    return { wallet, session_id: body.sessionId, epoch: body.sessionEpoch, handle: "Chiki " + wallet.slice(0, 5) };
+  },
+  ownedAssets: (wallet) => {
+    if (!_assetsReady) return null;
+    return regOwned(wallet, "chikimon").slice(0, 400).map(row => {
+      const canonical = chikiseumLive.engine?.species.get(row.sp)?.[0];
+      const clean = row.owner === wallet && row.state === "active" && ORIGIN_CLEAN.has(row.origin)
+        && canonical && canonical.class === row.kind && (row.gameStatus ?? "good") === "good";
+      const escrow = row.listedOffchain || row.pendingHandover || row.mintPending || _nftBoardListed(row);
+      return { asset_id: row.id, species: row.sp, display_name: canonical?.display_name || row.sp,
+        rarity: canonical?.class || row.kind, eligible: !!clean && !escrow,
+        reason: !clean ? "This creature's ownership record needs review." : escrow ? "This creature is listed or transferring." : "" };
+    });
+  },
+  leaseFactory: async () => store.kind === "postgres" ? store.chikiseumLease() : null,
+});
+
+// Local server integration tests use real signature sessions and server-issued registry records.
+// This is a module-only seam, NOT an endpoint or an environment/client ownership bypass.
+export function _chikiseumServiceForTest() {
+  if (NETWORK !== "devnet" || DATABASE_URL || process.env.RENDER || !/^http:\/\/(127\.0\.0\.1|localhost):/.test(RPC_URL || ""))
+    throw new Error("Local isolated server fixture required");
+  return chikiseumLive;
+}
+
+// Optional loopback binding for isolated local fixtures. Production keeps its existing host.
+const httpServer = app.listen(Number(PORT), process.env.BIND_HOST || undefined, () => {
   console.log(`Chiki backend v2 on :${PORT} · ${NETWORK} · store=${store.kind} · treasury ${treasury.publicKey.toBase58()}`);
   console.log(`verifyHolders=${verifyOn} · holdMin=${MIN_HOLD_MINUTES} · dailyCap=${DAILY_FRAC>=1?"none":Math.round(DAILY_FRAC*100)+"% pool/day"} · perWallet=${WALLET_DAILY} SOL`);
 });
@@ -19027,6 +19070,7 @@ store.init()
   .then(()=>loadCupState())
   .then(()=>console.log(`cup state loaded (public=${cupPublic}, owed prizes=${cupPrizes.size})`))
   .catch(e=>console.error("store.init failed:", e?.message||e));
+chikiseumLive.start();
 
 // The guard runs the moment the database is reachable — before the first player can be handed an
 // empty profile — and then on a slow timer, so an in-place wipe of a database we are already on is

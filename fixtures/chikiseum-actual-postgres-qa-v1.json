@@ -1,0 +1,60 @@
+{
+  "schema": "chikiseum.actual-local-postgres-qa/v1",
+  "production_calls": false,
+  "production_credentials": false,
+  "public_test": false,
+  "activation_authorized": false,
+  "host": "127.0.0.1",
+  "port": 54481,
+  "database": "chikiseum_lease_qa",
+  "authentication": "isolated local trust only",
+  "created_fresh_database": true,
+  "database_left_for_root_cleanup": true,
+  "postgresql_version": "PostgreSQL 17.10 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.1.1.101), 64-bit",
+  "passed": 7,
+  "failed": 0,
+  "node_test_count_including_parent": 8,
+  "tests": [
+    "two independent actual PG pools cannot both own the advisory arena lock",
+    "real canonical completed combat XP persists atomically and restores exactly once",
+    "concurrent observer reads see whole JSON versions, never partial UPSERT state",
+    "terminating only the owned dedicated PG PID invalidates stale lease and lets a new worker claim",
+    "real PG statement rejection preserves previous JSON and invalidates the writer",
+    "actual database stays unchanged when the 32MiB client write guard rejects a payload",
+    "128 compact full-cache checkpoints persist with headroom and restore as cancelled without XP"
+  ],
+  "measurements": {
+    "concurrent_claim_ms": 2.3597079999999977,
+    "completed_store_write_ms": 0.8555409999999881,
+    "real_combat_elapsed_seconds": 48.399999999999636,
+    "completion_xp_per_player": 22,
+    "completed_store_bytes": 8954,
+    "atomic_observer_reads": 25,
+    "atomic_distinct_versions": 21,
+    "terminated_owned_pid": 30133,
+    "loss_to_reclaim_ms": 9.203292000000033,
+    "compact_write_ms": 15.647041999999942,
+    "compact_checkpoint_bytes": 716231,
+    "compact_store_bytes": 716369,
+    "compact_jsonb_bytes": 339515,
+    "capacity_matches": 128,
+    "capacity_cancelled_on_restart": 128,
+    "capacity_fake_completions": 0
+  },
+  "source_sha256": {
+    "chikiseum-live-lease.js": "505599164d2f18d3cd45bcb1553ebe7d3a9adb26da20bd35cd86fe97097e9a7a",
+    "chikiseum-live-service.js": "fc2d1f895c52c769e7ebac94a8c34dfb18a724ffa6106fac3a1f6b61676ab4fc",
+    "chikiseum-live-engine.js": "ce43dcb856893b20793d970de894b9c1f8d5792e95fc9b9115839fb1c49a9d85",
+    "chikiseum-live-progression.js": "d265d7a2258a6063fea4c78502978ef023b56b5111eb6d553ec06f7b9ec789c6",
+    "chikiseum-live-navigation.js": "9470884e073740d1f2410ab7d55b5079f7beaa897c7ed37b5b8352ddeeb423c9",
+    "chikiseum-live-real-postgres.test.js": "878e9add5529099f9686feefc2fda3c636eb810a29837aa221df74a1c981cb05"
+  },
+  "combat_fixture": "actual canonical engine casts and exact navigation; synthetic trusted admissions; no injected HP, positions, metrics or completions",
+  "capacity_fixture": "128 actual engine matches with synthetic maximum-size transient request/event caches; unchanged runtime; no fabricated completed fights or XP",
+  "duration_ms": 633.239,
+  "remaining_scope": [
+    "signed-wallet HTTP integration is a separate gate",
+    "local trust PostgreSQL tests are not production PostgreSQL connectivity/failover proof",
+    "compact active-match headroom does not prove maximum historical asset/receipt-book capacity or production concurrent throughput"
+  ]
+}

@@ -1,0 +1,50 @@
+{
+  "schema": "chikiseum.service-adversarial-qa/v1",
+  "activation_authorized": false,
+  "deployed": false,
+  "production_calls": false,
+  "production_auth_verified": false,
+  "authentication_fixture": "synthetic trusted callbacks, no credential minting",
+  "ownership_fixture": "synthetic trusted asset registry callbacks",
+  "combat_fixture": "real canonical engine and exact hash-bound navigation; actual card casts; no HP, position, metrics or completion injection",
+  "durable_lease_fixture": "in-memory faulting lease and fake PostgreSQL protocol client",
+  "real_http": "temporary 127.0.0.1 Express listener",
+  "tests": 27,
+  "passed": 27,
+  "failed": 0,
+  "service_adversarial_tests": 15,
+  "lease_adversarial_tests": 7,
+  "existing_progression_tests": 5,
+  "source_sha256": {
+    "chikiseum-live-service.js": "72d51ac2c106b3fffcac9672b33624be4a98ac01829e5c0289edaa866e27dd86",
+    "chikiseum-live-progression.js": "d265d7a2258a6063fea4c78502978ef023b56b5111eb6d553ec06f7b9ec789c6",
+    "chikiseum-live-lease.js": "505599164d2f18d3cd45bcb1553ebe7d3a9adb26da20bd35cd86fe97097e9a7a",
+    "chikiseum-live-engine.js": "ce43dcb856893b20793d970de894b9c1f8d5792e95fc9b9115839fb1c49a9d85",
+    "chikiseum-live-navigation.js": "9470884e073740d1f2410ab7d55b5079f7beaa897c7ed37b5b8352ddeeb423c9",
+    "chikiseum-live-service-adversarial.test.js": "59d0769a78dc75d8857d8424a39b931a942695eb1b27f678731b45c750b098a4",
+    "chikiseum-live-lease-adversarial.test.js": "12eb2068e6f698fde243d27eef8d52c37bdddb1486b426214836166ab0d32681"
+  },
+  "verified": [
+    "HTTP origin and content-type gates; rejected client stat fields; bounded private error bodies",
+    "authentication and current ownership rechecked after serial queue wait",
+    "foreign match views denied; auth tokens/session secrets omitted from wire and durable checkpoint",
+    "20 concurrent identical cast retries reserve exactly one canonical cast and echo exact caller ACK",
+    "failed durable completion write installs no XP and retains completion drain until successful retry",
+    "ambiguous committed write plus restart gives XP exactly once with no attack replay",
+    "actual earned level7-to8/card-tier0-to1 upgrade applies only to the next battle",
+    "shutdown write failure still releases exclusive lease",
+    "expired engine admissions pruned from service audit memory on next one-second audit",
+    "lost lease clears internal ready; five-second boot retry backoff; serial capacity128",
+    "corrupt durable awards and reserved prototype identifiers fail closed",
+    "fake PostgreSQL second worker denied; same connection lock/read/write; exact arena KV key",
+    "PG query/event/acquisition faults invalidate authority and destroy connection once",
+    "connection end during acquisition cannot resurrect valid lease",
+    "32MiB persistence size bound rejects oversized write before DB mutation",
+    "daily wallet and opponent-pair reward caps persist across progression books"
+  ],
+  "remaining_scope": [
+    "real signed-wallet/server-issued-asset HTTP integration is a separate agent gate",
+    "real PostgreSQL failover/concurrent production load is not simulated protocol proof",
+    "persistence headroom under maximum legal concurrent match traffic remains a separate capacity gate"
+  ]
+}
