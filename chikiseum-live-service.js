@@ -65,6 +65,7 @@ export class ChikiseumLiveService {
         throw new Error('Invalid durable PvP state');
       this.book = new ChikiseumProgressBook(saved?.progression ?? null);
       this.engine = this.engineFactory();
+      if (this.rehearsalEnabled === false) this.engine.rehearsal = false;
       if (saved) this.engine.restore(saved.engine); // Pending matches become cancelled, never completed/awarded.
       this.bindings = { catalogue_sha256: this.engine.catalogue_sha256, arena: clone(this.engine.arena), ...ART_BINDING };
       await this.flush(true);

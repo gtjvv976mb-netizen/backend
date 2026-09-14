@@ -95,6 +95,12 @@ export class ChikiseumLiveEngine {
     this.terminalTTL = finite(terminalTTL, 30, 3600, 'terminal TTL');
     this.admissions = new Map(); this.accounts = new Map(); this.assets = new Map();
     this.matches = new Map(); this.leases = new Map(); this.queueEntries = new Map(); this.challenges = new Map(); this.completions = new Map();
+    // REHEARSAL — an explicitly-labelled practice opponent. It is offered in the lobby ONLY and is
+    // never placed in the matchmaking queue, so "no AI is filling the queue" stays literally true:
+    // a player who queues is still only ever paired with a human. A rehearsal match records NO
+    // completion, so it awards no battle XP and cannot be farmed for levels, and it is excluded
+    // from the durable checkpoint because its opponent does not survive a restart.
+    this.rehearsal = true; this.rehearsalIds = new Set();
     this.closed = false; this.lastClock = -Infinity;
   }
 
@@ -131,6 +137,67 @@ export class ChikiseumLiveEngine {
       expires_at: admission.expires_at, fighter: copy(fighter), handle,
       catalogue_sha256: this.catalogue_sha256, arena: copy(this.arena), level_source: 'server_earned_pvp' };
   }
+  static REHEARSAL_HANDLE = 'Training Dummy (AI)';
+  isRehearsal(id) { return this.rehearsalIds.has(id); }
+  _rehearsalMatch(m) { return m.players.some(p => this.rehearsalIds.has(p.trainer_id)); }
+  // One partner per trainer, mirroring their fighter exactly. Mirroring is not flavour: compatible()
+  // demands the same card tier, a level within 3 and an identical slot count, so a single shared bot
+  // could never be challengeable by everyone.
+  rehearsalPartner(memberId) {
+    if (!this.rehearsal) return null;
+    const me = this.admissions.get(memberId); if (!me) return null;
+    const botId = 'ai-' + memberId, now = this._now();
+    let bot = this.admissions.get(botId);
+    if (bot && !this.leases.has(botId)
+      && (bot.fighter.species !== me.fighter.species || bot.fighter.level !== me.fighter.level)) {
+      this._removeAdmission(botId); bot = null;   // they swapped fighters — re-mirror
+    }
+    if (!bot) {
+      if (this.admissions.size >= this.maxAdmissions) return null;
+      const fighter = copy(me.fighter);
+      fighter.asset_id = 'rehearsal-' + memberId;
+      bot = { id: botId, wallet: 'rehearsal:' + memberId, asset_id: fighter.asset_id,
+        handle: ChikiseumLiveEngine.REHEARSAL_HANDLE, fighter, expires_at: now + this.sessionTTL, last_seen: now };
+      this.admissions.set(botId, bot); this.accounts.set(bot.wallet, botId); this.assets.set(bot.asset_id, botId);
+      this.rehearsalIds.add(botId);
+    }
+    bot.last_seen = now; bot.expires_at = now + this.sessionTTL;
+    return bot;
+  }
+  // Drives every rehearsal fighter one step. Runs through the SAME public cast/move API a human
+  // uses, so the bot is bound by energy, cooldowns, the global cooldown and the movement cadence
+  // exactly as a player is — it cannot do anything a player could not. Every action is best-effort:
+  // a rejected cast (cooling down, no energy) must never disturb the tick for real matches.
+  _driveRehearsal() {
+    if (!this.rehearsal || this.rehearsalIds.size === 0) return;
+    for (const botId of [...this.rehearsalIds]) {
+      try {
+        if (!this.admissions.has(botId)) { this.rehearsalIds.delete(botId); continue; }
+        const ownerId = botId.slice(3), owner = this.admissions.get(ownerId);
+        if (!this.leases.has(botId) && (!owner || owner.expires_at <= this._now())) { this._removeAdmission(botId); continue; }
+        const mid = this.leases.get(botId); if (!mid) continue;
+        const m = this.matches.get(mid); if (!m || m.status !== 'active') continue;
+        const self = m.players.find(x => x.trainer_id === botId);
+        const foe = m.players.find(x => x.trainer_id !== botId);
+        if (!self || !foe || self.hp <= 0 || foe.hp <= 0) continue;
+        const now = this._now();
+        // Close to roughly mid-range, then hold: walking onto the opponent is not a strategy.
+        const dx = foe.position.x - self.position.x, dz = foe.position.z - self.position.z;
+        const gap = Math.hypot(dx, dz);
+        if (gap > 4.5) { try { this.move(botId, mid, dx / gap, dz / gap, opaque()); } catch {} }
+        else if (gap < 2.2) { try { this.move(botId, mid, -dx / gap, -dz / gap, opaque()); } catch {} }
+        if (now < m.global_cooldowns[self.side] - 1e-9) continue;
+        // Cheapest ready card that it can actually pay for, preferring one that reaches the target.
+        const ready = self.slots
+          .map(slot => ({ slot, card: this.cards.get(`${self.species}:${slot}`) }))
+          .filter(({ slot, card }) => now >= (m.cooldowns[self.side][slot] ?? 0) - 1e-9
+            && card.mechanics.cost <= self.energy + 1e-9)
+          .sort((a, b) => (b.card.radius >= gap) - (a.card.radius >= gap)
+            || a.card.mechanics.cost - b.card.mechanics.cost || a.slot - b.slot);
+        if (ready.length) { try { this.cast(botId, mid, ready[0].slot, opaque()); } catch {} }
+      } catch { /* one bot never breaks the tick for everyone else */ }
+    }
+  }
   _member(id) {
     this._guard(); const p = this.admissions.get(id);
     if (!p || p.expires_at <= this._now()) fail('Current verified admission required', 'ADMISSION_EXPIRED', 401);
@@ -144,7 +211,7 @@ export class ChikiseumLiveEngine {
   }
   _available(p) { if (this.leases.has(p.id)) fail('Trainer already matched', 'ACCOUNT_BUSY', 409); }
   lobby(id) {
-    this.expire(); const me = this._member(id), now = this._now();
+    this.expire(); const me = this._member(id); this.rehearsalPartner(id); const now = this._now();
     const peers = [...this.admissions.values()].filter(p => p.id !== id && !this.leases.has(p.id) && now - p.last_seen <= 45)
       .sort((a, b) => b.last_seen - a.last_seen || a.id.localeCompare(b.id)).slice(0, 50);
     return { schema: 'chikiseum.live-lobby/v1', ...this._flags(), match_id: this.leases.get(id) ?? null,
@@ -164,6 +231,8 @@ export class ChikiseumLiveEngine {
     const duplicate = [...this.challenges.values()].find(c => c.sender === id && c.target === targetId);
     if (duplicate) return { ...this._flags(), challenge_id: duplicate.id };
     if ([...this.challenges.values()].filter(c => c.sender === id).length >= 4 || this.challenges.size >= this.maxAdmissions * 4) fail('Challenge limit reached', 'RATE_LIMIT', 429);
+    // The dummy has nobody to press accept for it, so challenging it starts the match at once.
+    if (this.rehearsalIds.has(peer.id)) return { ...this._flags(), challenge_id: opaque(), match_id: this._newMatch(peer, me) };
     const cid = opaque(); this.challenges.set(cid, { id: cid, sender: id, target: targetId, expires: this._now() + 30 });
     return { ...this._flags(), challenge_id: cid };
   }
@@ -187,6 +256,7 @@ export class ChikiseumLiveEngine {
     for (const [side, member] of [['A', a], ['B', b]]) {
       m.players.push({ ...copy(member.fighter), side, trainer_id: member.id, handle: member.handle,
         hp: member.fighter.max_hp, energy: 3, statuses: {}, ready: false, position: this.navigation.actorHome(side) });
+      if (this.rehearsalIds.has(member.id)) m.players.at(-1).ready = true;   // nobody presses ready for it
       m.identities[side] = { id: member.id, wallet: member.wallet, asset_id: member.asset_id };
       this.leases.set(member.id, id); this.queueEntries.delete(member.id); this._removeChallenges(member.id);
     }
@@ -372,7 +442,9 @@ export class ChikiseumLiveEngine {
     for (const p of m.players) { for (const [name, old] of Object.entries(p.statuses)) this._endStatus(m, p, name, old); p.statuses = {}; this.leases.delete(p.trainer_id); }
     m.status = status; m.winner = winner; m.deadline = null; m.revision++;
     this._event(m, m.players[0], 'finish', null, { winner, reason: status });
-    if (status === 'finished' && m.started_at !== null) this.completions.set(m.match_id, {
+    // A rehearsal records no completion at all: that is the whole of "practice awards nothing".
+    // Battle levels stay server-earned against real opponents and cannot be ground out on a dummy.
+    if (status === 'finished' && m.started_at !== null && !this._rehearsalMatch(m)) this.completions.set(m.match_id, {
       schema: 'chikiseum.live-completion/v1', match_id: m.match_id, status, winner,
       started_at: m.started_at, completed_at: m.completed_at, catalogue_sha256: this.catalogue_sha256,
       arena_sha256: this.arena.reference_plan_sha256, players: m.players.map(p => ({ ...m.identities[p.side],
@@ -384,6 +456,8 @@ export class ChikiseumLiveEngine {
     if (this.accounts.get(p.wallet) === id) this.accounts.delete(p.wallet);
     if (this.assets.get(p.asset_id) === id) this.assets.delete(p.asset_id);
     this.admissions.delete(id); this.queueEntries.delete(id); this._removeChallenges(id);
+    if (this.rehearsalIds.delete(id)) return;   // it WAS the dummy; nothing further to cascade
+    if (this.admissions.has('ai-' + id)) this._removeAdmission('ai-' + id);   // take its owner's dummy with it
   }
   revoke(id) {
     const mid = this.leases.get(id), m = this.matches.get(mid);
@@ -396,7 +470,7 @@ export class ChikiseumLiveEngine {
     if (mid) { const [m, p] = this._load(id, mid); if (ACTIVE.has(m.status)) this._finish(m, m.status === 'ready' ? 'cancelled' : 'forfeit', m.status === 'ready' ? null : opposite(p.side)); }
     this.queueEntries.delete(id); this._removeChallenges(id); return { ...this._flags(), cancelled: true };
   }
-  tick() { this.expire(); }
+  tick() { this._driveRehearsal(); this.expire(); }
   expire() {
     this._guard(); const now = this._now();
     for (const [cid, c] of this.challenges) if (c.expires <= now) this.challenges.delete(cid);
@@ -429,7 +503,7 @@ export class ChikiseumLiveEngine {
   checkpoint() {
     return { schema: 'chikiseum.live-checkpoint/v1', catalogue_sha256: this.catalogue_sha256,
       arena_sha256: this.arena.reference_plan_sha256, restart_policy: 'cancel_unfinished',
-      completions: [...this.completions.values()].map(copy), matches: [...this.matches.values()].map(m => {
+      completions: [...this.completions.values()].map(copy), matches: [...this.matches.values()].filter(m => !this._rehearsalMatch(m)).map(m => {
         // No command can replay after restart without a NEW verified admission.
         // Restore cancels unfinished matches, so transient ACK/pending-cast data
         // is deliberately not durable. Do not clone huge runtime maps first.
