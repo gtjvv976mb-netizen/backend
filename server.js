@@ -19019,6 +19019,9 @@ const chikiseumLive = installChikiseumLive(app, {
   },
   leaseFactory: async () => store.kind === "postgres" ? store.chikiseumLease() : null,
 });
+// Rehearsal: a clearly-labelled practice opponent, offered in the lobby only and never in the
+// matchmaking queue, awarding no battle XP. Set CHIK_REHEARSAL=off to withdraw it entirely.
+chikiseumLive.rehearsalEnabled = String(process.env.CHIK_REHEARSAL || "on").toLowerCase() !== "off";
 
 // Local server integration tests use real signature sessions and server-issued registry records.
 // This is a module-only seam, NOT an endpoint or an environment/client ownership bypass.
