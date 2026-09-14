@@ -756,7 +756,7 @@ function pgStore() {
       const row = r.rows[0] || {};
       return { chikis: Number(row.chikis || 0), holders: Number(row.holders || 0), legends: Number(row.legends || 0) };
     },
-    // Wallets whose roster contains a Legendary (for Glory gifts).
+    // Wallets whose roster contains a Legendary.
     async legendHolderWallets() {
       const r = await pool.query(`SELECT wallet FROM players WHERE profile IS NOT NULL AND profile->'chikis' @> '[{"isLegend": true}]'::jsonb`);
       return r.rows.map(x => x.wallet);
@@ -1232,9 +1232,9 @@ let cupAutoNextAt = 0;               // earliest time the auto-runner may act ag
 const CUP_ROUND_MAX_MS = 4 * 60 * 1000;   // a round auto-finalizes after this even if a match is stuck (idle players forfeit far sooner)
 const CUP_ROUND_GAP_MS = 7000;            // pause between finalizing a round and starting the next, so results are visible
 const cupPrizes = new Map();         // wallet -> owed SOL (DURABLE — these are real funds; persisted to kv)
-const cupPayers = new Map();         // wallet -> Glory paid in entry fees (DURABLE log, so we can refund on a reset)
-const gloryCredits = new Map();      // wallet -> pending Glory to ADD on the player's next login/refresh.
-                                     // Lives OUTSIDE the profile so client saves can't clobber it (Glory is client-authoritative).
+// Glory was removed by owner decision: Cup entry is free, nothing charges or grants it, and no
+// endpoint reports it. The durable paid-log and the pending-credit ledger are gone with it. Stored
+// profile.glory values are deliberately LEFT ALONE rather than wiped — inert, never read again.
 let cupTotalAwarded = Number(process.env.CUP_AWARDED_SEED || 8);   // DURABLE cumulative SOL ever rewarded as Cup prizes; seeded with the 2 cups already run (4 SOL each). New cups add to it.
 async function saveCupAwarded() { try { await store.kvSet("cup_total_awarded", cupTotalAwarded); } catch (e) {} }
 let cupChampion = null;   // {wallet, name, ts} — the REIGNING Chikoria Cup champion (latest only)
@@ -1448,8 +1448,7 @@ async function loadCupState() {
   try { const p = await store.kvGet("cup_prizes"); if (p && typeof p === "object") for (const k in p) { const v = Number(p[k]) || 0; if (v > 0) cupPrizes.set(k, v); } } catch (e) {}
   try { const v = await store.kvGet("cup_public"); if (v !== null && v !== undefined) cupPublic = !!v; } catch (e) {}   // honor an explicit admin toggle; otherwise keep the default (public)
   try { const a = await store.kvGet("cup_auto"); if (a !== null && a !== undefined) cupAuto = !!a; } catch (e) {}   // auto-run setting persists across restarts
-  try { const py = await store.kvGet("cup_payers"); if (py && typeof py === "object") for (const k in py) cupPayers.set(k, Number(py[k]) || 0); } catch (e) {}
-  try { const gc = await store.kvGet("glory_credits"); if (gc && typeof gc === "object") for (const k in gc) { const v = Number(gc[k]) || 0; if (v > 0) gloryCredits.set(k, v); } } catch (e) {}
+
   try { const ta = await store.kvGet("cup_total_awarded"); if (ta != null) cupTotalAwarded = Number(ta) || 0; } catch (e) {}
   try { const ch = await store.kvGet("cup_champion"); if (ch != null) cupChampion = ch; } catch (e) {}
   try { const bw = await store.kvGet("banned_wallets"); if (Array.isArray(bw)) for (const w of bw) if (isPubkey(w)) bannedWallets.add(w); } catch (e) {}   // reward-pool bans persist across restarts
@@ -1464,23 +1463,6 @@ async function loadCupState() {
   try { const cs = await store.kvGet("cup_state"); if (cs && cs.status) liveCup = createCup({}, cs); } catch (e) { console.error("cup_state restore failed:", e?.message || e); }   // resume an in-progress bracket after a restart
 }
 async function saveCupPrizes() { const o = {}; for (const [k, v] of cupPrizes) if (v > 0) o[k] = v; try { await store.kvSet("cup_prizes", o); } catch (e) {} }
-async function savePayers() { const o = {}; for (const [k, v] of cupPayers) if (v > 0) o[k] = v; try { await store.kvSet("cup_payers", o); } catch (e) {} }
-async function saveGloryCredits() { const o = {}; for (const [k, v] of gloryCredits) if (v > 0) o[k] = v; try { await store.kvSet("glory_credits", o); } catch (e) {} }
-// Apply any pending Glory credit to a freshly-loaded profile (called on login/refresh). Persists + clears the credit
-// so it survives the client's authoritative profile saves and lands exactly once.
-async function applyGloryCredit(wallet, profile) {
-  const credit = gloryCredits.get(wallet) || 0;
-  if (!(credit > 0) || !profile) return profile;
-  profile.glory = (Number(profile.glory) || 0) + credit;
-  try { await store.setProfile(wallet, profile); } catch (e) {}
-  gloryCredits.delete(wallet); await saveGloryCredits();
-  return profile;
-}
-// Add Glory back to a wallet's stored profile (used to refund cup entry fees on a reset).
-async function refundGlory(wallet, amount) {
-  if (!isPubkey(wallet) || !(amount > 0)) return false;
-  try { const p = await store.getProfile(wallet); if (!p) return false; p.glory = (Number(p.glory) || 0) + amount; await store.setProfile(wallet, p); return true; } catch (e) { return false; }
-}
 // Persist the LIVE bracket so a restart (deploy / spin-down / crash) resumes instead of losing the cup.
 async function persistCup() { try { await store.kvSet("cup_state", liveCup ? liveCup.snapshot() : null); } catch (e) {} }
 const cupAdminOk = (req) => {
@@ -1496,7 +1478,7 @@ function cupSnapshot(forWallet) {
   const out = {
     exists: !!liveCup, public: cupPublic, auto: cupAuto,
     status: s ? s.status : "none",
-    entryGlory: s ? s.entryGlory : 100, prizePool: s ? s.prizePool : 4.0, cap: s ? s.cap : 10,
+    entryFree: true, prizePool: s ? s.prizePool : 4.0, cap: s ? s.cap : 10,
     entrants: s ? s.entrants.map(e => ({ name: e.snap.name, player: e.snap.player || null, br: e.snap.br, element: e.snap.element, bot: !!e.bot, ready: !!e.ready })) : [],
     round: live ? liveCup.roundName : null,
     matches: live ? liveCup.currentMatches() : [],
@@ -1586,7 +1568,7 @@ export async function cupSnapFromBody(wallet, snap) {
   const br = Math.max(1, Math.min(MAX_BR, Math.min(Number(snap?.br) || bestBr, bestBr)));   // can't claim a higher BR than your best legendary
   const name = stripTags(snap?.name || (prof?.handle) || wallet.slice(0, 4)).slice(0, 18) || wallet.slice(0, 4);
   const player = stripTags(prof?.handle || "").slice(0, 18) || null;   // the PLAYER's profile name (shown in the Hub, not the Chikimon's name)
-  return { snap: { name, player, element: el, br, arenaSkills: skills, cardTier: ct, glory: 0 } };
+  return { snap: { name, player, element: el, br, arenaSkills: skills, cardTier: ct } };
 }
 
 const CHAT_WINDOW = 120000;                   // a wallet shows as "online" for 2 min after its last beat
@@ -1979,7 +1961,7 @@ app.post("/verify", async (req, res) => {
       const p = await store.touch(wallet, holdOk, balance);   // the DB players flag reads the REAL hold, never the waiver
       whaleSince = p?.whale_since ?? null;
       firstSeen = Number(p?.first_seen) || 0;
-      profile = await applyGloryCredit(wallet, p?.profile || null);   // pending Glory gift on login (clobber-proof)
+      profile = p?.profile || null;
     } catch (dbErr) {
       dbOk = false;
       console.warn("verify: DB unavailable — serving chain-only result:", String(dbErr?.message || dbErr));
@@ -2069,7 +2051,7 @@ app.post("/profile", async (req, res) => {
   let prev = null;
   try { prev = await store.getProfile(wallet); } catch (e) {}
   // AUTH GATE. A signature is required for: MMO saves, any write touching identity/score
-  // (glory/handle), OR any write against an ESTABLISHED account (one that already has an mmo save).
+  // (the legacy glory field/handle), OR any write against an ESTABLISHED account (one with an mmo save).
   // The last clause closes the hole where an unsigned {profile:{}} for a victim wallet slipped past
   // the shape check and let sanitize zero their glory + drop their handle (a real griefing wipe).
   const touchesIdentity = ("glory" in profile) || ("handle" in profile);
@@ -2166,7 +2148,8 @@ function buildSafeProfile(wallet, profile, prev, hasMmo, stampMs) {
   const safe = isAdminWallet(wallet) ? profile : sanitizeProfile(prev, profile, wallet);
   // SECURITY: an unsigned legacy write must NOT drop protected identity/score fields it didn't
   // supply — carry them forward from the stored profile so a `{profile:{}}` can't zero a wallet's
-  // Glory (Cup entry currency, real prize pool) or erase its handle/leaderboard score.
+  // legacy fields or erase its handle/leaderboard score. Glory itself is retired and unused, but the
+  // carry-forward stays: dropping it would let an unsigned write blank a stored field it never sent.
   if (!isAdminWallet(wallet) && prev) {
     if (!("glory"  in profile) && prev.glory  != null) safe.glory  = prev.glory;
     if (!("handle" in profile) && prev.handle != null) safe.handle = prev.handle;
@@ -2912,19 +2895,7 @@ app.get("/admin/reset", async (req, res) => {
   catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
-// GET /admin/grant-glory-legends?key=SECRET[&amount=100] — gift Glory to EVERY wallet that owns a Legendary.
-// Credits a pending-ledger (not the live profile) so it survives the client's authoritative saves;
-// each player receives it on their next login/refresh.
-app.get("/admin/grant-glory-legends", async (req, res) => {
-  if (!ADMIN_KEY || req.query?.key !== ADMIN_KEY) return res.status(403).json({ error: "forbidden" });
-  const amount = Math.max(1, Number(req.query?.amount) || 100);
-  try {
-    const wallets = await store.legendHolderWallets();
-    for (const w of wallets) gloryCredits.set(w, (gloryCredits.get(w) || 0) + amount);
-    await saveGloryCredits();
-    res.json({ ok: true, grantedEach: amount, legendaryHolders: wallets.length, applied: "on each player's next login/refresh" });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
-});
+
 
 /* ----------------------------- chat API ----------------------------- */
 // Send a message (global, or a DM if `to` is set). Profanity is masked server-side.
@@ -3742,14 +3713,14 @@ app.get("/cup/status", async (req, res) => {
   catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
-// Player: enter the cup — deducts the Glory entry fee from the stored profile, seats a clamped snapshot.
+// Player: enter the cup — free entry, seats a clamped snapshot.
 app.post("/cup/register", async (req, res) => {
   const wallet = req.body?.wallet;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
   // ============ YOU MAY NOT SEAT SOMEONE ELSE ============
   // This route read req.body.wallet and never proved it — no signature, no market token, no
   // presence. Measured: a caller with no credential of any kind seated 7 strangers, filled an 8-seat
-  // lobby, and burned 100 Glory from each. Every one of those players will no-show, forfeit round 1,
+  // lobby. Every one of those players will no-show, forfeit round 1,
   // and hand the attacker's own entry a clean run at a 1.00 SOL prize — while real entrants are
   // locked out of a tournament with a real SOL pool.
   //
@@ -3788,18 +3759,14 @@ app.post("/cup/register", async (req, res) => {
   try {
     const prof = await store.getProfile(wallet);
     if (!prof) return res.status(403).json({ error: "play first — no saved profile found" });
-    const fee = liveCup.state.entryGlory;
-    const glory = Number(prof.glory) || 0;
-    if (glory < fee) return res.status(402).json({ error: `need ${fee} ✨ Glory to enter (you have ${Math.floor(glory)})`, glory });
+    // Cup entry is FREE. The Glory entry fee, and Glory itself, were removed by owner decision:
+    // nothing charges it, nothing grants it, nothing reports it. Stored balances are left untouched
+    // in saved profiles rather than wiped — they are simply inert and never read again.
     const built = await cupSnapFromBody(wallet, req.body?.snap || {});
     if (built.error) return res.status(403).json({ error: built.error });
-    if (fee > 0) {
-      prof.glory = glory - fee; await store.setProfile(wallet, prof);
-      cupPayers.set(wallet, (cupPayers.get(wallet) || 0) + fee); await savePayers();   // remember how much they paid, so a reset can refund it
-    }
     liveCup.register(wallet, built.snap);
     await persistCup();
-    res.json({ ok: true, gloryLeft: prof.glory, ...cupSnapshot(wallet) });
+    res.json({ ok: true, ...cupSnapshot(wallet) });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
@@ -3833,22 +3800,12 @@ app.post("/cup/ready", async (req, res) => {
 app.post("/cup/create", async (req, res) => {
   if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
   try {
-    const entryGlory = req.body?.entryGlory != null ? Math.max(0, Number(req.body.entryGlory) || 0) : 100;   // 100 ✨ Glory entry by default
     const prizePool = Math.max(0, Number(req.body?.prizePool) || 4.0);
     const cap = [8, 10, 16].includes(Number(req.body?.cap)) ? Number(req.body.cap) : 10;
-    // REFUND THE PREVIOUS LOBBY: anyone seated in the cup being replaced gets their entry Glory back,
-    // so players who paid are never burned by a reset.
-    let refunded = 0, refundEach = (liveCup && Array.isArray(liveCup.state.entrants)) ? (Number(liveCup.state.entryGlory) || 0) : 0;
-    if (refundEach > 0) {
-      for (const e of liveCup.state.entrants) {
-        if (!e || e.bot || !isPubkey(e.wallet)) continue;
-        if (await refundGlory(e.wallet, refundEach)) { refunded++; cupPayers.delete(e.wallet); }   // refunded → clear from the paid log
-      }
-      await savePayers();
-    }
-    liveCup = createCup({ entryGlory, prizePool, cap, seedBase: "cup-" + Date.now() });
+    // Entry is free, so a reset takes nothing from anyone and there is nothing to refund.
+    liveCup = createCup({ entryGlory: 0, prizePool, cap, seedBase: "cup-" + Date.now() });
     await persistCup();
-    res.json({ ok: true, refundedPlayers: refunded, refundEachGlory: refundEach, ...cupSnapshot(req.body?.wallet) });
+    res.json({ ok: true, ...cupSnapshot(req.body?.wallet) });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
@@ -4306,28 +4263,15 @@ app.post("/cup/grant", async (req, res) => {
   res.json({ ok: true, wallet, granted: sol, owedNow: cupPrizes.get(wallet) });
 });
 
-// Admin: refund cup-entry GLORY to wallets (e.g., players from a lost lobby that wasn't auto-refunded).
+// Admin: retained endpoint, now a no-op — Cup entry is free, so nothing is ever charged or refunded.
 // Pass {wallets:[...]} to refund a specific list, or omit it to refund everyone in the durable paid-log.
 app.post("/cup/refund", async (req, res) => {
   if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
-  const amount = Math.max(1, Number(req.body?.amount) || 100);
-  // refund a specific {wallets:[...]}, OR source:"finishers" (everyone in the prize ledger = first cup's entrants), OR the paid-log
-  let list;
-  if (Array.isArray(req.body?.wallets) && req.body.wallets.length) list = req.body.wallets;
-  else if (req.body?.source === "finishers") list = [...cupPrizes.keys()];
-  else list = [...cupPayers.keys()];
-  const done = [];
-  for (const w of list) { if (await refundGlory(w, amount)) { done.push(w); cupPayers.delete(w); } }
-  await savePayers();
-  res.json({ ok: true, refundedEachGlory: amount, count: done.length, wallets: done });
+  // Entry is free and nothing is charged, so there is nothing to refund.
+  res.json({ ok: true, refunded: 0, note: "Cup entry is free; no fees are taken." });
 });
 
-// Admin: view the durable paid-log (who paid entry Glory and how much) — for auditing refunds.
-app.get("/cup/payers", async (req, res) => {
-  if (!cupAdminOk(req)) return res.status(403).json({ error: "admin only" });
-  const payers = [...cupPayers.entries()].map(([wallet, glory]) => ({ wallet, glory }));
-  res.json({ count: payers.length, totalGlory: payers.reduce((s, x) => s + x.glory, 0), payers });
-});
+
 
 /* ----------------------------- LIVE PvP battles ----------------------------- */
 const pvpMatches = new Map();   // matchId -> live match (in-memory; a battle is short-lived)
@@ -18982,8 +18926,6 @@ async function flushDurableState() {
     ["cup public flag", () => store.kvSet("cup_public", cupPublic)],
     ["cup auto flag", () => store.kvSet("cup_auto", cupAuto)],
     ["cup prizes", () => store.kvSet("cup_prizes", shutdownPositiveMap(cupPrizes))],
-    ["cup payers", () => store.kvSet("cup_payers", shutdownPositiveMap(cupPayers))],
-    ["glory credits", () => store.kvSet("glory_credits", shutdownPositiveMap(gloryCredits))],
     ["cup awarded", () => store.kvSet("cup_total_awarded", cupTotalAwarded)],
     ["cup champion", () => store.kvSet("cup_champion", cupChampion)],
   ];

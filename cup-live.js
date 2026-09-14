@@ -51,7 +51,7 @@ function hydrate(snap){
 function createCup(opts={}, snap=null){
   const S = snap ? hydrate(snap) : {
     status:"registration",                 // registration | live | finished
-    entryGlory: opts.entryGlory ?? 100,
+    entryGlory: opts.entryGlory ?? 0,   // retired: entry is free. Field kept so persisted cups still restore.
     prizePool: opts.prizePool ?? 4.0,
     seedBase: opts.seedBase || ("cup-"+Date.now()),
     cap: [8,10,16].includes(opts.cap) ? opts.cap : 10, entrants: [], byes: [],   // 8/10/16 real players; bracket padded to 16 with byes
