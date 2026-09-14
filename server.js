@@ -2259,7 +2259,7 @@ app.get("/admin/grant-chiki", async (req, res) => {
     let regId = null;
     if (REG_ALL_ON && _assetsReady) {
       const spn = spFromChikiIndex(sp);
-      if (spn) { try { regId = mintAsset("chikimon", wallet, { sp: spn, kind: "normal", lvl: 1 }, "issued").id; } catch (e) {} }
+      if (spn) { try { regId = mintAsset("chikimon", wallet, { sp: spn, kind: kindForSpecies(spn), lvl: 1 }, "issued").id; } catch (e) {} }
     }
     res.json({ ok: true, wallet, granted: { sp, nick }, totalChikis: profile.chikis.length, ...(regId ? { regId } : {}) });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
@@ -2337,7 +2337,7 @@ app.get("/admin/restore-chikis", async (req, res) => {
       for (const a of added) {
         const spn = spFromChikiIndex(a.sp);
         if (!spn) continue;
-        try { mintAsset("chikimon", wallet, { sp: spn, kind: a.isLegend ? "legendary" : "normal", lvl: 1 }, "restitution"); }
+        try { mintAsset("chikimon", wallet, { sp: spn, kind: kindForSpecies(spn), lvl: 1 }, "restitution"); }
         catch (e) { break; }   // capacity — the roster grant above already stands; backfill heals later
       }
     }
@@ -2380,7 +2380,7 @@ async function adminGiftChiki(req, res) {
     // CHIK_REG_ALL — an admin gift is a server-witnessed creature: record it at creation.
     if (REG_ALL_ON && _assetsReady) {
       const spn = spFromChikiIndex(si);
-      if (spn) { try { mintAsset("chikimon", wallet, { sp: spn, kind: isLegend ? "legendary" : "normal", lvl: 1 }, "issued"); } catch (e) {} }
+      if (spn) { try { mintAsset("chikimon", wallet, { sp: spn, kind: kindForSpecies(spn), lvl: 1 }, "issued"); } catch (e) {} }
     }
     res.json({ ok: true, pending: false, granted: { sp: si, level: lv, isLegend, nick: gift.nick } });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
@@ -2840,7 +2840,7 @@ app.post("/gift/claim", async (req, res) => {
     // has one) is deliberately untouched: grandfathering never deletes, and the record stays honest.
     if (REG_ALL_ON && _assetsReady) {
       const spn = spFromChikiIndex(g.sp);
-      if (spn) { try { mintAsset("chikimon", wallet, { sp: spn, kind: g.isLegend ? "legendary" : "normal", lvl: 1 }, "issued"); } catch (e) {} }
+      if (spn) { try { mintAsset("chikimon", wallet, { sp: spn, kind: kindForSpecies(spn), lvl: 1 }, "issued"); } catch (e) {} }
     }
     res.json({ ok: true, accepted: true, replaced: ri, granted: { sp: g.sp, level: g.level, isLegend: g.isLegend } });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
@@ -11710,6 +11710,16 @@ let _regBackfillRuns = 0, _regBackfillRows = 0;
 // clamps c.sp to 0..20 (:186) — an index of 21+ would be silently rewritten to 20 (alon), i.e. a
 // legendary would become a meme in the stored roster. The nine live in the registry/ledger only,
 // keyed by species string, which is the sole path the MMO writes anyway (the client only READS it).
+// The arena's canonical catalogue is the single source of truth for a species' class, and the
+// engine already derives rarity/HP/damage from it (chikiseum-live-engine _fighter reads
+// kit[0].class). A registry row's `kind` must therefore AGREE with the species, never disagree —
+// four mint paths used to decide it independently and got it wrong (see kindForSpecies callers).
+function kindForSpecies(name) {
+  if (SPECIES_MEME.includes(name)) return "meme";
+  if (SPECIES_LEGEND.includes(name)) return "legendary";
+  if (SPECIES_NORMAL.includes(name)) return "normal";
+  return "normal";
+}
 function spFromChikiIndex(i) {
   i = i | 0;
   if (i >= 0 && i <= 9) return SPECIES_NORMAL[i];
@@ -19039,12 +19049,30 @@ const chikiseumLive = installChikiseumLive(app, {
     if (!_assetsReady) return null;
     return regOwned(wallet, "chikimon").slice(0, 400).map(row => {
       const canonical = chikiseumLive.engine?.species.get(row.sp)?.[0];
-      const clean = row.owner === wallet && row.state === "active" && ORIGIN_CLEAN.has(row.origin)
-        && canonical && canonical.class === row.kind && (row.gameStatus ?? "good") === "good";
+      // EVERY Chikimon you genuinely own can enter. The only bars are real ownership and
+      // mid-sale states — never a cosmetic bookkeeping disagreement.
+      //
+      // This used to also require `canonical.class === row.kind`, which gated nothing and blocked
+      // almost everyone: `kind` is never passed to the arena engine (admit() takes species + level),
+      // and the engine derives rarity, HP and damage from the canonical catalogue itself
+      // (chikiseum-live-engine _fighter: `RARITY[kit[0].class]`). Meanwhile four mint paths each
+      // decided `kind` on their own and got it wrong — a grant wrote "normal" for every species, and
+      // the gift/restitution paths had no "meme" branch at all, so `isLegend = sp >= 10` stamped
+      // "legendary" onto popcat/moodeng/doge/pepe/chillguy/alon. Those creatures are perfectly real
+      // and perfectly owned; the equality test rejected them forever with a message about ownership
+      // review. 11 of 21 species via a grant, 6 of 21 via a gift or restitution.
+      // kindForSpecies() now keeps new rows honest; this stops punishing the old ones.
+      const owned = row.owner === wallet && row.state === "active" && ORIGIN_CLEAN.has(row.origin)
+        && (row.gameStatus ?? "good") === "good";
+      // The engine cannot build a fighter for a species it has no canonical kit for — that one is a
+      // hard requirement, not bookkeeping (_fighter: fail('Unknown canonical fighter')).
+      const known = !!canonical;
       const escrow = row.listedOffchain || row.pendingHandover || row.mintPending || _nftBoardListed(row);
       return { asset_id: row.id, species: row.sp, display_name: canonical?.display_name || row.sp,
-        rarity: canonical?.class || row.kind, eligible: !!clean && !escrow,
-        reason: !clean ? "This creature's ownership record needs review." : escrow ? "This creature is listed or transferring." : "" };
+        rarity: canonical?.class || row.kind, eligible: !!owned && known && !escrow,
+        reason: !owned ? "This creature's ownership record needs review."
+          : !known ? "This species has no arena kit yet."
+          : escrow ? "This creature is listed or transferring." : "" };
     });
   },
   leaseFactory: async () => store.kind === "postgres" ? store.chikiseumLease() : null,
