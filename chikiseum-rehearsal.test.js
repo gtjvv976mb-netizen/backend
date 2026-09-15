@@ -25,7 +25,9 @@ function fixture(options = {}) {
   e.admit(trusted('A'));
   return { e, trusted, advance: s => { now += s; mono += s; }, at: () => now };
 }
-const botOf = lobby => lobby.trainers.find(t => t.handle === ChikiseumLiveEngine.REHEARSAL_HANDLE);
+// A client finds the practice opponent by its FLAG, never by its display string — the same way
+// the real client must, so a copy change can never hide it or turn a human into a dummy.
+const botOf = lobby => lobby.trainers.find(t => t.rehearsal === true);
 
 test('the dummy is offered in the lobby, labelled, and always compatible', () => {
   const { e } = fixture();
@@ -34,6 +36,39 @@ test('the dummy is offered in the lobby, labelled, and always compatible', () =>
   assert.equal(bot.handle, 'Training Dummy (AI)');
   assert.equal(bot.compatible, true, 'the dummy must mirror the challenger or it cannot be fought');
   assert.equal(bot.fighter.species, 'galador');
+});
+
+test('the lobby marks the practice opponent explicitly, and marks nobody else', () => {
+  const { e, trusted } = fixture();
+  e.admit(trusted('B'));
+  const lobby = e.lobby('A');
+  assert.equal(lobby.rehearsal_available, true);
+  const flagged = lobby.trainers.filter(t => t.rehearsal);
+  assert.equal(flagged.length, 1, 'exactly one trainer is the dummy');
+  assert.equal(flagged[0].handle, ChikiseumLiveEngine.REHEARSAL_HANDLE, 'the flag and the label agree');
+  assert.equal(flagged[0].instant, true, 'challenging it skips the accept step');
+  const human = lobby.trainers.find(t => t.trainer_id === 'B');
+  assert.equal(human.rehearsal, false, 'a real player is never marked as the dummy');
+  assert.equal(human.instant, false, 'challenging a human still needs their accept');
+  // With rehearsal withdrawn the lobby says so, rather than silently offering nothing — and the
+  // dummy that already existed goes at once, not whenever its session happens to expire.
+  e.rehearsal = false;
+  const off = e.lobby('A');
+  assert.equal(off.rehearsal_available, false);
+  assert.equal(off.trainers.some(t => t.rehearsal), false);
+  assert.equal(e.admissions.has('ai-A'), false, 'a dummy admitted before the switch survived it');
+});
+
+test('withdrawing rehearsal mid-practice ends the match instead of leaving it fightable', () => {
+  const { e } = fixture();
+  const bot = botOf(e.lobby('A'));
+  const mid = e.challenge('A', bot.trainer_id).match_id;
+  e.ready('A', mid);
+  assert.equal(e.matches.get(mid).status, 'active');
+  e.rehearsal = false; e.tick();
+  assert.notEqual(e.matches.get(mid).status, 'active', 'a practice match outlived the switch');
+  assert.equal(e.completions.size, 0, 'ending it still awards nothing');
+  assert.equal(e.admissions.has('ai-A'), false);
 });
 
 test('the dummy NEVER enters matchmaking — queueing still only finds humans', () => {
