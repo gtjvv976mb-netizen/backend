@@ -19034,13 +19034,13 @@ const chikiseumLive = installChikiseumLive(app, {
   // deposited into THIS treasury wallet (memo-tagged, verified on-chain) before the match is
   // created, and the treasury pays the winner or refunds both afterwards. The ledger and its
   // payout pump live in the arena service; this only hands it the chain and the signer.
-  //   CHIK_WAGERS=on                 accept new wagers (default off: routes answer, nothing new is taken)
+  //   CHIK_WAGERS=off                withdraw new wagers (default on; routes still answer, nothing new is taken)
   //   CHIK_WAGER_MIN_SOL / MAX_SOL   stake bounds (default 0.001 / 0.05 — low while custody is server-held)
   //   CHIK_WAGER_WALLET_DAILY_SOL    stakes one wallet may risk per UTC day (default 0.25)
   //   CHIK_WAGER_RAKE_BPS            house cut of the pot in basis points (default 0)
   // Switching CHIK_WAGERS off never strands money: a ledger already holding stakes keeps settling.
   wagers: {
-    enabled: String(process.env.CHIK_WAGERS || "off").toLowerCase() === "on",
+    enabled: String(process.env.CHIK_WAGERS || "on").toLowerCase() !== "off",
     treasury: treasury.publicKey.toBase58(),
     chain: makeWagerChain({ conn, treasuryPubkey: treasury.publicKey.toBase58() }),
     rail: makeWagerRail({ conn, treasury }),

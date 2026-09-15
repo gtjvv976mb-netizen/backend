@@ -10,7 +10,8 @@ Custody is **server-held**. Both stakes are transferred into the treasury wallet
 that pays task rewards) *before* the match is created, and the treasury pays the winner or
 refunds both afterwards. That means the host holding `TREASURY_SECRET` custodies player money for
 the length of a match. The caps are low on purpose (0.05 SOL per stake, 0.25 SOL per wallet per
-day by default) and the feature is **off by default** (`CHIK_WAGERS=on` to accept new wagers).
+day by default). The feature is **on**; `CHIK_WAGERS=off` withdraws new wagers without stranding
+any that are already funded.
 
 Stakes are never spendable by anything else: `poolSol()` — what `/claim`, the earning rate and
 `/stats` see — is the treasury balance **minus** open wager liability. `/pool` reports the raw
@@ -116,7 +117,7 @@ the treasury with the memo `chikiseum-wager:<wager_id>:<leg>`.
 
 | env | default | meaning |
 |---|---|---|
-| `CHIK_WAGERS` | `off` | `on` to accept new wagers. Off never strands money: held stakes keep settling. |
+| `CHIK_WAGERS` | `on` | `off` to stop accepting new wagers. Off never strands money: held stakes keep settling. |
 | `CHIK_WAGER_MIN_SOL` | `0.001` | minimum stake |
 | `CHIK_WAGER_MAX_SOL` | `0.05` | maximum stake |
 | `CHIK_WAGER_WALLET_DAILY_SOL` | `0.25` | stakes one wallet may risk per UTC day (posted + accepted, refunded or not) |
