@@ -215,7 +215,13 @@ export class ChikiseumLiveEngine {
     const peers = [...this.admissions.values()].filter(p => p.id !== id && !this.leases.has(p.id) && now - p.last_seen <= 45)
       .sort((a, b) => b.last_seen - a.last_seen || a.id.localeCompare(b.id)).slice(0, 50);
     return { schema: 'chikiseum.live-lobby/v1', ...this._flags(), match_id: this.leases.get(id) ?? null,
-      trainers: peers.map(p => ({ trainer_id: p.id, handle: p.handle, fighter: this._publicFighter(p.fighter), compatible: ChikiseumLiveEngine.compatible(me.fighter, p.fighter) })),
+      rehearsal_available: this.rehearsal,
+      // `rehearsal` marks the practice opponent explicitly: a client must not have to match the
+      // display handle to find it, and must never present it as another player. Challenging it
+      // starts the match at once (no accept step) and the result awards no battle XP.
+      trainers: peers.map(p => ({ trainer_id: p.id, handle: p.handle, fighter: this._publicFighter(p.fighter),
+        rehearsal: this.rehearsalIds.has(p.id), instant: this.rehearsalIds.has(p.id),
+        compatible: ChikiseumLiveEngine.compatible(me.fighter, p.fighter) })),
       challenges: [...this.challenges.values()].filter(c => c.target === id).map(c => ({ id: c.id, from: c.sender, expires: c.expires })) };
   }
   queue(id) {
@@ -480,6 +486,11 @@ export class ChikiseumLiveEngine {
   tick() { this._driveRehearsal(); this.expire(); }
   expire() {
     this._guard(); const now = this._now();
+    // Withdrawing rehearsal means withdrawing it NOW. rehearsalPartner() stops minting new dummies,
+    // but one already admitted would stay in the lobby — and challengeable — until its session TTL
+    // ran out, so "CHIK_REHEARSAL=off removes it entirely" would be false for the next 15 minutes.
+    // revoke() also ends any practice match in progress, which awards nothing either way.
+    if (!this.rehearsal) for (const id of [...this.rehearsalIds]) this.revoke(id);
     for (const [cid, c] of this.challenges) if (c.expires <= now) this.challenges.delete(cid);
     for (const [id, created] of this.queueEntries) if (created <= now - 90) this.queueEntries.delete(id);
     for (const [mid, m] of this.matches) {
