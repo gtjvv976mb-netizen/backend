@@ -19,6 +19,7 @@ import * as PhysMod from "./world_physics.js";                     // server-sid
 import { installChikiseumLive } from "./chikiseum-live-service.js";
 import { acquireChikiseumLease } from "./chikiseum-live-lease.js";
 import { buildHealth } from "./build-stamp.js";   // which commit is answering — resolved at boot, reported by /health
+import { makeWagerChain, makeWagerRail } from "./chikiseum-wager-chain.js";   // SOL wager deposit reader + treasury payout rail
 
 dotenv.config();
 const {
@@ -337,12 +338,19 @@ async function chikiBalance(owner, strict = false) {
 export function _setBalanceForTest(wallet, v) { _balCache.set(String(wallet), { t: Date.now(), v: Number(v) || 0 }); return Number(v) || 0; }
 // Treasury (reward pool) SOL — CACHED 20s. Pool changes slowly; this kills the per-request getBalance spam.
 let _poolCache = { t: 0, v: 0 };
-const poolSol = async () => {
+const treasurySol = async () => {
   if (_poolCache.t && Date.now() - _poolCache.t < 20000) return _poolCache.v;
   const v = (await conn.getBalance(treasury.publicKey)) / LAMPORTS_PER_SOL;
   _poolCache = { t: Date.now(), v };
   return v;
 };
+// The SPENDABLE pool. Chikiseum wager stakes sit in the same treasury wallet while a match is
+// decided, but they are the players' money, not the reward pool's: every consumer of poolSol —
+// /claim, the earning rate, /stats — sees the balance NET of that liability, so a task reward can
+// never be paid out of somebody's stake. The raw balance is reported separately by /pool.
+// (chikiseumLive is defined further down; every caller of poolSol is a request handler, which
+// only runs once the module has finished evaluating.)
+const poolSol = async () => Math.max(0, (await treasurySol()) - chikiseumLive.liabilitySol());
 
 /* ----------------------------- storage ----------------------------- */
 // ============ THE WORLD CHRONICLE — CHIK_CHRONICLE (default OFF) ============
@@ -1931,8 +1939,10 @@ app.get("/health", async (_q, res) => {
 });
 
 app.get("/pool", async (_q, res) => {
-  try { res.json({ poolSol: await poolSol(), players: await store.count(), dailyPaid: await store.dailyTotal() }); }
-  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  try {
+    const [pool, raw] = [await poolSol(), await treasurySol()];
+    res.json({ poolSol: pool, treasurySol: raw, wagerEscrowSol: chikiseumLive.liabilitySol(), players: await store.count(), dailyPaid: await store.dailyTotal() });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
 app.post("/verify", async (req, res) => {
@@ -19020,6 +19030,28 @@ const chikiseumLive = installChikiseumLive(app, {
     });
   },
   leaseFactory: async () => store.kind === "postgres" ? store.chikiseumLease() : null,
+  // SOL wagers between two players on one arena match. Custody is server-held: both stakes are
+  // deposited into THIS treasury wallet (memo-tagged, verified on-chain) before the match is
+  // created, and the treasury pays the winner or refunds both afterwards. The ledger and its
+  // payout pump live in the arena service; this only hands it the chain and the signer.
+  //   CHIK_WAGERS=on                 accept new wagers (default off: routes answer, nothing new is taken)
+  //   CHIK_WAGER_MIN_SOL / MAX_SOL   stake bounds (default 0.001 / 0.05 — low while custody is server-held)
+  //   CHIK_WAGER_WALLET_DAILY_SOL    stakes one wallet may risk per UTC day (default 0.25)
+  //   CHIK_WAGER_RAKE_BPS            house cut of the pot in basis points (default 0)
+  // Switching CHIK_WAGERS off never strands money: a ledger already holding stakes keeps settling.
+  wagers: {
+    enabled: String(process.env.CHIK_WAGERS || "off").toLowerCase() === "on",
+    treasury: treasury.publicKey.toBase58(),
+    chain: makeWagerChain({ conn, treasuryPubkey: treasury.publicKey.toBase58() }),
+    rail: makeWagerRail({ conn, treasury }),
+    adminOk: _questAdminOk,
+    rakeBps: Math.max(0, Math.min(2000, Math.round(Number(process.env.CHIK_WAGER_RAKE_BPS) || 0))),
+    limits: {
+      min_lamports: Math.round((Number(process.env.CHIK_WAGER_MIN_SOL) || 0.001) * LAMPORTS_PER_SOL),
+      max_lamports: Math.round((Number(process.env.CHIK_WAGER_MAX_SOL) || 0.05) * LAMPORTS_PER_SOL),
+      wallet_daily_lamports: Math.round((Number(process.env.CHIK_WAGER_WALLET_DAILY_SOL) || 0.25) * LAMPORTS_PER_SOL),
+    },
+  },
 });
 // Rehearsal: a clearly-labelled practice opponent, offered in the lobby only and never in the
 // matchmaking queue, awarding no battle XP. Set CHIK_REHEARSAL=off to withdraw it entirely.

@@ -242,6 +242,13 @@ export class ChikiseumLiveEngine {
     const peer = this.admissions.get(c.sender); if (!peer) fail('Challenger admission expired');
     return { ...this._flags(), match_id: this._newMatch(peer, me) };
   }
+  // A match the SERVICE decided on — used once both sides of a wager have been funded. It is the
+  // same _newMatch as a challenge or the queue, with the same admission, availability and
+  // compatibility rules; the engine still knows nothing about money.
+  pair(idA, idB) {
+    this.expire(); const a = this._member(idA), b = this._member(idB);
+    return { ...this._flags(), match_id: this._newMatch(a, b) };
+  }
   _newMatch(a, b) {
     this._available(a); this._available(b);
     if (a.wallet === b.wallet || a.asset_id === b.asset_id || !ChikiseumLiveEngine.compatible(a.fighter, b.fighter)) fail('Invalid matching pair');
