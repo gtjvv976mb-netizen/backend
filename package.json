@@ -7,6 +7,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
+    "test": "node --test build-stamp.test.js && npm run test:chikiseum",
+    "test:build": "node --test build-stamp.test.js",
     "test:chikiseum": "node --test chikiseum-live-engine.test.js chikiseum-live-navigation.test.js chikiseum-live-parity.test.js chikiseum-live-progression.test.js chikiseum-live-lease-adversarial.test.js chikiseum-live-service-adversarial.test.js chikiseum-arena-eligibility.test.js chikiseum-rehearsal.test.js",
     "test:chikiseum:http": "node chikiseum-live-server.test.mjs",
     "treasury": "node scripts/new-wallet.js"

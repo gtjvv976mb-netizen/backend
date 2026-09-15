@@ -85,3 +85,20 @@ proofs remain adapter/release requirements—not established by pure unit tests.
 - `chikiseum-live-parity.test.js` compares all 402 cards × 3 tier levels × 2 status
   scenarios against independent original Python authority using actual navigation.
   Synthetic admissions in unit tests are explicitly **not production auth proof**.
+
+### Running the tests
+
+`npm test` runs everything; `npm run test:chikiseum` runs the arena suites alone.
+
+One suite needs an input this repo does not contain. `chikiseum-live-parity.test.js`
+shells out to `chikiseum-live-python-oracle.py`, which imports the original Python
+authority from a **sibling checkout at `../chikiseum_practice/`** (`realtime_engine.py`,
+`engine.py`, `reference_arena.py`). That tree is not a package.json dependency and is not
+vendored here, so on a fresh clone this one test fails until it is checked out beside the
+repo. The failure names exactly what is missing.
+
+It is left failing on purpose. The whole point of the suite is that the expected values
+come from an implementation written independently of this engine; regenerating them from
+the engine would have it agree with itself and prove nothing, and marking the test skipped
+would let release receipts cite a gate that was never evaluated. A red parity test means
+"not checked", which is the truth when the oracle is absent.

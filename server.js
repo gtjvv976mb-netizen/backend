@@ -18,6 +18,7 @@ import { loadTerrain, terrainInfo, terrainReady, surfaceHeight, SEA } from "./wo
 import * as PhysMod from "./world_physics.js";                     // server-side movement simulation (CHIK_PHYS=1; OFF by default)
 import { installChikiseumLive } from "./chikiseum-live-service.js";
 import { acquireChikiseumLease } from "./chikiseum-live-lease.js";
+import { buildHealth } from "./build-stamp.js";   // which commit is answering — resolved at boot, reported by /health
 
 dotenv.config();
 const {
@@ -1914,6 +1915,7 @@ app.get("/health", async (_q, res) => {
   const ok = _draining === false && dbReady && _chatReady && stateReady && rosterOk;
   res.status(ok ? 200 : 503).json({
     ok, draining: _draining, dbReady, chatReady: _chatReady, stateReady,
+    build: buildHealth(),
     rosterGuard: {
       mode: ROSTER_GUARD_MODE, armed: ROSTER_MIN > 0, tripped: _rosterGuard.tripped,
       profiles: _rosterGuard.profiles, floor: _rosterGuard.floor, min: ROSTER_MIN,
