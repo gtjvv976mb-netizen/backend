@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import express from 'express';
 import { ChikiseumLiveService, installChikiseumLive, LIVE_PREFIX } from './chikiseum-live-service.js';
-import { ChikiseumLiveEngine, LiveRejected } from './chikiseum-live-engine.js';
+import { ChikiseumLiveEngine, LiveRejected, SPECIES_TRAITS } from './chikiseum-live-engine.js';
 import { ChikiseumLiveNavigation } from './chikiseum-live-navigation.js';
 import { ChikiseumProgressBook } from './chikiseum-live-progression.js';
 
@@ -89,6 +89,26 @@ test('HTTP gate rejects arbitrary origins, content types and client stat writes;
       body: JSON.stringify(f.body('walletA', { asset_id: 'asset-walletA', level: 30, hp: 99999 })) });
     assert.equal(injected.status, 400); assert.equal(service.engine.admissions.size, 0);
   } finally { await service.stop(); await new Promise(resolve => server.close(resolve)); }
+});
+test('private roster exposes only owned server-derived traits and rejects client overrides', async () => {
+  const f = fixture(); await f.service.boot(); f.add('walletA'); f.add('walletB');
+  f.owned.get('walletA')[0].trait = { name: 'Forged', stride: 100, focus: 100, ward: 100, reach: 100 };
+  f.owned.get('walletA').push({ asset_id: 'invalid-legacy-asset', species: 'constructor', eligible: false });
+  const a = await f.service.command('roster', f.body('walletA'));
+  const b = await f.service.command('roster', f.body('walletB'));
+  assert.deepEqual(a.fighters.map(row => row.asset_id), ['asset-walletA', 'invalid-legacy-asset']);
+  assert.deepEqual(b.fighters.map(row => row.asset_id), ['asset-walletB']);
+  assert.deepEqual(a.fighters[0].trait, SPECIES_TRAITS.galador);
+  assert.equal(a.fighters[1].trait, null);
+  assert.deepEqual(b.fighters[0].trait, SPECIES_TRAITS.galador);
+  assert.notEqual(a.fighters[0].trait, SPECIES_TRAITS.galador);
+  a.fighters[0].trait.ward = 100;
+  assert.deepEqual((await f.service.command('roster', f.body('walletA'))).fighters[0].trait, SPECIES_TRAITS.galador);
+  await rejected(f.service.command('roster', f.body('walletA', { trait: { ward: 100 } })), 'INVALID_COMMAND');
+  await rejected(f.service.command('session', f.body('walletA', { asset_id: 'asset-walletA', trait: { ward: 100 } })), 'INVALID_COMMAND');
+  const session = await f.service.command('session', f.body('walletA', { asset_id: 'asset-walletA' }));
+  assert.deepEqual(session.fighter.trait, SPECIES_TRAITS.galador);
+  await f.service.stop();
 });
 test('auth is rechecked after serial wait; superseded requests cannot admit or cast', async () => {
   const f = fixture(); await f.service.boot(); f.add('walletA');

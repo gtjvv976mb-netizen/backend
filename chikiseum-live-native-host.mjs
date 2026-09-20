@@ -61,7 +61,8 @@ for (const side of ['A', 'B']) {
   players[side] = { auth, asset_id: row.id, canonical_species: selected.species, pvp_level: selected.level };
 }
 const sources = ['server.js', 'chikiseum-live-service.js', 'chikiseum-live-engine.js', 'chikiseum-live-navigation.js',
-  'chikiseum-live-progression.js', 'chikiseum-live-lease.js', 'chikiseum-profiles.json', 'chikiseum_reference_arena_v2.json', 'chikiseum-live-native-host.mjs'];
+  'chikiseum-live-progression.js', 'chikiseum-live-lease.js', 'chikiseum-profiles.json', 'chikiseum-species-traits.json',
+  'chikiseum_reference_arena_v2.json', 'chikiseum-live-native-host.mjs'];
 const metadata = { schema: 'chikiseum.local-authenticated-native-fixture/v1', fixture_only: true,
   label: 'AUTOMATED SIGNED-WALLET FIXTURE • SYNTHETIC TEST LEASE • NOT PUBLIC HUMAN PROOF',
   contains_ephemeral_credentials: true, contains_private_keys: false, private_mode: '0600',
