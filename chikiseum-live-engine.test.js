@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ChikiseumLiveEngine, LiveRejected, COOLDOWNS, cardGeometry } from './chikiseum-live-engine.js';
+import { ChikiseumLiveEngine, LiveRejected, COOLDOWNS, SPECIES_TRAITS, cardGeometry } from './chikiseum-live-engine.js';
 
 // Pure-engine tests: trusted admissions are synthetic, never a production auth proof.
 const navigation = {
@@ -38,6 +38,100 @@ test('trusted owned-asset admission derives canonical stats and rejects fixture 
   assert.deepEqual(s.fighter.slots, Array.from({ length: 12 }, (_, i) => i));
   assert.equal(s.level_source, 'server_earned_pvp'); assert.equal(s.currency, 'NONE');
   assert.equal(s.real_sol_enabled, false); assert.equal(s.inventory_verified, true); assert.equal(s.token, undefined);
+});
+test('all 41 species have bounded server-owned traits and a real favored card', () => {
+  const { e, trusted } = fixture();
+  assert.equal(Object.keys(SPECIES_TRAITS).length, 41);
+  assert.equal(new Set(Object.values(SPECIES_TRAITS).map(t => t.name)).size, 41);
+  for (const [species, trait] of Object.entries(SPECIES_TRAITS)) {
+    assert.ok(e.species.get(species).some(c => c.arch === trait.signature_arch), `${species} lacks favored card`);
+    for (const key of ['stride', 'focus', 'ward', 'reach']) assert.ok(trait[key] >= .9 && trait[key] <= 1.1, `${species}.${key}`);
+  }
+  const forged = e.admit({ ...trusted('C', 'firix'), trait: { name: 'Hacked', stride: 100, focus: 100,
+    ward: 100, reach: 100, signature_effect: 'fury' } });
+  assert.deepEqual(forged.fighter.trait, SPECIES_TRAITS.firix);
+  assert.notEqual(forged.fighter.trait, SPECIES_TRAITS.firix);
+});
+test('species stride, focus, ward and reach change server-authoritative tactical outcomes', () => {
+  const f = fixture(); f.e.admit(f.trusted('A', 'firix')); f.e.admit(f.trusted('B', 'forestle')); const mid = f.match();
+  const m = f.e.matches.get(mid), a = m.players[0], b = m.players[1];
+  assert.notEqual(a.trait.stride, b.trait.stride);
+  assert.notEqual(a.trait.focus, b.trait.focus);
+  assert.notEqual(a.trait.ward, b.trait.ward);
+  assert.notEqual(a.trait.reach, b.trait.reach);
+  const aRange = f.e.state('A', mid).you.hand[0].contact_range_m;
+  const bRange = f.e.state('B', mid).you.hand[0].contact_range_m;
+  assert.equal(aRange, cardGeometry(f.e.cards.get('firix:0'), a.trait).contact_range_m);
+  assert.equal(bRange, cardGeometry(f.e.cards.get('forestle:0'), b.trait).contact_range_m);
+  a.energy = 0; b.energy = 0; f.advance(.1); const energy = f.e.state('A', mid).players.map(p => p.energy);
+  assert.ok(Math.abs(energy[0] - .1 * a.trait.focus) < 1e-9);
+  assert.ok(Math.abs(energy[1] - .1 * b.trait.focus) < 1e-9);
+  f.advance(.1); const ax = a.position.x, bx = b.position.x;
+  f.move(mid, 'A', 1, 0); f.move(mid, 'B', -1, 0);
+  assert.ok(Math.abs(a.position.x - ax - 3.8 * .2 * a.trait.stride) < 1e-9);
+  assert.ok(Math.abs(bx - b.position.x - 3.8 * .2 * b.trait.stride) < 1e-9);
+  a.position.x = -.75; b.position.x = .75; a.energy = 6;
+  const hpBefore = b.hp, strike = f.e.cards.get('firix:0');
+  f.cast(mid, 'A', 0); f.advance(.05); const impact = f.e.state('A', mid).events.find(x => x.type === 'impact');
+  const expectedDamage = Math.round((strike.mechanics.dmg[a.card_tier] * a.damage_multiplier * 1.07 / b.trait.ward + Number.EPSILON) * 1000) / 1000;
+  assert.equal(impact.amount, expectedDamage); assert.equal(b.hp, hpBefore - expectedDamage);
+});
+test('Quick card displayed range equals stride-scaled dash plus reach-scaled contact', () => {
+  const { e } = fixture();
+  for (const [species, expected] of [['nervousmonkey', 7.388], ['borealon', 6.6]]) {
+    const geometry = cardGeometry(e.cards.get(`${species}:2`), SPECIES_TRAITS[species]);
+    assert.equal(geometry.range_m, expected);
+    assert.equal(geometry.range_m, Math.round((geometry.dash_range_m + geometry.contact_range_m) * 1000) / 1000);
+    for (const [offset, shouldHit] of [[-.01, true], [.01, false]]) {
+      const f = fixture(); f.e.admit(f.trusted('A', species)); f.e.admit(f.trusted('B', species));
+      const mid = f.match(), m = f.e.matches.get(mid), distance = geometry.range_m + offset;
+      m.players[0].position.x = -distance / 2; m.players[1].position.x = distance / 2;
+      assert.equal(f.e.state('A', mid).you.hand[2].range_m, expected);
+      f.cast(mid, 'A', 2); f.advance(.05);
+      const impact = f.e.state('A', mid).events.find(x => x.type === 'impact');
+      assert.equal(impact.reason === null, shouldHit, `${species} distance ${distance}`);
+    }
+  }
+});
+test('favored card procs once after real hit, not on misses or fully shielded targets', () => {
+  const f = fixture(); f.e.admit(f.trusted('A', 'electrox')); f.e.admit(f.trusted('B', 'electrox')); const mid = f.match();
+  const m = f.e.matches.get(mid), a = m.players[0], b = m.players[1];
+  a.position.x = -.75; b.position.x = .75; b.energy = 3;
+  f.cast(mid, 'A', 1, 'trait-real-hit-one'); f.advance(.05);
+  let state = f.e.state('A', mid); let impact = state.events.find(x => x.type === 'impact');
+  assert.equal(impact.signature_effect, 'sunder'); assert.equal(impact.signature_triggered, true);
+  assert.equal(impact.signature_amount, .25);
+  assert.ok(Math.abs(b.energy - (3 + .05 * b.trait.focus + .05 - .25)) < 1e-9);
+  f.cast(mid, 'A', 1, 'trait-real-hit-one'); assert.ok(Math.abs(b.energy - (3 + .05 * b.trait.focus + .05 - .25)) < 1e-9);
+
+  const shielded = fixture(); shielded.e.admit(shielded.trusted('A', 'electrox')); shielded.e.admit(shielded.trusted('B', 'electrox'));
+  const sid = shielded.match(), sm = shielded.e.matches.get(sid), sp = sm.players[1];
+  sm.players[0].position.x = -.75; sp.position.x = .75; sp.energy = 3;
+  sp.statuses.shield = { slot: 3, source_side: 'B', amount: 100, expires_at: 1004 };
+  shielded.cast(sid, 'A', 1); shielded.advance(.05); state = shielded.e.state('A', sid);
+  impact = state.events.find(x => x.type === 'impact'); assert.equal(impact.amount, 0);
+  assert.equal(impact.signature_triggered, undefined);
+  assert.ok(Math.abs(sp.energy - (3 + .05 * sp.trait.focus + .05)) < 1e-9);
+
+  const missed = fixture(); missed.e.admit(missed.trusted('A', 'electrox')); missed.e.admit(missed.trusted('B', 'electrox'));
+  const mid2 = missed.match(); missed.e.matches.get(mid2).players[1].position.x = 20;
+  missed.cast(mid2, 'A', 1); missed.advance(.05); state = missed.e.state('A', mid2);
+  impact = state.events.find(x => x.type === 'impact'); assert.equal(impact.reason, 'out_of_range');
+  assert.equal(impact.signature_triggered, undefined);
+});
+test('support signatures trigger only on favored valid cast and never exceed HP/energy caps', () => {
+  const f = fixture(); f.e.admit(f.trusted('A', 'adalor')); f.e.admit(f.trusted('B', 'adalor')); const mid = f.match();
+  const a = f.e.matches.get(mid).players[0]; a.hp -= 10;
+  f.cast(mid, 'A', 9, 'adalor-rally-once'); f.advance(.05); const s = f.e.state('A', mid);
+  assert.equal(a.hp, a.max_hp - 6);
+  const cast = s.events.find(x => x.type === 'cast'); assert.equal(cast.signature_effect, 'recover');
+  assert.equal(cast.signature_amount, 4);
+  f.cast(mid, 'A', 9, 'adalor-rally-once'); assert.equal(a.hp, a.max_hp - 6);
+  const g = fixture(); g.e.admit(g.trusted('A', 'dragonos')); g.e.admit(g.trusted('B', 'dragonos'));
+  const gm = g.match(); g.e.matches.get(gm).players[0].energy = 2;
+  g.cast(gm, 'A', 4); g.advance(.05); const charge = g.e.state('A', gm).events.find(x => x.type === 'cast');
+  assert.equal(charge.signature_effect, 'surge'); assert.equal(charge.signature_amount, .25);
+  assert.ok(g.e.matches.get(gm).players[0].energy <= 6);
 });
 test('one account and one asset lease; failed switch does not erase prior admission', () => {
   const { e, trusted } = fixture();
@@ -105,19 +199,22 @@ test('cooldowns, energy, request reuse and finite input are authoritative', () =
 test('movement is simultaneous, intent-only, monotonic-cadenced and max .2s', () => {
   const { e, match, advance, move, cast } = fixture(); const mid = match();
   rejected(() => move(mid, 'A', 1, 0)); advance(1); const first = move(mid, 'A', 1, 0, 'move-idempotent-one');
-  assert.equal(first.players[0].position.x, -4.24); const replay = move(mid, 'A', 1, 0, 'move-idempotent-one');
+  const expectedStep = 3.8 * .2 * first.players[0].trait.stride;
+  assert.equal(first.players[0].position.x, -5 + expectedStep); const replay = move(mid, 'A', 1, 0, 'move-idempotent-one');
   assert.deepEqual(replay.players[0].position, first.players[0].position); rejected(() => move(mid, 'A', -1, 0, 'move-idempotent-one'));
   cast(mid); advance(.05); move(mid, 'B', 0, 1); move(mid, 'A', 0, 1);
   assert.equal(e.state('A', mid).players[0].movement_remaining, undefined);
-  advance(.2); const diagonal = move(mid, 'A', 1, 1); assert.ok(Math.abs(Math.hypot(diagonal.players[0].position.x + 4.24, diagonal.players[0].position.z - .19) - .76) < 1e-9);
+  advance(.2); const before = e.state('A', mid).players[0].position; const diagonal = move(mid, 'A', 1, 1);
+  assert.ok(Math.abs(Math.hypot(diagonal.players[0].position.x - before.x, diagonal.players[0].position.z - before.z) - expectedStep) < 1e-9);
 });
 test('standard/overtime/crest fractional regen and cap6', () => {
   const { e, match, advance } = fixture(); const mid = match();
-  e.matches.get(mid).players[0].energy = 0; advance(.25); assert.equal(e.state('A', mid).players[0].energy, .25);
-  e.matches.get(mid).players[0].position = { x: 0, y: 0, z: 0 }; advance(.25); assert.equal(e.state('A', mid).players[0].energy, .75);
+  const focus = e.state('A', mid).players[0].trait.focus;
+  e.matches.get(mid).players[0].energy = 0; advance(.25); assert.equal(e.state('A', mid).players[0].energy, .25 * focus);
+  e.matches.get(mid).players[0].position = { x: 0, y: 0, z: 0 }; advance(.25); assert.equal(e.state('A', mid).players[0].energy, .5 * focus + .25);
   for (let i = 0; i < 3; i++) { advance(30); e.state('A', mid); e.state('B', mid); }
   e.matches.get(mid).players[0].energy = 0; e.matches.get(mid).players[0].position = { x: -5, y: 0, z: 0 };
-  advance(.2); const s = e.state('A', mid); assert.equal(s.realtime.phase, 'overtime'); assert.equal(s.players[0].energy, .3);
+  advance(.2); const s = e.state('A', mid); assert.equal(s.realtime.phase, 'overtime'); assert.equal(s.players[0].energy, .3 * focus);
 });
 test('range misses and blocked LOS do not heal, weaken or drain energy', () => {
   for (const slot of [5, 8, 10]) {
@@ -194,6 +291,11 @@ test('checkpoint is serializable, restart cancels active but preserves normal co
   const { e, match, cast, advance } = fixture(); const mid = match(); cast(mid);
   const checkpoint = JSON.parse(JSON.stringify(e.checkpoint())); const fresh = fixture().e; fresh.admissions.clear(); fresh.accounts.clear(); fresh.assets.clear();
   assert.equal(fresh.restore(checkpoint).cancelled_on_restart, 1); assert.equal(fresh.matches.get(mid).pending_casts.length, 0); assert.equal(fresh.drainCompletions().length, 0);
+  const legacy = structuredClone(checkpoint); for (const player of legacy.matches[0].players) delete player.trait;
+  const legacyEngine = fixture().e; legacyEngine.admissions.clear(); legacyEngine.accounts.clear(); legacyEngine.assets.clear();
+  assert.equal(legacyEngine.restore(legacy).cancelled_on_restart, 1);
+  assert.deepEqual(legacyEngine.matches.get(mid).players[0].trait, SPECIES_TRAITS.galador);
+  assert.equal(legacy.matches[0].players[0].trait, undefined); // Restore never rewrites its caller's durable record.
   const completed = fixture(); const cmid = completed.match(); completed.e.matches.get(cmid).players[1].hp = 1; completed.cast(cmid); completed.advance(.05); completed.e.tick();
   const restored = fixture().e; restored.admissions.clear(); restored.accounts.clear(); restored.assets.clear(); restored.restore(JSON.parse(JSON.stringify(completed.e.checkpoint())));
   assert.equal(restored.drainCompletions().length, 1); assert.equal(restored.drainCompletions()[0].match_id, cmid);
@@ -217,6 +319,7 @@ test('match, event, cast and movement caches fail closed at declared bounds', ()
 test('corrupt checkpoint cannot restore mutated stats, identities, cardinality or rewards', () => {
   const f = fixture(); f.match(); const checkpoint = JSON.parse(JSON.stringify(f.e.checkpoint()));
   for (const corrupt of [c => c.matches[0].players[0].max_hp = 99999,
+    c => c.matches[0].players[0].trait.ward = 100,
     c => c.matches[0].players[0].energy = 7,
     c => c.matches[0].identities.A.wallet = '',
     c => c.matches[0].metrics.A.damage_dealt = NaN,

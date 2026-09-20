@@ -14,7 +14,7 @@ const folder = dirname(fileURLToPath(import.meta.url));
 const prefix = process.argv[2] ?? '/private/tmp/chikiseum-full-real-server-qa-v1';
 const sourceFiles = ['server.js', 'pvp-engine.js', 'chikiseum-live-service.js', 'chikiseum-live-engine.js',
   'chikiseum-live-navigation.js', 'chikiseum-live-progression.js', 'chikiseum-live-lease.js',
-  'chikiseum-profiles.json', 'chikiseum_reference_arena_v2.json', 'chikiseum-live-server.test.mjs'];
+  'chikiseum-profiles.json', 'chikiseum-species-traits.json', 'chikiseum_reference_arena_v2.json', 'chikiseum-live-server.test.mjs'];
 const sha = raw => createHash('sha256').update(raw).digest('hex');
 const pins = () => Object.fromEntries(sourceFiles.map(p => [p, sha(readFileSync(resolve(folder, p)))]));
 const before = pins();
@@ -104,16 +104,22 @@ try {
     const body = { ...A.auth }; delete body[key]; const r = await post(P + '/roster', body); check(r.status === 400, `required auth field ${key} cannot be omitted`);
   }
   const hostile = await post(P + '/roster', A.auth, { Origin: 'https://evil.invalid' }); check(hostile.status === 403 && hostile.data.code === 'ORIGIN_DENIED', 'real namespace rejects hostile web origin');
-  for (const extra of [{ level: 30 }, { hp: 9999 }, { species: 'doge' }, { damage: 9999 }, { stake: 1 }, { currency: 'SOL' }, { slots: [6] }, { winner: 'A' }]) {
+  for (const extra of [{ level: 30 }, { hp: 9999 }, { species: 'doge' }, { damage: 9999 }, { trait: { ward: 100 } },
+    { stake: 1 }, { currency: 'SOL' }, { slots: [6] }, { winner: 'A' }]) {
     const r = await rpc(A, 'session', { asset_id: normalA.id, ...extra }); check(r.status === 400, 'client fighter/stat/money/outcome extras rejected by real HTTP whitelist');
   }
   const missing = await rpc(A, 'session', { asset_id: 'made-up-asset' }); check(missing.status === 403, 'fake owned asset cannot be admitted');
   const stolen = await rpc(A, 'session', { asset_id: legendB.id }); check(stolen.status === 403, 'real registry prevents selecting rival asset');
   const roster = await command(A, 'roster'); check(roster.schema === 'chikiseum.live-roster/v1' && roster.fighters.length === 2, 'actual owned normal and legendary registry assets are listed');
+  const firixRow = roster.fighters.find(x => x.asset_id === normalA.id);
+  const galadorRow = roster.fighters.find(x => x.asset_id === legendA.id);
+  check(firixRow?.trait?.name === 'Cinder Rush' && galadorRow?.trait?.name === 'Tidal Conductor', 'owned roster previews each canonical species trait before selection');
+  check(roster.fighters.every(x => x.asset_id !== normalB.id && x.asset_id !== legendB.id), 'private trait roster does not reveal rival owned assets');
   check(roster.fighters.every(x => x.level === 1 && x.xp === 0), 'client-authored MMO registry level30 does not elevate separate PvP level1');
   check(roster.fighters.every(x => x.eligible), 'clean hatched registry fixtures pass actual eligibility gate');
   const sA = await command(A, 'session', { asset_id: normalA.id }), sB = await command(B, 'session', { asset_id: normalB.id });
   check(sA.fighter.species === 'firix' && sA.fighter.level === 1 && sA.fighter.rarity === 'normal', 'normal admission is rebuilt by server canonical roster/earned level');
+  check(JSON.stringify(sA.fighter.trait) === JSON.stringify(firixRow.trait), 'selected fighter uses the same canonical trait as the roster preview');
   check(sA.schema === 'chikiseum.live-session/v1' && !sA.token && sA.fighter.asset_id === normalA.id, 'live admission binds exact own asset, no practice bearer');
   const normalMid = await newMatch(A, B); const normalState = await command(A, 'state', { match_id: normalMid });
   check(normalState.you.hand.length === 3 && normalState.you.asset_id === normalA.id, 'normal kit privately renders exact original three-card hand');

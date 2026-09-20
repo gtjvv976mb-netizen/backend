@@ -28,6 +28,23 @@ const opposite = s => s === 'A' ? 'B' : 'A';
 const opaque = () => randomBytes(18).toString('hex');
 const safe = s => typeof s === 'string' && s.length > 0 && s.length <= 160 && !/[\x00-\x1f\x7f]/.test(s);
 const freeze = obj => { if (obj && typeof obj === 'object') { Object.values(obj).forEach(freeze); Object.freeze(obj); } return obj; };
+const traitDocument = JSON.parse(readFileSync(new URL('./chikiseum-species-traits.json', import.meta.url)));
+if (traitDocument.schema !== 'chikiseum.species-traits/v1' || !traitDocument.profiles
+  || Object.keys(traitDocument.profiles).length !== 41 || !traitDocument.signatures
+  || Object.keys(traitDocument.signatures).length !== 41) throw new Error('Invalid Chikimon trait catalogue');
+const SIGNATURE_EFFECTS = new Set(['surge', 'recover', 'sunder', 'fury']);
+export const SPECIES_TRAITS = freeze(Object.fromEntries(Object.entries(traitDocument.profiles).map(([species, row]) => {
+  if (!safe(species) || !Array.isArray(row) || row.length !== 6 || !safe(row[0]) || !safe(row[1]))
+    throw new Error('Invalid Chikimon trait identity');
+  for (const value of row.slice(2)) if (typeof value !== 'number' || !Number.isFinite(value) || value < .9 || value > 1.1)
+    throw new Error('Unbalanced Chikimon trait');
+  const signature = traitDocument.signatures[species];
+  if (!Array.isArray(signature) || signature.length !== 2 || !safe(signature[0]) || !SIGNATURE_EFFECTS.has(signature[1]))
+    throw new Error('Invalid Chikimon signature');
+  if (SELF.has(signature[0]) && !['surge', 'recover'].includes(signature[1])) throw new Error('Unsafe self signature');
+  return [species, { name: row[0], style: row[1], stride: row[2], focus: row[3], ward: row[4], reach: row[5],
+    signature_arch: signature[0], signature_effect: signature[1] }];
+})));
 export class LiveRejected extends Error {
   constructor(message, code = 'INVALID_COMMAND', status = 400) { super(message); this.name = 'LiveRejected'; this.code = code; this.status = status; }
 }
@@ -39,7 +56,7 @@ const finite = (x, min, max, field) => {
 const integer = (x, min, max, field) => { finite(x, min, max, field); if (!Number.isInteger(x)) fail(`Invalid ${field}`); return x; };
 const requestId = id => { if (!safe(id) || id.length < 8 || id.length > 80) fail('A stable request ID is required'); };
 
-export function cardGeometry(card) {
+export function cardGeometry(card, trait = null) {
   const { arch, delivery } = card;
   let reach;
   if (SELF.has(arch)) reach = 0;
@@ -47,8 +64,11 @@ export function cardGeometry(card) {
   else if (arch === 'nova' || RANGED.has(delivery)) reach = 12;
   else if (WAVES.has(delivery)) reach = round(Math.min(9, Math.max(2.8, card.radius * .05)));
   else reach = 1.9;
-  return { range_m: reach, contact_range_m: arch === 'quick' ? 1.9 : reach,
-    dash_range_m: arch === 'quick' ? 5 : 0, range_model: 'practice_delivery/v1', delivery, arch };
+  const reachMultiplier = trait?.reach ?? 1, strideMultiplier = trait?.stride ?? 1;
+  const contact = round((arch === 'quick' ? 1.9 : reach) * reachMultiplier);
+  const dash = arch === 'quick' ? round(5 * strideMultiplier) : 0;
+  return { range_m: arch === 'quick' ? round(dash + contact) : round(reach * reachMultiplier), contact_range_m: contact,
+    dash_range_m: dash, range_model: 'practice_delivery/v1', delivery, arch };
 }
 
 export class ChikiseumLiveEngine {
@@ -83,6 +103,10 @@ export class ChikiseumLiveEngine {
       values.sort((a, b) => a.slot - b.slot);
       if (values.some((c, i) => c.slot !== i || c.class !== values[0].class)) throw new Error('Noncontiguous canonical kit');
     }
+    if (this.species.size !== Object.keys(SPECIES_TRAITS).length
+      || [...this.species.keys()].some(species => !SPECIES_TRAITS[species]
+        || !this.species.get(species).some(card => card.arch === SPECIES_TRAITS[species].signature_arch)))
+      throw new Error('Trait roster or signature differs from canonical cards');
     this.navigation = navigation;
     this.arena = freeze({ ...navigation.binding(), realtime_rules: { ...RULES,
       card_cooldowns_seconds: COOLDOWNS, status_seconds: STATUS_SECONDS } });
@@ -115,7 +139,8 @@ export class ChikiseumLiveEngine {
     const [hpMul, damageMul] = RARITY[kit[0].class];
     return { asset_id: record.asset_id, species: record.species, display_name: kit[0].display_name,
       rarity: kit[0].class, level: record.level, card_tier: record.level < 8 ? 0 : record.level < 16 ? 1 : 2,
-      max_hp: round((120 + 6 * record.level) * hpMul), damage_multiplier: damageMul, slots: kit.map(c => c.slot), level_source: 'server_earned_pvp' };
+      max_hp: round((120 + 6 * record.level) * hpMul), damage_multiplier: damageMul, slots: kit.map(c => c.slot),
+      trait: copy(SPECIES_TRAITS[record.species]), level_source: 'server_earned_pvp' };
   }
   admit(record) {
     this._guard(); this.expire();
@@ -206,7 +231,8 @@ export class ChikiseumLiveEngine {
   _publicFighter(fighter) { const { slots, damage_multiplier, asset_id, ...publicData } = fighter; return copy(publicData); }
   static compatible(a, b) {
     if (a.card_tier !== b.card_tier || Math.abs(a.level - b.level) > 3 || a.slots.length !== b.slots.length) return false;
-    const pa = a.max_hp * a.damage_multiplier, pb = b.max_hp * b.damage_multiplier;
+    const pa = a.max_hp * a.damage_multiplier * Math.sqrt(a.trait.focus * a.trait.ward * a.trait.stride * a.trait.reach);
+    const pb = b.max_hp * b.damage_multiplier * Math.sqrt(b.trait.focus * b.trait.ward * b.trait.stride * b.trait.reach);
     return Math.max(pa, pb) / Math.min(pa, pb) <= 1.15;
   }
   _available(p) { if (this.leases.has(p.id)) fail('Trainer already matched', 'ACCOUNT_BUSY', 409); }
@@ -295,12 +321,12 @@ export class ChikiseumLiveEngine {
     const elapsed = m.started_at === null ? 0 : Math.max(0, Math.min(180, clockEnd - m.started_at));
     const remaining = m.status === 'active' ? Math.max(0, 180 - elapsed) : 0;
     result.server_time = now; result.match_remaining_seconds = remaining;
-    result.realtime = { elapsed, remaining, duration: 180, energy_regen_per_second: elapsed >= 90 ? 1.5 : 1,
+    result.realtime = { elapsed, remaining, duration: 180, energy_regen_per_second: round((elapsed >= 90 ? 1.5 : 1) * p.trait.focus),
       server_time: now, phase: elapsed >= 90 ? 'overtime' : 'standard', tick_seconds: .05, movement_budgeted: false };
     const cds = copy(m.cooldowns[p.side]), own = [...m.cast_requests].filter(([, command]) => command.side === p.side);
     result.you = { side: p.side, asset_id: p.asset_id, committed: false, hand: m.status === 'active' ? p.slots.map(slot => {
       const c = this.cards.get(`${p.species}:${slot}`); return { slot, key: c.key, name: c.card_name,
-        cost: c.mechanics.cost, cooldown_seconds: COOLDOWNS[c.arch], ...cardGeometry(c) };
+        cost: c.mechanics.cost, cooldown_seconds: COOLDOWNS[c.arch], ...cardGeometry(c, p.trait) };
     }) : [], cooldowns: cds, cooldown_remaining: Object.fromEntries(Object.entries(cds).map(([s, until]) => [s, Math.max(0, until - now)])),
     global_cooldown_until: m.global_cooldowns[p.side], cast_ack: own.at(-1)?.[0] ?? null };
     return result;
@@ -344,7 +370,7 @@ export class ChikiseumLiveEngine {
     if (m.move_requests.size >= 16384) fail('Movement command limit reached', 'RATE_LIMIT', 429);
     const mono = this._mono(), elapsed = mono - m.movement[p.side].last_time;
     if (elapsed < .05 - 1e-9) fail('Movement cadence is server limited', 'MOVE_CADENCE', 429);
-    const length = Math.hypot(dx, dz), distance = 3.8 * Math.min(elapsed, .2) * Math.min(1, length);
+    const length = Math.hypot(dx, dz), distance = 3.8 * p.trait.stride * Math.min(elapsed, .2) * Math.min(1, length);
     const target = m.players.find(x => x.side !== p.side);
     const swept = this.navigation.sweepIntent(p.position, length ? dx / length : 0, length ? dz / length : 0, distance, target.position);
     m.movement[p.side].last_time = mono;
@@ -364,6 +390,17 @@ export class ChikiseumLiveEngine {
     m.events.push(event);
     // Events are append-only with monotone seq; keep enough history for bounded reconnect.
     if (m.events.length > 1024) m.events.splice(0, m.events.length - 1024);
+    return event;
+  }
+  _signature(m, p, target, card, landed) {
+    if (p.hp <= 0 || card.arch !== p.trait.signature_arch || !landed) return { triggered: false, amount: 0 };
+    const effect = p.trait.signature_effect;
+    let amount = 0;
+    if (effect === 'surge') { amount = round(Math.min(.25, 6 - p.energy)); p.energy = round(p.energy + amount); }
+    else if (effect === 'recover') { amount = round(Math.min(4, p.max_hp - p.hp)); p.hp = round(p.hp + amount); }
+    else if (effect === 'sunder') { amount = round(Math.min(.25, target.energy)); target.energy = round(target.energy - amount); }
+    else if (effect === 'fury') amount = .07;
+    return { triggered: effect === 'fury' || amount > 0, amount };
   }
   _endStatus(m, target, name, status) {
     const caster = m.players.find(x => x.side === status.source_side);
@@ -381,7 +418,7 @@ export class ChikiseumLiveEngine {
     const overtime = Math.max(0, until - Math.max(start, boundary)); let changed = false;
     m.last_updated_at = until;
     for (const p of m.players) {
-      let regen = standard + overtime * 1.5;
+      let regen = (standard + overtime * 1.5) * p.trait.focus;
       if (p.hp > 0 && this.navigation.onEmblem(p.position)) regen += until - start;
       const energy = Math.min(6, round(p.energy + regen, 9)); changed ||= energy !== p.energy; p.energy = energy;
       for (const [name, s] of Object.entries(p.statuses)) {
@@ -397,7 +434,7 @@ export class ChikiseumLiveEngine {
     for (const p of quick) {
       const origin = before.get(p.side), destination = before.get(opposite(p.side));
       const dx = destination.x - origin.x, dz = destination.z - origin.z, separation = Math.hypot(dx, dz);
-      const approach = Math.min(5, Math.max(0, separation - 1.25) / (quick.length === 2 ? 2 : 1));
+      const approach = Math.min(5 * p.trait.stride, Math.max(0, separation - 1.25) / (quick.length === 2 ? 2 : 1));
       const swept = this.navigation.sweepIntent(origin, separation ? dx / separation : 0, separation ? dz / separation : 0, approach, destination);
       p.position = copy(swept.position); if (swept.travelled > 1e-9) m.movement_revision++;
       dash.set(p.side, { dash_from: origin, dash_to: copy(p.position), dash_duration: Math.max(.12, swept.travelled / 10),
@@ -409,34 +446,44 @@ export class ChikiseumLiveEngine {
       const slot = slots.get(p.side), c = this.cards.get(`${p.species}:${slot}`), mech = c.mechanics, tier = p.card_tier;
       const target = m.players.find(x => x.side !== p.side);
       m.metrics[p.side].cast_count++;
-      this._event(m, p, 'cast', slot, { card_key: c.key, attack_origin: copy(p.position), target_position: copy(target.position), ...cardGeometry(c), ...(dash.get(p.side) ?? {}) });
+      const castEvent = this._event(m, p, 'cast', slot, { card_key: c.key, attack_origin: copy(p.position), target_position: copy(target.position),
+        ...cardGeometry(c, p.trait), ...(dash.get(p.side) ?? {}) });
       if (c.arch === 'guard' || c.arch === 'bulwark') this._status(m, p, p, 'shield', slot, now, { amount: mech.shield[tier] }, c.arch === 'bulwark' ? 6 : 4);
       else if (c.arch === 'charge') { p.energy = Math.min(6, p.energy + mech.energy); this._status(m, p, p, 'charge', slot, now, { multiplier: mech.nextmul[tier] }); }
       else if (c.arch === 'rally') this._status(m, p, p, 'rally', slot, now, { multiplier: 1 + mech.buff[tier] });
       else attacks.push({ p, target, slot, c });
+      if (SELF.has(c.arch)) {
+        const result = this._signature(m, p, target, c, true);
+        if (result.triggered) Object.assign(castEvent, { signature_name: p.trait.name, signature_effect: p.trait.signature_effect,
+          signature_triggered: true, signature_amount: result.amount });
+      }
     }
     const pending = attacks.map(a => {
       const { p, target, c } = a, statuses = p.statuses; let damage = c.mechanics.dmg[p.card_tier] * p.damage_multiplier;
       for (const name of ['rally', 'charge']) if (statuses[name]) damage *= statuses[name].multiplier;
       if (statuses.weaken) damage *= 1 - statuses.weaken.fraction;
-      damage = round(damage);
+      if (c.arch === p.trait.signature_arch && p.trait.signature_effect === 'fury') damage *= 1.07;
+      damage = round(damage / target.trait.ward);
       const separation = Math.hypot(p.position.x - target.position.x, p.position.z - target.position.z);
-      let reason = separation > cardGeometry(c).contact_range_m + 1e-9 ? 'out_of_range' : null;
+      let reason = separation > cardGeometry(c, p.trait).contact_range_m + 1e-9 ? 'out_of_range' : null;
       if (!reason && !this.navigation.lineOfSight(p.position, target.position, .9)) reason = 'blocked_line_of_sight';
       if (reason) damage = 0;
       const shield = target.statuses.shield, blocked = shield ? Math.min(damage, shield.amount) : 0;
       if (blocked) { shield.amount -= blocked; this._event(m, target, 'block', shield.slot, { target_side: target.side, amount: blocked }); }
-      return { ...a, damage: round(damage - blocked), reason, separation };
+      return { ...a, damage: round(damage - blocked), blocked, reason, separation };
     });
     for (const { p, target, c, damage } of pending) {
       m.metrics[p.side].damage_dealt = round(m.metrics[p.side].damage_dealt + Math.min(target.hp, damage));
       target.hp = Math.max(0, round(target.hp - damage));
       if (c.arch === 'nova') p.hp = Math.max(0, p.hp - c.mechanics.recoil[p.card_tier]);
     }
-    for (const { p, target, slot, c, damage, reason, separation } of pending) {
+    for (const { p, target, slot, c, damage, blocked, reason, separation } of pending) {
       const mech = c.mechanics, tier = p.card_tier;
+      const signature = this._signature(m, p, target, c, damage > 0 || (p.trait.signature_effect === 'fury' && !reason && blocked > 0));
       this._event(m, p, 'impact', slot, { target_side: target.side, amount: damage, reason, distance_m: separation,
-        attack_origin: copy(p.position), target_position: copy(target.position), ...cardGeometry(c) });
+        ...(signature.triggered ? { signature_name: p.trait.name, signature_effect: p.trait.signature_effect,
+          signature_triggered: true, signature_amount: signature.amount } : {}),
+        attack_origin: copy(p.position), target_position: copy(target.position), ...cardGeometry(c, p.trait) });
       if (damage && c.arch === 'drain' && p.hp > 0) {
         const healed = Math.min(p.max_hp - p.hp, damage * mech.heal[tier]);
         if (healed > 0) { p.hp = round(p.hp + healed); this._event(m, p, 'heal', slot, { target_side: p.side, amount: round(healed) }); }
@@ -549,6 +596,7 @@ export class ChikiseumLiveEngine {
         if (p.side !== (index === 0 ? 'A' : 'B') || !safe(p.trainer_id) || !this.species.has(p.species) || !this.navigation.validPosition(p.position)) throw new Error('Corrupt persisted fighter');
         const canonical = this._fighter(p);
         for (const key of ['max_hp', 'card_tier', 'damage_multiplier', 'rarity']) if (p[key] !== canonical[key]) throw new Error('Persisted fighter stats changed');
+        if (p.trait !== undefined && JSON.stringify(p.trait) !== JSON.stringify(canonical.trait)) throw new Error('Persisted fighter trait changed');
         if (JSON.stringify(p.slots) !== JSON.stringify(canonical.slots) || !Number.isFinite(p.hp) || p.hp < 0 || p.hp > p.max_hp
           || !Number.isFinite(p.energy) || p.energy < 0 || p.energy > 6) throw new Error('Corrupt persisted HP or energy');
         const identity = saved.identities[p.side], metric = saved.metrics[p.side];
@@ -571,6 +619,7 @@ export class ChikiseumLiveEngine {
     for (const completion of checkpoint.completions) this.completions.set(completion.match_id, copy(completion));
     for (const saved of checkpoint.matches) {
       const m = { ...copy(saved), cast_requests: new Map(saved.cast_requests), move_requests: new Map(saved.move_requests), arena: this.arena };
+      for (const p of m.players) p.trait = copy(SPECIES_TRAITS[p.species]); // Canonicalize legacy checkpoints after validation.
       this.matches.set(m.match_id, m);
       if (ACTIVE.has(m.status)) { m.last_updated_at = this._now(); this._finish(m, 'server_restart'); }
     }

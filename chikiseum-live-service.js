@@ -5,7 +5,7 @@
 // injected rail; it never holds a key. The engine stays free — a wagered match is an ordinary
 // match whose outcome the ledger reads afterwards.
 import { createHash } from 'node:crypto';
-import { ChikiseumLiveEngine, LiveRejected } from './chikiseum-live-engine.js';
+import { ChikiseumLiveEngine, LiveRejected, SPECIES_TRAITS } from './chikiseum-live-engine.js';
 import { ChikiseumProgressBook } from './chikiseum-live-progression.js';
 import { ChikiseumLiveNavigation } from './chikiseum-live-navigation.js';
 import { ChikiseumWagerLedger, WagerRejected, LAMPORTS_PER_SOL } from './chikiseum-wagers.js';
@@ -285,7 +285,7 @@ export class ChikiseumLiveService {
       }
       const publicRows = rows.slice(0, 400).map(r => ({ asset_id: r.asset_id, species: r.species,
         display_name: r.display_name, rarity: r.rarity, eligible: r.eligible === true, reason: r.reason || '',
-        ...this.book.fighter(r.asset_id) }));
+        ...this.book.fighter(r.asset_id), trait: Object.hasOwn(SPECIES_TRAITS, r.species) ? clone(SPECIES_TRAITS[r.species]) : null }));
       if (route === 'roster') return { schema: 'chikiseum.live-roster/v1', ...this.flags(), ...this.bindings, fighters: publicRows };
       const prior = this.admitted.get(auth.wallet);
       const id = createHash('sha256').update(auth.wallet + '\0' + auth.session_id + '\0' + auth.epoch).digest('hex').slice(0, 36);

@@ -26,7 +26,7 @@ Methods (all synchronous):
 - `challenge(id,targetId)`: `{challenge_id}`; target must be recently present and compatible.
 - `accept(id,challengeId)`: `{match_id}`; only its target can accept.
 - `state(id,matchId)`, `ready(id,matchId)`: private `chikiseum.battle/v1` view.
-- `move(id,matchId,dx,dz,requestId)`: intent axes only; server-monotonic 50ms cadence, 3.8m/s, max elapsed .2s, exact navigation sweep and rival exclusion.
+- `move(id,matchId,dx,dz,requestId)`: intent axes only; server-monotonic 50ms cadence, 3.8m/s base speed scaled by canonical species stride, max elapsed .2s, exact navigation sweep and rival exclusion.
 - `cast(id,matchId,slot,requestId)`: reserves canonical cost/cooldown immediately; full private view with equal top-level/`you.cast_ack` and `cast_queued` true while pending, false for completed idempotent replay.
 - `cancel(id,matchId?)`: clear queue/challenges; ready cancel or active forfeit. No XP summary.
 - `revoke(id)`: immediately cancel/forfeit and release identity leases; use when auth/ownership/session invalidates.
@@ -42,6 +42,31 @@ engine, including no invented rend/bleed/status behavior.
 
 `LiveRejected` carries `code` and HTTP-compatible `status`. Caller metadata is
 never accepted as authoritative time, position, HP or outcome.
+
+## Chikimon tactical traits
+
+`chikiseum-species-traits.json` defines one named, bounded profile for each of the
+41 canonical species. The engine validates the roster and favored card against the
+402-card catalogue at startup. Admissions derive the profile from the owned asset's
+canonical species; client-supplied traits are ignored. The authenticated `roster`
+response includes each owned fighter's canonical trait before selection, and the
+session returns that same profile. `stride` scales movement and
+Quick dash distance, `focus` scales passive energy recovery, `ward` reduces incoming
+card damage, and `reach` scales card contact/ranged distance. Matchmaking includes
+these modifiers in its compatibility estimate while retaining the existing rarity
+and server-earned-level limits. Practice opponents mirror the player's profile.
+
+Each species also favors one card archetype. A confirmed favored cast or hit can
+restore up to 0.25 energy, recover up to 4 HP, drain up to 0.25 rival energy, or
+deal 7% more damage, depending on its canonical signature. Attack signatures
+require an actual hit; missed or fully shielded attacks cannot drain or recover.
+The effect is resolved once per accepted cast, capped by HP/energy limits, and
+reported on the confirmed event for lightweight client feedback. The engine still
+does not handle money: wagered and free matches use the same authoritative rules.
+
+Durable fighters now carry their canonical trait. Restore accepts pre-trait
+checkpoints but rejects altered trait values when present, then attaches the
+canonical profile before cancelling unfinished matches under the restart policy.
 
 ## Bounds and persistence
 
