@@ -20,6 +20,7 @@ import { installChikiseumLive } from "./chikiseum-live-service.js";
 import { acquireChikiseumLease } from "./chikiseum-live-lease.js";
 import { buildHealth } from "./build-stamp.js";   // which commit is answering — resolved at boot, reported by /health
 import { makeWagerChain, makeWagerRail } from "./chikiseum-wager-chain.js";   // SOL wager deposit reader + treasury payout rail
+import { createRealmLink } from "./realm-link.js";   // iOS pairing: a credential that plays an account but cannot move its value
 
 dotenv.config();
 const {
@@ -958,6 +959,16 @@ function memStore() {
 }
 
 const store = makeStore();
+
+/* ----------------------------- Realm Link (the iOS app's pairing) ----------------------------- */
+// The app has no wallet and never will — a wallet-connect button is an App Store guideline 3.1.1
+// problem. So the player signs in on the website, mints a code, and types it into the app once.
+// From then on the app holds a DEVICE CREDENTIAL that authorises PLAYING this account.
+//
+// It must never authorise MOVING VALUE, and that is enforced here rather than trusted to the
+// client: a link session's market token comes from a separate pool, which makes "this request came
+// from a paired device" decidable on the server. See `appTokenGuard` below and realm-link.js.
+const realmLink = createRealmLink({ store, isPubkey });
 
 /* ----------------------------- the world chronicle engine (CHIK_CHRONICLE) ----------------------------- */
 // One append path (chronicleAdd) + one counter path (chronicleBump). Both are SYNCHRONOUS in-memory
@@ -1913,6 +1924,40 @@ app.use((req, res, next) => {
   });
 });
 
+// ---- THE APP CANNOT SELL, AND THIS IS WHERE THAT BECOMES TRUE ---------------------------------
+//
+// realm/chiki-ios.js refuses the selling routes in the browser and the app carries no code that
+// can sign a transaction. Both are real, and neither is enforcement: a client is a client, and
+// someone not using our client can post whatever they like. A paired device's market token comes
+// from a separate pool (realm-link.js), so "this came from the app" is decidable here.
+//
+// ONE PLACE, NOT ELEVEN. Adding this check to each route would work until the twelfth route was
+// written, and the failure mode is silent — an App Store app quietly able to list items for sale.
+// Matching on the path keeps a future /market/whatever closed by default.
+//
+// EARNING IS DELIBERATELY NOT LISTED. Minting what you won, hatching, gathering, claiming a node
+// and saving your profile all stay open: the whole design is that what you earn in the app is
+// really yours. What the app cannot do is turn it into money.
+const APP_DENY_PATH = new RegExp([
+  "^/market/op$",                        // every Trading Post write: list, cancel, order_*, auction_*
+  "^/market/(buy-onchain|order-pay)$",   // paying for one
+  "^/nft/market/(buy|list|delist|confirm)$",
+  "^/meme/buy$",
+  "^/claim$",                            // the SOL faucet
+  "^/quest/(payout|rewards/payout)$",
+  "^/cup/(register|ready)$",             // the Cup pays a real SOL prize pool
+].join("|"));
+
+app.use((req, res, next) => {
+  if (req.method !== "POST" || !APP_DENY_PATH.test(req.path)) return next();
+  const tok = req.body?.mktToken || req.body?.token || req.headers["x-mkt-token"];
+  if (!isAppToken(tok)) return next();
+  return res.status(403).json({
+    error: "Selling and trading are not available in the app. Everything you earn here is yours to keep.",
+    code: "APP_READ_ONLY",
+  });
+});
+
 app.get("/health", async (_q, res) => {
   let dbReady = false;
   try { await store.ping(); dbReady = true; } catch {}
@@ -1952,8 +1997,19 @@ app.post("/verify", async (req, res) => {
     // SIGN-IN (web): the client may attach a Phantom-signed "Chikoria sign-in" message.
     // A valid Ed25519 signature proves the caller OWNS this wallet (paste-any-address is
     // read-only). Absence is not an error — desktop builds still link by public address.
-    const signedIn = verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig);
+    const sigSignedIn = verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig);
+    // REALM LINK: a paired iOS device proves itself with a device credential instead of an Ed25519
+    // signature, because it has no wallet to sign with. It is a WEAKER proof on purpose and buys
+    // strictly less: the market token minted for it below comes from a separate pool, and
+    // appTokenGuard refuses it on every route that moves value.
+    const linked = req.body?.linkToken ? realmLink.resolve(req.body.linkToken, req.body?.device_id) : null;
+    const linkOk = !!linked && linked.wallet === wallet;
+    const signedIn = sigSignedIn || linkOk;
     if (signedIn) { try { await store.kvSet("signin:" + wallet, { ts: Date.now() }); } catch (e) {} }
+    // A signature is the owner turning up in person. If a deletion was requested from a phone, the
+    // owner being here is the answer to it — stand the request down. A link token cannot do this:
+    // a stolen phone must not be able to cancel the very request its theft would have prompted.
+    if (sigSignedIn) { try { realmLink.cancelDeletion(wallet); } catch (e) {} }
     // 1) The wallet GATE = the on-chain balance. This is the only thing the connect flow truly
     //    needs, and it never touches the database.
     let balance = 0, holdOk = true;
@@ -1998,7 +2054,10 @@ app.post("/verify", async (req, res) => {
     // (ack/cancel/bid). Non-signed-in (address-only / demo) callers get none. We ALSO bind this
     // wallet to the client's OWN net_id here — the only place a sid can be tied to a wallet safely,
     // since the net_id is private (in the owner's save) and arrives with a proven signature.
-    const mktToken = signedIn ? mintMarketToken(wallet) : "";
+    // A LINK SESSION GETS A DIFFERENT TOKEN. Same envelope, same field, different pool — so the
+    // server can tell a paired phone from a signed-in browser even for the same wallet at the same
+    // moment, which is what makes "the app cannot sell" a server fact instead of a client promise.
+    const mktToken = signedIn ? (linkOk ? realmLink.mintAppToken(wallet, req.body.linkToken) : mintMarketToken(wallet)) : "";
     if (signedIn) bindSid(stripTags(String(req.body?.netId || "")).slice(0, 40), wallet);
     // the identity-proof event everything else keys on — counter only, never a raw wallet-named row
     if (signedIn && CHRONICLE_ON) chronicleBump(wallet, "signin", 1);
@@ -2046,6 +2105,83 @@ app.post("/verify", async (req, res) => {
                      `re-enter until this wallet holds ${MIN.toLocaleString()} $CHIKI again.`;
     res.json(out);
   } catch (e) { res.status(500).json({ error: "verify failed: " + String(e.message || e) }); }
+});
+
+/* ------------------------------- Realm Link routes -------------------------------------------
+ *
+ * The pairing flow, end to end:
+ *
+ *   website (has the wallet)                app (has no wallet)
+ *   ── POST /link/new  ──► code "K4T92XPD"
+ *                                           ── POST /link/redeem {code, device_id} ──► linkToken
+ *                                           ── POST /verify {wallet, linkToken, device_id} ──► play
+ *
+ * Nothing here moves money, and a link token cannot: see APP_DENY_PATH above.
+ */
+
+/** Proof that the CALLER HOLDS THE WALLET — a signature, or a market token that is not the app's. */
+function walletProven(req) {
+  const wallet = req.body?.wallet;
+  if (!wallet || !isPubkey(wallet)) return false;
+  if (verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig)) return true;
+  const tok = req.body?.mktToken;
+  // A paired phone is explicitly NOT enough here. Pairing more devices, listing them and revoking
+  // them are wallet-holder powers; a device credential must not be able to extend itself.
+  return !!tok && !isAppToken(tok) && mktTokenOk(wallet, tok);
+}
+
+app.post("/link/new", (req, res) => {
+  if (!walletProven(req)) return res.status(401).json({ error: "sign in with your wallet first", code: "NOT_PROVEN" });
+  const out = realmLink.newCode(req.body.wallet);
+  if (out.error) return res.status(out.status || 400).json(out);
+  res.json(out);
+});
+
+app.post("/link/redeem", (req, res) => {
+  // Unauthenticated on purpose: the code IS the proof, and the device has nothing else to offer.
+  // It is short, short-lived, single-use and rate-limited per device — see realm-link.js.
+  const out = realmLink.redeem({
+    code: req.body?.code,
+    device_id: req.body?.device_id,
+    device_name: req.body?.device_name,
+    client: req.body?.client,
+  });
+  if (out.error) return res.status(out.status || 400).json(out);
+  res.json(out);
+});
+
+app.post("/link/devices", (req, res) => {
+  if (!walletProven(req)) return res.status(401).json({ error: "sign in with your wallet first", code: "NOT_PROVEN" });
+  res.json({ devices: realmLink.devices(req.body.wallet), deletion: realmLink.deletionStatus(req.body.wallet) });
+});
+
+app.post("/link/revoke", (req, res) => {
+  // Two callers, two proofs: the website's Revoke button holds the wallet; the app signing itself
+  // out holds only its own token, which is proof enough to destroy exactly that token.
+  const byToken = String(req.body?.linkToken || "");
+  if (byToken) {
+    const rec = realmLink.resolve(byToken, req.body?.device_id);
+    if (!rec) return res.status(401).json({ error: "that device credential is not valid", code: "BAD_TOKEN" });
+    return res.json(realmLink.revoke({ linkToken: byToken }));
+  }
+  if (!walletProven(req)) return res.status(401).json({ error: "sign in with your wallet first", code: "NOT_PROVEN" });
+  res.json(realmLink.revoke({ wallet: req.body.wallet, device_id: req.body?.device_id }));
+});
+
+// App Store guideline 5.1.1(v): the app must be able to REQUEST account deletion. It must not be
+// able to complete one — a Chikoria account is a wallet, and the app cannot prove it holds it.
+// So: accepted from the phone, completed after a grace period, and cancelled the moment the real
+// owner signs in on the website with a signature (see /verify). A stolen phone cannot erase an
+// account its owner still uses.
+app.post("/link/delete_account", (req, res) => {
+  const tok = String(req.body?.linkToken || "");
+  const rec = tok ? realmLink.resolve(tok, req.body?.device_id) : null;
+  const proven = walletProven(req);
+  if (!rec && !proven) return res.status(401).json({ error: "not authorised", code: "NOT_PROVEN" });
+  const wallet = rec ? rec.wallet : req.body.wallet;
+  const out = realmLink.requestDeletion({ wallet, device_id: req.body?.device_id });
+  if (out.error) return res.status(out.status || 400).json(out);
+  res.json(out);
 });
 
 // Save / load a wallet's game profile (chikis + progress) so it follows the wallet across devices.
@@ -17870,8 +18006,15 @@ function mktWallet(b) {
 // nine places; one definition means the next change to the token model cannot land in eight of them.
 function mktTokenOk(w, t) {
   t = String(t || "");
-  return !!w && t.length >= 16 && marketTokens[w] === t;
+  if (!w || t.length < 16) return false;
+  if (marketTokens[w] === t) return true;
+  // A paired iOS device carries a token from the Realm Link pool. It is a real sign-in for
+  // PLAYING — gathering, hatching, saving, the Chikiseum — and appTokenGuard is what stops it
+  // anywhere value moves. Accepting it here is what lets the app play at all.
+  return realmLink.appTokenWallet(t) === w;
 }
+/** Did this request come from a paired device rather than a wallet signature? */
+function isAppToken(t) { return !!realmLink.appTokenWallet(String(t || "")); }
 // the wallet the persisted board already attributes this sid to (or "" if none) — used to reject a
 // hijack where an attacker asserts a victim's (public, still-unbound) net_id at /verify.
 function _sidBoardWallet(sid) {

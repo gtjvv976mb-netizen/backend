@@ -7,12 +7,13 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node --test build-stamp.test.js && npm run test:chikiseum",
+    "test": "node --test build-stamp.test.js && npm run test:chikiseum && npm run test:link",
     "test:build": "node --test build-stamp.test.js",
     "test:chikiseum": "node --test chikiseum-live-engine.test.js chikiseum-live-navigation.test.js chikiseum-live-parity.test.js chikiseum-live-progression.test.js chikiseum-live-lease-adversarial.test.js chikiseum-live-service-adversarial.test.js chikiseum-arena-eligibility.test.js chikiseum-rehearsal.test.js chikiseum-wagers.test.js chikiseum-wagers-service.test.js chikiseum-wager-chain.test.js",
     "test:wagers": "node --test chikiseum-wagers.test.js chikiseum-wagers-service.test.js chikiseum-wager-chain.test.js",
     "test:chikiseum:http": "node chikiseum-live-server.test.mjs",
-    "treasury": "node scripts/new-wallet.js"
+    "treasury": "node scripts/new-wallet.js",
+    "test:link": "node realm-link.test.mjs"
   },
   "dependencies": {
     "@metaplex-foundation/mpl-core": "^1.10.0",
