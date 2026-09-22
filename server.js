@@ -133,6 +133,42 @@ const isPubkey = (s) => { try { new PublicKey(s); return true; } catch { return 
 // world PRESENCE (cosmetic avatar + name) accepts a real pubkey OR a safe per-install id — presence is not identity; rewards/BR/cup stay pubkey+signature gated
 const isPresenceId = (s) => typeof s === "string" && (isPubkey(s) || /^[A-Za-z0-9_-]{6,44}$/.test(s));
 
+/* ── APP-NATIVE ACCOUNT ADDRESSES ─────────────────────────────────────────────────────────────
+ * An iOS player who has never heard of Solana still needs an account, and every keyed thing in
+ * this file is keyed by a base58 address. So they are given one that is OFF the Ed25519 curve.
+ *
+ * `isWalletless` is therefore not a flag, a column or a token property — it is a fact about the
+ * address, recomputed from the address itself at every call site. Nothing can desynchronise it:
+ * not a stale token, not a dropped database row, not a redeploy. An address for which no private
+ * key can exist is an address nobody can sign for, and an address nobody can sign for is one we
+ * must never send SOL or mint an NFT to, because that asset would be gone for good.
+ *
+ * Real wallets are always on-curve — a Phantom key is derived from a seed — so this never
+ * misclassifies a player who actually holds one. The one address family that IS off-curve and
+ * not ours is a PDA (a multisig vault, say), and such an address cannot produce a sign-in
+ * signature either, so it was already outside every proven-owner path in this file.
+ */
+const isWalletless = (s) => { try { return !PublicKey.isOnCurve(new PublicKey(s).toBytes()); } catch { return false; } };
+function newWalletlessAddress() {
+  // ~50% of random 32-byte values are off-curve, so this lands on the first or second try.
+  for (let i = 0; i < 64; i++) {
+    const b = crypto.randomBytes(32);
+    if (!PublicKey.isOnCurve(b)) return new PublicKey(b).toBase58();
+  }
+  return "";   // never observed; realm-link.js refuses to issue an account rather than a signable one
+}
+
+/* Would sending value to this address destroy it? Consulted before every treasury send and every
+ * server-signed mint.
+ *
+ * TWO CHECKS, NOT ONE. The system address is 32 zero bytes and is ON the curve, so the off-curve
+ * test does not cover it — that is why the literal comparison it replaces stays. (Measured, not
+ * assumed: PublicKey.isOnCurve("111…1") is true.) Off-curve covers app-native accounts and the
+ * incinerator; the literal covers the system program. An address that fails either way is one no
+ * signature can ever spend from, so a payout to it is a burn with extra steps. */
+const SYSTEM_ADDRESS = "11111111111111111111111111111111";
+const unpayable = (s) => String(s || "") === SYSTEM_ADDRESS || isWalletless(s);
+
 /* Prove the request really comes from the owner of `wallet`:
    the client signs "…wallet:<wallet>…ts:<ms>…" with their Phantom key; we verify it here.
    Stops anyone from CHATTING / PINNING as the team, rewards, or any other wallet they don't own. */
@@ -594,6 +630,21 @@ function pgStore() {
     async payoutClear(wallet) { await pool.query(`UPDATE quest_winners SET payout_at=0, payout_sig=NULL, payout_lvbh=0 WHERE wallet=$1 AND paid=false`, [wallet]); },
     // ---- per-quest reward pouch: idempotent accrual (done_mask bit-OR) + variable-amount admin payout ----
     async qrAccrue(wallet, bit) { await pool.query(`INSERT INTO quest_rewards(wallet,done_mask) VALUES($1,$2::bigint) ON CONFLICT(wallet) DO UPDATE SET done_mask = quest_rewards.done_mask | $2::bigint`, [wallet, questMask(bit).toString()]); },
+    // Carry an app-native account's accrued quest pouch onto the wallet it binds to. The mask is
+    // OR'd rather than overwritten, for the same reason qrAccrue OR's it: each chapter pays once
+    // per wallet, so a chapter both rows completed must not be able to pay twice.
+    async qrMove(from, to) {
+      const r = await pool.query(`SELECT done_mask, paid_amount FROM quest_rewards WHERE wallet=$1`, [from]);
+      const row = r.rows[0];
+      if (!row) return { moved: false };
+      await pool.query(
+        `INSERT INTO quest_rewards(wallet,done_mask,paid_amount) VALUES($1,$2::bigint,$3)
+         ON CONFLICT(wallet) DO UPDATE SET done_mask = quest_rewards.done_mask | $2::bigint,
+                                          paid_amount = quest_rewards.paid_amount + $3`,
+        [to, String(row.done_mask), Number(row.paid_amount) || 0]);
+      await pool.query(`DELETE FROM quest_rewards WHERE wallet=$1`, [from]);
+      return { moved: true, done_mask: String(row.done_mask) };
+    },
     async qrGet(wallet) { const r = await pool.query(`SELECT wallet,done_mask,paid_amount,payout_sig,payout_at,payout_lvbh,payout_amount FROM quest_rewards WHERE wallet=$1`, [wallet]); return r.rows[0] || null; },
     async qrList(limit) { const r = await pool.query(`SELECT wallet,done_mask,paid_amount FROM quest_rewards WHERE done_mask > 0 ORDER BY wallet LIMIT $1`, [Math.max(1, limit|0)]); return r.rows; },
     async qrPayoutBegin(wallet) {
@@ -853,6 +904,16 @@ function memStore() {
     async payoutConfirm(wallet, sig) { const r=_memWinners.get(wallet); if(r){ r.paid=true; r.payout_sig=sig; } },
     async payoutClear(wallet) { const r=_memWinners.get(wallet); if(r&&!r.paid){ r.payout_at=0; r.payout_sig=null; r.payout_lvbh=0; } },
     async qrAccrue(wallet, bit) { const r=_memQR.get(wallet)||{wallet,done_mask:0n,paid_amount:0,payout_sig:null,payout_at:0,payout_lvbh:0,payout_amount:0}; r.done_mask=questMask(r.done_mask)|questMask(bit); _memQR.set(wallet,r); },
+    async qrMove(from, to) {
+      const src = _memQR.get(from);
+      if (!src) return { moved: false };
+      const dst = _memQR.get(to) || { wallet: to, done_mask: 0n, paid_amount: 0, payout_sig: null, payout_at: 0, payout_lvbh: 0, payout_amount: 0 };
+      dst.done_mask = questMask(dst.done_mask) | questMask(src.done_mask);
+      dst.paid_amount = (Number(dst.paid_amount) || 0) + (Number(src.paid_amount) || 0);
+      _memQR.set(to, dst);
+      _memQR.delete(from);
+      return { moved: true, done_mask: String(src.done_mask) };
+    },
     async qrGet(wallet) { return _memQR.get(wallet)||null; },
     async qrList(limit) { return [..._memQR.values()].filter(r=>r.done_mask>0).slice(0,Math.max(1,limit|0)); },
     async qrPayoutBegin(wallet) { return _memWith(async()=>{ const r=_memQR.get(wallet); if(!r) return {state:"none"};
@@ -960,15 +1021,22 @@ function memStore() {
 
 const store = makeStore();
 
-/* ----------------------------- Realm Link (the iOS app's pairing) ----------------------------- */
+/* ----------------------------- Realm Link (the iOS app's accounts) ----------------------------- */
 // The app has no wallet and never will — a wallet-connect button is an App Store guideline 3.1.1
-// problem. So the player signs in on the website, mints a code, and types it into the app once.
-// From then on the app holds a DEVICE CREDENTIAL that authorises PLAYING this account.
+// problem. Two ways in, then:
 //
-// It must never authorise MOVING VALUE, and that is enforced here rather than trusted to the
-// client: a link session's market token comes from a separate pool, which makes "this request came
-// from a paired device" decidable on the server. See `appTokenGuard` below and realm-link.js.
-const realmLink = createRealmLink({ store, isPubkey });
+//   PAIR   the player has a wallet: they sign in on the website, mint a code, type it into the app
+//          once, and the app holds a DEVICE CREDENTIAL that authorises PLAYING this account.
+//   CREATE the player has no wallet: the app makes an account on the spot, keyed by an off-curve
+//          address (see isWalletless above). No code, no website, no crypto in the flow at all.
+//   BIND   a created account later moves onto a real wallet the player proves by signature, which
+//          is the only way it gains the ability to sell. One-way.
+//
+// Neither credential may ever authorise MOVING VALUE, and that is enforced here rather than
+// trusted to the client: a link session's market token comes from a separate pool, which makes
+// "this request came from a paired device" decidable on the server. See `appTokenGuard` below and
+// realm-link.js.
+const realmLink = createRealmLink({ store, isPubkey, isWalletless, newAddress: newWalletlessAddress });
 
 /* ----------------------------- the world chronicle engine (CHIK_CHRONICLE) ----------------------------- */
 // One append path (chronicleAdd) + one counter path (chronicleBump). Both are SYNCHRONOUS in-memory
@@ -1958,6 +2026,42 @@ app.use((req, res, next) => {
   });
 });
 
+/* A SECOND, DIFFERENT GUARD — and the difference is the whole point.
+ *
+ * APP_DENY_PATH above is about WHERE the request came from: a paired phone may not sell, because
+ * selling belongs on the website where the player can sign. The account behind it is a real
+ * wallet, so the routes it is refused are exactly the value-moving ones. Earning stays open,
+ * deliberately, including minting a certificate for what you won.
+ *
+ * This guard is about WHAT THE ACCOUNT IS. An app-native account's address is off-curve, so an
+ * on-chain asset created for it could never be transferred, sold or burned by anyone — it would be
+ * destroyed at the moment of minting, and the player would have been told they had received
+ * something. That is worse than a refusal, so these routes refuse.
+ *
+ * It keys on the ADDRESS, not on the token, and so it holds no matter who is asking or what they
+ * are holding. A player who wants a real certificate binds a wallet; after that the address is
+ * on-curve and this guard stops applying to them, with nothing to migrate and no flag to flip.
+ */
+const NO_WALLET_DENY_PATH = new RegExp([
+  "^/assets/nft/(prepare|mint|reconcile)$",   // compose or submit an mpl-core create for this owner
+  "^/assets/nft/mint/confirm$",
+  "^/nft/market/",                            // buy/list/delist/confirm all name the owner on-chain
+  "^/quest/(payout|rewards/payout)$",         // treasury -> wallet $CHIKI
+  "^/claim$",                                 // treasury -> wallet SOL (also refused in-route, with copy)
+  "^/meme/buy$",
+  "^/market/(buy-onchain|order-pay)$",
+].join("|"));
+
+app.use((req, res, next) => {
+  if (req.method !== "POST" || !NO_WALLET_DENY_PATH.test(req.path)) return next();
+  const w = req.body?.wallet;
+  if (!w || !isWalletless(w)) return next();
+  return res.status(403).json({
+    error: "This account has no wallet yet. Connect a Phantom wallet on chikimonsters.com to trade, sell or collect on-chain — everything you have earned comes with you.",
+    code: "NO_WALLET",
+  });
+});
+
 app.get("/health", async (_q, res) => {
   let dbReady = false;
   try { await store.ping(); dbReady = true; } catch {}
@@ -1991,8 +2095,9 @@ app.get("/pool", async (_q, res) => {
 });
 
 app.post("/verify", async (req, res) => {
-  const wallet = req.body?.wallet;
+  let wallet = req.body?.wallet;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  let movedFrom = "";
   try {
     // SIGN-IN (web): the client may attach a Phantom-signed "Chikoria sign-in" message.
     // A valid Ed25519 signature proves the caller OWNS this wallet (paste-any-address is
@@ -2003,23 +2108,61 @@ app.post("/verify", async (req, res) => {
     // strictly less: the market token minted for it below comes from a separate pool, and
     // appTokenGuard refuses it on every route that moves value.
     const linked = req.body?.linkToken ? realmLink.resolve(req.body.linkToken, req.body?.device_id) : null;
+    // THE DEVICE THAT WAS ASLEEP DURING A BIND. When an app-native account is bound to a real
+    // wallet, its device credentials follow the account — so a phone that has not checked in since
+    // still asks about the retired address, and `linked.wallet === wallet` is false. That is not a
+    // bad credential and must not read as one.
+    //
+    // The fix is to CONTINUE, not to answer something special. An earlier version returned a small
+    // {rebind:true, signedIn:false} object and stopped — which is a shape no client in existence
+    // understands: the compiled Godot pack cannot be rebuilt from source and reads the standard
+    // envelope, so it would have rendered a signed-out screen at a player who did nothing wrong.
+    // Instead the address is simply corrected here and the rest of the route runs exactly as it
+    // would have for the new wallet. The client gets a complete, signed-in envelope naming the new
+    // address — which is the address it should have been using — plus `movedFrom` so the app's
+    // policy layer can re-stamp what it cached. A client that ignores `movedFrom` still works,
+    // because `wallet` in the envelope is the answer.
+    if (linked && linked.wallet !== wallet && isWalletless(wallet) && realmLink.boundTo(wallet) === linked.wallet) {
+      movedFrom = wallet;
+      wallet = linked.wallet;
+    }
     const linkOk = !!linked && linked.wallet === wallet;
     const signedIn = sigSignedIn || linkOk;
+    // Is this session an APP session, and is the account one with no wallet behind it at all?
+    // Two different questions with two different consequences, so two variables.
+    const appSession = linkOk;
+    const noWallet = isWalletless(wallet);
     if (signedIn) { try { await store.kvSet("signin:" + wallet, { ts: Date.now() }); } catch (e) {} }
     // A signature is the owner turning up in person. If a deletion was requested from a phone, the
     // owner being here is the answer to it — stand the request down. A link token cannot do this:
     // a stolen phone must not be able to cancel the very request its theft would have prompted.
     if (sigSignedIn) { try { realmLink.cancelDeletion(wallet); } catch (e) {} }
+    // ...with one exception, and it is not a weakening of that rule. For an app-native account
+    // there IS no signature and never can be, so cancel-by-signature would mean a deletion request
+    // can never be withdrawn at all. The device is the strongest owner such an account has.
+    if (appSession && noWallet) { try { realmLink.cancelDeletionByDevice(req.body.linkToken, req.body?.device_id); } catch (e) {} }
     // 1) The wallet GATE = the on-chain balance. This is the only thing the connect flow truly
     //    needs, and it never touches the database.
     let balance = 0, holdOk = true;
-    if (verifyOn) { balance = await chikiBalance(wallet); holdOk = balance >= MIN; }
+    // An app-native address holds nothing and never will — the RPC round trip can only return 0.
+    if (verifyOn && !noWallet) { balance = await chikiBalance(wallet); holdOk = balance >= MIN; }
+    else if (verifyOn) { holdOk = false; }
     // OPEN-GATES (admin-triggered event): the 500k hold is waived in the RESPONSE eligibility only.
     // `holdOk` — the real on-chain answer — still feeds store.touch's players flag and the old-game
     // chikis count below, and the SOL faucets (/claim, quest winner slots) re-check the hold
     // themselves and stay closed. The sign-in SIGNATURE is a separate variable (signedIn, above)
     // and is never waived: an unsigned wallet still gets no mktToken, no session, no cloud save.
-    const gateWaived = !holdOk && openGatesActive();
+    //
+    // THE 500,000 $CHIKI ENTRY GATE IS OFF IN THE APP (owner, 2026-09-22). An App Store build may
+    // not ask a player to go and acquire half a million of a token somewhere else before it will
+    // let them play — that is guideline 3.1.1 whichever way it is worded, and it is also simply a
+    // bad first five minutes. So an app session is eligible, full stop.
+    //
+    // NOTE THE SHAPE OF THIS, because the obvious alternative is a trap: setting MIN_HOLD=0 would
+    // ALSO open /claim, /chat/send and the ten 1,000,000-$CHIKI quest winner slots, which re-read
+    // `holdOk` for themselves. This waives ENTRY only, exactly as OPEN-GATES already does, and
+    // every faucet stays shut. `holdOk` below is still the real on-chain answer.
+    const gateWaived = !holdOk && (openGatesActive() || appSession);
     const eligible = holdOk || gateWaived;
     // 2) DB-backed EXTRAS (whale hold-timer + cross-device roster/Glory). Degrade gracefully if
     //    the database is unreachable — a dead/expired Postgres must NEVER zero out a real holder's
@@ -2090,6 +2233,13 @@ app.post("/verify", async (req, res) => {
       }
     }
     const out = { wallet, eligible, balance, chikis, whalePending, whaleReadyInMs, minHold: MIN, verified: verifyOn, firstSeen, profile: profile || null, dbOk, signedIn, isAdmin, mktToken, sessionId };
+    // Additive keys — an older client ignores them; the app's policy layer reads them to decide
+    // what to offer. `walletless` is computed from the address, not remembered, so it cannot drift.
+    if (noWallet) { out.walletless = true; out.canSell = false; }
+    if (appSession) out.app = true;
+    // Only ever present on the one verify that notices the move. `wallet` above already names the
+    // new address, so this is a hint for re-stamping a cache, not something anything depends on.
+    if (movedFrom) { out.movedFrom = movedFrom; out.rebind = true; }
     if (signedIn && syncRtOn()) { out.sessionEpoch = sessEpoch; out.handoffWait = handoffWait; }
     // LIVE EVENTS (additive keys — an older client ignores them): the real hold verdict, the waiver
     // flag while OPEN-GATES is on, the active-event banners, and — once the event has ended — the
@@ -2099,7 +2249,12 @@ app.post("/verify", async (req, res) => {
     if (gateWaived) out.gateWaived = true;
     const _evw = liveEventsWire();
     if (_evw) out.events = _evw;
-    if (!holdOk && !openGatesActive())
+    // THE NOTE MUST FOLLOW THE GATE. This is the refusal card's text, and it used to key on
+    // `!openGatesActive()` alone — so the moment an app session became eligible above, an app
+    // player with nothing was let in and then handed a card telling them to go and acquire half a
+    // million $CHIKI. Keyed on `gateWaived` now, which is the same variable `eligible` is built
+    // from, so the copy and the gate cannot drift apart again.
+    if (!holdOk && !gateWaived)
       out.gateNote = `Hold ${MIN.toLocaleString()} $CHIKI to enter Chikoria. Everything you earned is saved to this wallet — ` +
                      `if you joined during Open Gates, your progress and creatures are kept and waiting; you just can't ` +
                      `re-enter until this wallet holds ${MIN.toLocaleString()} $CHIKI again.`;
@@ -2118,6 +2273,33 @@ app.post("/verify", async (req, res) => {
  *
  * Nothing here moves money, and a link token cannot: see APP_DENY_PATH above.
  */
+
+/* Proof that the caller is the OWNER OF THIS ACCOUNT, for the purpose of reading and writing its
+ * cloud save. A signature, or the device credential of a phone paired to it.
+ *
+ * This is a DIFFERENT question from walletProven below, and the two must not be merged. That one
+ * asks "does the caller hold this wallet's key" and deliberately refuses a phone, because pairing
+ * further devices and revoking them are wallet-holder powers. This one asks "is this the player
+ * whose progress that is", and a paired phone plainly is — it is the same proof /verify already
+ * accepts to sign the session in at all, and the save IS the play.
+ *
+ * For an app-native account it is the ONLY possible answer: no key for that address exists, so a
+ * signature can never be produced, and a rule that demands one means the account can never save.
+ * That was a real defect, caught by the test suite before it shipped: an app player would have
+ * played happily for an hour and lost everything on the next launch.
+ *
+ * Three call sites had their own copy of this rule (the /verify strip, /profile POST, /profile
+ * GET). They share this one now, because a rule about who owns a save that is written down three
+ * times is a rule that will be updated in two places.
+ */
+function ownerProven(wallet, src) {
+  if (!wallet || !isPubkey(wallet)) return false;
+  if (verifyWalletSig(wallet, src?.authMsg, src?.authSig)) return true;
+  const tok = String(src?.linkToken || "");
+  if (!tok) return false;
+  const rec = realmLink.resolve(tok, src?.device_id);
+  return !!rec && rec.wallet === wallet;
+}
 
 /** Proof that the CALLER HOLDS THE WALLET — a signature, or a market token that is not the app's. */
 function walletProven(req) {
@@ -2184,6 +2366,190 @@ app.post("/link/delete_account", (req, res) => {
   res.json(out);
 });
 
+/* ============================= APP-NATIVE ACCOUNTS: CREATE AND BIND =============================
+ *
+ *   POST /account/new    {device_id}                     -> {wallet, linkToken}   (in the app)
+ *   POST /account/claim  {linkToken, device_id}          -> {code}                (in the app)
+ *   POST /link/bind      {wallet, authMsg, authSig, code} -> {bound}              (on the website)
+ *
+ * The third one is the interesting one, and the reason it is written the way it is below.
+ */
+
+app.post("/account/new", async (req, res) => {
+  // Unauthenticated on purpose — there is nothing yet to authenticate. This is "tap Create an
+  // account and start playing", and it is the route that makes the App Store build usable by
+  // someone who has never held a token. Rate limits live in realm-link.js.
+  const out = realmLink.createAccount({
+    device_id: req.body?.device_id,
+    device_name: req.body?.device_name,
+    client: req.body?.client,
+  });
+  if (out.error) return res.status(out.status || 400).json(out);
+  // Give the account a players row immediately, so a crash between here and the first save does
+  // not leave a device holding a credential for an account that does not exist anywhere.
+  try { await store.touch(out.wallet, false, 0); } catch (e) { /* chain-only mode; /verify heals it */ }
+  res.json(out);
+});
+
+app.post("/account/claim", (req, res) => {
+  const out = realmLink.claimCode(String(req.body?.linkToken || ""), req.body?.device_id);
+  if (out.error) return res.status(out.status || 400).json(out);
+  res.json(out);
+});
+
+/* THE MIGRATION, AND WHY IT REFUSES MORE THAN IT MOVES.
+ *
+ * A wallet is the primary key of this whole service: five Postgres tables, ~25 kv blobs, three kv
+ * key families whose KEY embeds the address, some sixty in-memory maps, the live sockets, the
+ * Chikiseum admissions and the wager sides. None of it is joined by a foreign key — every
+ * reference is a bare TEXT column or a plain string map key — so a migration that misses one does
+ * not error. It silently orphans, and the player finds out weeks later that something they earned
+ * is gone.
+ *
+ * So this does not attempt to move an arbitrary account. It moves an APP-NATIVE one, and it leans
+ * on a property the guards elsewhere in this file already give us for free: an app-native account
+ * is PROVABLY EMPTY in almost all of those subsystems, because it was never able to reach them.
+ * It cannot have claimed (unpayable), won a quest payout (unpayable), listed on the market
+ * (APP_DENY_PATH), minted on-chain (nftCoreCreate refuses), bought a meme egg, entered the Cup or
+ * funded a wager (NO_WALLET_DENY_PATH). What it CAN have is the short list actually moved below.
+ *
+ * Every one of those "cannot" claims is nonetheless CHECKED rather than trusted, and a surprise
+ * refuses the bind. A player told "not yet, talk to us" has lost nothing; a player whose account
+ * was half-migrated has lost something nobody can reconstruct.
+ */
+async function bindAppAccount(from, to, code) {
+  if (!isWalletless(from)) return { error: "that is not an app account", status: 400, code: "NOT_APP_ACCOUNT" };
+  if (isWalletless(to)) return { error: "that is not a wallet you can sign with", status: 400, code: "NOT_A_WALLET" };
+
+  // ---- refuse rather than merge -------------------------------------------------------------
+  // Two cloud saves cannot become one. The game resolves saves by newest-saved_at WHOLESALE, with
+  // no field merge, precisely because merging inventories is a duplication faucet — so a bind into
+  // a wallet that is already playing would silently discard one side's entire history.
+  let destProfile = null;
+  try { destProfile = await store.getProfile(to); } catch (e) { return { error: "the database is unavailable — try again shortly", status: 503, code: "DB_DOWN" }; }
+  if (destProfile && typeof destProfile === "object" && Object.keys(destProfile).length) {
+    return { error: "That wallet already has a Chikoria account with progress on it. Binding would have to merge two save files, which would lose one of them — sign in with a wallet that has not played, or contact support.", status: 409, code: "WALLET_IN_USE" };
+  }
+
+  // ---- checked "cannot"s: a surprise here means a guard leaked, so stop ----------------------
+  const surprises = [];
+  try { if (await store.winnerGet(from)) surprises.push("quest winner slot"); } catch (e) {}
+  // The accrued quest pouch is NOT a surprise — it is the ordinary case, and it is moved below.
+  // /quest/complete calls qrAccrue unconditionally, so any app player who finished a chapter has
+  // one; refusing on it would have refused almost every real bind.
+  if ((cupPrizes.get(from) || 0) > 0) surprises.push("an owed Cup prize");
+  for (const id of (assetsByOwner.get(from) || [])) {
+    const row = assetReg.get(id);
+    if (!row) continue;
+    if (row.mint || row.mintPending) { surprises.push("an on-chain certificate"); break; }
+    if (row.listedOffchain || row.pendingHandover || _nftBoardListed(row)) { surprises.push("an asset in escrow or listed"); break; }
+  }
+  try { if (chikiseumLive && typeof chikiseumLive.walletBusy === "function" && chikiseumLive.walletBusy(from)) surprises.push("a live Chikiseum match"); } catch (e) {}
+  if (surprises.length) {
+    console.error("bind refused — app account", from, "unexpectedly holds:", surprises.join(", "));
+    return { error: "This account has something we cannot move automatically (" + surprises.join(", ") + "). Nothing has been changed — please contact support and we will do it by hand.", status: 409, code: "NEEDS_HAND" };
+  }
+
+  // ---- move what it can actually have -------------------------------------------------------
+  const moved = { profile: false, assets: 0, quest: false, questPouch: false, battleWins: false, credLatch: 0 };
+
+  // 1. The players row and the cloud save. This IS the account as the player experiences it.
+  let profile = null;
+  try { profile = await store.getProfile(from); } catch (e) { return { error: "the database is unavailable — try again shortly", status: 503, code: "DB_DOWN" }; }
+  try {
+    await store.touch(to, false, 0);                 // the destination row must exist before it is written
+    if (profile) { await store.setProfile(to, profile); moved.profile = true; }
+    await store.setProfile(from, null);              // the old row stays, emptied — never two live copies
+  } catch (e) {
+    return { error: "the save could not be moved — nothing was changed", status: 503, code: "MOVE_FAILED" };
+  }
+
+  // 2. Every creature in the registry. Owner field AND both owner indexes, or the census and the
+  //    cap read a set that disagrees with the rows.
+  const ids = [...(assetsByOwner.get(from) || [])];
+  for (const id of ids) {
+    const row = assetReg.get(id);
+    if (!row || row.owner !== from) continue;
+    row.owner = to;
+    // The provenance chain is append-only and is what regChainSaysCreator reads back at restore,
+    // so a row that somehow lacks one gets an empty array rather than throwing halfway through a
+    // migration and leaving the registry split between two owners.
+    if (!Array.isArray(row.chain)) row.chain = [];
+    regEvent(row, "bound", { from, to });
+    ownerSet(to).add(id);
+    moved.assets++;
+  }
+  if (ids.length) {
+    assetsByOwner.delete(from);
+    _assetsDirty = true;
+    censusInvalidate();
+    try { await saveAssetLedger(true); } catch (e) { console.error("bind: asset ledger save failed", String(e?.message || e)); }
+  }
+
+  // 3. The kv rows whose KEY embeds the address — invisible to any column scan, so listed by hand.
+  try {
+    const q = await store.kvGet(QKEY(from));
+    if (q) { await store.kvSet(QKEY(to), q); await store.kvSet(QKEY(from), null); moved.quest = true; }
+  } catch (e) {}
+  try { await store.kvSet("signin:" + from, null); } catch (e) {}
+
+  // 3b. The accrued quest pouch — real $CHIKI the player earned while they had nowhere to receive
+  //     it. _payoutQuestReward HELD it rather than clearing it for exactly this moment; without
+  //     this line the hold would have been a slower way of losing it.
+  try { const q = await store.qrMove(from, to); moved.questPouch = !!(q && q.moved); } catch (e) { console.error("bind: quest pouch move failed", String(e?.message || e)); }
+
+  // 4. The blobs keyed BY address inside one row.
+  if (battleWins && Object.prototype.hasOwnProperty.call(battleWins, from)) {
+    battleWins[to] = (battleWins[to] || 0) + battleWins[from];
+    delete battleWins[from];
+    moved.battleWins = true;
+    try { await saveBattleWins(true); } catch (e) {}
+  }
+  for (const k of [...credLatch.keys()]) {
+    if (!k.endsWith(":" + from)) continue;
+    credLatch.set(k.slice(0, k.length - from.length) + to, credLatch.get(k));
+    credLatch.delete(k);
+    moved.credLatch++;
+  }
+  if (moved.credLatch) { try { saveCredLatch(); } catch (e) {} }
+
+  // 5. Ephemeral presence. Dropped rather than re-keyed: the client reconnects within a tick and
+  //    re-announces itself at the new address, and a re-keyed socket whose auth still names the
+  //    old one is worse than no socket at all.
+  onlineUsers.delete(from);
+  for (const sock of wsClients) {
+    const st = sock._chik;
+    if (st && st.wallet === from) { try { wsSend(sock, { t: "superseded", flushMs: 0 }); sock.close(); } catch (e) {} }
+  }
+
+  // 6. Hand the device credentials over, burn the code, and record where the account went.
+  const done = realmLink.commitBind({ from, to, code });
+  console.log("bind:", from, "->", to, JSON.stringify({ ...moved, devices: done.devices }));
+  return { ok: true, from, to, moved, devices: done.devices };
+}
+
+app.post("/link/bind", async (req, res) => {
+  // A SIGNATURE, not a market token. Binding is the one action that decides where a player's
+  // future on-chain value lands, so it takes the strongest proof this service has and nothing
+  // less — walletProven would also accept a market token, which a shared browser can leak.
+  const wallet = req.body?.wallet;
+  if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
+  if (!verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig))
+    return res.status(401).json({ error: "sign in with your wallet first", code: "NOT_PROVEN" });
+
+  const look = realmLink.claimResolve({ code: req.body?.code, wallet });
+  if (look.error) return res.status(look.status || 400).json(look);
+
+  try {
+    const out = await bindAppAccount(look.from, look.to, look._code);
+    if (out.error) return res.status(out.status || 400).json(out);
+    res.json(out);
+  } catch (e) {
+    console.error("bind failed:", String(e?.message || e));
+    res.status(500).json({ error: "the bind did not complete — nothing was changed", code: "BIND_FAILED" });
+  }
+});
+
 // Save / load a wallet's game profile (chikis + progress) so it follows the wallet across devices.
 app.post("/profile", async (req, res) => {
   const wallet = req.body?.wallet, profile = req.body?.profile;
@@ -2204,7 +2570,7 @@ app.post("/profile", async (req, res) => {
   // the shape check and let sanitize zero their glory + drop their handle (a real griefing wipe).
   const touchesIdentity = ("glory" in profile) || ("handle" in profile);
   const isEstablished = !!(prev && prev.mmo);
-  if ((hasMmo || touchesIdentity || isEstablished) && !verifyWalletSig(wallet, req.body?.authMsg, req.body?.authSig)) {
+  if ((hasMmo || touchesIdentity || isEstablished) && !ownerProven(wallet, req.body)) {
     return res.status(401).json({ error: "sign-in required to save progress" });
   }
   // SUPERSEDED SESSION — refuse BEFORE the write, or the loser clobbers the live session's save.
@@ -2356,7 +2722,7 @@ app.get("/profile", async (req, res) => {
   try {
     let p = await store.getProfile(wallet);
     // the MMO cloud-save is owner-only: strip it unless the caller proves ownership
-    if (p && typeof p === "object" && p.mmo && !verifyWalletSig(wallet, req.query?.authMsg, req.query?.authSig)) {
+    if (p && typeof p === "object" && p.mmo && !ownerProven(wallet, req.query)) {
       p = { ...p };
       delete p.mmo;
     }
@@ -3134,6 +3500,14 @@ app.post("/claim", async (req, res) => {
   const wallet = req.body?.wallet;
   if (!wallet || !isPubkey(wallet)) return res.status(400).json({ error: "valid 'wallet' required" });
   if (isBanned(wallet)) return res.status(403).json({ error: "this wallet is not eligible for reward-pool payouts", banned: true });   // banned → no claims, no Cup prizes
+  // This route builds a SystemProgram.transfer to `wallet` further down. An app-native account has
+  // no key and so no way to ever spend what it is sent — the SOL would leave the pool and help
+  // nobody. Refused with the remedy, not a bare 403: binding a wallet is a thing the player can
+  // actually go and do, and it is the same sentence the app shows for selling.
+  if (unpayable(wallet)) return res.status(403).json({
+    error: "This account has no wallet yet, so there is nowhere to send SOL. Connect a Phantom wallet on chikimonsters.com to collect.",
+    code: "NO_WALLET",
+  });
 
   let bal = 0;
   try { bal = await chikiBalance(wallet); } catch (e) {}
@@ -3414,6 +3788,11 @@ async function _questSave(wallet, led) { try { await store.kvSet(QKEY(wallet), l
 // Send `amt` whole $CHIKI, returning the signature WITHOUT awaiting confirmation, so the caller can durably
 // record the sig BEFORE confirming — the crux of an idempotent, non-double-paying payout.
 async function sendChikiRaw(destWallet, amt) {
+  // LAST LINE OF DEFENCE, deliberately at the bottom rather than only at the callers. Every caller
+  // of this function is a payout path, and a payout to an address no key can sign for is a burn
+  // dressed up as a reward. The two callers today check `unpayable` themselves and skip cleanly
+  // with the reward cleared; this throw exists for the third one, whoever writes it.
+  if (unpayable(destWallet)) throw new Error("refusing to send $CHIKI to an address no key can sign for: " + String(destWallet));
   // TOKEN-2022 mint: derive both ATAs against the Token-2022 program AND pass it to the
   // transfer ix — the defaults target legacy Tokenkeg and fail with InvalidAccountData.
   const destPk = new PublicKey(destWallet);
@@ -3596,7 +3975,19 @@ async function _payoutQuestReward(wallet) {
   // OWNER POLICY (2026-07-22): eligibility is checked when the reward is EARNED (hold + age
   // gates on the final quest). Selling afterwards no longer forfeits the payout — no
   // at-payout balance re-check. Burn/system addresses are unpayable black holes: skip them.
-  if (wallet === "11111111111111111111111111111111") { await store.qrPayoutClear(wallet).catch(() => {}); return { skipped: "system/burn address — unpayable" }; }
+  if (wallet === SYSTEM_ADDRESS) { await store.qrPayoutClear(wallet).catch(() => {}); return { skipped: "system/burn address — unpayable" }; }
+  // AN APP-NATIVE ACCOUNT IS HELD, NOT CLEARED, and the difference matters a great deal.
+  //
+  // It is unpayable for the same reason the burn address is — no key can sign for an off-curve
+  // address — so the send must not happen. But unlike the burn address it can STOP being
+  // unpayable: binding a Phantom wallet is exactly that, and it is the thing we are asking these
+  // players to do. Clearing here would quietly delete what they earned in the hours before they
+  // did it, and they would never know it had been there. So the accrual stays on the row, the
+  // payout simply does not run, and the bind carries the row across (see bindAppAccount).
+  if (isWalletless(wallet)) {
+    await store.qrPayoutClear(wallet).catch(() => {});   // only the in-flight payout fields; done_mask is untouched
+    return { skipped: "no wallet yet — the reward is held until one is connected", held: true };
+  }
   const now = Date.now();
   let out;
   try { out = await sendChikiRaw(wallet, owed); }
@@ -3808,7 +4199,9 @@ async function _payoutOne(wallet) {
     return { pending: true, needsReconcile: true, note: "a prior payout attempt was not durably recorded — verify on-chain and resolve via /quest/reconcile before releasing (NOT auto-resending, to avoid a double-pay)" };
   }
   // Anti-sybil: the winner must STILL hold the stake at payout time (defeats flash/cycled-stake capture of all slots).
-  if (wallet === "11111111111111111111111111111111") { await store.payoutClear(wallet).catch(() => {}); return { skipped: "system/burn address — unpayable" }; }
+  // Unpayable addresses — the system/burn address, and every app-native account, neither of which
+  // any key can sign for — are skipped rather than sent to. See `unpayable` at the top of the file.
+  if (unpayable(wallet)) { await store.payoutClear(wallet).catch(() => {}); return { skipped: "unpayable address (no key can sign for it)" }; }
 
   // ...AND NOW IT ACTUALLY DOES. The line above described a check that did not exist: there was no
   // chikiBalance call anywhere between payoutBegin and sendChikiRaw, and balance_at_win was recorded
@@ -9554,6 +9947,12 @@ function nftAttributes(row) {
 // the collection's, so adding one here would silently detach that asset from the collection's 20%.
 async function nftCoreCreate(args) {
   if (_nftCoreStub) return await _nftCoreStub(args);
+  // An NFT created with `owner` set to an address no key can sign for is unrecoverable: it cannot
+  // be transferred, sold or burned by anyone, ever. That is a strictly worse outcome than not
+  // minting it, and the off-chain registry row keeps the creature playable either way — so this
+  // refuses rather than "succeeds". An app-native player who wants a real certificate binds a
+  // wallet first (realm-link.js), and then this address is a normal one.
+  if (unpayable(args && args.owner)) throw new Error("refusing to mint to an address no key can sign for: " + String(args && args.owner));
   const d = nftDelegate();
   if (!d) throw new Error("minting is not configured");
   if (!NFT_COLLECTION) throw new Error("the NFT collection is not configured");
