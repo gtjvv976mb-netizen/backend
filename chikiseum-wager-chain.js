@@ -93,13 +93,23 @@ export function classifySendError(error) {
   return notBroadcast ? 'not_broadcast' : 'ambiguous';
 }
 
-export function makeWagerRail({ conn, treasury }) {
+export function makeWagerRail({ conn, treasury, unpayable = null }) {
   if (!conn || typeof conn.sendRawTransaction !== 'function' || typeof conn.getLatestBlockhash !== 'function') throw new Error('Connection required');
   if (!treasury || !treasury.publicKey || typeof treasury.secretKey === 'undefined') throw new Error('Treasury keypair required');
+  if (unpayable !== null && typeof unpayable !== 'function') throw new Error('unpayable must be a predicate');
+  const refuse = msg => Object.assign(new Error(msg), { name: 'SendTransactionError' });
   return {
     async send({ to, lamports, memo }) {
-      if (!Number.isSafeInteger(lamports) || lamports <= 0) throw Object.assign(new Error('invalid lamports'), { name: 'SendTransactionError' });
-      let dest; try { dest = new PublicKey(to); } catch { throw Object.assign(new Error('invalid payee'), { name: 'SendTransactionError' }); }
+      if (!Number.isSafeInteger(lamports) || lamports <= 0) throw refuse('invalid lamports');
+      let dest; try { dest = new PublicKey(to); } catch { throw refuse('invalid payee'); }
+      // THIS IS THE LOWEST LEVEL THAT BROADCASTS, so the "nobody can spend from there" rule lives
+      // here and not only in the callers. An app-native account's address is off the curve — no
+      // key for it can exist — and the system program is where a blank payee field ends up. SOL
+      // sent to either is gone. The ledger and routes refuse these earlier; this is the check that
+      // holds when one of them is wrong.
+      if (!PublicKey.isOnCurve(dest.toBytes())) throw refuse('unpayable payee: off-curve address');
+      if (dest.equals(SystemProgram.programId)) throw refuse('unpayable payee: system program');
+      if (unpayable && unpayable(dest.toBase58())) throw refuse('unpayable payee');
       // Anything up to and including signing cannot have broadcast. Only sendRawTransaction can.
       let raw, blockhash, lastValidBlockHeight;
       try {

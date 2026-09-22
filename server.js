@@ -2010,14 +2010,24 @@ const APP_DENY_PATH = new RegExp([
   "^/market/op$",                        // every Trading Post write: list, cancel, order_*, auction_*
   "^/market/(buy-onchain|order-pay)$",   // paying for one
   "^/nft/market/(buy|list|delist|confirm)$",
+  // Posting, accepting or funding a Chikiseum wager stakes real SOL and names this wallet as a
+  // payee. Reading the board and one's own wagers stays open to the app.
+  "^/chikiseum/live/v1/wager_(post|accept|deposit)$",
   "^/meme/buy$",
   "^/claim$",                            // the SOL faucet
   "^/quest/(payout|rewards/payout)$",
   "^/cup/(register|ready)$",             // the Cup pays a real SOL prize pool
 ].join("|"));
 
+// THE PATH THE GUARDS SEE MUST BE THE PATH THE ROUTER SEES. Express matches routes case-insensitively
+// and ignores a trailing slash, so `/cup/register/` and `/Cup/Register` both reach the /cup/register
+// handler — but a `$`-anchored, case-sensitive regex against req.path matched neither, and every
+// route these two guards exist to close was reachable by appending "/". Reproduced against the
+// booted server before this was written. Normalise first; both guards test THIS, never req.path.
+const guardPath = (req) => String(req.path || "").toLowerCase().replace(/\/+$/, "") || "/";
+
 app.use((req, res, next) => {
-  if (req.method !== "POST" || !APP_DENY_PATH.test(req.path)) return next();
+  if (req.method !== "POST" || !APP_DENY_PATH.test(guardPath(req))) return next();
   const tok = req.body?.mktToken || req.body?.token || req.headers["x-mkt-token"];
   if (!isAppToken(tok)) return next();
   return res.status(403).json({
@@ -2050,10 +2060,18 @@ const NO_WALLET_DENY_PATH = new RegExp([
   "^/claim$",                                 // treasury -> wallet SOL (also refused in-route, with copy)
   "^/meme/buy$",
   "^/market/(buy-onchain|order-pay)$",
+  // The Cup pays a real SOL prize. An off-curve account that wins one becomes OWED SOL that /claim
+  // must refuse as unpayable — a treasury liability to an address nobody can spend from — and
+  // bindAppAccount then refuses that account forever ("an owed Cup prize"). It was reachable: this
+  // list did not name /cup/*, and the route's presence-based tier asks for no token at all.
+  "^/cup/(register|ready)$",
+  // A wager is settled by the treasury paying the winner. An off-curve winner would be a stake
+  // the treasury can never pay out and a bind that is refused forever — the Cup problem again.
+  "^/chikiseum/live/v1/wager_(post|accept|deposit)$",
 ].join("|"));
 
 app.use((req, res, next) => {
-  if (req.method !== "POST" || !NO_WALLET_DENY_PATH.test(req.path)) return next();
+  if (req.method !== "POST" || !NO_WALLET_DENY_PATH.test(guardPath(req))) return next();
   const w = req.body?.wallet;
   if (!w || !isWalletless(w)) return next();
   return res.status(403).json({
@@ -2425,9 +2443,13 @@ async function bindAppAccount(from, to, code) {
   // Two cloud saves cannot become one. The game resolves saves by newest-saved_at WHOLESALE, with
   // no field merge, precisely because merging inventories is a duplication faucet — so a bind into
   // a wallet that is already playing would silently discard one side's entire history.
-  let destProfile = null;
-  try { destProfile = await store.getProfile(to); } catch (e) { return { error: "the database is unavailable — try again shortly", status: 503, code: "DB_DOWN" }; }
-  if (destProfile && typeof destProfile === "object" && Object.keys(destProfile).length) {
+  let destProfile = null, destQuest = null;
+  try { destProfile = await store.getProfile(to); destQuest = await store.kvGet(QKEY(to)); }
+  catch (e) { return { error: "the database is unavailable — try again shortly", status: 503, code: "DB_DOWN" }; }
+  // "Already plays" is decided by the quest ledger as well as the profile column. A web player who
+  // signed in and finished chapters but never saved a profile has a QKEY row and an empty profile;
+  // step 3 below writes QKEY(to) unconditionally, and used to erase those chapters without a word.
+  if ((destProfile && typeof destProfile === "object" && Object.keys(destProfile).length) || destQuest) {
     // The copy names the thing they should do instead, because for the most likely person to hit
     // this there IS a right answer and it is not "contact support": a player whose wallet already
     // plays Chikoria does not want to move an app account onto it at all — they want this phone
@@ -2460,12 +2482,27 @@ async function bindAppAccount(from, to, code) {
   // 1. The players row and the cloud save. This IS the account as the player experiences it.
   let profile = null;
   try { profile = await store.getProfile(from); } catch (e) { return { error: "the database is unavailable — try again shortly", status: 503, code: "DB_DOWN" }; }
+  // Two writes, and a fault between them used to leave TWO LIVE COPIES with the code unburned and
+  // every retry refused as WALLET_IN_USE — the player stuck between an app account that still plays
+  // and a wallet holding a stale clone, told "nothing was changed". Now: the empty of `from` is the
+  // step that can fail, and if it does the copy just written to `to` is taken back before returning,
+  // so the state the message describes is the state that exists.
   try {
     await store.touch(to, false, 0);                 // the destination row must exist before it is written
     if (profile) { await store.setProfile(to, profile); moved.profile = true; }
-    await store.setProfile(from, null);              // the old row stays, emptied — never two live copies
   } catch (e) {
     return { error: "the save could not be moved — nothing was changed", status: 503, code: "MOVE_FAILED" };
+  }
+  try {
+    await store.setProfile(from, null);              // the old row stays, emptied — never two live copies
+  } catch (e) {
+    let undone = false;
+    try { if (moved.profile) await store.setProfile(to, null); undone = true; } catch (e2) {}
+    console.error("bind: emptying", from, "failed after copying to", to, "— rollback", undone ? "ok" : "FAILED", String(e?.message || e));
+    if (undone) return { error: "the save could not be moved — nothing was changed", status: 503, code: "MOVE_FAILED" };
+    // Both writes landed the wrong way round and the rollback failed too: say so, loudly, rather than
+    // claim nothing changed. The old address still holds the account; the wallet holds a copy.
+    return { error: "the save was copied but the old account could not be closed — do NOT retry; email support@chikimonsters.com with this code", status: 500, code: "MOVE_SPLIT" };
   }
 
   // 2. Every creature in the registry. Owner field AND both owner indexes, or the census and the
@@ -2526,11 +2563,22 @@ async function bindAppAccount(from, to, code) {
     if (st && st.wallet === from) { try { wsSend(sock, { t: "superseded", flushMs: 0 }); sock.close(); } catch (e) {} }
   }
 
-  // 6. Hand the device credentials over, burn the code, and record where the account went.
+  // 6. Hand the device credentials over, burn the code, and record where the account went. A
+  //    deletion pending on the DESTINATION is cancelled too: the owner just proved they want this
+  //    wallet, and a timer set weeks ago must not delete the account they just moved onto it.
   const done = realmLink.commitBind({ from, to, code });
+  try { realmLink.cancelDeletion(to); } catch (e) {}
   console.log("bind:", from, "->", to, JSON.stringify({ ...moved, devices: done.devices }));
   return { ok: true, from, to, moved, devices: done.devices };
 }
+
+// ONE BIND AT A TIME PER APP ACCOUNT. Two browsers (or one double-tap) submitting the same code
+// used to both pass claimResolve and both run the migration; the second found the profile already
+// gone, moved nothing, and then commitBind rewrote `bound[from]` to ITS wallet while every device
+// token already pointed at the first — the sleeping phone was bounced to a signed-out screen. The
+// claim is now locked in claimResolve and released on every refusal, and this set is the belt to
+// that brace for the window between the two.
+const _bindsInFlight = new Set();
 
 app.post("/link/bind", async (req, res) => {
   // A SIGNATURE, not a market token. Binding is the one action that decides where a player's
@@ -2543,14 +2591,26 @@ app.post("/link/bind", async (req, res) => {
 
   const look = realmLink.claimResolve({ code: req.body?.code, wallet });
   if (look.error) return res.status(look.status || 400).json(look);
-
+  if (_bindsInFlight.has(look.from)) {
+    realmLink.releaseClaim(look._code);
+    return res.status(409).json({ error: "that account is already being bound — wait a moment", code: "BIND_IN_PROGRESS" });
+  }
+  _bindsInFlight.add(look.from);
   try {
     const out = await bindAppAccount(look.from, look.to, look._code);
-    if (out.error) return res.status(out.status || 400).json(out);
+    if (out.error) {
+      // Refused, so the code must work again for the next attempt — except after a split move,
+      // where a retry is exactly the wrong thing and the code stays locked for support to see.
+      if (out.code !== "MOVE_SPLIT") realmLink.releaseClaim(look._code);
+      return res.status(out.status || 400).json(out);
+    }
     res.json(out);
   } catch (e) {
     console.error("bind failed:", String(e?.message || e));
+    realmLink.releaseClaim(look._code);
     res.status(500).json({ error: "the bind did not complete — nothing was changed", code: "BIND_FAILED" });
+  } finally {
+    _bindsInFlight.delete(look.from);
   }
 });
 
@@ -19538,8 +19598,13 @@ const chikiseumLive = installChikiseumLive(app, {
   available: () => !_draining && _assetsReady && _ownReady
     && !(_rosterGuard.tripped && ROSTER_GUARD_MODE === "refuse"),
   authenticate: (body) => {
-    const wallet = mktWallet(body);
-    if (!wallet || bannedWallets.has(wallet) || typeof body.sessionId !== "string"
+    // mktTokenOk, not mktWallet: a paired phone's Realm Link token is a real sign-in for PLAYING,
+    // and the arena is play. What it may not do is put SOL on the line — the wager_* routes that
+    // fund or accept a stake are named in APP_DENY_PATH and NO_WALLET_DENY_PATH, so an app token
+    // or a walletless account gets into the arena and is refused only at the money.
+    const wallet = String(body?.wallet || "");
+    if (!isPubkey(wallet) || !mktTokenOk(wallet, body?.mktToken)) return null;
+    if (bannedWallets.has(wallet) || typeof body.sessionId !== "string"
       || !body.sessionId || liveSession.get(wallet)?.sid !== body.sessionId
       || !Number.isSafeInteger(body.sessionEpoch) || body.sessionEpoch < 0
       || (syncRtOn() ? body.sessionEpoch !== (sessionEpoch.get(wallet) || 0) : body.sessionEpoch !== 0)) return null;
@@ -19589,7 +19654,7 @@ const chikiseumLive = installChikiseumLive(app, {
     enabled: String(process.env.CHIK_WAGERS || "on").toLowerCase() !== "off",
     treasury: treasury.publicKey.toBase58(),
     chain: makeWagerChain({ conn, treasuryPubkey: treasury.publicKey.toBase58() }),
-    rail: makeWagerRail({ conn, treasury }),
+    rail: makeWagerRail({ conn, treasury, unpayable }),
     adminOk: _questAdminOk,
     rakeBps: Math.max(0, Math.min(2000, Math.round(Number(process.env.CHIK_WAGER_RAKE_BPS) || 0))),
     limits: {

@@ -72,6 +72,15 @@ const CODE_RATE_WINDOW_MS = 60 * 1000;
 const CODE_RATE_MAX = 6;                     // per wallet per minute
 const REDEEM_RATE_WINDOW_MS = 60 * 1000;
 const REDEEM_RATE_MAX = 10;                  // per device_id per minute, against code guessing
+// The per-device limit is keyed on a string the caller chooses, so on its own it limits nothing
+// against a guesser who rotates device_ids. The global cap is the one that actually bounds the
+// guess rate: 300/min against a 40-bit code space is ~7,000 years to a 50% hit on one live code.
+const REDEEM_GLOBAL_MAX = 300;               // per minute across all devices
+// Claim codes are guessed from the WEBSITE side by a signed-in wallet. A wallet is free to make,
+// so this needs the same pair: a per-wallet limit for the honest case, a global one for the attack.
+const CLAIM_RATE_WINDOW_MS = 60 * 1000;
+const CLAIM_RATE_MAX = 10;                   // per wallet per minute
+const CLAIM_GLOBAL_MAX = 300;                // per minute across all wallets
 const DEVICES_MAX_PER_WALLET = 10;
 const DELETE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
 // An app-native account has no owner who can turn up and object, so its grace period exists only
@@ -163,11 +172,9 @@ export function createRealmLink({ store, isPubkey, newAddress, isWalletless, log
 	]).then(() => { ready = true; });
 
 	async function save() {
+		// Every leg of `restored` catches its own failure and the chain then sets `ready`, so once
+		// this await returns the gate is open. A failed read leaves the in-memory map as it was.
 		if (!ready) await restored;
-		if (!ready) {
-			log.error("realm-link: NOT persisting — restore incomplete; refusing to overwrite every paired device");
-			return;
-		}
 		try {
 			await Promise.all([store.kvSet(KV_TOKENS, tokens), store.kvSet(KV_DELETIONS, deletions), store.kvSet(KV_BOUND, bound)]);
 		} catch (e) { log.warn("realm-link persist failed:", String(e?.message || e)); }
@@ -203,6 +210,8 @@ export function createRealmLink({ store, isPubkey, newAddress, isWalletless, log
 		if (!id) return { error: "device_id required", status: 400, code: "NO_DEVICE" };
 		if (!rateOk("redeem:" + id, REDEEM_RATE_WINDOW_MS, REDEEM_RATE_MAX))
 			return { error: "too many attempts — wait a minute", status: 429, code: "RATE_LIMIT" };
+		if (!rateOk("redeem:*", REDEEM_RATE_WINDOW_MS, REDEEM_GLOBAL_MAX))
+			return { error: "too many attempts right now — try again in a moment", status: 429, code: "RATE_LIMIT" };
 
 		sweepCodes();
 		const typed = clean(code, 32).toUpperCase().replace(/[^A-Z0-9]/g, "");
@@ -283,7 +292,9 @@ export function createRealmLink({ store, isPubkey, newAddress, isWalletless, log
 		for (let i = 0; i < 8 && !wallet; i++) {
 			const a = String(newAddress() || "");
 			// BOTH checks, every time. isPubkey alone would accept a real, signable address.
-			if (a && isPubkey(a) && isWalletless(a) && !tokens[a] && !bound[a]) wallet = a;
+			// `tokens` is keyed by token, not by address, so the collision check has to look at the
+			// values: an address already held by any device is not one to hand out a second time.
+			if (a && isPubkey(a) && isWalletless(a) && !bound[a] && !Object.values(tokens).some((v) => v.wallet === a)) wallet = a;
 		}
 		if (!wallet) {
 			log.error("realm-link: could not mint an off-curve account address — refusing to issue a signable one");
@@ -343,15 +354,30 @@ export function createRealmLink({ store, isPubkey, newAddress, isWalletless, log
 	function claimResolve({ code, wallet }) {
 		if (!isPubkey(wallet)) return { error: "valid 'wallet' required", status: 400 };
 		if (isWalletless(wallet)) return { error: "that is not a wallet you can sign with", status: 400, code: "NOT_A_WALLET" };
+		if (!rateOk("claimres:" + wallet, CLAIM_RATE_WINDOW_MS, CLAIM_RATE_MAX))
+			return { error: "too many attempts — wait a minute", status: 429, code: "RATE_LIMIT" };
+		if (!rateOk("claimres:*", CLAIM_RATE_WINDOW_MS, CLAIM_GLOBAL_MAX))
+			return { error: "too many attempts right now — try again in a moment", status: 429, code: "RATE_LIMIT" };
 		sweepCodes();
 		const typed = clean(code, 32).toUpperCase().replace(/[^A-Z0-9]/g, "");
 		if (typed.length !== CODE_LEN) return { error: "that code is not valid", status: 400, code: "BAD_CODE" };
 		let found = null;
-		for (const [c, r] of claims) if (sameSecret(c, typed) && !r.used && r.exp > Date.now()) { found = [c, r]; break; }
+		for (const [c, r] of claims) if (sameSecret(c, typed) && !r.used && !r.inflight && r.exp > Date.now()) { found = [c, r]; break; }
 		if (!found) return { error: "that code is not valid any more", status: 400, code: "BAD_CODE" };
 		const [c, rec] = found;
-		if (rec.wallet === wallet) return { error: "that account is already this wallet", status: 409, code: "SAME_ACCOUNT" };
+		// The code is now owned by one migration until commitBind burns it or releaseClaim gives it
+		// back. Two /link/bind calls carrying the same code used to both resolve it and both start
+		// moving the account; the second one now sees "not valid" instead of a half-moved profile.
+		// (A wallet that signs cannot equal an app address — one is on-curve, the other is not — so
+		// there is no same-account case to check for here.)
+		rec.inflight = true;
 		return { from: rec.wallet, to: wallet, _code: c };
+	}
+
+	/** A bind that resolved a code and then did not commit hands the code back so a retry can use it. */
+	function releaseClaim(code) {
+		const rec = claims.get(String(code || ""));
+		if (rec && !rec.used) rec.inflight = false;
 	}
 
 	/**
@@ -397,10 +423,12 @@ export function createRealmLink({ store, isPubkey, newAddress, isWalletless, log
 		if (t.length !== 64) return null;
 		const rec = tokens[t];
 		if (!rec) return null;
-		// device_id is checked when the caller sends one. A token that leaked without the device id
-		// is still a token, so this is defence in depth rather than the lock itself.
+		// A token is bound to the device that minted it, and the caller has to say which device it
+		// is. This used to be checked only when a device_id was SENT, which made the check optional
+		// for exactly the caller it exists for: a leaked token worked as long as the thief left the
+		// field out. Now a token with a device on record needs that device, every time.
 		const id = clean(device_id, 64);
-		if (id && rec.device_id && id !== rec.device_id) return null;
+		if (rec.device_id && id !== rec.device_id) return null;
 		const now = Date.now();
 		if (now - (rec.last_seen || 0) > 60 * 1000) { rec.last_seen = now; save().catch(() => {}); }
 		return rec;
@@ -535,11 +563,11 @@ export function createRealmLink({ store, isPubkey, newAddress, isWalletless, log
 
 	return {
 		newCode, redeem, resolve, revoke, devices,
-		createAccount, claimCode, claimResolve, commitBind, boundTo,
+		createAccount, claimCode, claimResolve, releaseClaim, commitBind, boundTo,
 		mintAppToken, appTokenWallet,
 		requestDeletion, cancelDeletion, cancelDeletionByDevice, deletionStatus, due,
 		stats, restored,
 		// exported for tests
-		_constants: { CODE_LEN, CODE_TTL_MS, CLAIM_TTL_MS, DELETE_GRACE_MS, DELETE_GRACE_APP_MS, DEVICES_MAX_PER_WALLET, CREATE_RATE_MAX },
+		_constants: { CODE_LEN, CODE_TTL_MS, CLAIM_TTL_MS, DELETE_GRACE_MS, DELETE_GRACE_APP_MS, DEVICES_MAX_PER_WALLET, CREATE_RATE_MAX, CLAIM_RATE_MAX, REDEEM_GLOBAL_MAX, CLAIM_GLOBAL_MAX },
 	};
 }
