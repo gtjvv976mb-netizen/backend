@@ -2428,7 +2428,11 @@ async function bindAppAccount(from, to, code) {
   let destProfile = null;
   try { destProfile = await store.getProfile(to); } catch (e) { return { error: "the database is unavailable — try again shortly", status: 503, code: "DB_DOWN" }; }
   if (destProfile && typeof destProfile === "object" && Object.keys(destProfile).length) {
-    return { error: "That wallet already has a Chikoria account with progress on it. Binding would have to merge two save files, which would lose one of them — sign in with a wallet that has not played, or contact support.", status: 409, code: "WALLET_IN_USE" };
+    // The copy names the thing they should do instead, because for the most likely person to hit
+    // this there IS a right answer and it is not "contact support": a player whose wallet already
+    // plays Chikoria does not want to move an app account onto it at all — they want this phone
+    // paired to the account they already have, which is the existing flow and loses nothing.
+    return { error: "That wallet already plays Chikoria, and binding would have to merge two save files — one of them would be lost, so nothing was changed. If you want this phone on the account you already play, use 'New code' above and type it into the app instead. If you really meant to move the app account onto a wallet, use one that has not played, or email support@chikimonsters.com and we will do it by hand.", status: 409, code: "WALLET_IN_USE" };
   }
 
   // ---- checked "cannot"s: a surprise here means a guard leaked, so stop ----------------------
