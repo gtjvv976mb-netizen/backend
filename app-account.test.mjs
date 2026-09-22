@@ -194,7 +194,8 @@ console.log('\n*** it cannot be sent anything on-chain — the money-destroying 
 
 	for (const path of ['/assets/nft/mint', '/assets/nft/prepare', '/nft/market/buy', '/nft/market/list',
 	                    '/nft/market/delist', '/nft/market/confirm', '/meme/buy', '/quest/rewards/payout',
-	                    '/market/buy-onchain', '/market/order-pay']) {
+	                    '/market/buy-onchain', '/market/order-pay',
+	                    '/chikiseum/live/v1/wager_post', '/chikiseum/live/v1/wager_accept', '/chikiseum/live/v1/wager_deposit']) {
 		const r = await post(path, { wallet: app, mktToken: v.data.mktToken, id: 'x' });
 		check(r.status === 403, `${path} refuses an account with no wallet`);
 	}
@@ -307,6 +308,56 @@ console.log('\nbinding refuses rather than merging two save files');
 
 	const still = await post('/verify', { wallet: a2.data.wallet, linkToken: a2.data.linkToken, device_id: 'phone-B' });
 	check(still.data.signedIn === true, 'the refused account is untouched and still playable');
+
+	// The refusal hands the code back: the player picks a different wallet and it just works.
+	const w2 = signer();
+	const retry = await post('/link/bind', { wallet: w2.wallet, authMsg: w2.authMsg, authSig: w2.authSig, code: c2.data.code });
+	check(retry.status === 200 && retry.data.to === w2.wallet, 'and the refusal did not burn the code — another wallet can still claim it');
+}
+
+console.log('\ntwo binds racing on one claim code move the account exactly once');
+{
+	const a8 = await post('/account/new', { device_id: 'phone-H' });
+	await post('/profile', { wallet: a8.data.wallet, linkToken: a8.data.linkToken, device_id: 'phone-H', profile: { mmo: { trainer: 'Gary' } } });
+	const c8 = await post('/account/claim', { linkToken: a8.data.linkToken, device_id: 'phone-H' });
+	const w8 = signer();
+	const body = { wallet: w8.wallet, authMsg: w8.authMsg, authSig: w8.authSig, code: c8.data.code };
+	const [r1, r2] = await Promise.all([post('/link/bind', body), post('/link/bind', body)]);
+	const wins = [r1, r2].filter((r) => r.status === 200);
+	const loses = [r1, r2].filter((r) => r.status !== 200);
+	check(wins.length === 1, 'exactly one of them succeeds');
+	check(loses.length === 1 && loses[0].data.code !== 'MOVE_SPLIT', `the other is refused cleanly, not half-moved (${loses[0] && loses[0].data.code})`);
+	const moved = await fetch(`${BASE}/profile?wallet=${w8.wallet}&linkToken=${a8.data.linkToken}&device_id=phone-H`).then((r) => r.json());
+	check(!!(moved.profile && moved.profile.mmo && moved.profile.mmo.trainer === 'Gary'), 'and the save is at the wallet, intact');
+}
+
+console.log('\na device credential is only good from the device it was issued to');
+{
+	const a7 = await post('/account/new', { device_id: 'phone-G' });
+	const noDev = await post('/verify', { wallet: a7.data.wallet, linkToken: a7.data.linkToken });
+	check(noDev.data.signedIn !== true, '*** a leaked credential with the device id left out does not sign in ***');
+	const wrongDev = await post('/verify', { wallet: a7.data.wallet, linkToken: a7.data.linkToken, device_id: 'phone-X' });
+	check(wrongDev.data.signedIn !== true, 'nor with a different device id');
+	const saveNoDev = await post('/profile', { wallet: a7.data.wallet, linkToken: a7.data.linkToken, profile: { mmo: { trainer: 'Thief' } } });
+	check(saveNoDev.status === 401, 'and the cloud save cannot be written without it');
+	const right = await post('/verify', { wallet: a7.data.wallet, linkToken: a7.data.linkToken, device_id: 'phone-G' });
+	check(right.data.signedIn === true, 'while the issuing device signs in as before');
+}
+
+console.log('\nthe deny lists hold on every spelling the router also accepts');
+{
+	// Express routes /market/op/ and /MARKET/OP to the same handler. The guards used to match the
+	// raw path, so a trailing slash walked straight past both of them.
+	const a9 = await post('/account/new', { device_id: 'phone-I' });
+	const v9 = await post('/verify', { wallet: a9.data.wallet, linkToken: a9.data.linkToken, device_id: 'phone-I' });
+	for (const path of ['/market/op/', '/Market/Op', '/market/op//']) {
+		const r = await post(path, { wallet: a9.data.wallet, mktToken: v9.data.mktToken, op: 'list', sid: 'x', listing: { id: 'l1' } });
+		check(r.status === 403, `${path} is refused for an app token`);
+	}
+	for (const path of ['/cup/register/', '/CUP/register', '/claim/']) {
+		const r = await post(path, { wallet: a9.data.wallet, mktToken: v9.data.mktToken });
+		check(r.status === 403, `${path} is refused for a walletless account`);
+	}
 }
 
 console.log('\nan app account cannot borrow the wallet-holder powers');

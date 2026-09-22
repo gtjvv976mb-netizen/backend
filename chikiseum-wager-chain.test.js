@@ -134,3 +134,24 @@ test('helpers: memosOf, wagerMemoOf and lamportDelta on odd shapes never throw',
   assert.deepEqual(memosOf(null), []); assert.equal(wagerMemoOf({}), null); assert.equal(lamportDelta(undefined, alice), 0);
   assert.equal(lamportDelta({ transaction: { message: { accountKeys: [alice] } }, meta: { preBalances: [5], postBalances: [9] } }, alice), 4, 'bare string keys are handled too');
 });
+
+test('rail.send refuses a payee nobody can spend from, before anything is signed or sent', async () => {
+  const conn = fakeConn(), rail = makeWagerRail({ conn, treasury });
+  // Off the Ed25519 curve: the shape of an app-native account address. No key for it can exist.
+  let offCurve = null;
+  for (let i = 0; i < 64 && !offCurve; i++) {
+    const bytes = Keypair.generate().publicKey.toBytes(); bytes[31] ^= 0x40 | i;
+    if (!PublicKey.isOnCurve(bytes)) offCurve = new PublicKey(bytes).toBase58();
+  }
+  assert.ok(offCurve, 'found an off-curve address to test with');
+  for (const to of [offCurve, '11111111111111111111111111111111']) {
+    await assert.rejects(rail.send({ to, lamports: 1000, memo: 'm' }), e => classifySendError(e) === 'not_broadcast' && !e.ambiguous && /unpayable/.test(e.message));
+  }
+  assert.equal(conn.sentRaw.length, 0, 'nothing reached the RPC');
+  // The caller's own rule is honoured too, on top of the built-in ones.
+  const strict = makeWagerRail({ conn, treasury, unpayable: a => a === mallory });
+  await assert.rejects(strict.send({ to: mallory, lamports: 1000, memo: 'm' }), /unpayable/);
+  const ok = await strict.send({ to: alice, lamports: 1000, memo: 'm' });
+  assert.match(ok.sig, /^Sent/);
+  assert.throws(() => makeWagerRail({ conn, treasury, unpayable: 'yes' }), /predicate/);
+});
