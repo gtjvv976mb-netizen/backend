@@ -118,7 +118,7 @@ function sameSecret(a, b) {
 
 const clean = (s, n) => String(s == null ? "" : s).replace(/[\u0000-\u001f<>]/g, "").trim().slice(0, n);
 
-export function createRealmLink({ store, isPubkey, newAddress, isWalletless, log = console }) {
+export function createRealmLink({ store, isPubkey, newAddress, isWalletless, log = console, appGraceMs = DELETE_GRACE_APP_MS }) {
 	if (!store || typeof store.kvGet !== "function") throw new Error("realm-link needs a store");
 	if (typeof isPubkey !== "function") throw new Error("realm-link needs isPubkey");
 	// Injected rather than imported so this module keeps no opinion about which Solana library is
@@ -502,11 +502,12 @@ export function createRealmLink({ store, isPubkey, newAddress, isWalletless, log
 	// period, and signing in on the website with the actual wallet cancels it. A stolen phone
 	// therefore cannot erase an account the owner still uses.
 	//
-	// EXECUTION IS NOT WIRED HERE, ON PURPOSE. What "delete" removes from a wallet-keyed game
-	// economy — the profile, the on-chain assets it does not own, the market history other players
-	// settled against — is a product decision, not a detail, and it is still open in IOS-APP.md.
-	// `due()` lists the accounts past their grace period so whoever makes that decision can act on
-	// it; nothing in this file erases anything.
+	// EXECUTION lives in server.js (executeAccountDeletion + the hourly sweep), because the data is
+	// spread across the whole service. It erases APP-NATIVE accounts — the only kind the app can
+	// create — once `due()` lists them. A WALLET account (made on the website, or an app account
+	// already bound onto a wallet) is not erased automatically: what "delete" means for a wallet-
+	// keyed economy — on-chain assets, market history other players settled against — is still an
+	// owner decision (APPSTORE.md). The sweep logs those and leaves them for a person.
 
 	function requestDeletion({ wallet, device_id }) {
 		if (!isPubkey(wallet)) return { error: "valid 'wallet' required", status: 400 };
@@ -518,7 +519,7 @@ export function createRealmLink({ store, isPubkey, newAddress, isWalletless, log
 		// asked to be forgotten waiting a week. It still is not instant, because the one thing a
 		// grace period genuinely buys here is an undo for a mis-tap.
 		const app = isWalletless(wallet);
-		const grace = app ? DELETE_GRACE_APP_MS : DELETE_GRACE_MS;
+		const grace = app ? appGraceMs : DELETE_GRACE_MS;
 		deletions[wallet] = { requested_at: now, completes_at: now + grace, device_id: clean(device_id, 64), app };
 		save().catch(() => {});
 		return { accepted: true, completes_at: new Date(deletions[wallet].completes_at).toISOString(), grace_days: Math.round(grace / 86400000) };
@@ -547,6 +548,26 @@ export function createRealmLink({ store, isPubkey, newAddress, isWalletless, log
 
 	function deletionStatus(wallet) { return deletions[wallet] || null; }
 
+	/**
+	 * The account has been erased (server.js executeAccountDeletion): drop every credential that
+	 * could still reach it — device tokens, their app tokens, open pairing and claim codes — and the
+	 * request itself. After this the phone that asked is signed out and cannot sign back in.
+	 */
+	function completeDeletion(wallet) {
+		let revoked = 0;
+		for (const [t, v] of Object.entries(tokens)) {
+			if (v.wallet !== wallet) continue;
+			dropAppTokensFor(t);
+			delete tokens[t];
+			revoked++;
+		}
+		for (const [c, v] of codes) if (v.wallet === wallet) codes.delete(c);
+		for (const [c, v] of claims) if (v.wallet === wallet) claims.delete(c);
+		delete deletions[wallet];
+		save().catch(() => {});
+		return { revoked };
+	}
+
 	function due(now = Date.now()) {
 		return Object.entries(deletions)
 			.filter(([, v]) => v.completes_at <= now)
@@ -565,7 +586,7 @@ export function createRealmLink({ store, isPubkey, newAddress, isWalletless, log
 		newCode, redeem, resolve, revoke, devices,
 		createAccount, claimCode, claimResolve, releaseClaim, commitBind, boundTo,
 		mintAppToken, appTokenWallet,
-		requestDeletion, cancelDeletion, cancelDeletionByDevice, deletionStatus, due,
+		requestDeletion, cancelDeletion, cancelDeletionByDevice, deletionStatus, due, completeDeletion,
 		stats, restored,
 		// exported for tests
 		_constants: { CODE_LEN, CODE_TTL_MS, CLAIM_TTL_MS, DELETE_GRACE_MS, DELETE_GRACE_APP_MS, DEVICES_MAX_PER_WALLET, CREATE_RATE_MAX, CLAIM_RATE_MAX, REDEEM_GLOBAL_MAX, CLAIM_GLOBAL_MAX },
