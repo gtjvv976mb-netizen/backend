@@ -584,6 +584,18 @@ function pgStore() {
     },
     async kvGet(k) { const r = await pool.query(`SELECT v FROM kv WHERE k=$1`, [k]); return r.rows[0]?.v ?? null; },
     async kvSet(k, v) { await pool.query(`INSERT INTO kv(k,v) VALUES($1,$2::jsonb) ON CONFLICT(k) DO UPDATE SET v=$2::jsonb`, [k, jsonbSafe(v)]); },
+    // App Store 5.1.1(v): erase an account's rows. Only ever called by executeAccountDeletion, which
+    // decides WHICH accounts may be erased and clears the in-memory state first.
+    async deleteAccount(wallet, kvKeys) {
+      await pool.query(`DELETE FROM players WHERE wallet=$1`, [wallet]);
+      await pool.query(`DELETE FROM presence WHERE wallet=$1`, [wallet]);
+      await pool.query(`DELETE FROM quest_rewards WHERE wallet=$1`, [wallet]);
+      if (kvKeys && kvKeys.length) await pool.query(`DELETE FROM kv WHERE k = ANY($1::text[])`, [kvKeys]);
+      if (CHRONICLE_ON) {
+        await pool.query(`DELETE FROM chronicle_events WHERE wallet=$1`, [wallet]);
+        await pool.query(`DELETE FROM chronicle_agg WHERE wallet=$1`, [wallet]);
+      }
+    },
     async firstSeen(wallet) { const r = await pool.query(`SELECT first_seen FROM players WHERE wallet=$1`, [wallet]); return r.rows[0] ? Number(r.rows[0].first_seen) : 0; },
     async winnersRemaining(cap) { const n = Number((await pool.query(`SELECT COUNT(*)::int n FROM quest_winners`)).rows[0].n); return Math.max(0, cap - n); },
     async winnerGet(wallet) { const r = await pool.query(`SELECT wallet,rank,won_at,balance_at_win,paid,payout_sig FROM quest_winners WHERE wallet=$1`, [wallet]); return r.rows[0] || null; },
@@ -834,6 +846,12 @@ function memStore() {
     async init() {},
     async kvGet(k) { return kv.has(k) ? kv.get(k) : null; },
     async kvSet(k, v) { kv.set(k, v); },
+    async deleteAccount(wallet, kvKeys) {
+      players.delete(wallet); presenceMap.delete(wallet); _memQR.delete(wallet);
+      for (const k of (kvKeys || [])) kv.delete(k);
+      for (let i = _memChronEvents.length - 1; i >= 0; i--) if (_memChronEvents[i].wallet === wallet) _memChronEvents.splice(i, 1);
+      for (const k of [..._memChronAgg.keys()]) if (String(k).includes(wallet)) _memChronAgg.delete(k);
+    },
     // ---- chronicle (CHIK_CHRONICLE): same contract as the Postgres tables, in memory (dev/sims).
     async chronInsertEvents(rows) {
       for (const r of (rows || [])) { if (_memChronIdem.has(r.idem)) continue; _memChronIdem.add(r.idem); _memChronEvents.push(r); }
@@ -1036,7 +1054,10 @@ const store = makeStore();
 // trusted to the client: a link session's market token comes from a separate pool, which makes
 // "this request came from a paired device" decidable on the server. See `appTokenGuard` below and
 // realm-link.js.
-const realmLink = createRealmLink({ store, isPubkey, isWalletless, newAddress: newWalletlessAddress });
+// DELETE_GRACE_APP_MS overrides the 24-hour undo window for app-made accounts. Tests set it to a
+// few hundred milliseconds; production leaves it unset.
+const realmLink = createRealmLink({ store, isPubkey, isWalletless, newAddress: newWalletlessAddress,
+  ...(Number(process.env.DELETE_GRACE_APP_MS) > 0 ? { appGraceMs: Number(process.env.DELETE_GRACE_APP_MS) } : {}) });
 
 /* ----------------------------- the world chronicle engine (CHIK_CHRONICLE) ----------------------------- */
 // One append path (chronicleAdd) + one counter path (chronicleBump). Both are SYNCHRONOUS in-memory
@@ -2383,6 +2404,110 @@ app.post("/link/delete_account", (req, res) => {
   if (out.error) return res.status(out.status || 400).json(out);
   res.json(out);
 });
+
+/* ============================ ACCOUNT DELETION, CARRIED OUT (5.1.1(v)) ============================
+ *
+ * /link/delete_account above RECORDS a request; this is what honours it. An hourly sweep takes every
+ * request past its grace period (realmLink.due()) and erases the account.
+ *
+ * It erases APP-NATIVE accounts — the only kind the app can create, which is what the guideline
+ * covers. It uses the same map of "where an app account's data lives" that bindAppAccount below
+ * moves, and the same checked-not-trusted stance: an app account cannot have minted, listed, won a
+ * Cup prize or be mid-match, and if one somehow has, the deletion waits for a person rather than
+ * erase half an account.
+ *
+ * A WALLET account is logged and left alone. Deleting it means deciding what happens to on-chain
+ * assets and market history other players settled against, and that is still the owner's call
+ * (APPSTORE.md, "Account deletion").
+ */
+async function executeAccountDeletion(w) {
+  if (!isWalletless(w)) return { skipped: "wallet account — needs an owner decision" };
+  if (!_assetsReady) return { postponed: "asset registry not restored yet" };
+  try { if (chikiseumLive && typeof chikiseumLive.walletBusy === "function" && chikiseumLive.walletBusy(w)) return { postponed: "in a live Chikiseum match" }; } catch (e) {}
+
+  // Check everything first, change nothing until every check has passed.
+  const ids = [...(assetsByOwner.get(w) || [])].filter((id) => { const r = assetReg.get(id); return r && r.owner === w; });
+  const held = [];
+  for (const id of ids) {
+    const row = assetReg.get(id);
+    if (row.mint || row.mintPending) { held.push("an on-chain certificate"); break; }
+    if (row.listedOffchain || row.pendingHandover || _nftBoardListed(row)) { held.push("an asset in escrow or listed"); break; }
+  }
+  if ((cupPrizes.get(w) || 0) > 0) held.push("an owed Cup prize");
+  if (held.length) {
+    console.error("account deletion HELD for a person —", w, "holds", held.join(", "));
+    return { postponed: "needs a person: " + held.join(", ") };
+  }
+
+  // 1. The creatures: retired, never removed. The provenance chain stays so editions and caps still
+  //    add up; the row simply belongs to nobody who can play it.
+  for (const id of ids) {
+    const row = assetReg.get(id);
+    if (!Array.isArray(row.chain)) row.chain = [];
+    if (row.state !== "burned") { row.state = "burned"; regEvent(row, "account_deleted", {}); }
+  }
+  if (ids.length) {
+    assetsByOwner.delete(w);
+    _assetsDirty = true;
+    censusInvalidate();
+    try { await saveAssetLedger(true); } catch (e) { console.error("account deletion: asset ledger save failed", String(e?.message || e)); }
+  }
+
+  // 2. The in-memory maps keyed by the address.
+  if (battleWins && Object.prototype.hasOwnProperty.call(battleWins, w)) {
+    delete battleWins[w];
+    try { await saveBattleWins(true); } catch (e) {}
+  }
+  let latches = 0;
+  for (const k of [...credLatch.keys()]) if (k.endsWith(":" + w)) { credLatch.delete(k); latches++; }
+  if (latches) { try { saveCredLatch(); } catch (e) {} }
+  onlineUsers.delete(w);
+  for (const sock of wsClients) {
+    const st = sock._chik;
+    if (st && st.wallet === w) { try { wsSend(sock, { t: "superseded", flushMs: 0 }); sock.close(); } catch (e) {} }
+  }
+
+  // 3. The database rows: the player and its save, presence, the quest ledger, the kv keys that embed
+  //    the address, and its chronicle.
+  await store.deleteAccount(w, [QKEY(w), "signin:" + w]);
+
+  // 4. Every credential that could still reach it, and the request itself.
+  const creds = realmLink.completeDeletion(w);
+  const out = { erased: true, assets: ids.length, devices: creds.revoked };
+  console.log("account deleted:", w, JSON.stringify(out));
+  return out;
+}
+
+const _deletionWalletLogged = new Set();
+let _deletionSweepBusy = false;
+async function sweepAccountDeletions() {
+  if (_deletionSweepBusy) return;
+  _deletionSweepBusy = true;
+  try {
+    await realmLink.restored;
+    for (const req of realmLink.due()) {
+      if (!isWalletless(req.wallet)) {
+        if (!_deletionWalletLogged.has(req.wallet)) {
+          _deletionWalletLogged.add(req.wallet);
+          console.warn("account deletion due for a WALLET account — left for a person:", req.wallet);
+        }
+        continue;
+      }
+      try {
+        const r = await executeAccountDeletion(req.wallet);
+        if (!r.erased) console.warn("account deletion not yet done:", req.wallet, JSON.stringify(r));
+      } catch (e) {
+        console.error("account deletion failed:", req.wallet, String(e?.message || e));
+      }
+    }
+  } finally {
+    _deletionSweepBusy = false;
+  }
+}
+// Hourly in production. DELETION_SWEEP_MS shortens it for tests.
+const DELETION_SWEEP_MS = Number(process.env.DELETION_SWEEP_MS) > 0 ? Number(process.env.DELETION_SWEEP_MS) : 60 * 60 * 1000;
+setInterval(sweepAccountDeletions, DELETION_SWEEP_MS).unref?.();
+setTimeout(sweepAccountDeletions, Math.min(DELETION_SWEEP_MS, 60 * 1000)).unref?.();
 
 /* ============================= APP-NATIVE ACCOUNTS: CREATE AND BIND =============================
  *
