@@ -2509,6 +2509,75 @@ const DELETION_SWEEP_MS = Number(process.env.DELETION_SWEEP_MS) > 0 ? Number(pro
 setInterval(sweepAccountDeletions, DELETION_SWEEP_MS).unref?.();
 setTimeout(sweepAccountDeletions, Math.min(DELETION_SWEEP_MS, 60 * 1000)).unref?.();
 
+/* ================================ APP LOAD DIAGNOSTICS ================================
+ *
+ *   POST /client-diag  {session, …}   the iOS app's report of a load that did not come alive
+ *   GET  /client-diag?key=…           the most recent reports, newest first (support only)
+ *
+ * The app is a web view around the realm, and when the realm fails to load on a phone — killed
+ * for memory, stuck, erroring — the only witness is the phone. So the shell sends what it saw:
+ * the load stages with timings, how often the web content process died, the page's own errors,
+ * the hardware model and iOS version. No account, no device id, no IP is kept: `session` is a
+ * random id minted per app launch so successive snapshots of one launch replace each other.
+ *
+ * Reading is behind a key whose SHA-256 is below; the key itself is not in this repository.
+ */
+const DIAG_READ_SHA256 = "d9eb84d4a8a1662b6fd3c665d20bfdb2b91ee6c0b6f01503939b075cf1621d24";
+const DIAG_KEEP = 200;
+const DIAG_MAX_BYTES = 32 * 1024;
+const diagRing = [];
+let diagLoaded = null, diagSaveTimer = null;
+const diagRate = new Map();   // requester -> {n, since}; a per-IP token count, never stored
+function diagLoad() {
+  if (!diagLoaded) {
+    diagLoaded = (async () => {
+      try { const v = await store.kvGet("client_diag"); if (Array.isArray(v)) diagRing.push(...v.slice(-DIAG_KEEP)); } catch (e) {}
+    })();
+  }
+  return diagLoaded;
+}
+function diagSave() {
+  if (diagSaveTimer) return;
+  diagSaveTimer = setTimeout(async () => {
+    diagSaveTimer = null;
+    try { await store.kvSet("client_diag", diagRing.slice(-DIAG_KEEP)); } catch (e) {}
+  }, 5000);
+  diagSaveTimer.unref?.();
+}
+app.post("/client-diag", async (req, res) => {
+  const who = String(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "").split(",")[0].trim();
+  const now = Date.now();
+  const r = diagRate.get(who);
+  if (!r || now - r.since > 10 * 60 * 1000) diagRate.set(who, { n: 1, since: now });
+  else if (++r.n > 60) return res.status(429).json({ error: "too many reports" });
+  if (diagRate.size > 5000) diagRate.clear();
+
+  const b = req.body;
+  if (!b || typeof b !== "object" || Array.isArray(b)) return res.status(400).json({ error: "expected a JSON object" });
+  let raw;
+  try { raw = JSON.stringify(b); } catch (e) { return res.status(400).json({ error: "bad report" }); }
+  if (raw.length > DIAG_MAX_BYTES) return res.status(413).json({ error: "report too large" });
+  const session = String(b.session || "").slice(0, 64);
+  if (!session) return res.status(400).json({ error: "session required" });
+
+  await diagLoad();
+  const i = diagRing.findIndex((e) => e.session === session);
+  if (i >= 0) diagRing.splice(i, 1);
+  diagRing.push({ session, at: now, report: JSON.parse(raw) });
+  while (diagRing.length > DIAG_KEEP) diagRing.shift();
+  diagSave();
+  res.json({ ok: true });
+});
+app.get("/client-diag", async (req, res) => {
+  const key = String(req.query.key || "");
+  const got = crypto.createHash("sha256").update(key).digest();
+  const want = Buffer.from(DIAG_READ_SHA256, "hex");
+  if (!key || !crypto.timingSafeEqual(got, want)) return res.status(404).json({ error: "not found" });
+  await diagLoad();
+  const n = Math.max(1, Math.min(DIAG_KEEP, parseInt(req.query.n, 10) || 20));
+  res.json({ reports: diagRing.slice(-n).reverse() });
+});
+
 /* ============================= APP-NATIVE ACCOUNTS: CREATE AND BIND =============================
  *
  *   POST /account/new    {device_id}                     -> {wallet, linkToken}   (in the app)
